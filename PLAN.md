@@ -1,0 +1,379 @@
+# ESP32 Nitrox CCR Controller — Master Plan
+
+Rebreather controller on ESP32: 3× R22D galvanic O₂ cells on an ADS1115 (PGA=16),
+depth sensing, ZHL-16C decomputation, handset over UART, web UI over a private AP,
+and a PC simulator to validate the control/deco logic before hardware trust.
+
+## Decisions locked
+
+| Topic | Decision |
+|---|---|
+| Platform | ESP32, PlatformIO, Arduino framework (FreeRTOS), C++17 |
+| Gas config | Nitrox CCR — controller manages O₂ injection only; diluent switching manual |
+| ADC | ADS1115, PGA=16, continuous 16 SPS, cells on A0/A1/A2 single-ended; **bench today: 2 cells on A0/A1, A2 free** |
+| Air reference | 11 mV @ 21% O₂ nominal; per-cell calibration factors in NVS |
+| Depth sensor | BMP085 for bench; **MS5837-30bar (CSB→GND, addr 0x76)** for wet prototype; one-constant swap |
+| ADS1115 DRDY | Not wired on bench → timed non-blocking reads + bus recovery; driver supports DRDY later (`PIN_DRDY=-1` disables) |
+| Cell calibration | **2-point**: air (mandatory, always applied) + high-O₂ plateau at configurable `CAL_O2_FI` (default 0.99); scripted `CAL O2` via solenoid enrichment of a sealed chamber |
+| Mid-dive cell proof | At ~10 m push setpoint to 1.10; vote group must prove >1.0, else clamp all setpoints to ≤0.90 + alarm (diver-overridable, always logged) |
+| Alarms | Low 0.18, high warn 1.45, hard cutoff 1.60, CNS alarm 80% — all configurable |
+| Setpoints | 4 configurable with depth crossover + hysteresis (defaults 0.40 / 0.70 / 1.00 / 1.30) |
+| Deco | Bühlmann ZHL-16C + gradient factors, GF low/high configurable; UART exposes NDL, total deco time, stop ladder (next stop depth+time) |
+| Handset | ASCII line protocol, defined from scratch, UART2 @ 115200 |
+| Battery | Full support: divider sense on ADC1, alarms, pre-dive check, per-snapshot logging |
+| Dives | 10-dive FIFO, 30 s snapshots + event-driven snapshots, CSV export |
+| Validation | PC simulator + unit tests vs published deco tables before hardware trust |
+| Web UI | Mobile-first, clean, responsive (phone portrait → single column; desktop → dashboard grid); no framework, no CDN |
+
+## 1. Architecture
+
+```
+espRebController/
+├── platformio.ini            # env:esp32 + env:native (unit tests) + env:sim
+├── include/config/
+│   ├── pins.h                # every GPIO in one header
+│   └── defaults.h            # all startup defaults
+├── src/
+│   ├── main.cpp              # task bootstrap, SAFE-mode boot, reset-reason log
+│   ├── sensors/
+│   │   ├── ads1115_bus.cpp   # custom hang-proof ADS1115 driver (no stock lib)
+│   │   ├── depth_sensor.*    # interface; bmp085.cpp, ms5837.cpp
+│   │   └── battery.cpp       # ESP32 ADC1 + divider, smoothed, calibratable
+│   ├── control/
+│   │   ├── voting.cpp        # median-of-N, disagreement, health scores
+│   │   ├── setpoints.cpp     # SP table, crossovers, clamp machinery
+│   │   ├── injector.cpp      # pulse control, stuck-open detection
+│   │   ├── calibration.cpp   # 2-point cal, CAL O2 sequencer, TEST CELLS
+│   │   ├── cellproof.cpp     # mid-dive high-ppO2 validation
+│   │   └── predive.cpp       # check sequencer + AUTO lockout
+│   ├── deco/zhl16c.cpp       # 16 compartments, GF, NDL, schedule, CNS clock
+│   ├── comms/
+│   │   ├── settings.cpp      # ONE key/value registry → NVS (handset+web shared)
+│   │   ├── uart_proto.cpp    # handset protocol
+│   │   └── web/              # ESPAsyncWebServer + WebSocket + LittleFS pages
+│   ├── log/divelog.cpp       # dive records, events, CSV export
+│   └── hud.cpp               # 3-LED pattern engine
+├── sim/                      # PC build of the real logic + world model
+└── test/                     # native unit tests (voting, deco, setpoints, proto)
+```
+
+**RTOS layout**
+
+| Task | Core | Job |
+|---|---|---|
+| `SensorTask` | 0, high prio | ADS1115 + depth + battery @ ~15 Hz; never blocks |
+| `ControlTask` | 1 | voting → setpoints → injector; cellproof/predive state machines |
+| `UARTTask` | — | handset line protocol, telemetry at 2 Hz |
+| `WebTask` | — | alive only when WiFi enabled (off during dive) |
+| `LogTask` | — | LittleFS writes off the critical path |
+
+### Pin defaults (`pins.h`, all changeable in one header)
+
+| Function | GPIO | Notes |
+|---|---|---|
+| I2C SDA / SCL | 21 / 22 | shared ADS1115 + BMP085/MS5837, 100 kHz, 4.7 kΩ pull-ups |
+| Solenoid drive | 27 | MOSFET gate; **INPUT_PULLDOWN until ControlTask alive**; monitor LED on same net |
+| HB / ERR / DECO LEDs | 2 / 4 / 5 | active-high |
+| Handset UART TX / RX | 17 / 16 | UART2, 115200 |
+| Battery sense | 35 | **ADC1 only** (ADC2 collides with WiFi); divider 100k/10k, `VBAT_CAL` trims |
+| ADS1115 DRDY (optional) | 18 | supported by driver; `-1` disables (bench today) |
+
+## 2. Safety skeleton (cross-cutting)
+
+The ADS1115/ADS1x15 hang problem (blocking reads during conversions, I2C
+lockup with SDA held low, MUX/CONFIG churn in continuous mode) is treated as a
+life-safety issue:
+
+1. **Three watchdog layers**
+   - TWDT on SensorTask and ControlTask.
+   - Hardware RNG-WDT fed only when both tasks heartbeat.
+   - Any watchdog reset → boot into **SAFE mode** (no injection, alarm, HB
+     double-beat) requiring handset `ACK`; reset reason logged every boot.
+2. **Solenoid failsafe at GPIO level**: drive pin failsafe-low; driver circuit
+   must be gate-low = valve closed. Firmware walls: never inject above 1.45;
+   drive forced OFF at ≥1.60 regardless of mode.
+3. **I2C hang-proofing**
+   - ADS1115 config register written **once** at init (continuous mode, 16 SPS,
+     PGA=16) and never touched again.
+   - Reads scheduled by conversion timing (62.5 ms period) — no polling of the
+     conversion-done bit, no busy-waits.
+   - All transactions under an I2C mutex with hard timeouts.
+   - Failure → **bus recovery**: ≤16 bit-banged SCL clocks + STOP + `Wire.begin()`
+     re-init. Recovery counter surfaced on web/handset; sustained recoveries →
+     warning.
+   - Same raw value for >5 s → sensor-health fault.
+   - 100 kHz bus speed, 4.7 kΩ pull-ups.
+4. **Reading plausibility**: absurd raw values or implausible sample-to-sample
+   jumps rejected before voting.
+5. **Degradation ladder** (ppO₂ sensing): 3 healthy → 2 (vote = **min** of two,
+   conservative) → 1 (use it + alarm) → 0 (**SAFE mode**, solenoid off).
+   Bench runs the full 2-cell path natively; 3rd cell auto-detected when fitted.
+6. **Stuck-open solenoid**: ppO₂ rising with zero commanded pulses → drive cut
+   + alarm.
+7. **Dropout discrimination**: one cell collapses vertically = sensor fault;
+   all cells collapse = real hypoxia. Both alarm; different ERR LED patterns.
+8. Hardware guidance (documented, not coded): physical manual-inhibit switch in
+   the O₂ line; keep max solenoid duty low (≤5%) so runaway firmware cannot
+   flood the loop.
+
+## 3. Signal chain & calibration
+
+- PGA=16 → ±256 mV, 7.8 µV LSB: 11 mV ≈ 1408 counts, ~0.001 bar resolution.
+- **Voted ppO₂ = median of healthy cells.**
+- **Disagreement**: |cell − median| > `CELL_DRIFT_BAR` (default 0.05) for 10
+  consecutive samples → cell excluded from vote, logged, warning LED.
+- **Health score** per cell: rolling variance vs median + responsiveness to
+  injection pulses (dead cells stop responding). Drives preferred-cell display
+  and early degradation warnings before outright failure.
+- **2-point calibration** per cell (NVS):
+  `ppO2 = (mV − mV₁)/scale + 0.21`, `scale = (mV₂ − mV₁)/(CAL_O2_FI − 0.21)`.
+  - Cal 1 (air, 0.21) **mandatory** — system never arms without it.
+  - Cal 2 at `CAL_O2_FI` (default 0.99 — settable, gas need not be pure).
+  - Sanity gates: implied slope within `CAL_SLOPE_BAND` (±15%) of single-point
+    slope, plausible offset → else reject 2-point **for that cell**, keep
+    air-only cal, warn, log.
+  - Calibration age shown; staleness flagged.
+- **`CAL O2` scripted enrichment calibration** (bench/surface only):
+  1. Preconditions enforced: air-cal passed, cells warm, depth ≈ 0, not dived;
+     two-step confirm (`CAL O2` then `CAL O2 CONFIRM`) — it enriches a closed
+     volume toward 1.0 bar O₂, must never fire from a stray UART byte.
+  2. Inject pulses until plateau ≥ `CAL_O2_TARGET` (0.95) or timeout; hard cap
+     `CAL_O2_MAX_PPO2` (1.0); capped soak time at plateau (cells degrade).
+  3. Hold, sample 30 s medians; validate spread / stability / plateau; compute
+     Cal-2 per passing cell.
+  4. Captures rise time + pulse responsiveness per cell → feeds health scores.
+- **`TEST CELLS`** standalone: the same pulse-and-measure scripted check
+  (inject a few seconds, verify all cells respond) without committing a cal.
+- Temperature: BMP085/MS5837 die temp for coarse cell compensation (~2%/°C);
+  dedicated loop temp sensor deferred to prototype.
+
+## 4. CellProof — mid-dive high-ppO₂ validation
+
+Galvanic cells that are linear at 0.4 but saturate at 1.0 pass an air cal and
+lie at depth. CellProof catches exactly this:
+
+- Arms **once per dive** on first descent through `CELLPROOF_DEPTH` (default 10 m).
+- Ramps active setpoint to `CELLPROOF_SP` (1.10) — ramped, and never above the
+  1.45 hard wall.
+- **Pass**: voted ≥ `CELLPROOF_MIN` (1.00) within `CELLPROOF_TIMEOUT` (60 s),
+  cross-checked against commanded-O₂ pulse integration so a genuinely slow loop
+  doesn't blame healthy cells.
+- Per-cell: cells that reach the group = **proven**; lagging cells =
+  **unproven** → excluded from voting whenever active SP > 1.0.
+- **Failure policy**: vote group fails → clamp every setpoint above
+  `CELLPROOF_OK_MAXSP` (default 0.90) to that cap **for the rest of the dive**;
+  alarm + ERR pattern + forced snapshot; web/handset show the clamp and its
+  expiry (= dive end). `CELLPROOF OVERRIDE` acknowledges and lifts the clamp —
+  diver outranks machine, but it is loud and logged.
+
+## 5. Setpoints & injection control
+
+| SP | Default | Active when |
+|---|---|---|
+| SP1 surface | 0.40 | depth < 2.0 m |
+| SP2 in-water | 0.70 | 2.0 m – D1 |
+| SP3 deep-1 | 1.00 | D1 (30 m) – D2 |
+| SP4 deep-2 | 1.30 | > D2 (50 m) |
+
+- Crossover depths + `SP_HYST` (0.5 m) prevent flapping; every SP change logged
+  with a forced snapshot. Clamps (cellproof, high-ppO₂) apply as a layer on top.
+- **Bang-bang + pulse width**: inject `INJ_PULSE_MS` (300 ms) when
+  voted < SP − 0.03; stop above SP + 0.02; max duty `INJ_MAX_DUTY` 5%.
+  Deterministic, no windup — right behavior for a CCR. Low ppO₂ increases
+  aggressiveness but never bypasses the high wall.
+- Bench: solenoid GPIO also drives a monitoring LED (same net) so injection is
+  visible. `PULSE` handset command = single manual test pulse.
+
+## 6. Deco engine — ZHL-16C + GF
+
+- 16 N₂ compartments, fitted nitrox parameters; inspired ppN₂ from **measured**
+  ambient pressure (depth) and **measured** loop ppO₂ — rebreather-correct inert
+  partial pressure, O₂ treated as inert.
+- GF low/high configurable (default 30/85) → ceiling depth, stop ladder
+  (depth + time per stop, ~6 stops), total ascent time at `ASC_RATE` (6 m/min)
+  with last 3 m at `ASC_RATE_SLOW` (1 m/min).
+- **NDL** = no-stop time remaining at current depth: forward-simulate tissue
+  loading holding depth until GF ceiling exceeds current depth. 0 whenever a
+  ceiling already exists.
+- **CNS O₂** single-trigger clock (NOAA table), alarm at 80%.
+- Validated in `test/` against published NDL tables and published deco
+  schedules; invariants checked (NDL monotonic, ceiling continuous, schedule
+  total = stops + ascent). Compared against an independent implementation
+  (Subsurface-derived) in the sim harness.
+- Caveat: simulator + unit validation is bench confidence, **not** a dive-
+  release certification.
+
+## 7. Pre-dive sequence (AUTO lockout)
+
+```
+IDLE → WARMUP (120 s, cells)
+     → AIR CHECK (all cells within 8% of 0.21)
+     → SOLENOID TEST (ppO2 rises ≥0.03 within 2 pulses, then falls back;
+        per-cell response measured)
+     → DEPTH ≈ 0 + sensor-identity check (MS5837 coefficients match NVS copy)
+     → BATTERY ≥ min
+     → PASS (enables AUTO)
+```
+
+No AUTO before PASS. `CHECK` re-runs the sequence; the web checklist page mirrors
+every step with pass/fail; every step logged. `CAL AIR` stores cell scale
+factors; `CAL DEPTH` surface-tares depth.
+
+## 8. Handset UART protocol (UART2 @ 115200, ASCII lines)
+
+**Downlink** (2 Hz):
+
+```
+T,<depth_m>,<voted>,<c1>,<c2>,<c3>,<sp>,<mode>,<flags_hex>
+D,<ndl_min>,<deco_total_min>,<ceiling_m>,<stop1_depth>|<stop1_min>,<stop2_depth>|<stop2_min>,...,<cns_pct>
+E,...            event lines (alarms, SP/mode changes, cellproof, calibrations) on change
+OK / ERR <why>   command replies
+```
+
+**Uplink commands**:
+`GET *|<key>` · `SET <key>=<val>` · `CHECK` · `AUTO` · `MANUAL` · `ACK` ·
+`CAL AIR` · `CAL O2` / `CAL O2 CONFIRM` · `CAL DEPTH` · `TEST CELLS` ·
+`CELLPROOF OVERRIDE` · `PULSE` · `DECO` (one-shot `D,` line) ·
+`DIVE START|END` · `LOG LIST` · `LOG EXPORT <n>` · `WIFI ON|OFF`.
+
+Unknown command → `ERR`; all writes reply `OK`/`ERR <reason>`. The handset and
+web edit the identical settings registry — one code path.
+
+## 9. Web server (WiFi truly off during dive)
+
+AP `ESPCCR-xxxx` with WPA2 password from settings (not editable during a dive).
+On `DIVE START` the **radio is disabled** (not just the server down — saves
+~40–70 mA too); auto-on at dive end; handset `WIFI ON|OFF` override.
+
+### Mobile-first, responsive UI
+
+- Plain HTML/CSS/vanilla JS from LittleFS. **No framework, no CDN** — the AP
+  has no internet, ever. Tiny WebSocket + DOM helper layer.
+- CSS grid: **single narrow column on phone**, multi-panel dashboard on
+  desktop/tablet. Touch targets ≥44 px, no hover-dependent UI.
+- Page budget ~50 KB + shared ~20 KB CSS/JS → instant over ESP32 flash serving.
+- Dark high-contrast theme, big numerals (the ppO2 number dominates). Page
+  accent color shifts with system state: clean / amber warning / red alarm —
+  glanceable.
+- `viewport` meta + apple-mobile-web-app-capable: "Add to Home Screen" gives a
+  fullscreen app feel; a tiny service worker caches pages so the UI opens
+  before the WebSocket connects.
+- WebSocket auto-reconnect + staleness banner — always obvious whether the
+  data is live.
+- State changes (mode, clamps, WiFi off) push toast notifications.
+- Client-side min/max on inputs, re-validated server-side through the same
+  `SET` path as the handset.
+
+### Pages
+
+| Page | Content |
+|---|---|
+| **Status** | Big ppO₂ + target, 3 cell bars + health, depth, mode, ceiling/NDL/deco ladder, CNS, battery, clamp status |
+| **Histogram** | Per-cell ppO₂ histograms (~60 bins, 0–1.9 bar, ~15 Hz accumulation since power-on) — the pre-dive cell-health picture; side-by-side desktop, tabbed on phone; canvas, no chart lib |
+| **Settings** | Grouped accordions; same registry as handset; dangerous actions behind confirm dialogs |
+| **Checklist** | Pre-dive stepper + calibration wizard (`CAL O2` sequence live) |
+| **Dives** | 10-dive list → detail with inline depth/ppO₂ charts → CSV export |
+
+## 10. Dive logging (LittleFS)
+
+- **30 s snapshots**, 32 B binary records: depth, voted ppO₂, 3 cells, active
+  SP, mode + alarm bitmask, CNS%, ceiling, NDL, deco-total, pulses in window,
+  battery, temp → ~4 KB per dive-hour.
+- **Event-driven snapshots** on any alarm / SP change / mode change / cellproof
+  / calibration — the 30 s grid never misses the moment of interest.
+- **Dive header**: max depth, bottom time, min/max ppO₂, total pulses (≈ gas
+  used), full event log with timestamps, GF + SP config in force, calibration
+  age/quality, cellproof outcome, cell health start/end.
+- FIFO of **10 dives**; CSV export via handset and web.
+
+## 11. Settings registry
+
+Single source of truth, NVS-persisted, identical surface over handset `SET/GET`
+and the web Settings page.
+
+| Group | Keys (defaults) |
+|---|---|
+| Alarms | `ALLO_LOW` 0.18 · `ALLO_HIGH` 1.45 · `ALLO_CUTOFF` 1.60 · `CNS_ALARM` 80 |
+| Setpoints | `SP1` 0.40 · `SP2` 0.70 · `SP3` 1.00 · `SP4` 1.30 · `D1` 30 · `D2` 50 · `SP_HYST` 0.5 |
+| Injection | `INJ_PULSE_MS` 300 · `INJ_MAX_DUTY` 5 · deadbands |
+| Voting | `CELL_DRIFT_BAR` 0.05 · drift window |
+| Calibration | `CAL_O2_FI` 0.99 · `CAL_O2_TARGET` 0.95 · `CAL_O2_MAX_PPO2` 1.0 · `CAL_SLOPE_BAND` 15 · per-cell cal factors |
+| CellProof | `CELLPROOF_EN` on · `CELLPROOF_DEPTH` 10 · `CELLPROOF_SP` 1.10 · `CELLPROOF_MIN` 1.00 · `CELLPROOF_TIMEOUT` 60 · `CELLPROOF_OK_MAXSP` 0.90 |
+| Deco | `GF_LOW` 30 · `GF_HIGH` 85 · `ASC_RATE` 6 · `ASC_RATE_SLOW` 1 · `WATER_DENSITY` 1.025 |
+| Battery | `VBAT_MIN` · `VBAT_CAL` |
+| System | WiFi AP SSID/pass · telemetry rate · depth sensor select (`BMP085`/`MS5837`) |
+
+## 12. HUD (3 LEDs)
+
+| LED | Pattern |
+|---|---|
+| **HB** | 1 Hz = AUTO alive · slow = standby · **double-beat = degraded or post-reset SAFE** — a glance tells the state |
+| **ERR/WARN** | off = clean · slow blink = warning (cell disagreement, high warn, low battery) · fast blink = alarm (low ppO₂, dropout, cellproof clamp) · solid = hard fault / SAFE mode. Cleared via `ACK` |
+| **DECO** | solid while the GF ceiling demands a stop |
+
+## 13. Depth sensor abstraction
+
+`DepthSensor` interface; `bmp085.cpp` (bench) and `ms5837.cpp` (wet prototype),
+selected by one constant. MS5837-30bar specifics:
+
+- CSB tied to GND → address `0x76` (avoids collision with BMP085 at 0x77 when
+  both are on the bus during transition testing).
+- OSR 4096 (~10 ms) pressure + temperature, interleaved at ~8 Hz; same
+  non-blocking command→wait-on-timestamp→timed-read pattern as the ADC driver.
+- Factory coefficients C1–C6 read at init, cached, saved to NVS → a swapped
+  sensor is detected (coefficient checksum mismatch = pre-dive failure, and a
+  sensor-identity check).
+- **Errata 2 correction implemented** (`GShock`/`OT` oversampling/low-temp
+  fixups) — without it readings drift below ~10 °C, exactly diver territory.
+- Resolution ~0.5 mbar ≈ 5 mm at depth — ample for setpoint crossovers and
+  deco ceilings.
+- Depth = f(pressure, `WATER_DENSITY` default 1.025) with `CAL DEPTH` surface
+  tare stored in NVS.
+- Wet-prototype practice: MS5837 must be potted (epoxy) with a vented capillary
+  for pressure; the die is not directly submersible. Bench-validate the real
+  driver against the BMP085 side-by-side before potting.
+
+## 14. Simulator (`sim/`, native PlatformIO target)
+
+PC build of the **real** firmware logic — voting, setpoints, injector,
+calibration, cellproof, ZHL-16C, logging, UART protocol — with the hardware
+layer (ADS1115, I2C, GPIO, NVS, WiFi) stubbed. Not a re-implementation.
+
+- **World model**: scripted depth profiles (embedded set + CSV input),
+  configurable SAC rate, loop volume, air diluent. Virtual cells with real
+  physics: injection raises ppO₂, metabolism lowers it, proportional to ambient
+  pressure; noise, drift.
+- **Fault injection flags**: dead cell, noisy cell, slow cell, **cell saturated
+  above ~0.8 bar**, cell disagreement at time T, stuck-open solenoid.
+- Runs the real control loop and asserts: setpoints held, alarms fire on time,
+  voting degrades correctly, **CellProof fires on the saturated cell and the
+  clamp engages**.
+- Output: identical `T,`/`D,`/`E,` UART stream to stdout (handset protocol
+  testable) + real dive-file format (log format validated as a side effect) +
+  optional headless HTTP (localhost) to watch a simulated dive in the web UI.
+- **Deco schedule calculator**: dive profile in → full stop table out → compared
+  against unit-test expectations and an independent reference implementation.
+
+## 15. Milestones (bench-first)
+
+| # | Deliverable | Exit criteria |
+|---|---|---|
+| **M1** | Scaffold, `pins.h`/`defaults.h`, hang-proof ADS1115 driver, I2C bus recovery, 3 watchdog layers, battery sense, HB LED | **24 h soak with SDA/SCL yank fault injection — full recovery without reboot**; SAFE-mode boot verified |
+| **M2** | Median voting + health scores, 2-cell bench mode, solenoid LED pulsing, `CAL AIR`, `CAL O2` + `TEST CELLS` sequencers, pre-dive sequence | Bench pre-dive passes with 2 cells; scripted enrichment cal works end-to-end on the bench jar setup |
+| **M3** | BMP085 driver (+ breathe-on-it depth sim), setpoint crossovers + clamps, dive file format, MS5837 driver incl. Errata 2, CellProof | Setpoint crossovers verified by breathing on the BMP085; dive CSV exports correctly |
+| **M4** | **Simulator-first** deco: ZHL-16C + NDL + schedule + CNS → unit tests vs published tables → sim world model + fault injection → DECO LED + `D,` UART line + web ladder | Unit tests match published NDL/deco tables; sim soak runs show no setpoint escapes |
+| **M5** | UART protocol complete, web server (status/histogram/settings/checklist/dives, mobile-first), WiFi auto-off | Handset integration on real UART; UI usable on a phone over the AP |
+| **M6** | System sim soak + hardening: 50 scripted dives incl. faults; MS5837 swap/potting checklist; battery redundancy notes | Zero missed alarms / setpoint escapes across the soak suite; production soak harness in CI-ish loop |
+
+## 16. Design watch-outs (recorded decisions)
+
+- BMP085 is a **bench stand-in only** — MS5837-30bar before any wet test; the
+  driver ships in M3 so there is no last-minute code change before wet testing.
+- Solenoid driver circuit must fail **closed** on a floating/pulled-low gate;
+  keep firmware max duty low; recommend a hardware manual-inhibit switch in the
+  O₂ line that needs zero firmware cooperation.
+- WiFi credentials fixed, not editable mid-dive.
+- Simulator-validated deco ≠ dive-release certification; cross-check against
+  independent implementations before anyone wears it.
+- Bench cells share a common ground referenced to ADS1115 GND; handset powered
+  from the same rail (UART common ground).

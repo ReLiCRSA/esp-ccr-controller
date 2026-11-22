@@ -204,3 +204,80 @@ size_t toCsv(const DiveMeta& meta,
 }
 
 } // namespace logfmt
+
+namespace logfmt {
+
+void packHeader(uint32_t startEpoch, uint8_t slot, uint8_t out[HEADER_SIZE]) {
+    for (size_t i = 0; i < HEADER_SIZE; ++i) out[i] = 0;
+    out[0] = 'R'; out[1] = 'B'; out[2] = 'D'; out[3] = 'V';
+    out[4] = DIVE_VERSION;
+    out[8] = (uint8_t)(startEpoch);
+    out[9] = (uint8_t)(startEpoch >> 8);
+    out[10] = (uint8_t)(startEpoch >> 16);
+    out[11] = (uint8_t)(startEpoch >> 24);
+    out[12] = slot;
+    const uint16_t crc = crc16(out, 14);
+    out[14] = (uint8_t)crc;
+    out[15] = (uint8_t)(crc >> 8);
+}
+
+bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch, uint8_t& slot) {
+    if (in[0] != 'R' || in[1] != 'B' || in[2] != 'D' || in[3] != 'V') return false;
+    if (in[4] != DIVE_VERSION) return false;
+    const uint16_t crc = crc16(in, 14);
+    if (in[14] != (uint8_t)crc || in[15] != (uint8_t)(crc >> 8)) return false;
+    startEpoch = (uint32_t)in[8] | ((uint32_t)in[9] << 8) |
+                 ((uint32_t)in[10] << 16) | ((uint32_t)in[11] << 24);
+    slot = in[12];
+    return true;
+}
+
+ScanResult scanRecords(const uint8_t* img, size_t len,
+                       void (*cb)(const RawRecord&, void*), void* ctx) {
+    ScanResult res;
+    res.bytesConsumed = 0;
+    if (len < HEADER_SIZE) return res;
+    uint32_t epoch = 0;
+    uint8_t slot = 0;
+    if (!unpackHeader(img, epoch, slot)) return res;
+    res.headerOk = true;
+    res.startEpoch = epoch;
+    res.bytesConsumed = HEADER_SIZE;
+
+    size_t p = HEADER_SIZE;
+    while (p + 1 <= len) {
+        const uint8_t tag = img[p];
+        size_t sz = 0;
+        if (tag == REC_SNAPSHOT) sz = SNAPSHOT_SIZE;
+        else if (tag == REC_EVENT) sz = EVENT_SIZE;
+        else if (tag == REC_META) sz = 64;
+        else break;                       // unknown tag: torn/foreign, stop
+        if (p + 1 + sz > len) break;      // truncated tail: stop
+        const uint8_t* rec = img + p + 1;
+        bool ok = false;
+        if (tag == REC_SNAPSHOT) {
+            Snapshot s;
+            ok = unpackSnapshot(rec, s);
+            if (ok) res.snapshots++;
+        } else if (tag == REC_EVENT) {
+            Event e;
+            ok = unpackEvent(rec, e);
+            if (ok) res.events++;
+        } else {
+            DiveMeta m;
+            ok = unpackMeta(rec, m);
+            if (ok) res.metaOk = true;
+        }
+        if (!ok) break;                   // CRC fail: stop, keep what came before
+        if (cb) {
+            const RawRecord r{tag, rec, sz};
+            cb(r, ctx);
+        }
+        p += 1 + sz;
+        res.bytesConsumed = p;
+        if (tag == REC_META) break;       // trailer terminates the dive
+    }
+    return res;
+}
+
+} // namespace logfmt

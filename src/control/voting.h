@@ -61,6 +61,10 @@ public:
 
     void setPresentMask(uint8_t mask); // bench: 0b011 until 3rd cell fitted
     uint8_t presentMask() const { return present_; }
+    /// Re-tune the bar without rebuilding (which would forget which cells are
+    /// already excluded): a mid-dive CELL_DRIFT_BAR SET must not silently
+    /// re-admit every excluded cell by resetting the engine.
+    void setConfig(const Config& cfg) { cfg_ = cfg; }
 
     /// Evidence from outside this layer (CellProof): cells that have been shown
     /// not to track high ppO2. Treated like any other exclusion — reported in

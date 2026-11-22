@@ -59,6 +59,13 @@ public:
 
     explicit Zhl16Ccr(const Config& cfg);
 
+    /// Re-tune (GF, density, ascent rates) without recomputing tissues from
+    /// scratch — a mid-dive GF SET changes the schedule, not the dive.
+    void setConfig(const Config& cfg) {
+        cfg_ = cfg;
+        computeGf();
+    }
+
     void reset();  // tissues equilibrated to surface air (0.21)
 
     // Integrate one real-time step. pAmbBar = measured absolute pressure,
@@ -86,6 +93,8 @@ public:
     const Config& config() const { return cfg_; }
 
 private:
+    void computeGf();  // per-compartment GF from gfLow/gfHigh
+
     // returns ceiling computed from a given tissue array (used by const sims)
     static double ceilingBarFrom(const double pt[16], const float gf[16]);
     static double cnsLimitMin(double ppO2);

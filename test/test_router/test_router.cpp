@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "comms/cmd_router.h"
+#include "comms/settings_apply.h"
 
 using comms::CommandRouter;
 using namespace ctrl;
@@ -264,6 +265,21 @@ void test_deco_and_status_lines_come_from_the_chain() {
     TEST_ASSERT_TRUE(has(r, "D1=30.000"));
 }
 
+void test_set_actually_moves_the_live_chain() {
+    // The full handset path: SET -> registry -> ACT_SETTINGS -> applier ->
+    // live loop. Pins that the firmware's single applier actually changes
+    // behaviour, not just stored text.
+    Bench b;
+    CommandRouter::Response r = b.run("SET ALLO_LOW=0.30");
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_SETTINGS);
+    TEST_ASSERT_EQUAL_UINT8(comms::CLAMP_NONE, comms::applySettings(b.reg, b.cfg));
+    b.loop.setConfig(b.cfg);
+
+    b.ticks(0.25f, 0.0f, 5.0f);  // 0.25 bar: above the old 0.18 floor, below the new
+    TEST_ASSERT_TRUE_MESSAGE(b.loop.alarmBits() & (1u << alarms::BIT_LOW_PPO2),
+                             "SET ALLO_LOW never reached the live alarm engine");
+}
+
 void test_log_and_pulse_and_calibration_commands_delegations() {
     Bench b;
     CommandRouter::Response r = b.run("LOG LIST");
@@ -312,6 +328,7 @@ int main() {
     RUN_TEST(test_ack_always_honoured);
     RUN_TEST(test_testcells_runs_on_the_bench_and_reports_masks);
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);
+    RUN_TEST(test_set_actually_moves_the_live_chain);
     RUN_TEST(test_log_and_pulse_and_calibration_commands_delegations);
     return UNITY_END();
 }

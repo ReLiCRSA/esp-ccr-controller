@@ -22,7 +22,16 @@ namespace logfmt {
 constexpr uint32_t DIVE_MAGIC = 0x56444252; // "RBDV" little-endian
 // v2: the snapshot alarm mask widened to 10 bits (see Snapshot::alarmBits).
 // v1 files never left the bench, and a v1 decoder must not misread v2 flags.
-constexpr uint8_t DIVE_VERSION = 2;
+// v3: on-disk records are TYPE-TAGGED (one byte before each packed record:
+// 'S' snapshot, 'E' event, 'M' meta trailer). Snapshots and events are
+// interleaved chronologically by the writer; without a tag, a reader cannot
+// tell a 36-byte row from a 10-byte row without guessing on CRC collisions,
+// and one wrong guess desynchronises every row after it. Records produced
+// by pack* are unchanged — the tag belongs to the file, not the codec.
+constexpr uint8_t DIVE_VERSION = 3;
+constexpr uint8_t REC_SNAPSHOT = 'S';
+constexpr uint8_t REC_EVENT = 'E';
+constexpr uint8_t REC_META = 'M';
 constexpr size_t SNAPSHOT_SIZE = 36;  // 34 B of fields + CRC16, see below
 constexpr size_t EVENT_SIZE = 10;     // 8 B of fields + CRC16
 // flags bits 3..4 are the wire home for alarm bits 8..9 (see Snapshot).
@@ -89,6 +98,11 @@ bool unpackEvent(const uint8_t in[EVENT_SIZE], Event& out);
 size_t packMeta(const DiveMeta& m, uint8_t out[64]);      // incl. magic+version+crc
 bool unpackMeta(const uint8_t in[64], DiveMeta& out);     // false on magic/CRC fail
 
+// ---- file header: fixed 16 B at the front of every dive file ---------------
+constexpr size_t HEADER_SIZE = 16;
+void packHeader(uint32_t startEpoch, uint8_t slot, uint8_t out[HEADER_SIZE]);
+bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch, uint8_t& slot);
+
 // ---- CSV export into caller buffer; returns chars written (0 = overflow) ----
 size_t toCsv(const DiveMeta& meta,
              const Snapshot* snaps, size_t nSnaps,
@@ -97,5 +111,30 @@ size_t toCsv(const DiveMeta& meta,
 
 // ---- CRC16-CCITT (used for record integrity on flash) ----
 uint16_t crc16(const uint8_t* data, size_t len);
+
+// ---- tagged record stream (the file layout; see DIVE_VERSION note) ---------
+// Pure walk over the bytes of a dive file: fixed 16 B header, then
+// tag+record pairs, meta trailer last. Parsing stops at the first tag that
+// is unknown, the first record that fails its CRC, and nothing after that
+// is reported — that is the contract between a mid-write reset and the
+// diver reading the log later. Kept free of any file API so the host tests
+// can feed it a byte image directly.
+struct RawRecord {
+    uint8_t tag;               // REC_SNAPSHOT / REC_EVENT / REC_META
+    const uint8_t* bytes;      // packed record (codec-sized, tag excluded)
+    size_t size;
+};
+
+struct ScanResult {
+    bool headerOk = false;
+    uint32_t startEpoch = 0;
+    int snapshots = 0;
+    int events = 0;
+    bool metaOk = false;       // a complete dive ends with a valid trailer
+    size_t bytesConsumed;      // header + every accepted record
+};
+
+ScanResult scanRecords(const uint8_t* img, size_t len,
+                       void (*cb)(const RawRecord&, void*), void* ctx);
 
 } // namespace logfmt

@@ -78,6 +78,12 @@ public:
 
     explicit Loop(const Config& cfg);
 
+    /// Re-apply configuration to the live chain (handset/web SET path). The
+    /// engines re-tune in place: their state — dive activity, exclusions,
+    /// latches, tissues — survives, because reloading settings must never
+    /// look like a fresh start to the control chain.
+    void setConfig(const Config& cfg);
+
     /// One control cycle. `nowMs` is a monotonic clock (millis() on the ESP32,
     /// the sim's virtual clock). dt is taken from kTickMs: a cycle that arrives
     /// late must not be papered over.

@@ -32,7 +32,8 @@ ctrl::Loop::Loop(const Config& cfg)
 // actually left the valve are reported back, verdict to the sequencer.
 // ---------------------------------------------------------------------------
 void Loop::drivePulseTest(uint32_t nowMs) {
-    const bool wantTest = predive_.running() && predive_.current() == predive::S_SOLENOID;
+    const bool prediveStep = predive_.running() && predive_.current() == predive::S_SOLENOID;
+    const bool wantTest = prediveStep || cellTest_;
 
     if (wantTest && !ptActive_) {  // step just started
         ptActive_ = true;
@@ -54,11 +55,13 @@ void Loop::drivePulseTest(uint32_t nowMs) {
 
     if (po.done && !ptDone_) {
         ptDone_ = true;
+        cellTest_ = false;  // a standalone run is over; the walls never changed
         // The step passes when every fitted cell reacted to oxygen the loop is
         // provably receiving. A solenoid that refuses to fire is a failure too:
         // zero pulses delivered with no rise says exactly that.
         const bool allOk = (po.passMask & cfg_.presentMask) == cfg_.presentMask;
-        predive_.reportSolTest(allOk, pi.pulsesDelivered);
+        if (prediveStep) predive_.reportSolTest(allOk, pi.pulsesDelivered);
+        // `TEST CELLS` from the handset: the caller reads the masks.
     }
     if (!wantTest) ptActive_ = false;  // sequencer moved on / aborted
 }
@@ -232,6 +235,25 @@ bool Loop::requestAuto(bool on) {
     }
     autoMode_ = true;
     return true;
+}
+
+void Loop::setConfig(const Config& cfg) {
+    cfg_ = cfg;
+    // In place, not rebuilt: the chain's memory (dive edge, cell exclusions,
+    // latches, proof verdict, tissues) is control state, not configuration.
+    // A SET must retune the rules without pretending the dive restarted.
+    voting_.setConfig(cfg.voting);
+    voting_.setPresentMask(cfg.presentMask);
+    spEng_.setConfig(cfg.sp);
+    injector_.setConfig(cfg.inj);
+    alarmMgr_.setConfig(cfg.alarms);
+    cpEng_.setConfig(cfg.cellproof);
+    cpCfg_ = cfg.cellproof;
+    predive_.setConfig(cfg.predive);
+    deco_.setConfig(cfg.deco);
+    // pulseTest's Cfg is deliberately not hot-reloaded: changing the verdict
+    // thresholds mid-test would make an in-flight verdict meaningless.
+    // It is re-applied at the next test start by the firmware.
 }
 
 }  // namespace ctrl

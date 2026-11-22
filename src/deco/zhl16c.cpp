@@ -31,6 +31,11 @@ constexpr double kLn2 = 0.6931471805599453;
 } // namespace
 
 Zhl16Ccr::Zhl16Ccr(const Config& cfg) : cfg_(cfg) {
+    computeGf();
+    reset();
+}
+
+void Zhl16Ccr::computeGf() {
     // gf per compartment: linear interpolation on the a-coefficient.
     // Config carries GF as percent (30 = 30%); the math uses fractions 0..1.
     // Fastest tissue (largest a) gets gfLow; slowest gets gfHigh.
@@ -40,7 +45,6 @@ Zhl16Ccr::Zhl16Ccr(const Config& cfg) : cfg_(cfg) {
         const double t = (aFast - kA[i]) / span;
         gf_[i] = static_cast<float>((cfg_.gfLow + (cfg_.gfHigh - cfg_.gfLow) * t) / 100.0);
     }
-    reset();
 }
 
 void Zhl16Ccr::reset() {

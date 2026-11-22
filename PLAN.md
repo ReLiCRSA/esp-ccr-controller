@@ -475,8 +475,8 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
-| C2 | bench acceptance script (`tools/hw_accept.py`): boot lines, UART2 session, web AP up, `GET`/`SET` refusals on a wired handset, then flash the current build | pending — port free |
-| C3 | MS5837 swap + potting checklist, pre-dive on real cells | pending — hardware |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | tool ready, replay-validated — run when the port is free |
+| C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram page: needs a firmware-side ~15 Hz cell accumulator module first (its own tested module, not a page) | deferred |
 
 ## 16. Design watch-outs (recorded decisions)

@@ -1,0 +1,91 @@
+# Bench acceptance & hardware checklists (C2 / C3, PLAN.md 15)
+
+Rules that never expire: **never open `/dev/ttyUSB0` while
+`tools/soak_logger.py` runs** (two readers, both blind), and nothing here
+counts as done until it is *watched happening on the bench*.
+
+## C2 — flash + acceptance (run first, every flash)
+
+```
+pgrep -f soak_logger          # must be empty; kill before touching the port
+pio run -e esp32 -t upload    # only once the soak has ended
+pio run -e esp32 -t uploadfs  # page into LittleFS (optional: fallback is in flash)
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
+```
+
+`hw_accept.py` checks the boot console (fresh boot banner, ≥2 HB lines
+matching the soak_logger contract, no SAFE/FATAL, `settings: N keys from
+NVS`, `control: SP=…`, `web: AP "…"`) and then runs the **refusal matrix**
+over the wired handset: `AUTO` cold → `ERR predive required`; `SET SP2`
+mid-dive → `ERR dive locked`; `WIFI ON` mid-dive → `ERR wifi locked in
+dive`; `CAL AIR` mid-dive → `ERR cal locked in dive`; overlong line →
+`ERR line too long`; junk → `ERR unknown command`. Every one of those is a
+host-tested invariant — the bench exists to prove the wire, not the logic.
+
+Expected boot order (post-A5e firmware):
+
+```
+=== ESP-CCR controller M1 boot ===
+reset reason: power-on
+settings: N keys from NVS
+control: SP=0.40/0.70/1.00/1.30 cells=111 wall=1.45 cutoff=1.60 ...
+web: AP "ESP-CCR-xxxx" on 192.168.4.1 (heap ...)
+HB st=... (every 5 s)
+```
+
+Then by hand, in this order (each mirrors a sim scenario):
+
+1. Phone joins the AP → status page live at <1 s, `NO DATA` banner within
+   3 s of pulling power.
+2. `DIVE START` from the phone → AP **gone** (radio off), `GET T` over
+   UART2 still streaming, HB keeps printing.
+3. `SET SP2=0.60` over UART2 mid-dive → refused; `SET GF_LOW=35` → OK and
+   `E,` line + `SAFETY` reply (event-logged).
+4. `DIVE END` → AP returns (it was on before the dive), log slot appears
+   in `LOG LIST`, `/dive/<n>.csv` downloads and matches `LOG EXPORT <n>`.
+5. `WIFI OFF` from the phone, dive, end dive → radio stays **off** (diver
+   outranks the machine's auto-restore).
+
+## C3-a — MS5837-30BA swap (before ANY wet test)
+
+- [ ] Potting inspection: gel-filled port free of voids, epoxy not lifted
+      at the rim; any wicking under the seal = scrap, not rework.
+- [ ] Breather orientation per datasheet; if the case gets condensation in
+      a cold-water sim bucket, the potting is already suspect.
+- [ ] I2C: address 0x70 (verify with the boot line, not a datasheet),
+      10 kΩ pull-ups, leads twisted, ≤30 cm — same bus-recovery drill as
+      the M1 soak (yank SDA/SCL, expect `i2cerr/rec` move, **no reset**).
+- [ ] Cross-check vs BMP085 on the same standpipe: 0.0 / 2.0 / 5.0 m, both
+      readings within 0.3 m; MS5837 hysteresis checked by going up and
+      down through 3 m.
+- [ ] Firmware still refuses a bad bus: cover the sensor, expect
+      `stale`/`SENSOR` alarm, injection stops, valve stays shut.
+
+## C3-b — cells, grounding, battery
+
+- [ ] All three cell grounds and the ADS1115 GND on one point; handset
+      powered from the same rail (UART common ground) — a ground loop here
+      fakes exactly the drift the voting layer hunts.
+- [ ] Bench rig with two cells: build with `presentMask = 0b011`;
+      `GET CELLS` / `PROOF` must never report a phantom third cell.
+- [ ] Battery: HB `vbat=` within 0.1 V of a meter at three loads;
+      `VBAT_MIN` alarm fires with the meter confirming; log the divider
+      trim for the build.
+
+## C3-c — mechanical inhibit (zero firmware cooperation)
+
+- [ ] Actuate the inline manual O₂ inhibit with the board injecting:
+      solenoid LED and `pulses=` keep counting, loop ppO₂ falls — the
+      diver's bailout must work identically with the firmware brain-dead.
+- [ ] Solenoid driver fails **closed**: signal lead unplugged → no O₂.
+
+## M2/M3 bench sequence (once control firmware is flashed)
+
+1. `CHECK` → `PRE,` steps pass, `AUTO` unlocks (a cold boot refuses it).
+2. `TEST CELLS` on the jar → masks `007` with three live cells.
+3. `CAL AIR` in air; `CAL O2` two-step on the bench jar at `CAL_O2_FI`.
+4. Descend the jar: SP bands cross at the right depths (±0.2 m),
+   CellProof arms >`CELLPROOF_DEPTH` and passes with honest cells.
+5. Fault drills the sim already proves the firmware should survive:
+   disconnect one cell (drift exclusion), yank I2C mid-dive (injection
+   stops, no reset), stick the valve (stuck-open alarm, duty cap).

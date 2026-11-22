@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0e1116">
+  <title>ESP-CCR — Checklist</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body data-page="checklist">
+<main>
+  <div class="card">
+    <h2>Pre-dive checks — AUTO stays locked until all pass</h2>
+    <div id="steps" style="margin-top:.75rem"></div>
+    <div style="margin-top:1rem;display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="primary" id="run">Run all checks</button>
+      <button id="calair">Calibrate air (0.21)</button>
+      <button id="calo2">Calibrate O₂ (two-step)</button>
+    </div>
+  </div>
+</main>
+<script src="app.js"></script>
+<script>
+const STEPS = [
+  ["warmup", "Cell warm-up (120 s)"],
+  ["air", "Air check — all cells within 8 % of 0.21"],
+  ["sol", "Solenoid test — ppO₂ rises on 2 pulses, then falls back"],
+  ["depth", "Depth sensor ≈ 0 m and identity OK"],
+  ["batt", "Battery above minimum"],
+];
+const el = document.getElementById("steps");
+function paint(state) {
+  el.innerHTML = STEPS.map(([id, name]) => {
+    const st = state[id] || "…";
+    const cls = st === "PASS" ? "ok" : st === "FAIL" ? "alarm" : "";
+    return `<div class="setrow"><label>${name}</label><span class="pill ${cls}">${st}</span></div>`;
+  }).join("");
+}
+const st = {}; paint(st);
+App.state.checklist = { run() {
+  let i = 0;
+  const step = () => {
+    if (i >= STEPS.length) return;
+    st[STEPS[i][0]] = "…"; paint(st);
+    setTimeout(() => { st[STEPS[i][0]] = i === 2 ? "FAIL" : "PASS"; paint(st); i++; setTimeout(step, 700); }, 900);
+  };
+  step();
+}};
+document.getElementById("run").onclick = () => App.send("CHECK");
+document.getElementById("calair").onclick = () => App.send("CAL AIR");
+document.getElementById("calo2").onclick = () => {
+  if (confirm("CAL O2 enriches the loop toward 1.0 bar O₂. Bench only, chamber sealed. Continue?"))
+    App.send("CAL O2 CONFIRM");
+};
+App.start();
+</script>
+</body>
+</html>

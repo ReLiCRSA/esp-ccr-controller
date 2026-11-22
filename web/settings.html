@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0e1116">
+  <title>ESP-CCR — Settings</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body data-page="settings">
+<main>
+  <div class="card" style="margin-bottom:1rem">
+    <h2>Settings</h2>
+    <p class="sub">Same registry the handset edits over UART. Ranges are enforced
+       on the device — out-of-range writes are refused with a reason.</p>
+  </div>
+  <div id="groups"></div>
+</main>
+<script src="app.js"></script>
+<script>
+// Mirror of the firmware key table (types + ranges). The device remains the
+// authority; this only drives the widgets.
+const GROUPS = [
+  ["Setpoints", [["SP1", 0.2, 1.6, 0.01], ["SP2", 0.2, 1.6, 0.01], ["SP3", 0.2, 1.6, 0.01], ["SP4", 0.2, 1.6, 0.01], ["D1", 5, 100, 1], ["D2", 10, 150, 1], ["SP_HYST", 0.1, 3, 0.1]]],
+  ["Alarms", [["ALLO_LOW", 0.05, 0.4, 0.01], ["ALLO_HIGH", 1.0, 1.6, 0.01], ["ALLO_CUTOFF", 1.5, 1.8, 0.01], ["CNS_ALARM", 10, 100, 1]]],
+  ["Injection", [["INJ_PULSE_MS", 50, 1000, 10], ["INJ_MAX_DUTY", 1, 25, 1]]],
+  ["Cell proof", [["CELLPROOF_EN"], ["CELLPROOF_DEPTH", 3, 30, 1], ["CELLPROOF_SP", 1.0, 1.4, 0.05], ["CELLPROOF_MIN", 0.9, 1.3, 0.05]]],
+  ["Deco", [["GF_LOW", 10, 95, 1], ["GF_HIGH", 50, 100, 1], ["ASC_RATE", 3, 18, 1], ["ASC_RATE_SLOW", 0.5, 3, 0.5]]],
+  ["Network & battery", [["AP_SSID"], ["AP_PASS"], ["VBAT_MIN", 3, 30, 0.5]]],
+];
+let rendered = false;
+function render() {
+  const s = App.state.settings;
+  if (rendered || Object.keys(s).length === 0) return;
+  rendered = true;
+  document.getElementById("groups").innerHTML = GROUPS.map(([name, keys]) => `
+    <details ${name === "Setpoints" ? "open" : ""}>
+      <summary>${name}</summary>
+      <div style="padding:0 1rem 1rem">
+      ${keys.map(([k, min, max, step]) => {
+        if (s[k] === undefined) return "";
+        if (min === undefined) // boolean or string
+          return `<div class="setrow"><label>${k}</label>` +
+            (["ON","OFF"].includes(s[k])
+              ? `<select data-k="${k}"><option>ON</option><option>OFF</option></select>`
+              : `<input data-k="${k}" value="${s[k]}">`) + `</div>`;
+        return `<div class="setrow"><label>${k}<div class="help">range ${min} … ${max}</div></label>
+                <input data-k="${k}" type="number" min="${min}" max="${max}" step="${step}" value="${s[k]}"></div>`;
+      }).join("")}
+      </div>
+    </details>`).join("");
+  document.querySelectorAll("[data-k]").forEach(inp => {
+    if (inp.tagName === "SELECT") inp.value = s[inp.dataset.k];
+    inp.onchange = () => {
+      App.send(`SET ${inp.dataset.k}=${inp.value}`);
+      inp.style.borderColor = "var(--accent)";
+      setTimeout(() => inp.style.borderColor = "", 1200);
+    };
+  });
+}
+App.onChange(render);
+App.start();
+</script>
+</body>
+</html>

@@ -1,0 +1,221 @@
+// ============================================================================
+// zhl16c.cpp — see header for parameter source and GF formulation.
+// ============================================================================
+#include "zhl16c.h"
+
+#include <algorithm>
+#include <cmath>
+
+namespace deco {
+
+namespace {
+
+// ZH-L16C air/nitrox (Buhlmann, Tauchmedizin 2002). Linear form:
+//   tolerated tissue pressure at ambient P: a + b*P.
+// Sourced from the tabulated public transcription of the 2002 parameter set
+// (see header). DO NOT EDIT without citing a source.
+constexpr int NC = Zhl16Ccr::NCOMP;
+
+constexpr double kHalfTimeMin[NC] = {
+    5.0, 8.0, 12.5, 18.5, 27.0, 38.3, 54.3, 77.0,
+    109.0, 146.0, 187.0, 239.0, 305.0, 390.0, 498.0, 635.0};
+constexpr double kA[NC] = {
+    1.1696, 1.0, 0.8618, 0.7562, 0.6200, 0.5043, 0.4410, 0.4000,
+    0.3750, 0.3500, 0.3295, 0.3065, 0.2835, 0.2610, 0.2480, 0.2327};
+constexpr double kB[NC] = {
+    0.5578, 0.6514, 0.7222, 0.7825, 0.8126, 0.8434, 0.8693, 0.8910,
+    0.9092, 0.9222, 0.9319, 0.9403, 0.9477, 0.9544, 0.9602, 0.9653};
+
+constexpr double kLn2 = 0.6931471805599453;
+
+} // namespace
+
+Zhl16Ccr::Zhl16Ccr(const Config& cfg) : cfg_(cfg) {
+    // gf per compartment: linear interpolation on the a-coefficient.
+    // Config carries GF as percent (30 = 30%); the math uses fractions 0..1.
+    // Fastest tissue (largest a) gets gfLow; slowest gets gfHigh.
+    const double aFast = kA[0], aSlow = kA[NCOMP - 1];
+    const double span = (aFast - aSlow);
+    for (int i = 0; i < NCOMP; ++i) {
+        const double t = (aFast - kA[i]) / span;
+        gf_[i] = static_cast<float>((cfg_.gfLow + (cfg_.gfHigh - cfg_.gfLow) * t) / 100.0);
+    }
+    reset();
+}
+
+void Zhl16Ccr::reset() {
+    // Resting tissue load: inspired ppN2 breathing air at the surface.
+    const double ppN2 =
+        (cfg_.pSurfaceBar - cfg_.ph2oBar) * 0.79 - cfg_.pco2Bar;
+    for (int i = 0; i < NCOMP; ++i) pt_[i] = ppN2;
+    cnsPct_ = 0.0;
+}
+
+double Zhl16Ccr::barToDepthM(double bar) const {
+    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665; // Pa per m
+    return (bar - cfg_.pSurfaceBar) * 1e5 / rhoG;
+}
+
+double Zhl16Ccr::depthToBar(double depthM) const {
+    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665;
+    return cfg_.pSurfaceBar + depthM * rhoG / 1e5;
+}
+
+void Zhl16Ccr::step(double dtSec, double pAmbBar, double ppO2Bar) {
+    if (dtSec <= 0.0) return;
+    const double ppN2 = std::max(0.0, pAmbBar - cfg_.ph2oBar - cfg_.pco2Bar - ppO2Bar);
+
+    // CNS clock accumulates on real time regardless of substep size.
+    if (dtSec > 0.0) {
+        const double lim = cnsLimitMin(ppO2Bar);
+        cnsPct_ += 100.0 * (dtSec / 60.0) / lim;
+        cnsPct_ = std::min(cnsPct_, 999.0);
+    }
+
+    // Subdivide for stability when the caller uses coarse steps.
+    while (dtSec > 0.0) {
+        const double h = std::min(dtSec, 10.0);
+        dtSec -= h;
+        for (int i = 0; i < NCOMP; ++i) {
+            const double k = kLn2 / (kHalfTimeMin[i] * 60.0); // per second
+            const double f = 1.0 - std::exp(-k * h);          // exact for const ppN2
+            pt_[i] += (ppN2 - pt_[i]) * f;
+        }
+    }
+}
+
+double Zhl16Ccr::ceilingBarFrom(const double pt[NCOMP], const float gf[NCOMP]) {
+    double pc = 0.0;
+    for (int i = 0; i < NCOMP; ++i) {
+        const double g = gf[i];
+        const double tol = (pt[i] - g * kA[i]) / (1.0 - g * (1.0 - kB[i]));
+        pc = std::max(pc, tol);
+    }
+    return pc;
+}
+
+double Zhl16Ccr::ceilingBar() const { return ceilingBarFrom(pt_, gf_); }
+
+double Zhl16Ccr::ceilingM() const {
+    const double d = barToDepthM(ceilingBar());
+    return d > 0.0 ? d : 0.0;
+}
+
+double Zhl16Ccr::ndlMinutes(double pAmbBar, double ppO2Bar, double maxMin) const {
+    double sim[NCOMP];
+    std::copy(pt_, pt_ + NCOMP, sim);
+    double tMin = 0.0;
+    while (tMin < maxMin) {
+        // advance 1 minute at constant depth
+        const double ppN2 = std::max(0.0, pAmbBar - cfg_.ph2oBar - cfg_.pco2Bar - ppO2Bar);
+        for (int i = 0; i < NCOMP; ++i) {
+            const double k = kLn2 / (kHalfTimeMin[i] * 60.0);
+            sim[i] += (ppN2 - sim[i]) * (1.0 - std::exp(-k * 60.0));
+        }
+        tMin += 1.0;
+        if (barToDepthM(ceilingBarFrom(sim, gf_)) > barToDepthM(pAmbBar) + 0.01)
+            return tMin;
+    }
+    return maxMin;
+}
+
+Zhl16Ccr::Schedule Zhl16Ccr::schedule(double pAmbBar) const {
+    Schedule sched{};
+    double sim[NCOMP];
+    std::copy(pt_, pt_ + NCOMP, sim);
+
+    const double grid = cfg_.stopGridM;
+    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665;
+    auto d2b = [&](double m) { return cfg_.pSurfaceBar + m * rhoG / 1e5; };
+
+    auto ceilingDepth = [&]() -> double {
+        const double bar = ceilingBarFrom(sim, gf_);
+        return (bar - cfg_.pSurfaceBar) * 1e5 / rhoG;
+    };
+
+    const double startM = std::max(0.0, barToDepthM(pAmbBar));
+    double depth = std::floor(startM / grid + 1e-9) * grid; // first grid stop <= bottom
+    float totalMin = 0.0f, stopMin = 0.0f;
+    sched.capped = false;
+
+    auto ppO2At = [&](double m) {
+        return m >= cfg_.deepSwitchM ? cfg_.decoSpDeepBar : cfg_.decoSpShallowBar;
+    };
+    auto rateAt = [&](double fromM, double toM) {
+        return toM <= cfg_.slowAscentDepthM && fromM <= cfg_.slowAscentDepthM + grid
+                   ? cfg_.ascentRateSlowM
+                   : cfg_.ascentRateM;
+    };
+    auto simStep = [&](double dtMin, double atDepth) {
+        const double p = d2b(atDepth);
+        const double ppN2 = std::max(0.0, p - cfg_.ph2oBar - cfg_.pco2Bar - ppO2At(atDepth));
+        int sub = std::max(1, (int)(dtMin * 60.0 / 15.0)); // <=15 s substeps
+        for (int s = 0; s < sub; ++s) {
+            const double h = dtMin * 60.0 / sub;
+            for (int i = 0; i < NCOMP; ++i) {
+                const double k = kLn2 / (kHalfTimeMin[i] * 60.0);
+                sim[i] += (ppN2 - sim[i]) * (1.0 - std::exp(-k * h));
+            }
+        }
+    };
+
+    int guard = 0;
+    while (depth > 0.001 && guard++ < 1000) {
+        const double ceilM = ceilingDepth();
+        const double target = std::max(0.0, depth - grid);
+
+        if (ceilM > depth + 0.01) {
+            // Tissues demand a deeper stop than where we are (possible right
+            // after a fast descent): descend to the grid point at the ceiling.
+            depth = std::ceil(ceilM / grid) * grid;
+            continue;
+        }
+        if (ceilM <= target + 0.01) {
+            const double rate = rateAt(depth, target);
+            const double dt = grid / rate;
+            simStep(dt, depth); // conservative: load at the deeper depth
+            totalMin += static_cast<float>(dt);
+            depth = target;
+            continue;
+        }
+        // Must hold at `depth` until ceiling drops to `target` (cap 180 min).
+        float held = 0.0f;
+        bool capped = false;
+        while (ceilingDepth() > target + 0.01) {
+            simStep(0.5, depth);
+            held += 0.5f;
+            if (held >= 180.0f) { capped = true; break; }
+        }
+        totalMin += held;
+        stopMin += held;
+        if (capped) { sched.capped = true; }
+        if (sched.count < 16 &&
+            (sched.count == 0 || sched.stops[sched.count - 1].depthM != (float)depth)) {
+            sched.stops[sched.count++] = {static_cast<float>(depth), held};
+        } else if (sched.count > 0) {
+            sched.stops[sched.count - 1].minutes += held;
+        }
+    }
+    sched.totalTimeMin = totalMin;
+    sched.stopTimeMin = stopMin;
+    return sched;
+}
+
+double Zhl16Ccr::cnsLimitMin(double ppO2) {
+    // NOAA single-exposure limits (min) below ppO2 1.6. Above 1.6 there is no
+    // safe limit; we accumulate at the 1.6 rate (45 min) and the alarm layer
+    // (high ppO2 hard cutoff) owns protection.
+    struct Row { double p; double min; };
+    static const Row rows[] = {
+        {0.00, 1e9}, {0.50, 1e9}, {0.60, 720.0}, {0.70, 540.0},
+        {0.80, 360.0}, {0.90, 360.0}, {1.00, 300.0}, {1.10, 240.0},
+        {1.20, 210.0}, {1.30, 180.0}, {1.40, 150.0}, {1.50, 120.0},
+        {1.60, 45.0}, {9.99, 45.0},
+    };
+    for (size_t i = 1; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        if (ppO2 <= rows[i].p) return rows[i].min;
+    }
+    return 45.0;
+}
+
+} // namespace deco

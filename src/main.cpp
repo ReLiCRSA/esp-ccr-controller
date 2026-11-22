@@ -30,6 +30,11 @@
 #include "sensors/battery.h"
 #include "sensors/bmp085.h"
 #include "sensors/wire_transport.h"
+#include "comms/nvs_store.h"
+#include "comms/settings.h"
+#include "comms/settings_apply.h"
+#include "comms/telemetry_bridge.h"
+#include "comms/uart2_task.h"
 #include "hud.h"
 
 // ---------------------------------------------------------------------------
@@ -63,8 +68,12 @@ static HudState    g_systemState = HudState::STANDBY;
 // Control chain. ctrl::Loop holds every control decision (and is what the PC
 // simulator exercises); this file feeds it and actuates the result.
 // ---------------------------------------------------------------------------
-static ctrl::Config   g_ctrlCfg;
-static ctrl::Loop*    g_loop = nullptr;   // constructed in setup(): needs config
+// Non-static (internal-linkage-free): the handset/web command tasks reference
+// these through externs. The linker — not a comment — enforces the wiring;
+// a static here would leave those externs unresolved and the map file would
+// grow a undefined-weak hole nobody notices until a task dereferences NULL.
+ctrl::Config g_ctrlCfg;
+ctrl::Loop* g_loop = nullptr;   // constructed in setup(): needs config
 static Heartbeat      g_hbControl{0};
 static volatile bool  g_controlRunning = false;
 
@@ -80,23 +89,20 @@ static press::Bmp085        g_pressure(g_pBus);
 static volatile float g_depthM = 0.0f;
 static volatile bool  g_depthValid = false;
 
-// Telemetry snapshot published by ControlTask, read by HUD / (later) the UART
-// and web bridges. Scalars only, so no lock is needed: 32-bit loads and stores
-// are atomic on this core, and a status line is allowed to catch last cycle's
-// value. What must never happen is a reader dereferencing the loop's own state
-// while the controller is mid-update — hence the copy.
-struct Telemetry {
-    volatile float votedBar;
-    volatile float setpointBar;
-    volatile float depthM;
-    volatile float vbat;
-    volatile uint16_t alarmBits;
-    volatile uint8_t voteMode;
-    volatile uint32_t pulses;
-    volatile bool solenoid;
-    volatile bool haveVote;
-};
-static Telemetry g_tel{};
+// Telemetry snapshot published by ControlTask, read by HUD / handset / web
+// bridges. Scalars only, so no lock is needed: 32-bit loads and stores are
+// atomic on this core, and a status line is allowed to catch last cycle's
+// value. What must never happen is a reader dereferencing the loop's own
+// state while the controller is mid-update — hence the copy. The struct and
+// the event ring live in comms/telemetry_bridge.h (host-tested).
+bridge::Telemetry g_bridgeTel{};
+bridge::EventRing g_bridgeEvents;
+bridge::DiveTotals g_bridgeTotals;
+
+// Settings + command surface (referenced by comms/uart2_task.cpp).
+settings::Registry g_settings;
+volatile bool g_calAirRequest = false;
+volatile bool g_calDepthRequest = false;
 
 static void setSystemState(HudState s) {
     if (g_systemState == s) return;
@@ -188,9 +194,9 @@ static void hudTask(void*) {
                           (unsigned long)st.recoveries,
                           g_battery.volts(),
                           g_sensorStale, g_battery.low(),
-                          g_tel.votedBar, g_tel.setpointBar, g_tel.alarmBits,
-                          (int)g_tel.voteMode, (unsigned long)g_tel.pulses,
-                          (int)g_tel.solenoid, (int)g_controlRunning);
+                          g_bridgeTel.votedBar, g_bridgeTel.setpointBar, g_bridgeTel.alarmBits,
+                          (int)g_bridgeTel.voteMode, (unsigned long)g_bridgeTel.pulses,
+                          (int)g_bridgeTel.solenoid, (int)g_controlRunning);
         }
 
         g_hbHud.seq++;
@@ -236,15 +242,85 @@ static void controlTask(void*) {
         const ctrl::State st = g_loop->cycle(sd, now);
         digitalWrite(PIN_SOLENOID, st.solenoid ? HIGH : LOW);
 
-        g_tel.votedBar = st.votedBar;
-        g_tel.setpointBar = st.setpointBar;
-        g_tel.depthM = st.depthSmoothedM;
-        g_tel.vbat = sd.vbat;
-        g_tel.alarmBits = st.alarms.bits;
-        g_tel.voteMode = static_cast<uint8_t>(st.vote.mode);
-        g_tel.pulses = g_loop->pulseCount();
-        g_tel.solenoid = st.solenoid;
-        g_tel.haveVote = st.haveVote;
+        g_bridgeTel.votedBar = st.votedBar;
+        g_bridgeTel.setpointBar = st.setpointBar;
+        g_bridgeTel.depthM = st.depthSmoothedM;
+        g_bridgeTel.vbat = sd.vbat;
+        g_bridgeTel.alarmBits = st.alarms.bits;
+        g_bridgeTel.voteMode = static_cast<uint8_t>(st.vote.mode);
+        g_bridgeTel.pulses = g_loop->pulseCount();
+        g_bridgeTel.solenoid = st.solenoid;
+        g_bridgeTel.haveVote = st.haveVote;
+        for (int i = 0; i < 3; i++) g_bridgeTel.cellBar[i] = sd.cells[i];
+        g_bridgeTel.diveActive = st.diveActive;
+        g_bridgeTel.autoMode = st.autoMode;
+        g_bridgeTel.cpState = static_cast<uint8_t>(st.cellproof.state);
+        g_bridgeTel.proofBan = g_loop->proofExclusion();
+        g_bridgeTel.unprovenMask = st.cellproof.unprovenHighMask;
+        g_bridgeTel.solDutyPct = g_loop->solDutyPct(now);
+
+        // Dive edges, in the chain's own clock: publisher bookkeeping, totals
+        // and the snapshot grid all restart with the dive (the handset/web
+        // command task opens and closes the actual file).
+        static bool prevDive = false;
+        static bridge::PublisherState pub;
+        static uint32_t diveStartMs = 0, lastSnapMs = 0, lastPulseBase = 0;
+        if (st.diveActive && !prevDive) {
+            pub = bridge::PublisherState{};
+            g_bridgeTotals = bridge::DiveTotals{};
+            diveStartMs = now;
+            lastSnapMs = now;
+            lastPulseBase = g_loop->pulseCount();
+            g_bridgeTel.diveStartMs = now;
+        }
+        prevDive = st.diveActive;
+
+        // Protocol events from the chain's transitions (alarm edges, mode,
+        // cellproof, vote membership): the handset E, lines and the dive
+        // log's event rows both come from this one publication.
+        bridge::publishEvents(st, (now - diveStartMs) / 1000u, g_bridgeEvents, pub);
+
+        if (st.diveActive) {
+            // running totals for the dive meta (max/min/total only: cheap)
+            g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
+            const int32_t dCm = (int32_t)(st.depthSmoothedM * 100.0f);
+            if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;
+            const int32_t v = (int32_t)(st.votedBar * 1000.0f);
+            if (st.haveVote) {
+                if (v < g_bridgeTotals.minVotedX1000) g_bridgeTotals.minVotedX1000 = v;
+                if (v > g_bridgeTotals.maxVotedX1000) g_bridgeTotals.maxVotedX1000 = v;
+            }
+            g_bridgeTotals.totalPulses = g_loop->pulseCount();
+            const float cns = g_loop->cnsPct();
+            g_bridgeTotals.cnsPeakPct = cns > 254.0f ? 254 : (uint8_t)cns;
+
+            // 30 s snapshot grid (PLAN 10). Event-driven snapshots are taken
+            // by the command task alongside each E, line; ControlTask only
+            // ever appends the grid row, keeping file ownership single-owner.
+            if (comms::diveLogRecording() && now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
+                lastSnapMs = now;
+                logfmt::Snapshot sn{};
+                sn.tSec = (now - diveStartMs) / 1000u;
+                sn.depthCm = dCm;
+                sn.votedX1000 = (int16_t)v;
+                for (int i = 0; i < 3; i++)
+                    sn.cellX1000[i] = (int16_t)(sd.cells[i] * 1000.0f);
+                sn.setpointX1000 = (int16_t)(st.setpointBar * 1000.0f);
+                sn.mode = st.autoMode ? 1 : 2;
+                sn.alarmBits = st.alarms.bits;
+                sn.cnsPct = g_bridgeTotals.cnsPeakPct;
+                sn.ceilingCm = (int16_t)(g_loop->deco().ceilingM() * 100.0);
+                sn.ndlMin = st.haveVote ? (int16_t)g_loop->deco().ndlMinutes(
+                    g_loop->deco().depthToBar(st.depthSmoothedM), st.votedBar) : 480;
+                sn.decoTotalMin = (int16_t)g_loop->deco().schedule(
+                    g_loop->deco().depthToBar(st.depthSmoothedM)).totalTimeMin;
+                const uint32_t p = g_loop->pulseCount();
+                sn.pulses = (uint16_t)(p - lastPulseBase);
+                lastPulseBase = p;
+                sn.battX1000 = (uint16_t)(sd.vbat * 1000.0f);
+                comms::diveLogAppendGrid(sn);
+            }
+        }
 
         // HUD and telemetry read the chain's own state, never a guess about it.
         hudSetDeco(g_loop->haveVote() && g_loop->deco().ceilingBar() >
@@ -431,7 +507,16 @@ void setup() {
     g_pressure.begin(millis());  // non-blocking; SensorTask keeps retrying
 #endif
 
+    // Boot order matters: NVS overlays the compile-time defaults, then ONE
+    // applier pass (the same one the handset/web use mid-flight) puts the
+    // numbers into the chain. A corrupt or schema-old NVS area falls back to
+    // defaults silently — the boot log says what was loaded.
+    const int loadedKeys = nvs::Store::load(g_settings);
     buildControlConfig();
+    const uint8_t applyClamps = comms::applySettings(g_settings, g_ctrlCfg);
+    if (loadedKeys > 0)
+        Serial.printf("settings: %d keys from NVS%s\n", loadedKeys,
+                      applyClamps ? "  [SOME VALUES CLAMPED: ordering enforced]" : "");
     seedCellCal();
     g_loop = new (std::nothrow) ctrl::Loop(g_ctrlCfg);
     if (g_loop == nullptr) {
@@ -468,6 +553,11 @@ void setup() {
         xTaskCreatePinnedToCore(controlTask, "control", 4096, nullptr, 22, nullptr, 1);
     else
         g_controlRunning = false;
+
+    // The handset/web session rides on the chain: no chain, no session
+    // (SAFE mode talks through the serial monitor and LEDs instead).
+    if (!forceSafe && !comms::startUart2Task())
+        Serial.println("** uart2 session NOT started (task create failed)");
 }
 
 void loop() {

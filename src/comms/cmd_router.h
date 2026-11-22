@@ -70,6 +70,7 @@ public:
 
     // ---- state the transport / firmware reads ------------------------------
     bool wifiEnabled() const { return wifiOn_; }
+    bool diving() const { return loop_.diveActive(); }
     /// True when DIVE START turned the radio off (so dive end knows to restore).
     bool wifiAutoOff() const { return wifiAutoOff_; }
     uint16_t logExportIndex() const { return logExportIdx_; }

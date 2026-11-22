@@ -135,6 +135,10 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
                   PREDIVE_TEST_PULSES * INJ_PULSE_MS,
               "injection duty window cannot hold the pre-dive cell-test pulses");
 
+// --- Dive log ----------------------------------------------------------------
+// 30 s snapshot grid (PLAN 10); event-driven snapshots ride the E, lines.
+#define DIVE_SNAPSHOT_GRID_MS       30000
+
 // --- Depth ---------------------------------------------------------------------
 // Bench stand-in (BMP085) until the MS5837-30bar is fitted: depth is derived
 // from absolute pressure with sea-water density.

@@ -1,0 +1,82 @@
+// ============================================================================
+// telemetry_bridge.cpp — event publication from the chain's own outputs.
+// Hardware-free on purpose: ControlTask calls publishEvents with the State it
+// already has, and the handset task drains the ring. Both halves are testable
+// without a board.
+// ============================================================================
+#include "telemetry_bridge.h"
+
+#include "control/alarms.h"
+
+namespace bridge {
+
+logfmt::DiveMeta DiveTotals::toMeta() const {
+    logfmt::DiveMeta m{};
+    m.durationSec = durationSec;
+    m.maxDepthCm = maxDepthCm;
+    m.minVotedX1000 = minVotedX1000 == 32767 ? 0 : static_cast<int16_t>(minVotedX1000);
+    m.maxVotedX1000 = maxVotedX1000 < -32768 ? 0 : static_cast<int16_t>(maxVotedX1000);
+    m.totalPulses = totalPulses > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(totalPulses);
+    m.cnsPeakPct = cnsPeakPct;
+    return m;
+}
+
+void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
+                   PublisherState& ps) {
+    // Alarms: raised/cleared transitions of the latch-applied bit set. The
+    // ids are protocol-visible (BIT_LOW_PPO2 .. BIT_HYPOXIA): never renumber.
+    const uint16_t changed = st.alarms.bits ^ ps.prevAlarmBits;
+    for (uint8_t bit = 0; bit < 10; ++bit) {
+        if (!(changed & (1u << bit))) continue;
+        const bool raised = st.alarms.bits & (1u << bit);
+        if (!ring.push({tSec,
+                        raised ? logfmt::EVT_ALARM_RAISED : logfmt::EVT_ALARM_CLEARED,
+                        static_cast<uint16_t>(bit)}))
+            ring.noteDropped();
+    }
+    ps.prevAlarmBits = st.alarms.bits;
+
+    // AUTO/MANUAL edge (mode id: 1 auto, 2 manual, matching the T, lines).
+    if (st.autoMode != ps.prevAuto) {
+        if (!ring.push({tSec, logfmt::EVT_MODE_CHANGE, st.autoMode ? 1 : 2}))
+            ring.noteDropped();
+        ps.prevAuto = st.autoMode;
+    }
+
+    // Cellproof verdict transitions.
+    const int16_t cp = static_cast<int16_t>(st.cellproof.state);
+    if (cp != ps.prevCp) {
+        if (cp == static_cast<int16_t>(cellproof::State::PASS) &&
+            ps.prevCp == static_cast<int16_t>(cellproof::State::RUNNING)) {
+            if (!ring.push({tSec, logfmt::EVT_CELLPROOF_PASS, st.cellproof.unprovenHighMask}))
+                ring.noteDropped();
+        } else if (cp == static_cast<int16_t>(cellproof::State::FAIL)) {
+            if (!ring.push({tSec, logfmt::EVT_CELLPROOF_FAIL, 0})) ring.noteDropped();
+        }
+        ps.prevCp = cp;
+    }
+
+    // Which cells carry the vote (a ban or a dropout is news the diver
+    // should see land in the log, not only on the display).
+    if (st.vote.activeMask != ps.prevActiveMask) {
+        for (uint8_t ch = 0; ch < 3; ++ch) {
+            const bool was = ps.prevActiveMask & (1u << ch);
+            const bool now = st.vote.activeMask & (1u << ch);
+            if (was == now) continue;
+            if (!ring.push({tSec, now ? logfmt::EVT_CELL_REJOIN : logfmt::EVT_CELL_EXCLUDED,
+                            ch}))
+                ring.noteDropped();
+        }
+        ps.prevActiveMask = st.vote.activeMask;
+    }
+
+    // Setpoint band changes (only report real moves, not float jitter).
+    if (ps.prevSp >= 0.0f && st.setpointBar > ps.prevSp + 0.02f) {
+        if (!ring.push({tSec, logfmt::EVT_SP_CHANGE,
+                        static_cast<uint16_t>(st.setpointBar * 100.0f)}))
+            ring.noteDropped();
+    }
+    ps.prevSp = st.setpointBar;
+}
+
+} // namespace bridge

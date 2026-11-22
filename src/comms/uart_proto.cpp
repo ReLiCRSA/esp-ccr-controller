@@ -166,11 +166,11 @@ bool parseCommand(const char* line, Command& out, const char** err) {
 
 size_t formatTelemetry(const Telemetry& t, char* out, size_t cap) {
     static const char* kMode[] = {"STANDBY", "AUTO", "MANUAL", "SAFE"};
-    const int n = emit(out, cap, "T,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,FLAGS0x%02X\n",
+    const int n = emit(out, cap, "T,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,FLAGS0x%02X,%.2f\n",
                        static_cast<double>(t.depthM), static_cast<double>(t.votedPpo2),
                        static_cast<double>(t.cells[0]), static_cast<double>(t.cells[1]),
                        static_cast<double>(t.cells[2]), static_cast<double>(t.setpoint),
-                       kMode[t.mode & 3], t.flags);
+                       kMode[t.mode & 3], t.flags, static_cast<double>(t.battV));
     return (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
 }
 

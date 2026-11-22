@@ -70,6 +70,7 @@ void UartLink::emitT(Sink sink, void* ctx) {
     t.votedPpo2 = tel_.votedBar;
     for (int i = 0; i < 3; i++) t.cells[i] = tel_.cellBar[i];
     t.setpoint = tel_.setpointBar;
+    t.battV = tel_.vbat;
     t.mode = tel_.diveActive ? (tel_.autoMode ? 1 : 2) : 0;
     uint16_t a = tel_.alarmBits;
     uint8_t f = 0;
@@ -152,7 +153,12 @@ void UartLink::streamLogExport(int slot, Sink sink, void* ctx) {
         emit(sink, ctx, buf, n);
         return;
     }
-    if (hw_.exportDive(slot, sink, hw_.ctx) < 0) {
+    // The sink belongs to whoever asked for the export (a handset print, a
+    // browser socket), so the export must hand the *caller's* sink context
+    // back to it — hw_.ctx is the firmware's hook object, and handing that to
+    // a transport sink is a wild-pointer cast waiting for the first LOG
+    // EXPORT over WiFi.
+    if (hw_.exportDive(slot, sink, ctx) < 0) {
         char buf[64];
         const size_t n = proto::formatErr("no such dive", buf, sizeof(buf));
         emit(sink, ctx, buf, n);

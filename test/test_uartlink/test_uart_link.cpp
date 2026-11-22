@@ -45,6 +45,7 @@ struct Hooks {
 
 struct Fixture;
 static Fixture* g_fix = nullptr;
+static void* g_exportCtx = reinterpret_cast<void*>(0x1);  // 'not called yet'
 
 struct Fixture {
     Config cfg;
@@ -86,8 +87,14 @@ struct Fixture {
             for (int i = 0; i < n; i++) { slots[i] = i + 1; mt[i] = 1700000000u + i; }
             return n;
         };
-        h.exportDive = [](int slot, UartLink::Sink sink, void*) {
+        h.exportDive = [](int slot, UartLink::Sink sink, void* ctx) {
+            // The sink we were handed belongs to the caller, so the context
+            // must be the caller's too: a transport sink that casts its ctx
+            // (a WebSocket client id) would otherwise be handed the
+            // firmware's hook object. Recorded here so the test can see it.
+            g_exportCtx = ctx;
             if (!g_fix || slot != 3) return -1;
+            sink("CTX-SEEN\n", ctx);
             sink("DIVE,3,1700000000,3\n", nullptr);
             sink("S,30,25.00,0.700,0.700,0.700,0.700,0.700,0x0000,12,0,480,0,5,12500\n", nullptr);
             return 1;
@@ -96,6 +103,7 @@ struct Fixture {
     }
 
     void send(const char* line) { link.handleLine(line, sinkLine, nullptr); }
+    void sendWithCtx(const char* line, void* ctx) { link.handleLine(line, sinkLine, ctx); }
     void pump(uint32_t tMs) {
         router.setNowMs(tMs);
         now = tMs;
@@ -252,6 +260,20 @@ void test_log_list_and_export_stream_over_the_session() {
     TEST_ASSERT_TRUE(hasLineStarting("ERR no such dive"));
 }
 
+// LOG EXPORT over a WebSocket is the case that bites: the export streams
+// through the *transport's* sink, so it must receive the transport's context.
+void test_an_export_hands_the_callers_sink_context_back() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+    int callerMarker = 0x5a;
+    g_exportCtx = reinterpret_cast<void*>(0x1);
+    f.sendWithCtx("LOG EXPORT 3", &callerMarker);
+    TEST_ASSERT_TRUE_MESSAGE(g_exportCtx == &callerMarker,
+                             "export ran with the firmware's ctx, not the caller's");
+    TEST_ASSERT_TRUE(hasLineStarting("CTX-SEEN"));   // and the sink kept using it
+}
+
 void test_publish_state_is_not_static_between_dives() {
     // A second chain (or a second dive object in the sim) must not inherit
     // another chain's "previous" alarm bits and fabricate a CLEAR event.
@@ -282,5 +304,6 @@ int main() {
     RUN_TEST(test_dive_lifecycle_opens_and_closes_the_log_and_announces_failure);
     RUN_TEST(test_log_list_and_export_stream_over_the_session);
     RUN_TEST(test_publish_state_is_not_static_between_dives);
+    RUN_TEST(test_an_export_hands_the_callers_sink_context_back);
     return UNITY_END();
 }

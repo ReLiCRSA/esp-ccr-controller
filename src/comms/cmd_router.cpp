@@ -146,6 +146,7 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         t.setpoint = loop_.setpointBar();
         t.mode = loop_.diveActive() ? (loop_.autoMode() ? 1 : 2) : 0;
         t.flags = telemetryFlags(loop_);
+        t.battV = loop_.vbatVolts();
         char buf[128];
         const size_t n = proto::formatTelemetry(t, buf, sizeof(buf));
         replyText(r, buf, n);
@@ -186,6 +187,39 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         replyText(r, buf, static_cast<size_t>(n));
         return;
     }
+    // The web Settings page needs each key's type, range and flags to put a
+    // min/max on its inputs and grey out what a dive locks; the handset gets
+    // the same view. Additive display key — exec() asks the registry before
+    // it asks here, so it can never shadow a real setting.
+    if (std::strcmp(key, "SCHEMA") == 0) {
+        char buf[CommandRouter::MAX_REPLY];
+        size_t cnt = 0;
+        const settings::Def* defs = settings::Registry::definitions(cnt);
+        int p = 0;
+        for (size_t i = 0; i < cnt && p < (int)sizeof(buf) - 48; i++) {
+            char tc = '?';
+            switch (defs[i].type) {
+                case settings::Type::FLOAT: tc = 'F'; break;
+                case settings::Type::INT16: tc = 'I'; break;
+                case settings::Type::UINT8: tc = 'U'; break;
+                case settings::Type::BOOL:  tc = 'B'; break;
+                case settings::Type::STRING: tc = 'S'; break;
+            }
+            if (defs[i].type == settings::Type::STRING)
+                p += std::snprintf(buf + p, sizeof(buf) - p, "K,%s,%c,%u,%u,%u,%s\n",
+                                   defs[i].key, tc, (unsigned)defs[i].minv,
+                                   (unsigned)defs[i].maxv, defs[i].flags,
+                                   defs[i].defStr ? defs[i].defStr : "");
+            else
+                p += std::snprintf(buf + p, sizeof(buf) - p, "K,%s,%c,%.6g,%.6g,%u,%.6g\n",
+                                   defs[i].key, tc, static_cast<double>(defs[i].minv),
+                                   static_cast<double>(defs[i].maxv), defs[i].flags,
+                                   static_cast<double>(defs[i].def));
+        }
+        replyText(r, buf, static_cast<size_t>(p));
+        return;
+    }
+
     replyErr(r, "unknown key");
 }
 

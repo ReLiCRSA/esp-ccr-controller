@@ -224,7 +224,9 @@ factors; `CAL DEPTH` surface-tares depth.
 **Downlink** (2 Hz):
 
 ```
-T,<depth_m>,<voted>,<c1>,<c2>,<c3>,<sp>,<mode>,<flags_hex>
+T,<depth_m>,<voted>,<c1>,<c2>,<c3>,<sp>,<mode>,<flags_hex>,<vbat>
+                                    ^ vbat appended last: a client that stops at
+                                      FLAGS is still correct (add-only rule)
 D,<ndl_min>,<deco_total_min>,<ceiling_m>,<stop1_depth>|<stop1_min>,<stop2_depth>|<stop2_min>,...,<cns_pct>
 E,...            event lines (alarms, SP/mode changes, cellproof, calibrations) on change
 OK / ERR <why>   command replies
@@ -235,6 +237,10 @@ OK / ERR <why>   command replies
 `CAL AIR` · `CAL O2` / `CAL O2 CONFIRM` · `CAL DEPTH` · `TEST CELLS` ·
 `CELLPROOF OVERRIDE` · `PULSE` · `DECO` (one-shot `D,` line) ·
 `DIVE START|END` · `LOG LIST` · `LOG EXPORT <n>` · `WIFI ON|OFF`.
+
+Display keys (resolved **after** the registry, so a real key like `D1` or
+`CAL_O2_FI` can never be shadowed): `GET T` · `GET D` · `GET CELLS` ·
+`GET PROOF` · `GET PRE` · `GET FAULT` · `GET SCHEMA`.
 
 Unknown command → `ERR`; all writes reply `OK`/`ERR <reason>`. The handset and
 web edit the identical settings registry — one code path: `comms::CommandRouter`
@@ -247,11 +253,58 @@ firmware constants (`test_settings`), and everything steering the gas loop
 (SP*, ALLO_*, CNS_ALARM, INJ_*, CELLPROOF_SP/MIN/OK_MAXSP) is `FL_DIVE_LOCK`;
 schedule tuning (D1/D2, GF_*, ascent rates, drift) stays writable mid-dive.
 
+`GET SCHEMA` answers one line per key —
+`K,<key>,<type>,<min>,<max>,<flags>,<default>` — so a client can put real
+min/max on its inputs and grey out what a dive locks, instead of inventing
+limits the server would refuse anyway.
+
+One session, not one per client: `comms::Session` (`src/comms/session.{h,cpp}`,
+host-tested in `test/test_session/`) owns the router, the protocol link, the
+session lock and the dive-file owner, and every transport calls `handleLine()`
+on it. Per-transport routers looked harmless and were not: each keeps its own
+memory of what the diver asked for, so a handset would bring the radio back at
+dive end because *its* router never heard the phone turn WiFi off.
+
 ## 9. Web server (WiFi truly off during dive)
 
-AP `ESPCCR-xxxx` with WPA2 password from settings (not editable during a dive).
-On `DIVE START` the **radio is disabled** (not just the server down — saves
-~40–70 mA too); auto-on at dive end; handset `WIFI ON|OFF` override.
+AP `<AP_SSID>-<mac tail>` (default `ESP-CCR-A1B2`) with the WPA2 password from
+the registry (`AP_SSID`/`AP_PASS`, both `FL_DIVE_LOCK`: not editable during a
+dive). On `DIVE START` the **radio is disabled** (not just the server down —
+saves ~40–70 mA too); auto-on at dive end; handset `WIFI ON|OFF` override.
+
+**Built** (`src/comms/web_server.{h,cpp}`, deps pinned in `platformio.ini`:
+`ESP32Async/AsyncTCP @ 3.6.1` + `ESP32Async/ESPAsyncWebServer @ 3.12.1` — the
+older forks' download URLs are dead):
+
+- `/ws` carries the handset protocol verbatim: one frame in = one command line
+  through `comms::session()`, reply frames out on the same socket. No JSON
+  command layer, no REST for settings — a browser cannot reach anything the
+  handset cannot, and cannot skip a lockout either.
+- **Answer framing:** the protocol is line-based and a command may answer with
+  many lines (`GET *`, `GET SCHEMA`, `LOG EXPORT`), so the bridge ends every
+  command with a `#<n>` control line (n = reply lines) and splits multi-line
+  replies into one frame per line. `#` can never start a protocol line, so
+  nothing collides. A browser then knows an answer is complete, and its
+  staleness banner is a round-trip timeout rather than a guess.
+- Pages: served from LittleFS `/index.html` when present, otherwise from the
+  build (`src/comms/web_page.h`) — so a wiped or unmounted filesystem costs the
+  UI nothing. `tools/sync_webdata.py` writes `data/index.html` from that same
+  literal for `pio run -e esp32 -t uploadfs` (one source of truth). Built-in
+  page: status, checklist, settings (ranges from `GET SCHEMA`), dives
+  (list → inline depth/ppO₂ chart → CSV), console. 23 KB, no CDN, no framework.
+  **Not built yet:** the per-cell histogram page (it needs a firmware-side
+  ~15 Hz accumulator, which is its own tested module, not a page) and the
+  service worker.
+- `GET /dive/<n>.csv` answers the same dive file as `LOG EXPORT <n>`, through
+  the same session lock, as a file download for the browser.
+- Task layout: `async_tcp` is pinned to **core 0** (with the WiFi driver) so
+  core 1 keeps control (prio 22), handset (12) and HUD, and the sensor task
+  (24) still preempts it. It is deliberately **not** registered with TWDT: a
+  wedged web server must never reset a diving controller.
+- Sockets are never closed from the command path — a client that sends
+  `DIVE START` must not have its own socket destroyed inside its own callback.
+  The radio going down ends the connections; `start()` runs `cleanupClients()`
+  afterwards.
 
 ### Mobile-first, responsive UI
 
@@ -268,6 +321,7 @@ On `DIVE START` the **radio is disabled** (not just the server down — saves
   before the WebSocket connects.
 - WebSocket auto-reconnect + staleness banner — always obvious whether the
   data is live.
+  (built: exponential-backoff reconnect, `NO DATA` banner, accent colour follows the alarm set)
 - State changes (mode, clamps, WiFi off) push toast notifications.
 - Client-side min/max on inputs, re-validated server-side through the same
   `SET` path as the handset.
@@ -355,7 +409,7 @@ between the modules (staleness gating the valve, the output fuse, the AUTO
 lockout, a spiked depth sample vs the bands). `test/test_divesoak/` is the M6
 exit criterion: **50 seeded dives** (7 of them pre-dive lockouts) with faults
 injected through the world only, asserting per-tick invariants rather than
-expectations. Suite total: **121 cases across 18 native suites**, plus
+expectations. Suite total: **144 cases across 22 native suites**, plus
 `pio run -e esp32` and `esp32_stalltest` building clean.
 
 The soak is checked for **sensitivity, not just greenness**: removing the
@@ -406,6 +460,24 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
 | **M4** | **Simulator-first** deco: ZHL-16C + NDL + schedule + CNS → unit tests vs published tables → sim world model + fault injection → DECO LED + `D,` UART line + web ladder | Unit tests match published NDL/deco tables; sim soak runs show no setpoint escapes |
 | **M5** | UART protocol complete, web server (status/histogram/settings/checklist/dives, mobile-first), WiFi auto-off | Handset integration on real UART; UI usable on a phone over the AP |
 | **M6** | System sim soak + hardening: 50 scripted dives incl. faults; MS5837 swap/potting checklist; battery redundancy notes | **Sim half done:** 50-dive seeded soak green (`test_divesoak`), mutation-checked for sensitivity; it paid for itself with the CellProof 2-vs-1 starvation chain (§16). Bench half pending the port: MS5837 swap + potting checklist, mechanical inhibit bench test. Residual hardening candidate: a scheduled proof (`maxAttempts`/cooldown currently bound the cost) and the diver's own bailout as the physical backstop |
+
+### Current work order (between milestones, while the 24 h soak owns the port)
+
+Nothing below is flashed or bench-tested until the soak ends (~09:45 on
+2026-11-23): logic, host tests and compile-only firmware work only.
+
+| Step | Deliverable | State |
+|---|---|---|
+| A1 | `ControlTask` runs the real `ctrl::Loop` on the board (compile-only during the soak) | done `1b921b4` |
+| B1 | 50-dive seeded sim soak as the regression net for all logic work | done `bda1825` |
+| A5a | one command router for handset and web — refusals are the surface | done `f247d30` |
+| A5b | one settings applier (in-place re-tune) + NVS + dive-file store | done `b322bc0` |
+| A5c | handset session on UART2 | done `0e681e1` |
+| A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
+| A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | **pending — next step** |
+| C2 | bench acceptance script (`tools/hw_accept.py`): boot lines, UART2 session, web AP up, `GET`/`SET` refusals on a wired handset, then flash the current build | pending — port free |
+| C3 | MS5837 swap + potting checklist, pre-dive on real cells | pending — hardware |
+| — | per-cell histogram page: needs a firmware-side ~15 Hz cell accumulator module first (its own tested module, not a page) | deferred |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -472,10 +544,15 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
   fields + CRC) and `EVENT_SIZE` 10; `test_logfmt` guards the stride with
   canary bytes. The alarm set is 10 bits wide and the record has no spare byte,
   so bits 8..9 (CNS_HIGH, HYPOXIA) ride in bits 3..4 of `flags`
-  (`kFLAGS_ALARM_HI = 0x18`), cleared back out on unpack. `DIVE_VERSION` is 2.
-  The LittleFS reader must **stop at the first record whose CRC fails** — a
-  reset mid-write may truncate a dive, it may not turn it into plausible
-  garbage.
+  (`kFLAGS_ALARM_HI = 0x18`), cleared back out on unpack. The v3 stream (the
+  one on disk today, `DIVE_VERSION = 3`) prefixes every record with a type tag
+  (`REC_SNAPSHOT 'S'` / `REC_EVENT 'E'` / `REC_META 'M'`) and puts a fixed
+  16 B CRC'd header at the front of the file, so a reader can walk the file
+  without knowing write order. `logfmt::scanRecords()` is the one pure walk
+  (byte image in, records out — host-tested by feeding it images directly).
+  The LittleFS reader must **stop at the first tag unknown or record whose CRC
+  fails** — a reset mid-write may truncate a dive, it may not turn it into
+  plausible garbage.
 - **A cell proof is only worth what it changes.** Four separate gaps, all found
   by the soak (dive 4: vote 0.82 bar, real loop 0.12 bar at 27 m — the loop was
   being *starved*, not over-enriched):
@@ -512,6 +589,54 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
   impossible — that case belongs in `test_sim`, with the third cell left honest
   on purpose); and a cell "jump" must stay under the plausibility gate
   (0.5 bar/sample), because the gate is right to reject bigger ones.
+- **One command session, not one per transport.** A per-transport router looks
+  fine in isolation and then the phone turns WiFi off, the handset's private
+  router never heard it, and at dive end the machine turns the radio back on —
+  undoing what the diver asked for on the client in front of him. Same failure
+  class for the two-step `CAL O2` arm (armed on the web, refused "not armed" on
+  the handset). `comms::Session` owns the router, link, lock and dive-file
+  owner; the UART2 task and the `/ws` bridge are byte movers only.
+  `test/test_session/` pins the invariants: identical refusals, diver intent
+  across transports, one shared arm, actions inside the session lock, and no
+  web command draining the handset's event ring.
+- **A sink callback gets the caller's context, never the firmware's hook
+  object.** `UartLink::streamLogExport` passed `hw_.ctx` into the transport's
+  sink — the first `LOG EXPORT` over WiFi would have handed a socket id cast to
+  the firmware's hook struct. The export must stream through the *asker's*
+  sink with the *asker's* ctx; `test_uartlink`'s export case records the ctx
+  and was verified by mutation (reverting the fix fails it).
+- **Web answer framing is wire-visible protocol, not UI detail.** The protocol
+  is line-based and one command may answer with many lines, so the bridge ends
+  every answer with `#<n>` (n = reply lines, `#0 dropped` on overflow) and
+  splits multi-line replies into one frame per line — unsplit, the browser's
+  parser sees one giant line and the page half-works silently. `#` can never
+  begin a protocol line, which is what makes the marker collision-free.
+- **Radio policy lives in exactly one function, and sockets are never closed
+  from the command path.** A client that sends `DIVE START` must not have its
+  own socket destroyed inside its own callback; the radio drop ends the
+  connections and `start()` runs `cleanupClients()` afterwards. Same reasoning
+  for `async_tcp`: pinned to core 0 (with the WiFi driver, away from control 22
+  / handset 12 / sensor 24 on core 1) and deliberately **not** TWDT-registered
+  — a wedged web server must never reset a diving controller.
+- **The page lives in firmware flash; the LittleFS copy is generated, not
+  edited.** `src/comms/web_page.h` is the single source; `tools/sync_webdata.py`
+  writes `data/index.html` from it, and the server falls back to the embedded
+  copy when the filesystem is missing, half-written or wiped. Hand-editing the
+  data copy guarantees the two versions only drift on the one board that has a
+  filesystem.
+- **The dive log has one owner but two writers.** ControlTask appends the 30 s
+  grid rows, the handset link appends event-driven rows; both go through
+  `g_logMtx` in `session_wiring.cpp`, and only the command path opens/closes
+  files. Two tasks appending to one LittleFS file without that mutex produces
+  interleaved records that each still pass their own CRC.
+- **Display keys resolve after the registry** in `CommandRouter::exec` —
+  `GET SCHEMA`/`GET T`/… are asked after the real keys, so a display key can
+  never shadow a real setting (`D1`, `CAL_O2_FI`).
+- **Known open race (A5e):** the handset/web task applies settings and dive
+  start/end directly to `ctrl::Loop` while ControlTask is mid-`cycle()` on the
+  other core. The session lock keeps commands from each other, not commands
+  from the control chain. Fix is to defer chain mutations to ControlTask's
+  cycle boundary; deliberately sequenced after A5d.
 - Solenoid driver circuit must fail **closed** on a floating/pulled-low gate;
   keep firmware max duty low; recommend a hardware manual-inhibit switch in the
   O₂ line that needs zero firmware cooperation.

@@ -34,7 +34,9 @@
 #include "comms/settings.h"
 #include "comms/settings_apply.h"
 #include "comms/telemetry_bridge.h"
+#include "comms/session.h"
 #include "comms/uart2_task.h"
+#include "comms/web_server.h"
 #include "hud.h"
 
 // ---------------------------------------------------------------------------
@@ -554,10 +556,22 @@ void setup() {
     else
         g_controlRunning = false;
 
-    // The handset/web session rides on the chain: no chain, no session
-    // (SAFE mode talks through the serial monitor and LEDs instead).
-    if (!forceSafe && !comms::startUart2Task())
-        Serial.println("** uart2 session NOT started (task create failed)");
+    // The handset and web session ride on the chain: no chain, no session.
+    // SAFE mode keeps them offline deliberately — a board that just
+    // watchdog-reset must not be accepting DIVE START from a phone before
+    // anyone knows why it reset. One session object, and both transports are
+    // started over it, so there is no way to end up with a handset that
+    // enforces one set of rules and a browser that enforces another.
+    if (forceSafe) {
+        Serial.println("** SAFE MODE: handset (UART2) and web AP stay offline until a clean boot");
+    } else if (!comms::initSession(*g_loop, g_settings, g_bridgeTel, g_bridgeEvents)) {
+        Serial.println("** session NOT initialised: handset and web offline (control still runs)");
+    } else {
+        if (!comms::startUart2Task())
+            Serial.println("** uart2 session NOT started (task create failed)");
+        if (!comms::web::start())
+            Serial.println("** web AP failed to start: the controller still dives");
+    }
 }
 
 void loop() {

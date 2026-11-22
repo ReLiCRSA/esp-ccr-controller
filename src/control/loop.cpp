@@ -80,6 +80,8 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     for (int i = 0; i < 3; i++)
         cellBar_[i] = (cfg_.presentMask & (1u << i)) ? in.cells[i] : 0.0f;
 
+    vbat_ = in.vbat;  // remembered for telemetry only
+
     // Median then boxcar: bands and CellProof switch on absolute thresholds,
     // so one spiked pressure sample must not move the setpoint (and a bare EMA
     // would asymptote towards a threshold without ever crossing it).

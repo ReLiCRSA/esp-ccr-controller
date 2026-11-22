@@ -115,6 +115,9 @@ public:
     void requestCellTest() { cellTest_ = true; }
     bool cellTestRequested() const { return cellTest_; }
     float cellBar(uint8_t ch) const { return cellBar_[ch]; }  // calibrated, pre-vote
+    /// Last pack voltage seen by the chain. Telemetry reads it here rather
+    /// than reaching into SensorData, so no client invents its own number.
+    float vbatVolts() const { return vbat_; }
     uint8_t cellTestPassMask() const { return pulseTest_.passMask(); }
     uint8_t cellTestFailMask() const { return pulseTest_.failMask(); }
     bool prediveRunning() const { return predive_.running(); }
@@ -166,6 +169,7 @@ private:
     bool haveVote_ = false;
     float depthSmooth_ = 0.0f, depthPrev_ = 0.0f, depthRate_ = 0.0f;
     float cellBar_[3] = {0.21f, 0.21f, 0.21f};
+    float vbat_ = 0.0f;  // last sample seen: telemetry, never a control input
     float spTarget_ = 0.0f;
     uint32_t lastCycleMs_ = 0;
     bool cycleSeen_ = false;

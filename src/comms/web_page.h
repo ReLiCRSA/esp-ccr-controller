@@ -1,0 +1,480 @@
+// ============================================================================
+// web_page.h — the built-in status/settings UI (PLAN.md 9), served when
+// LittleFS has no /index.html.
+//
+// Plain HTML/CSS/vanilla JS, one file, no framework and no CDN: the access
+// point has no internet, ever, and a page that cannot be fetched is a page
+// that cannot be read on the day it matters. Serving this built-in copy also
+// means the worst LittleFS outcome (not mounted, half-written, wiped) costs
+// the UI nothing — the phone still gets a screen.
+//
+// The same file is extracted to data/index.html for LittleFS installs
+// (tools/sync_webdata.py), so there is exactly one source of truth.
+//
+// Protocol: every command line is answered with reply lines and then a
+// '#<n>' control line (n = number of reply lines), so the page knows when an
+// answer is complete. See web_server.cpp.
+// ============================================================================
+#pragma once
+
+#include <pgmspace.h>
+
+// clang-format off
+static const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0f14">
+<title>ESP-CCR</title>
+<style>
+:root{--bg:#0b0f14;--panel:#141a22;--ink:#e8eef6;--dim:#8c9bb0;--line:#25303d;
+--ok:#39d98a;--warn:#ffb020;--bad:#ff4d4d;--accent:#39d98a}
+body.alarm{--accent:#ff4d4d} body.warn{--accent:#ffb020} body.stale{--accent:#5b6b7d}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif;
+border-top:5px solid var(--accent);transition:border-color .3s}
+header{padding:10px 12px 0;border-bottom:1px solid var(--line)}
+#brand{font-weight:700;letter-spacing:.06em;color:var(--accent)}
+#sysline{color:var(--dim);font-size:13px;margin-top:2px}
+nav{display:flex;gap:4px;margin-top:10px;flex-wrap:wrap}
+nav button{background:var(--panel);color:var(--dim);border:1px solid var(--line);
+border-bottom:none;border-radius:8px 8px 0 0;padding:10px 14px;min-height:44px;font-size:15px}
+nav button.on{color:var(--ink);background:var(--bg);font-weight:600}
+main{padding:14px} section{display:none} section.on{display:block}
+#stale{background:var(--bad);color:#fff;padding:8px 12px;font-weight:600}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+.hero{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.hero .v{font-size:64px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.hero .u{color:var(--dim);font-size:18px}
+.tgt{color:var(--dim);font-size:15px}
+.row{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:none}
+.k{color:var(--dim)}.n{font-variant-numeric:tabular-nums;font-weight:600}
+.cells{display:grid;gap:8px}
+.cell{display:grid;grid-template-columns:44px 1fr 74px;align-items:center;gap:10px}
+.bar{height:14px;background:#0e141b;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent)}
+.bar i.off{background:#3d4b5c}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.pill{display:inline-block;padding:4px 9px;border-radius:999px;font-size:13px;font-weight:600;
+border:1px solid var(--line);color:var(--dim);margin:2px 3px 2px 0}
+.pill.on{color:#0b0f14;border-color:transparent}
+.pill.on.ok{background:var(--ok)}.pill.on.warn{background:var(--warn)}.pill.on.bad{background:var(--bad)}
+button.act{background:#1b2530;color:var(--ink);border:1px solid var(--line);border-radius:10px;
+padding:12px 14px;min-height:44px;font-size:15px;margin:3px 4px 3px 0}
+button.act.big{background:var(--accent);color:#0b0f14;font-weight:700;border-color:transparent}
+button.act.danger{background:#3a1618;border-color:#6b2a2e;color:#ffd9db}
+input,select{background:#0e141b;color:var(--ink);border:1px solid var(--line);border-radius:9px;
+padding:11px 12px;min-height:44px;font-size:15px;width:100%}
+fieldset{border:1px solid var(--line);border-radius:12px;padding:12px;margin:0 0 12px}
+legend{color:var(--accent);font-weight:700;padding:0 6px;font-size:14px}
+.set{display:grid;grid-template-columns:1fr 132px;gap:10px;align-items:center;padding:6px 0}
+.set .lab{font-size:14px}.set .rng{color:var(--dim);font-size:12px}
+.set.locked .lab::after{content:" \1F512";color:var(--warn);font-size:12px}
+#log{background:#0e141b;border:1px solid var(--line);border-radius:10px;padding:10px;
+font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;min-height:120px;max-height:46vh;overflow:auto;margin:0}
+form.cmd{display:flex;gap:8px;margin-top:10px}
+form.cmd button{min-width:88px}
+#toasts{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;display:grid;gap:8px;
+z-index:9;width:min(94vw,520px)}
+.toast{background:#1b2530;border-left:4px solid var(--accent);padding:11px 13px;border-radius:9px;
+box-shadow:0 6px 22px rgba(0,0,0,.5);font-size:14px}
+.toast.bad{border-left-color:var(--bad)}.toast.ok{border-left-color:var(--ok)}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}
+th{color:var(--dim);font-weight:600;font-size:13px}
+a{color:var(--accent)}
+canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);border-radius:10px}
+.hint{color:var(--dim);font-size:13px}
+@media(min-width:900px){main{display:grid;grid-template-columns:2fr 1fr;gap:14px;align-items:start}}
+</style>
+</head>
+<body class="clean">
+<header>
+  <div id="brand">ESP-CCR</div>
+  <div id="sysline"><span id="link">connecting&#8230;</span> <span id="clock"></span></div>
+  <nav id="tabs">
+    <button data-v="status" class="on">Status</button>
+    <button data-v="check">Checklist</button>
+    <button data-v="settings">Settings</button>
+    <button data-v="dives">Dives</button>
+    <button data-v="console">Console</button>
+  </nav>
+</header>
+<div id="stale" hidden>NO DATA &#8212; the radio is off in a dive, or the link is down</div>
+<main>
+<section id="v-status" class="on">
+  <div class="card">
+    <div class="hero"><span class="v" id="ppo2">--.-</span><span class="u">bar ppO&#8322;</span>
+      <span class="tgt">target <b id="sp">-.-</b></span></div>
+    <div id="flags" style="margin-top:10px"></div>
+  </div>
+  <div class="card"><div class="cells" id="cells"></div>
+    <div class="hint" id="proofline"></div></div>
+  <div class="card">
+    <div class="row"><span class="k">depth</span><span class="n" id="depth">-</span></div>
+    <div class="row"><span class="k">ceiling / NDL</span><span class="n" id="cn">-</span></div>
+    <div class="row"><span class="k">deco</span><span class="n" id="deco">-</span></div>
+    <div class="row"><span class="k">CNS O&#8322;</span><span class="n" id="cns">-</span></div>
+    <div class="row"><span class="k">battery</span><span class="n" id="bat">-</span></div>
+    <div class="row"><span class="k">injection</span><span class="n" id="inj">-</span></div>
+  </div>
+</section>
+<section id="v-check">
+  <div class="card"><div id="pre"></div><div class="hint" id="cellline"></div></div>
+  <div class="card">
+    <button class="act big" data-c="CHECK">Run pre-dive checks</button>
+    <button class="act" data-c="TEST CELLS">Test cells</button>
+    <button class="act" data-c="AUTO">AUTO</button>
+    <button class="act" data-c="MANUAL">MANUAL</button>
+    <button class="act" data-c="ACK">ACK alarms</button>
+  </div>
+  <div class="card">
+    <button class="act big" data-c="DIVE START">DIVE START</button>
+    <button class="act danger" data-c="DIVE END">DIVE END</button>
+    <button class="act" data-c="GET PRE">Refresh checks</button>
+    <button class="act danger" data-c="CELLPROOF OVERRIDE">Lift clamp</button>
+  </div>
+  <div class="card"><fieldset><legend>Calibration</legend>
+    <div class="hint">Air is mandatory. The O&#8322; point needs a sealed loop or chamber enriched
+      to <span id="o2fi">0.99</span> &#8212; bench only. Two steps: arm, then confirm.</div>
+    <button class="act" data-c="CAL AIR">CAL AIR</button>
+    <button class="act" data-c="CAL O2">CAL O2 (arm)</button>
+    <button class="act" data-c="CAL O2 CONFIRM">CAL O2 CONFIRM</button>
+    <button class="act" data-c="CAL DEPTH">CAL DEPTH</button>
+  </fieldset></div>
+</section>
+<section id="v-settings"><div id="sets"></div></section>
+<section id="v-dives">
+  <div class="card"><button class="act big" id="refresh">List dives</button>
+    <div class="hint">Ten most recent dives, oldest overwritten.</div></div>
+  <div class="card" id="divelist"></div>
+  <div class="card" id="diveview" hidden></div>
+</section>
+<section id="v-console">
+  <div class="card"><pre id="log"></pre>
+    <form class="cmd" id="cmdform"><input id="cline" autocomplete="off" spellcheck="false"
+      placeholder="GET T"><button class="act">send</button></form>
+    <div class="hint">Everything here is the handset protocol, byte for byte.</div></div>
+</section>
+</main>
+<div id="toasts"></div>
+<script>
+"use strict";
+var $=function(id){return document.getElementById(id)};
+var view="status", sock=null, outq=[], busy=null, lastRx=0, bootMs=0, tries=0;
+var T=null, D=null, CELLS=null, PROOF=null, PRE=null, FAULT=null;
+var SCHEMA=[], VALS={}, diveActive=false;
+
+function toast(msg,kind){
+  var d=document.createElement("div"); d.className="toast"+(kind?" "+kind:""); d.textContent=msg;
+  $("toasts").appendChild(d);
+  setTimeout(function(){ if(d.parentNode) d.parentNode.removeChild(d); },5200);
+}
+function logline(s){
+  var p=$("log"); p.textContent+=s+"\n";
+  var lines=p.textContent.split("\n");
+  if(lines.length>400) p.textContent=lines.slice(lines.length-400).join("\n");
+  p.scrollTop=p.scrollHeight;
+}
+
+// ---- the command pipe: one outstanding command, '#' ends the answer --------
+function send(line){
+  return new Promise(function(res){ outq.push({l:line,lines:[],res:res}); pump(); });
+}
+function pump(){
+  if(busy||!sock||sock.readyState!==1) return;
+  var c=outq.shift(); if(!c) return;
+  busy=c; logline("> "+c.l); sock.send(c.l);
+  setTimeout(function(){ if(busy===c){ finish("ERR reply timeout"); } },4000);
+}
+function finish(extra){
+  if(extra) { busy.lines.push(extra); }
+  var c=busy; busy=null; if(c) c.res(c.lines);
+  pump();
+}
+function connect(){
+  var url=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws";
+  sock=new WebSocket(url);
+  sock.onopen=function(){ tries=0; lastRx=Date.now(); $("link").textContent="live";
+    send("GET SCHEMA").then(function(ls){ SCHEMA=[]; ls.forEach(function(l){
+      if(l.indexOf("K,")===0) SCHEMA.push(l.split(",").slice(1)); }); buildSettings(); });
+    send("GET *").then(function(ls){ VALS={}; ls.forEach(function(l){
+      var i=l.indexOf("="); if(i>0) VALS[l.slice(0,i)]=l.slice(i+1); });
+      if(!SCHEMA.length) send("GET SCHEMA").then(function(l2){ SCHEMA=[]; l2.forEach(function(l){
+        if(l.indexOf("K,")===0) SCHEMA.push(l.split(",").slice(1)); }); buildSettings(); });
+      else buildSettings(); });
+    pump(); };
+  sock.onclose=function(){
+    busy=null; outq=[]; lastRx=0; $("link").textContent="offline";
+    var t=Math.min(8000,400*Math.pow(2,tries++));
+    $("link").textContent="reconnect in "+Math.round(t/1000)+"s";
+    setTimeout(connect,t);
+  };
+  sock.onerror=function(){ if(sock) sock.close(); };
+  sock.onmessage=function(ev){
+    lastRx=Date.now();
+    var frames=String(ev.data).split(/[\r\n]+/);
+    for(var fi=0;fi<frames.length;fi++) if(frames[fi]) handleFrame(frames[fi]);
+  };
+  function handleFrame(s){
+    if(s.charAt(0)==="#"){
+      if(s.indexOf("#boot")===0){ var a=s.split(" "); bootMs=+a[1]||0;
+        $("clock").textContent="uptime "+Math.round(bootMs/1000)+"s"; return; }
+      if(s.indexOf("dropped")>0) toast("command too long","bad");
+      finish(); return;
+    }
+    logline(s);
+    var f=s.split(",");
+    if(f[0]==="T") { T=f; state(); }
+    else if(f[0]==="D") { D=f; state(); }
+    else if(f[0]==="CELLS") { CELLS=f; check(); }
+    else if(f[0]==="PROOF") { PROOF=f; state(); }
+    else if(f[0]==="PRE") { PRE=f; check(); }
+    else if(f[0]==="FAULT") { FAULT=f; state(); }
+    else if(f[0]==="E") {
+      var id=+f[2], val=+f[3];
+      toast(eventName(id,val),(id===1||id===10||id===11)?"bad":"ok"); }
+    else if(f[0]==="ERR") { toast(s,"bad"); }
+  }
+}
+var ALARMS=["LOW pO2","HIGH pO2","CELL DRIFT","SENSOR FAIL","BATTERY","SP CLAMP","STUCK OPEN",
+            "CELL PROOF","CELL EXCLUDED","CELL REJOIN","HYPOXIA"];
+function eventName(id,val){
+  if(id===1) return "ALARM "+(ALARMS[val]||("bit"+val))+" RAISED";
+  if(id===2) return "alarm "+(ALARMS[val]||("bit"+val))+" cleared";
+  var n={3:"mode",4:"setpoint",5:"cell excluded",6:"cell rejoin",7:"CAL AIR",8:"CAL O2",
+         9:"cell proof PASS",10:"cell proof FAIL",11:"clamp ON",12:"clamp OFF",
+         13:"pre-dive PASS",14:"RESET"};
+  return (n[id]||("event "+id))+" ("+val+")";
+}
+
+// ---- rendering ------------------------------------------------------------
+var FLAGNAMES=["LOW pO2","HIGH pO2","CELL DRIFT","SENSOR","BATTERY","SP CLAMP","SOLENOID","PROOF FAIL"];
+function flagBits(){ if(!T) return 0; var m=/FLAGS0x([0-9a-fA-F]{2})/.exec(T[8]||""); return m?parseInt(m[1],16):0; }
+
+function state(){
+  if(!T){ $("ppo2").textContent="--.-"; return; }
+  var voted=+T[2], sp=+T[6], mode=T[8]?T[7]:"STANDBY";
+  var bits=flagBits();
+  $("ppo2").textContent=voted.toFixed(2);
+  $("sp").textContent=sp.toFixed(2);
+  $("depth").textContent=(+T[1]).toFixed(1)+" m";
+  // battery is the field appended after FLAGS: absent on an older build
+  var vbat=(T.length>9)?+T[9]:0;
+  $("bat").textContent=vbat>0?(vbat.toFixed(2)+" V"):"n/a";
+  $("flags").innerHTML="";
+  var modePill=document.createElement("span");
+  modePill.className="pill on "+(mode==="AUTO"?"ok":mode==="MANUAL"?"warn":"");
+  modePill.textContent=mode; $("flags").appendChild(modePill);
+  for(var i=0;i<8;i++) if(bits&(1<<i)){
+    var p=document.createElement("span");
+    p.className="pill on "+(i<3||i===6||i===7?"bad":"warn"); p.textContent=FLAGNAMES[i];
+    $("flags").appendChild(p);
+  }
+  var cl=$("cells"); cl.innerHTML="";
+  for(var c=0;c<3;c++){
+    var v=+T[3+c];
+    var d=document.createElement("div"); d.className="cell";
+    d.innerHTML='<span class="k">cell '+(c+1)+'</span><span class="bar"><i style="width:'+
+      Math.max(0,Math.min(100,v/1.9*100))+'%"></i></span><span class="n">'+v.toFixed(3)+'</span>';
+    cl.appendChild(d);
+  }
+  if(D){
+    var ndl=+D[1], tot=+D[2], ce=+D[3], cns=D[D.length-1];
+    $("cn").textContent=(ce>0?ce.toFixed(1)+" m / ":"")+ (ndl<0?"n/a":ndl>=480?">480":ndl)+" min";
+    var stops=[]; for(var s=4;s<D.length-1;s++) if(D[s].indexOf("|")>0) stops.push(D[s].replace("|"," for "));
+    $("deco").textContent=(tot>0?tot.toFixed(1)+" min":"none")+(stops.length?" &#8212; "+stops.join(", "):"");
+    $("cns").textContent=(+cns).toFixed(0)+" %";
+  }
+  if(PROOF){
+    var st=["INACTIVE","IDLE","ARMED","RUNNING","PASS","FAIL"][+PROOF[1]]||"?";
+    $("proofline").textContent="cell proof: "+st+"  banned 0"+PROOF[3]+"  attempts "+PROOF[4];
+  }
+  if(FAULT){
+    var duty=+FAULT[3];
+    $("inj").textContent=(FAULT[1]==="1"?"STUCK OPEN ":"")+(FAULT[2]==="1"?"FUSE TRIPPED ":"")+
+      "duty "+duty.toFixed(1)+"%";
+  }
+  var cls="clean";
+  if(bits&((1<<0)|(1<<1)|(1<<6)|(1<<7))) cls="alarm"; else if(bits) cls="warn";
+  document.body.className=cls;
+  diveActive=(mode==="AUTO"||mode==="MANUAL");
+  lockSettings();
+}
+function check(){
+  if(!PRE) { $("pre").innerHTML='<span class="hint">no check data yet</span>'; return; }
+  var names=["warmup","air","solenoid","depth","battery"], txt=["pending","running","PASS","FAIL"];
+  var out="";
+  for(var i=0;i<5&&PRE.length>2+i;i++){
+    var s=+PRE[1+i], kind=s===2?"ok":s===3?"bad":s===1?"warn":"";
+    out+='<span class="pill'+(kind?" on "+kind:"")+'">'+names[i]+" "+txt[s]+"</span>";
+  }
+  if(PRE[6]==="1") out+='<span class="pill on ok">AUTO unlocked</span>';
+  $("pre").innerHTML=out;
+  if(CELLS){
+    var st=["idle","baseline","pulsing","recover","done"][+CELLS[1]]||"?";
+    $("cellline").textContent="cell test "+st+"  passed "+CELLS[2]+"  failed "+CELLS[3]+
+      (CELLS[4]==="1"?"  (running)":"");
+  }
+}
+
+// ---- settings -------------------------------------------------------------
+function buildSettings(){
+  var host=$("sets");
+  if(!SCHEMA.length){ host.innerHTML='<div class="card"><span class="hint">no schema yet</span></div>'; return; }
+  host.innerHTML="";
+  var groups={};
+  SCHEMA.forEach(function(d){
+    var key=d[0], g=key.indexOf("SP")===0||key==="D1"||key==="D2"||key==="SP_HYST"?"Setpoints":
+      key.indexOf("ALLO")===0||key==="CNS_ALARM"?"Alarms":
+      key.indexOf("INJ")===0?"Injection":key.indexOf("CELLPROOF")===0?"Cell proof":
+      key.indexOf("CELL_")===0?"Voting":key.indexOf("CAL")===0?"Calibration":
+      key.indexOf("GF")===0||key.indexOf("ASC")===0||key==="WATER_DENSITY"?"Deco":"System";
+    (groups[g]=groups[g]||[]).push(d);
+  });
+  Object.keys(groups).forEach(function(g){
+    var fs=document.createElement("fieldset"), lg=document.createElement("legend");
+    lg.textContent=g; fs.appendChild(lg);
+    groups[g].forEach(function(d){ fs.appendChild(field(d)); });
+    var c=document.createElement("div"); c.className="card"; c.appendChild(fs); host.appendChild(c);
+  });
+  lockSettings();
+}
+function field(d){
+  var key=d[0], type=d[1], min=+d[2], max=+d[3], flags=+d[4], def=d[5];
+  var w=document.createElement("div"); w.className="set"; w.dataset.key=key;
+  w.dataset.lock=(flags&1)?"1":"";
+  var lab=document.createElement("div"); lab.className="lab";
+  lab.innerHTML=key+((flags&2)?' <span class="pill on warn">safety</span>':"")+
+    '<div class="rng">'+(type==="S"?"length "+min+".."+max:min+" .. "+max)+" &#183; def "+def+"</div>";
+  w.appendChild(lab);
+  var inp=document.createElement("input");
+  inp.id="f_"+key; inp.name=key;
+  if(type==="B"){ inp.type="checkbox"; inp.checked=(VALS[key]==="1"); }
+  else if(type==="S"){ inp.type="text"; inp.value=VALS[key]||""; inp.minLength=min; inp.maxLength=max; }
+  else { inp.type="number"; inp.step=type==="F"?"0.01":"1"; inp.min=min; inp.max=max; inp.value=VALS[key]||def; }
+  inp.addEventListener("change",function(){ save(key,inp,flags); });
+  w.appendChild(inp);
+  return w;
+}
+function save(key,inp,flags){
+  var v=(inp.type==="checkbox")?(inp.checked?"1":"0"):inp.value;
+  if(inp.type==="number"){ var n=+v;
+    if(!isFinite(n)||n<+inp.min||n>+inp.max){ toast(key+": enter "+inp.min+" .. "+inp.max,"bad"); return; } }
+  if(inp.minLength&&v.length<inp.minLength){ toast(key+": too short","bad"); return; }
+  send("SET "+key+"="+v).then(function(ls){
+    var err=ls.filter(function(l){return l.indexOf("ERR")===0});
+    if(err.length){ toast(err[0],"bad"); inp.value=VALS[key]||""; return; }
+    VALS[key]=v;
+    toast(ls.filter(function(l){return l.indexOf("OK")===0}).join(" &#183; ")||"saved",
+      (flags&2)?"bad":"ok");
+    if(key.indexOf("AP_")===0) toast("AP name/password apply after the next radio restart","ok");
+  });
+}
+function lockSettings(){
+  document.querySelectorAll(".set").forEach(function(w){
+    var i=w.querySelector("input"); if(!i) return;
+    var locked=diveActive&&w.dataset.lock==="1";
+    w.classList.toggle("locked",locked);
+    if(locked) i.setAttribute("disabled",""); else i.removeAttribute("disabled");
+  });
+}
+
+// ---- dives ----------------------------------------------------------------
+function refreshDives(){
+  send("LOG LIST").then(function(ls){
+    var rows=ls.filter(function(l){return l.indexOf("L,")===0});
+    if(!rows.length){ $("divelist").innerHTML='<span class="hint">no dives recorded</span>'; return; }
+    var h='<table><tr><th>#</th><th>start</th><th></th></tr>';
+    rows.forEach(function(l){
+      var f=l.split(","), slot=+f[1], ep=+f[2];
+      var when=ep>100000?new Date(ep*1000).toLocaleString():"no clock";
+      h+="<tr><td>"+slot+"</td><td>"+when+"</td><td><button class='act' data-slot='"+slot+
+         "'>view</button> <a class='act' style='display:inline-block;padding:12px' href='/dive/"+
+         slot+".csv'>csv</a></td></tr>";
+    });
+    $("divelist").innerHTML=h+"</table>";
+    Array.prototype.forEach.call($("divelist").querySelectorAll("button"),function(b){
+      b.addEventListener("click",function(){ showDive(+b.dataset.slot); }); });
+  });
+}
+function showDive(slot){
+  var v=$("diveview"); v.hidden=false; v.innerHTML="loading dive "+slot+"&#8230;";
+  fetch("/dive/"+slot+".csv").then(function(r){ return r.text(); }).then(function(txt){
+    var snaps=[],meta=null;
+    txt.split("\n").forEach(function(l){
+      var f=l.split(",");
+      if(f[0]==="S"&&f.length>14) snaps.push({t:+f[1],d:+f[2],p:+f[3],sp:+f[8],al:+f[9]});
+      if(f[0]==="M") meta=f;
+    });
+    if(!snaps.length){ v.innerHTML="dive "+slot+": no readable records"; return; }
+    var h="<h3 style='margin-top:0'>dive "+slot+"</h3><canvas id='cv"+slot+"'></canvas>";
+    if(meta) h+="<div class='hint'>duration "+Math.round(+meta[1]/60)+" min &#183; max "+
+      (+meta[2]/100).toFixed(1)+" m &#183; ppO2 "+(+meta[3]/1000).toFixed(2)+" .. "+
+      (+meta[4]/1000).toFixed(2)+" &#183; pulses "+meta[5]+" &#183; CNS peak "+meta[6]+"%</div>";
+    v.innerHTML=h;
+    drawChart($("cv"+slot),snaps);
+  }).catch(function(){ v.innerHTML="could not read dive "+slot; });
+}
+function drawChart(cv,snaps){
+  var w=cv.clientWidth||600,hh=cv.clientHeight||180;
+  cv.width=w; cv.height=hh;
+  var g=cv.getContext("2d"); g.clearRect(0,0,w,hh);
+  var maxD=1,maxT=60;
+  snaps.forEach(function(s){ if(s.d>maxD) maxD=s.d; if(s.t>maxT) maxT=s.t; });
+  // depth (down) in amber, ppO2 scaled 0..2 in green
+  g.strokeStyle="#ffb020"; g.beginPath();
+  snaps.forEach(function(s,i){ var x=s.t/maxT*(w-4)+2, y=hh-(s.d/maxD)*(hh-8)-4;
+    i?g.lineTo(x,y):g.moveTo(x,y); });
+  g.stroke();
+  g.strokeStyle="#39d98a"; g.beginPath();
+  snaps.forEach(function(s,i){ var x=s.t/maxT*(w-4)+2, y=hh-(s.p/2)*(hh-8)-4;
+    i?g.lineTo(x,y):g.moveTo(x,y); });
+  g.stroke();
+  g.fillStyle="#8c9bb0"; g.font="11px system-ui";
+  g.fillText("depth "+maxD.toFixed(1)+" m",4,12); g.fillText("ppO2 2.0",w-56,12);
+}
+
+// ---- tabs + actions -------------------------------------------------------
+Array.prototype.forEach.call(document.querySelectorAll("#tabs button"),function(b){
+  b.addEventListener("click",function(){
+    view=b.dataset.v;
+    document.querySelectorAll("#tabs button").forEach(function(x){ x.classList.toggle("on",x===b); });
+    document.querySelectorAll("main section").forEach(function(s){
+      s.classList.toggle("on",s.id==="v-"+view); });
+    if(view==="dives") refreshDives();
+    if(view==="check") { send("GET PRE"); send("GET CELLS"); }
+  });
+});
+Array.prototype.forEach.call(document.querySelectorAll("button[data-c]"),function(b){
+  b.addEventListener("click",function(){
+    var c=b.dataset.c;
+    if(c==="DIVE END"&&!confirm("End the dive and close the log?")) return;
+    if(c==="CELLPROOF OVERRIDE"&&!confirm("Lift the cell-proof clamp? The machine re-applies it if the cells still disagree.")) return;
+    send(c).then(function(ls){ toast(ls.join(" &#183; "),ls.some(function(l){return l.indexOf("ERR")===0})?"bad":"ok"); });
+  });
+});
+$("cmdform").addEventListener("submit",function(e){
+  e.preventDefault();
+  var v=$("cline").value.trim(); if(!v) return;
+  $("cline").value=""; send(v);
+});
+$("refresh").addEventListener("click",refreshDives);
+
+// ---- cadence --------------------------------------------------------------
+setInterval(function(){
+  var stale=(Date.now()-lastRx>3000);
+  if(stale){ document.body.classList.add("stale"); $("stale").hidden=false; }
+  else { document.body.classList.remove("stale"); $("stale").hidden=true; }
+},1000);
+setInterval(function(){ if(sock&&sock.readyState===1) send("GET T"); },600);
+setInterval(function(){ if(sock&&sock.readyState===1&&(view==="status"||view==="check")) send("GET D"); },2400);
+setInterval(function(){ if(sock&&sock.readyState===1&&view==="check"){ send("GET PRE"); send("GET CELLS"); send("GET PROOF"); send("GET FAULT"); } },2400);
+connect();
+</script>
+</body></html>
+)HTML";
+// clang-format on

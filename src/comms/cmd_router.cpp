@@ -101,7 +101,10 @@ void CommandRouter::applyWifi(Response& r, bool on) {
 
 void CommandRouter::startDive(Response& r) {
     if (loop_.diveActive()) { replyErr(r, "dive active"); return; }
-    loop_.startDive(nowMs_);
+    // The dive gate flips here (dive-locked refusals and telemetry mode are
+    // true on the very next read); the chain's dive-state work lands at the
+    // next control tick — see the post* contract in loop.h.
+    loop_.postStartDive(nowMs_);
     logExportIdx_ = 0;
     if (wifiOn_) {            // drop the radio, remember to restore it later
         wifiOn_ = false;
@@ -116,7 +119,7 @@ void CommandRouter::startDive(Response& r) {
 
 void CommandRouter::endDive(Response& r) {
     if (!loop_.diveActive()) { replyErr(r, "no dive"); return; }
-    loop_.endDive(nowMs_);
+    loop_.postEndDive(nowMs_);
     r.actions |= ACT_DIVE_END;
     if (wifiAutoOff_) {        // restore what DIVE START took away
         wifiAutoOff_ = false;
@@ -291,13 +294,13 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
             // Diver outranks the machine. Always honoured, never argued — the
             // machine keeps the condition itself and keeps alarming if it
             // persists; only the latch/silence changes.
-            loop_.ackAlarms();
+            loop_.postAckAlarms();
             replyOk(r);
             break;
 
         case Kind::CHECK:
             if (loop_.diveActive()) { replyErr(r, "dive active"); break; }
-            loop_.prediveStart(nowMs_);
+            loop_.postPredive(nowMs_);
             replyOk(r, "CHECK");
             break;
 
@@ -339,12 +342,14 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
             break;
 
         case Kind::CELLPROOF_OVERRIDE:
-            if (loop_.cellproofOverride()) replyOk(r, "CLAMP LIFTED");
+            // Read to answer, post to act: the override itself runs at the
+            // next tick, on the control thread.
+            if (loop_.clampActive()) { loop_.postCpOverride(); replyOk(r, "CLAMP LIFTED"); }
             else replyErr(r, "no clamp active");
             break;
 
         case Kind::PULSE:
-            loop_.requestTestPulse();
+            loop_.postTestPulses(1);
             replyOk(r);
             break;
 

@@ -15,7 +15,9 @@
 // ============================================================================
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 
 #include "control/alarms.h"
 #include "control/calibration.h"
@@ -78,10 +80,11 @@ public:
 
     explicit Loop(const Config& cfg);
 
-    /// Re-apply configuration to the live chain (handset/web SET path). The
-    /// engines re-tune in place: their state — dive activity, exclusions,
-    /// latches, tissues — survives, because reloading settings must never
-    /// look like a fresh start to the control chain.
+    /// Re-apply configuration to the live chain. The engines re-tune in
+    /// place: their state — dive activity, exclusions, latches, tissues —
+    /// survives, because reloading settings must never look like a fresh
+    /// start to the control chain. Control-thread only; the handset/web SET
+    /// path uses postConfig() (see the request section below).
     void setConfig(const Config& cfg);
 
     /// One control cycle. `nowMs` is a monotonic clock (millis() on the ESP32,
@@ -89,12 +92,37 @@ public:
     /// late must not be papered over.
     State cycle(const SensorData& in, uint32_t nowMs);
 
-    // ---- dive lifecycle ----------------------------------------------------
+    // ---- dive lifecycle (control thread / simulator) ------------------------
+    // Direct application: for whoever owns the cycle() call. The handset and
+    // web paths must use the post* requests below instead.
     void startDive(uint32_t nowMs);
     void endDive(uint32_t nowMs);
     bool diveActive() const { return diveActive_; }
 
-    // ---- diver commands (handset / web / buttons) --------------------------
+    // ---- diver commands, safe from any thread (the command-path surface) ----
+    // The session lock keeps commands off each other; these keep commands off
+    // the control chain. Two halves, deliberately:
+    //   * the GATES (dive active, auto, cell test) flip immediately, because
+    //     dive-locked refusals, telemetry mode and "one test at a time" ask
+    //     for them the same millisecond the diver pressed the button;
+    //   * the CHAIN WORK (engine re-tune, tissue/proof reset, sequencer start,
+    //     ack latch, valve pulses) is queued and applied at the top of the
+    //     next cycle(), so the chain is never mutated mid-decision on the
+    //     other core. One control tick (100 ms) is the worst-case latency —
+    //     the handset is the in-water transport, so that bound is a lifeline
+    //     property, and `test_deferred` pins it.
+    void postConfig(const Config& cfg);
+    void postStartDive(uint32_t nowMs);
+    void postEndDive(uint32_t nowMs);
+    void postAckAlarms();
+    void postPredive(uint32_t nowMs);
+    void postCpOverride();
+    void postTestPulses(uint8_t n = 1);
+
+    // ---- diver commands ------------------------------------------------------
+    // requestAuto/requestCellTest flip GATES and are safe from any thread;
+    // the raw switch helpers mutate chain state and belong to the thread that
+    // calls cycle() (firmware ControlTask, simulator rig, factory paths).
     /// AUTO exactly as the handset must ask for it: refused unless the pre-dive
     /// checks passed (PLAN 7 hard lockout). Returns the mode in force.
     bool requestAuto(bool on);
@@ -104,14 +132,19 @@ public:
     void setAutoMode(bool on) { autoMode_ = on; }
     void ackAlarms() { alarmMgr_.ack(); }
     bool cellproofOverride() { return cpEng_.override(); }
-    void clearStuckOpen() { injector_.clearStuckOpen(); }
-    void prediveStart(uint32_t nowMs) { predive_.start(nowMs); }
+    /// Is the CellProof clamp up right now (post-FAIL, awaiting the diver)?
+    /// A read, so the command path can answer `CELLPROOF OVERRIDE` honestly
+    /// without mutating the chain off-thread.
+    bool clampActive() const { return cpEng_.state() == cellproof::State::FAIL; }
+    void clearStuckOpen() { injector_.clearStuckOpen(); }  // control thread
+    void prediveStart(uint32_t nowMs) { predive_.start(nowMs); }  // control thread
     /// Bench / handset `PULSE`: one valve pulse outside AUTO. The high wall,
     /// cutoff latch, duty cap and output fuse all still apply — a bench command
-    /// is not a bypass.
+    /// is not a bypass. Control-thread form; the command path posts it.
     void requestTestPulse() { injector_.requestTestPulse(); }
     /// Bench / handset `TEST CELLS`: run the cell responsiveness test now,
-    /// outside the pre-dive sequence. Same engine, same walls.
+    /// outside the pre-dive sequence. Same engine, same walls. The request is
+    /// just a gate flip — the test itself always runs inside cycle().
     void requestCellTest() { cellTest_ = true; }
     bool cellTestRequested() const { return cellTest_; }
     float cellBar(uint8_t ch) const { return cellBar_[ch]; }  // calibrated, pre-vote
@@ -121,7 +154,10 @@ public:
     uint8_t cellTestPassMask() const { return pulseTest_.passMask(); }
     uint8_t cellTestFailMask() const { return pulseTest_.failMask(); }
     bool prediveRunning() const { return predive_.running(); }
-    bool predivePassed() const { return predive_.allPassed(); }
+    /// Published by cycle(), never read across threads from the sequencer
+    /// itself: the AUTO grant is a decision, and decisions read published
+    /// values, not another core's mid-update state.
+    bool predivePassed() const { return predivePassed_; }
     bool prediveFailed() const { return predive_.failed(); }
     predive::Status prediveStatus(predive::Step s) const { return predive_.status(s); }
 
@@ -163,8 +199,13 @@ private:
     cal::PulseTest pulseTest_;
     depth::Filter<> depthF_;
 
-    bool diveActive_ = false;
-    bool autoMode_ = false;
+    // Gate flags: flipped synchronously by both the control thread and the
+    // command path (post*/request*). Aligned single bytes, read constantly by
+    // cycle() — atomics so "the handset task writes while core 1 reads" is a
+    // defined operation rather than a hope.
+    std::atomic<bool> diveActive_{false};
+    std::atomic<bool> autoMode_{false};
+
     bool solenoid_ = false;
     bool haveVote_ = false;
     float depthSmooth_ = 0.0f, depthPrev_ = 0.0f, depthRate_ = 0.0f;
@@ -176,8 +217,24 @@ private:
 
     // scripted pulse-and-check cell test: runs at the pre-dive solenoid step,
     // or standalone on the handset/web `TEST CELLS` command
-    bool ptActive_ = false, ptDone_ = false, cellTest_ = false;
+    bool ptActive_ = false, ptDone_ = false;
+    bool wasPulsing_ = false;  // edge for withdrawing a stopped test's pulses
+    std::atomic<bool> cellTest_{false};  // the gate; the body runs in cycle
+    std::atomic<bool> predivePassed_{false};  // sequencer verdict, published by cycle
     uint32_t ptPulseBase_ = 0;
+
+    // Deferred chain work from the command path (see post* requests). The
+    // mutex is held only to copy this small struct in or out — never while
+    // deciding anything — so cycle() can never block meaningfully on it.
+    struct Pending {
+        bool cfg = false, start = false, end = false, ack = false,
+             predive = false, cpOverride = false;
+        Config cfgVal;
+        uint32_t prediveStamp = 0;
+        uint8_t pulses = 0;
+    };
+    std::mutex reqMux_;
+    Pending pending_;
 
     voting::Result vote_{};
     alarms::Result alarmRes_{};

@@ -104,10 +104,11 @@ bool hookSave(void*) { return nvs::Store::save(g_settings); }
 
 void hookSettings(void*) {
     // The registry is the truth; this is the one place it becomes control
-    // configuration. Loop::setConfig re-tunes the engines in place, so a SET
-    // never looks like a restart to the dive in progress.
+    // configuration. postConfig queues the re-tune for the next control tick
+    // (engines re-tune in place, never a restart), so a SET from the handset
+    // or the browser never mutates the chain while ControlTask is mid-cycle.
     applySettings(g_settings, g_ctrlCfg);
-    if (g_loop) g_loop->setConfig(g_ctrlCfg);
+    if (g_loop) g_loop->postConfig(g_ctrlCfg);
 }
 
 void hookCalAir(void*) { g_calAirRequest = true; }

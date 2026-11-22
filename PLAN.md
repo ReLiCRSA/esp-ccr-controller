@@ -409,7 +409,7 @@ between the modules (staleness gating the valve, the output fuse, the AUTO
 lockout, a spiked depth sample vs the bands). `test/test_divesoak/` is the M6
 exit criterion: **50 seeded dives** (7 of them pre-dive lockouts) with faults
 injected through the world only, asserting per-tick invariants rather than
-expectations. Suite total: **144 cases across 22 native suites**, plus
+expectations. Suite total: **150 cases across 23 native suites**, plus
 `pio run -e esp32` and `esp32_stalltest` building clean.
 
 The soak is checked for **sensitivity, not just greenness**: removing the
@@ -474,7 +474,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5b | one settings applier (in-place re-tune) + NVS + dive-file store | done `b322bc0` |
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
-| A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | **pending — next step** |
+| A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
 | C2 | bench acceptance script (`tools/hw_accept.py`): boot lines, UART2 session, web AP up, `GET`/`SET` refusals on a wired handset, then flash the current build | pending — port free |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells | pending — hardware |
 | — | per-cell histogram page: needs a firmware-side ~15 Hz cell accumulator module first (its own tested module, not a page) | deferred |
@@ -632,11 +632,39 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 - **Display keys resolve after the registry** in `CommandRouter::exec` —
   `GET SCHEMA`/`GET T`/… are asked after the real keys, so a display key can
   never shadow a real setting (`D1`, `CAL_O2_FI`).
-- **Known open race (A5e):** the handset/web task applies settings and dive
-  start/end directly to `ctrl::Loop` while ControlTask is mid-`cycle()` on the
-  other core. The session lock keeps commands from each other, not commands
-  from the control chain. Fix is to defer chain mutations to ControlTask's
-  cycle boundary; deliberately sequenced after A5d.
+- **The chain is mutated on one thread only — the tick boundary.** The
+  session lock keeps commands off each other; it never kept them off
+  `ControlTask`, which cycles on its own priority and can preempt the handset
+  task mid-`setConfig`, or run truly parallel to the web task on core 0.
+  `ctrl::Loop` now splits every command into a **gate** and the **chain work**:
+  gates (`diveActive_`, `autoMode_`, `cellTest_`, atomics) flip synchronously,
+  because dive-locked refusals, telemetry mode and "one test at a time" must
+  see the diver's intent on the very next read; the heavier work (config
+  re-tune, dive-state reset, sequencer start, ack latch, pulses) is queued in
+  a tiny mutex-guarded mailbox that `cycle()` drains as step 0 — so the queued
+  config already decides the same tick it lands in, and worst-case latency
+  for a handset command is one 100 ms tick. That bound is a lifeline property,
+  not a nicety: **the handset is the in-water transport; the web is off during
+  a dive.** `test/test_deferred/` pins it, and a ThreadSanitizer run of the
+  two-threads stress shape is clean.
+- **Decisions read published verdicts, never another core's mid-update
+  state.** TSAN caught `requestAuto` computing `predive_.allPassed()` from the
+  command thread while `cycle()` rewrote the sequencer: the AUTO grant is a
+  decision, so the sequencer verdict is now *published* per tick
+  (`predivePassed_`). Display reads (`GET PRE`, `GET PROOF`) stay point-in-time
+  single-byte samples — no decision hangs on them, and anything that acts is
+  re-guarded inside the engine at apply time (a `CELLPROOF OVERRIDE` posted
+  against a stale FAIL is a no-op, not a bypass). A second-start guard
+  (`postStartDive` refuses while a dive is active, for the chain itself, not
+  just the router) keeps a stray command from zeroing tissues mid-dive — the
+  test watches CNS to prove it.
+- **`PULSE` never pulsed.** The cycle's "withdraw the stopped test's leftover
+  pulses" rule was unconditional, so it also ate the handset's standalone
+  `PULSE` queued between cycles — the command replied `OK` and the valve never
+  moved (pre-A5e it worked only when the write raced into the gap between
+  steps 3 and 6 of a cycle). The cancel is now edge-triggered on the pulse
+  test *leaving* PULSING. `test_deferred`'s pulse case is the regression:
+  post one pulse, watch exactly one leave the valve.
 - Solenoid driver circuit must fail **closed** on a floating/pulled-low gate;
   keep firmware max duty low; recommend a hardware manual-inhibit switch in the
   O₂ line that needs zero firmware cooperation.

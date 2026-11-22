@@ -69,6 +69,34 @@ void Loop::drivePulseTest(uint32_t nowMs) {
 State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     State st;
 
+    // ---- 0. deferred command work, applied on this thread ------------------
+    // The handset/web path flips gates synchronously but never touches the
+    // engines: everything heavier arrives queued, and lands here at the tick
+    // boundary — before sensors, so this tick already decides under the rules
+    // the diver just set. Worst-case latency for a handset command is one
+    // control tick (100 ms); the handset is the in-water transport, and a
+    // diver pressing ACK or MANUAL underwater is owed that bound.
+    {
+        Pending p;
+        {
+            std::lock_guard<std::mutex> g(reqMux_);
+            p = pending_;
+            pending_ = Pending{};
+        }
+        if (p.cfg) setConfig(p.cfgVal);
+        if (p.start) { cpEng_.diveStarted(); deco_.reset(); }
+        if (p.predive) predive_.start(p.prediveStamp ? p.prediveStamp : nowMs);
+        if (p.cpOverride) cpEng_.override();
+        if (p.ack) alarmMgr_.ack();
+        if (p.pulses) injector_.requestTestPulse(p.pulses);
+        if (p.end) cpEng_.diveEnded();
+    }
+
+    // Gate snapshot: one per tick, so no step of this decision runs against
+    // a mode that changed halfway through it.
+    const bool diveActive = diveActive_.load();
+    const bool autoMode = autoMode_.load();
+
     // Elapsed time is measured, not assumed: a task that arrives late must not
     // have its setpoint physics papered over with a nominal dt.
     uint32_t dt = kTickMs;
@@ -105,13 +133,25 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
         predive_.update(pi, nowMs);
     }
     drivePulseTest(nowMs);
+    // Publish the verdict for the command path (see predivePassed in loop.h):
+    // everything this tick could report about the checks is in by now.
+    predivePassed_ = predive_.allPassed();
     // A test pulse its step stopped waiting for must not linger in the
-    // injector and inject minutes later for no reason.
-    if (pulseTest_.state() != cal::TestState::PULSING) injector_.cancelTestPulse();
+    // injector and inject minutes later for no reason. Edge-triggered on
+    // purpose: the unconditional cancel also ate the handset's standalone
+    // `PULSE` (queued between cycles, withdrawn before the valve ever saw it —
+    // a command that silently did nothing). Only pulses belonging to a pulse
+    // test that just STOPPED are withdrawn; the diver's own pulse is never a
+    // leftover.
+    {
+        const bool pulsing = pulseTest_.state() == cal::TestState::PULSING;
+        if (wasPulsing_ && !pulsing) injector_.cancelTestPulse();
+        wasPulsing_ = pulsing;
+    }
 
     // ---- 4. CellProof (mid-dive high-ppO2 cell validation) -----------------
     cellproof::Input ci;
-    ci.diveActive = diveActive_;
+    ci.diveActive = diveActive;
     ci.depthM = depthSmooth_;
     ci.votedBar = vote_.votedPpo2;
     for (int i = 0; i < 3; i++) ci.cellsBar[i] = cellBar_[i];
@@ -163,7 +203,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     // Demand control is suspended while the pre-dive sequencer is scripting
     // test pulses: the test must own the valve, and a loop sitting in air at
     // 0.21 must not be "corrected" up to the setpoint underneath it.
-    ii.autoMode = autoMode_ && !predive_.running();
+    ii.autoMode = autoMode && !predive_.running();
     ii.depthStable = depthStable;
     // Injection needs a believable ppO2: injecting on a guess is how loops
     // die, so with no vote at all — or a vote built from frozen, no-longer
@@ -196,13 +236,13 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     // ---- 8. decompression + CNS (the diver's real exposure) ----------------
     // The deco converts depth with its own surface pressure and water density,
     // so depth and absolute pressure stay consistent inside one module.
-    if (diveActive_ && in.pressureValid)
+    if (diveActive && in.pressureValid)
         deco_.step(dt / 1000.0, deco_.depthToBar(std::max(0.0f, depthSmooth_)), vote_.votedPpo2);
 
     // ---- 9. fill the report ------------------------------------------------
     st.solenoid = solenoid_;
     st.autoMode = ii.autoMode;
-    st.diveActive = diveActive_;
+    st.diveActive = diveActive;
     st.votedBar = vote_.votedPpo2;
     st.setpointBar = spTarget_;
     st.depthSmoothedM = depthSmooth_;
@@ -219,19 +259,69 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     return st;
 }
 
-void Loop::startDive(uint32_t /*nowMs*/) {
+void Loop::startDive(uint32_t /*nowMs*/) {  // control thread: apply now
     diveActive_ = true;
     cpEng_.diveStarted();
     deco_.reset();
 }
 
-void Loop::endDive(uint32_t /*nowMs*/) {
+void Loop::endDive(uint32_t /*nowMs*/) {    // control thread: apply now
     diveActive_ = false;
     cpEng_.diveEnded();
 }
 
+// ---- the command-path surface (any thread) ---------------------------------
+// Gates flip here, chain work waits for cycle() step 0. See loop.h — the split
+// is what lets dive-locked refusals answer instantly while the engines are
+// never retuned mid-decision on the other core.
+
+void Loop::postConfig(const Config& cfg) {
+    std::lock_guard<std::mutex> g(reqMux_);
+    pending_.cfg = true;
+    pending_.cfgVal = cfg;   // last writer wins: a newer SET supersedes
+}
+
+void Loop::postStartDive(uint32_t /*nowMs*/) {
+    // Gate first: the dive is active the instant the diver says so. If it was
+    // already active, do NOT queue a second start body — re-running it would
+    // wipe tissues and proof state mid-dive. The router refuses this too; the
+    // chain refuses it for itself.
+    const bool wasActive = diveActive_.exchange(true);
+    std::lock_guard<std::mutex> g(reqMux_);
+    pending_.end = false;
+    if (!wasActive) pending_.start = true;  // coalesced: three starts, one dive
+}
+
+void Loop::postEndDive(uint32_t /*nowMs*/) {
+    diveActive_ = false;
+    std::lock_guard<std::mutex> g(reqMux_);
+    pending_.end = true;
+}
+
+void Loop::postAckAlarms() {
+    std::lock_guard<std::mutex> g(reqMux_);
+    pending_.ack = true;
+}
+
+void Loop::postPredive(uint32_t nowMs) {
+    std::lock_guard<std::mutex> g(reqMux_);
+    pending_.predive = true;
+    pending_.prediveStamp = nowMs;
+}
+
+void Loop::postCpOverride() {
+    std::lock_guard<std::mutex> g(reqMux_);
+    pending_.cpOverride = true;
+}
+
+void Loop::postTestPulses(uint8_t n) {
+    std::lock_guard<std::mutex> g(reqMux_);
+    const unsigned sum = pending_.pulses + n;
+    pending_.pulses = static_cast<uint8_t>(sum > 8 ? 8 : sum);  // injector's own cap
+}
+
 bool Loop::requestAuto(bool on) {
-    if (!on || !predive_.allPassed()) {
+    if (!on || !predivePassed_) {  // published verdict, not raw sequencer state
         autoMode_ = false;
         return false;
     }

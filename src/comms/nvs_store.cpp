@@ -87,7 +87,10 @@ bool Store::save(const settings::Registry& reg) {
         String packed;
         if (d.type == settings::Type::STRING) packed = String(text);
         else packed = String(typeTag(d.type)) + ":" + String(text);
-        if (!p.putString(d.key, packed)) ok = false;
+        if (!p.putString(d.key, packed)) {
+            ok = false;
+            Serial.printf("nvs: save FAILED for key %s\n", d.key);  // bench-visible
+        }
     }
     p.end();
     writeSchema();

@@ -74,6 +74,12 @@ Then by hand, in this order (each mirrors a sim scenario):
   frames on newlines as before. Telemetry pull cadence 600 ms -> 2 s.
 * The SCHEMA fetch is socket-open-only (never re-fetched; saves reuse the
   cached copy), so reconnects no longer stampede.
+* **`ERR settings not saved` was an 18-character key**: NVS rejects keys over
+  15 chars, per-write, deep inside `save()` — and the native suite never
+  touches NVS, so only the bench could catch it. Two offenders renamed
+  (`CELLPROOF_TMO`, `CELLPROOF_MAXSP`), `test_settings` now pins the 15-char
+  limit, schema marker bumped. Verified on the board: SET -> OK in ~40 ms,
+  reboot, boot line `settings: 32 keys from NVS`, values survive.
 
 ## C3-a — depth sensor (found live on the bench 2026-11-22)
 

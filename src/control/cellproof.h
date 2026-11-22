@@ -4,7 +4,7 @@
 // Galvanic cells that are linear at 0.4 but saturate at 1.0 pass an air cal
 // and lie to you at depth. On first descent through CELLPROOF_DEPTH the
 // controller sets the setpoint to CELLPROOF_SP and demands the voted ppO2
-// actually reach CELLPROOF_MIN within CELLPROOF_TIMEOUT. What each cell is
+// actually reach CELLPROOF_MIN within CELLPROOF_TMO. What each cell is
 // judged on is whether it TRACKED that demand change: on first descent the
 // loop is driven up, deeper in a dive the same run is a step down, and a cell
 // that does not move either way is not reading the loop.

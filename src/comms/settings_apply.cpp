@@ -83,8 +83,8 @@ uint8_t applySettings(const settings::Registry& reg, ctrl::Config& cfg) {
     cfg.cellproof.spBar = f("CELLPROOF_SP");
     cfg.cellproof.minPassBar = f("CELLPROOF_MIN");
     cfg.cellproof.timeoutMs =
-        static_cast<uint32_t>(reg.getInt(reg.find("CELLPROOF_TIMEOUT"))) * 1000u;
-    cfg.cellproof.okMaxSpBar = f("CELLPROOF_OK_MAXSP");
+        static_cast<uint32_t>(reg.getInt(reg.find("CELLPROOF_TMO"))) * 1000u;
+    cfg.cellproof.okMaxSpBar = f("CELLPROOF_MAXSP");
 
     // pre-dive battery floor follows the same VBAT_MIN the alarm uses
     cfg.predive.vbatMin = cfg.alarms.vbatMin;

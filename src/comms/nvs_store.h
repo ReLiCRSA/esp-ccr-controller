@@ -21,7 +21,8 @@ namespace nvs {
 class Store {
 public:
     static constexpr char kNamespace[] = "ccr-cfg";
-    static constexpr uint32_t kSchema = 3;  // bump on table/format change
+    static constexpr uint32_t kSchema = 4;  // bump on table/format change
+                                          // (4: NVS-illegal >15-char keys renamed)
 
     /// Read every key into `reg` (missing/bad/out-of-range keys stay at their
     /// default). Returns the number of keys actually loaded.

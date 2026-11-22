@@ -87,7 +87,7 @@ void test_value_as_string_and_list_all() {
     const size_t n = r.listAll(all, sizeof(all));
     TEST_ASSERT_TRUE(n > 300);
     TEST_ASSERT_NOT_NULL(std::strstr(all, "SP1=0.400\n"));
-    TEST_ASSERT_NOT_NULL(std::strstr(all, "CELLPROOF_OK_MAXSP=0.900\n"));
+    TEST_ASSERT_NOT_NULL(std::strstr(all, "CELLPROOF_MAXSP=0.900\n"));
     TEST_ASSERT_NOT_NULL(std::strstr(all, "AP_PASS=diveonly\n"));
     // tight buffer fails cleanly
     char tiny[8];
@@ -105,6 +105,20 @@ void test_reset_restores() {
     TEST_ASSERT_EQUAL_STRING("ESP-CCR", r.getString(r.find("AP_SSID")));
 }
 
+// Every settings key is an NVS key on the device: the ESP32 NVS layer
+// REJECTS keys over 15 characters, and it does so per-write deep inside
+// save() - the native suite never touches NVS, so only the bench sees it,
+// as "ERR settings not saved" on every save. Found on the bench 2026-11-23
+// (CELLPROOF_OK_MAXSP=18, CELLPROOF_TIMEOUT=17); the registry pins the
+// limit here so the build fails before the board ever has to.
+void test_keys_fit_nvs() {
+    size_t count = 0;
+    const Def* defs = Registry::definitions(count);
+    TEST_ASSERT_TRUE(count > 0);
+    for (size_t i = 0; i < count; i++)
+        TEST_ASSERT_MESSAGE(std::strlen(defs[i].key) <= 15, defs[i].key);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_defaults_load);
@@ -112,5 +126,6 @@ int main() {
     RUN_TEST(test_string_bounds_and_dive_lock_flags);
     RUN_TEST(test_value_as_string_and_list_all);
     RUN_TEST(test_reset_restores);
+    RUN_TEST(test_keys_fit_nvs);
     return UNITY_END();
 }

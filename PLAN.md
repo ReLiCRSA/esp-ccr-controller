@@ -708,3 +708,9 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   on open; DTR=IO0, RTS=EN on the classic auto-reset circuit). Several "the
   board reboots by itself" observations during web debugging were the laptop
   opening `/dev/ttyUSB0`, not the firmware.
+- **Settings keys are NVS keys: hard 15-character limit**, enforced by the
+  ESP32 NVS layer per-write — a longer key fails every save with
+  `ERR settings not saved`. `test_settings` pins the limit so the build
+  fails before the bench has to find it again. Renaming a key is legal only
+  with a `kSchema` bump (old NVS erased wholesale), and keys are
+  protocol-visible to the handset, so rename early or not at all.

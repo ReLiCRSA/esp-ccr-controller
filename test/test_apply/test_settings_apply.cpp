@@ -136,7 +136,7 @@ void test_mid_dive_setconfig_keeps_the_chains_memory() {
     TEST_ASSERT_EQUAL_UINT8(cellproof::State::FAIL, loop.cellproof().state);
 
     // diver lowers the clamp ceiling mid-dive
-    set(reg, "CELLPROOF_OK_MAXSP", "0.70");
+    set(reg, "CELLPROOF_MAXSP", "0.70");
     const uint8_t c = applySettings(reg, cfg);
     TEST_ASSERT_EQUAL_UINT8(comms::CLAMP_NONE, c);
     loop.setConfig(cfg);

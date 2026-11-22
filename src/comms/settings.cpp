@@ -46,8 +46,8 @@ const Def kTable[TCOUNT] = {
     {"CELLPROOF_DEPTH", Type::FLOAT, 10.0f, 3.0f, 30.0f, FL_NONE, nullptr},
     {"CELLPROOF_SP", Type::FLOAT, 1.10f, 1.00f, 1.40f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     {"CELLPROOF_MIN", Type::FLOAT, 1.00f, 0.90f, 1.30f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
-    {"CELLPROOF_TIMEOUT", Type::UINT8, 60.0f, 20.0f, 120.0f, FL_NONE, nullptr},
-    {"CELLPROOF_OK_MAXSP", Type::FLOAT, 0.90f, 0.60f, 1.00f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"CELLPROOF_TMO", Type::UINT8, 60.0f, 20.0f, 120.0f, FL_NONE, nullptr},
+    {"CELLPROOF_MAXSP", Type::FLOAT, 0.90f, 0.60f, 1.00f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     // deco
     {"GF_LOW", Type::UINT8, 30.0f, 10.0f, 95.0f, FL_SAFETY, nullptr},
     {"GF_HIGH", Type::UINT8, 85.0f, 50.0f, 100.0f, FL_SAFETY, nullptr},

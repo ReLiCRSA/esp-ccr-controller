@@ -77,7 +77,8 @@ static void sensorTask(void*) {
 
         if (now - lastBat >= VBAT_SAMPLE_INTERVAL_MS) {
             lastBat = now;
-            g_battery.update();
+            for (int i = 0; i < 8; ++i)
+                g_battery.addSample(analogReadMilliVolts(PIN_VBAT_SENSE));
         }
 
         g_sensorStale = g_ads.anyStale(now);

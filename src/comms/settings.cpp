@@ -74,7 +74,7 @@ const Def* Registry::definitions(size_t& count) {
 const Def* Registry::table() { return kTable; }
 
 void Registry::resetToDefaults() {
-    for (int s = 0; s < MAX_STRINGS; ++s) m_strs[s][0] = '\0';
+    for (size_t s = 0; s < MAX_STRINGS; ++s) m_strs[s][0] = '\0';
     int strSlot = 0;
     for (size_t i = 0; i < TCOUNT; ++i) {
         const Def& d = kTable[i];

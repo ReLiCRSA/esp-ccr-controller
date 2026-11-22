@@ -135,6 +135,49 @@ void test_descent_rise_is_not_stuck_open() {
     TEST_ASSERT_FALSE(latched); // ...but descending: physics, not fault
 }
 
+void test_stuck_open_window_survives_reading_dither() {
+    // Regression: ppO2 sample noise used to re-arm the evaluation window every
+    // cycle, so a valve that was wide open never accumulated 5 s of evidence.
+    Injector inj{Config{}};
+    uint32_t now = 0;
+    bool latched = false;
+    for (int i = 0; i < 80; ++i) {
+        const float v = 0.40f + 0.006f * i + ((i % 2) ? -0.010f : 0.0f);  // trend + dither
+        latched |= step(inj, now, v, 0.30f).stuckOpenLatched;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(latched, "dither hid a stuck-open valve");
+}
+
+void test_honest_cell_vetoes_injection_when_the_vote_lies() {
+    // Two cells stuck low: the vote says 0.50 (demand on) while an excluded
+    // third cell sees 1.50. The high wall must act on the veto.
+    Config c{};
+    Injector inj{c};
+    uint32_t now = 0;
+    for (int i = 0; i < 20; ++i) {
+        Input in{0.50f, 0.70f, true, true, true, now, 100};
+        in.highVetoBar = 1.50f;
+        now += 100;
+        const Output o = inj.update(in);
+        TEST_ASSERT_FALSE_MESSAGE(o.pulseStarted, "pulse started against the cell veto");
+        TEST_ASSERT_TRUE(o.inhibitedHigh);
+    }
+    TEST_ASSERT_EQUAL_UINT32(0, inj.pulsesTotal());
+}
+
+void test_veto_also_holds_the_pulse_already_running() {
+    Injector inj{Config{}};
+    uint32_t now = 0;
+    Input in{0.50f, 0.70f, true, true, true, now, 100};
+    now += 100;
+    TEST_ASSERT_TRUE(inj.update(in).pulseStarted);  // running pulse
+    in.nowMs = now;
+    now += 100;
+    in.highVetoBar = 1.70f;  // honest cell suddenly tells the truth
+    const Output o = inj.update(in);
+    TEST_ASSERT_FALSE_MESSAGE(o.solenoid, "valve kept firing after the veto tripped");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_pulse_when_below_setpoint);
@@ -146,5 +189,8 @@ int main() {
     RUN_TEST(test_unhealthy_sensing_refuses_injection);
     RUN_TEST(test_stuck_open_detection_and_lockout);
     RUN_TEST(test_descent_rise_is_not_stuck_open);
+    RUN_TEST(test_stuck_open_window_survives_reading_dither);
+    RUN_TEST(test_honest_cell_vetoes_injection_when_the_vote_lies);
+    RUN_TEST(test_veto_also_holds_the_pulse_already_running);
     return UNITY_END();
 }

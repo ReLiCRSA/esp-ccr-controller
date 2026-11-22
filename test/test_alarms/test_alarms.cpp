@@ -94,8 +94,19 @@ void test_warning_levels_and_sticky_bits() {
     TEST_ASSERT_EQUAL_UINT8(1, r2.edgeCount); // only the new one is an edge
 }
 
-void test_no_vote_suppresses_ppo2_alarms() {
+void test_high_alarm_uses_the_honest_cell_veto() {
+    // The vote lies (two poisoned cells agree at 0.50) while a third cell sees
+    // 1.60: HIGH_PPO2 must still fire. The veto is a safety rule, not a detail.
     Manager m{Config{}};
+    Inputs in = base();
+    in.votedBar = 0.50f;
+    in.highVetoBar = 1.60f;
+    Result r = m.update(in);
+    TEST_ASSERT_TRUE(r.bits & (1u << alarm::BIT_HIGH_PPO2));
+    TEST_ASSERT_FALSE(r.bits & (1u << alarm::BIT_LOW_PPO2));  // low still follows the vote
+}
+
+void test_no_vote_suppresses_ppo2_alarms() {    Manager m{Config{}};
     Inputs in = base();
     in.haveVote = false;
     in.votedBar = 0.02f; // must not fire pre-arm garbage
@@ -109,6 +120,7 @@ int main() {
     RUN_TEST(test_ack_suppresses_continuous_until_recovery_then_rearms);
     RUN_TEST(test_hypoxia_event_latches_until_ack);
     RUN_TEST(test_warning_levels_and_sticky_bits);
+    RUN_TEST(test_high_alarm_uses_the_honest_cell_veto);
     RUN_TEST(test_no_vote_suppresses_ppo2_alarms);
     return UNITY_END();
 }

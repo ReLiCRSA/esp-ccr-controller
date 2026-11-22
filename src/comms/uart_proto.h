@@ -65,7 +65,9 @@ size_t formatDeco(const DecoInfo& d, char* out, size_t cap);
 size_t formatEvent(uint32_t tSec, uint16_t id, uint16_t value, char* out, size_t cap);
 
 inline size_t formatOk(char* out, size_t cap) {
-    if (cap < 3) return 0; out[0]='O'; out[1]='K'; out[2]='\n'; return 3;
+    if (cap < 3) return 0;
+    out[0] = 'O'; out[1] = 'K'; out[2] = '\n';
+    return 3;
 }
 size_t formatErr(const char* reason, char* out, size_t cap);
 

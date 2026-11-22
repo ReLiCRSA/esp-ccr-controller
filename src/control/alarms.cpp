@@ -30,9 +30,13 @@ void Manager::evaluate(uint8_t bit, bool condition, Level level, Result& res) {
 
 Result Manager::update(const Inputs& in) {
     Result res;
+    // HIGH_PPO2 must see every fitted cell, not just the median: a majority of
+    // poisoned cells reading low cannot be allowed to hide a loop that is
+    // actually heading into oxygen toxicity.
+    const float highSeen = in.highVetoBar > in.votedBar ? in.highVetoBar : in.votedBar;
     if (in.haveVote) {
         evaluate(BIT_LOW_PPO2, in.votedBar < cfg_.lowBar, kLevel[BIT_LOW_PPO2], res);
-        evaluate(BIT_HIGH_PPO2, in.votedBar > cfg_.highBar, kLevel[BIT_HIGH_PPO2], res);
+        evaluate(BIT_HIGH_PPO2, highSeen > cfg_.highBar, kLevel[BIT_HIGH_PPO2], res);
         evaluate(BIT_HYPOXIA, in.vote.hypoxiaSuspect, kLevel[BIT_HYPOXIA], res);
         evaluate(BIT_CELL_DRIFT,
                  in.vote.disagreement || in.vote.dropoutEvent,

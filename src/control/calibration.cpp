@@ -153,16 +153,19 @@ PulseTestOutput PulseTest::update(const PulseTestInput& in) {
             }
             break;
 
-        case TestState::PULSING:
+        case TestState::PULSING: {
             for (int i = 0; i < 3; ++i)
                 if (in.cellsBar[i] > peak_[i]) peak_[i] = in.cellsBar[i];
             if (pulsesSent_ < cfg_.pulses) {
                 out.requestPulse = true;
                 pulsesSent_++;
             }
-            // verdicts once peaks have had time to develop
-            if (in.pulsesDelivered >= pulsesSent_ &&
-                in.nowMs - startPulseMs_ > 8000) {
+            // verdicts once peaks have had time to develop — or when the
+            // pulse phase times out (a duty-capped injector may deliver
+            // fewer than requested pulses; judge what actually happened)
+            const bool deliveredAll = in.pulsesDelivered >= pulsesSent_;
+            const bool timedOut = in.nowMs - startPulseMs_ >= cfg_.pulseTimeoutMs;
+            if ((deliveredAll && in.nowMs - startPulseMs_ > 8000) || timedOut) {
                 for (int i = 0; i < 3; ++i) {
                     if (!(in.presentMask & (1u << i))) continue;
                     if (peak_[i] - base_[i] >= cfg_.riseMinBar) passMask_ |= (1u << i);
@@ -172,6 +175,7 @@ PulseTestOutput PulseTest::update(const PulseTestInput& in) {
                 recStart_ = in.nowMs;
             }
             break;
+        }
 
         case TestState::RECOVER: {
             bool allBack = true;

@@ -28,6 +28,7 @@ struct Config {
     float stuckSlopeBarS = 0.05f;  // rise while not injecting...
     float stuckRiseBar = 0.06f;    // ...by at least this much...
     uint32_t stuckEvalMs = 5000;   // ...over this steady-depth window
+    float stuckHystBar = 0.02f;    // re-arm window only on a real fall back
 };
 
 struct Input {
@@ -38,6 +39,13 @@ struct Input {
     bool depthStable = true;    // for stuck-open evaluation
     uint32_t nowMs = 0;
     uint32_t dtMs = 0;
+    // Optional (last on purpose: structs here are aggregate-initialised in
+    // tests and firmware, and inserting a field in the middle would silently
+    // re-map every positional initialiser). Highest reading any fitted cell
+    // reports, even one excluded from the vote: the HIGH/CUTOFF walls must
+    // trip on it too. When two of three cells stick LOW the median lies while
+    // the honest third sees the truth — that cell keeps its veto.
+    float highVetoBar = 0.0f;
 };
 
 struct Output {
@@ -55,6 +63,9 @@ public:
 
     // Bench/calibration: one-shot pulse in non-AUTO modes too (walls apply).
     void requestTestPulse() { testPending_ = true; }
+    // Withdraw a pending test pulse once its test stops waiting: a pulse that
+    // never got to fire must not sit pending and inject minutes later.
+    void cancelTestPulse() { testPending_ = false; }
     void clearStuckOpen() { stuckLatched_ = false; riseBaseValid_ = false; }
 
     Output update(const Input& in);

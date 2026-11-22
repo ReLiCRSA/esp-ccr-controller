@@ -339,6 +339,22 @@ PC build of the **real** firmware logic — voting, setpoints, injector,
 calibration, cellproof, ZHL-16C, logging, UART protocol — with the hardware
 layer (ADS1115, I2C, GPIO, NVS, WiFi) stubbed. Not a re-implementation.
 
+**Status: built and green (`src/sim/`, `test/test_sim/`, 7 scenarios).**
+`sim/world.{h,cpp}` is the physics side (loop O₂ content in litres-atm, SAC ×
+ambient consumption, deterministic LCG noise, cell faults DEAD / SATURATE /
+SLOW / STUCK_AT, stuck-open solenoid, diluent flush). `sim/rig.{h,cpp}` wires
+the control chain in exactly the order ControlTask will — cells → voting →
+pre-dive (which drives `cal::PulseTest` at its solenoid step) → CellProof →
+setpoints → injector → alarms → deco — so a scenario that passes here is
+testing the real interaction, not a paraphrase. Faults are injected **only**
+through the world; nothing pokes a control module. Scenarios: clean 40 m dive
+(predive → AUTO lockout → CellProof → deep band → CNS), one saturated cell
+(drift exclusion + CellProof naming it), mid-dive cell death (dropout ≠
+hypoxia), two cells lying low (high-veto saves the loop), diluent-flush
+hypoxia (latch + ACK + recovery), poisoned cell failing the pulse test
+(no AUTO), stuck-open valve (latch + explicit clear).
+Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
+
 - **World model**: scripted depth profiles (embedded set + CSV input),
   configurable SAC rate, loop volume, air diluent. Virtual cells with real
   physics: injection raises ppO₂, metabolism lowers it, proportional to ambient
@@ -369,6 +385,24 @@ layer (ADS1115, I2C, GPIO, NVS, WiFi) stubbed. Not a re-implementation.
 
 - BMP085 is a **bench stand-in only** — MS5837-30bar before any wet test; the
   driver ships in M3 so there is no last-minute code change before wet testing.
+- **The high wall sees every fitted cell, not the vote** (`inj::Input::highVetoBar`,
+  same veto in `alarm::Inputs`). Found by the simulator: two cells stuck at
+  0.55/0.60 keep demanding O₂ while the honest third screams 1.5 — and the drift
+  rule may exclude *that* cell as the odd one out. A cell excluded from the vote
+  for reading low never loses its veto on the high side. `test_sim` scenario
+  `test_two_lying_cells_veto` is the regression test.
+- **Stuck-open window needs hysteresis** (`inj::Config::stuckHystBar`): a few mV
+  of ppO₂ dither used to re-arm the 5 s evaluation window every sample, so a
+  valve that was wide open never accumulated evidence (the simulator caught it;
+  the bench never would have).
+- **Depth feeding the bands is median-of-5 then boxcar-of-4**
+  (`control/depthfilter.h`), shared by firmware and sim: one spiked pressure
+  sample must not move the setpoint by 0.3 bar, and a bare EMA asymptotes toward
+  a band threshold without ever crossing it (CellProof then never arms).
+- **Optional struct fields go last** in `inj::Input` / `alarm::Inputs`. These
+  structs are aggregate-initialised positionally in tests and firmware; adding
+  `highVetoBar` in the middle silently re-mapped `nowMs` into it and broke three
+  injector tests. New fields append, always with a safe default.
 - Solenoid driver circuit must fail **closed** on a floating/pulled-low gate;
   keep firmware max duty low; recommend a hardware manual-inhibit switch in the
   O₂ line that needs zero firmware cooperation.

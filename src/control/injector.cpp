@@ -1,5 +1,7 @@
 #include "injector.h"
 
+#include <algorithm>
+
 namespace inj {
 
 void Injector::logOn(uint32_t startMs, uint32_t endMs) {
@@ -32,16 +34,22 @@ inj::Output Injector::update(const Input& in) {
     Output out;
     out.stuckOpenLatched = stuckLatched_;
 
+    const float wallSee = std::max(in.votedBar, in.highVetoBar);
+
     // ---- cutoff wall: hard, latching ---------------------------------------
-    if (in.votedBar >= cfg_.cutoffBar) cutoffLatch_ = true;
-    if (cutoffLatch_ && in.votedBar < cfg_.highWallBar) cutoffLatch_ = false;
-    const bool wallBlocked = cutoffLatch_ || in.votedBar >= cfg_.highWallBar;
+    if (wallSee >= cfg_.cutoffBar) cutoffLatch_ = true;
+    if (cutoffLatch_ && wallSee < cfg_.highWallBar) cutoffLatch_ = false;
+    const bool wallBlocked = cutoffLatch_ || wallSee >= cfg_.highWallBar;
     out.inhibitedHigh = wallBlocked;
 
     // ---- stuck-open supervision (depth-stable, non-injecting only) ---------
     if (pulseRemMs_ == 0 && !stuckLatched_) {
+        // Re-arm the evaluation window when it expires, when a pulse has just
+        // ended, or when ppO2 genuinely falls back. A few mV of dither must
+        // NOT re-arm it: that used to reset the timer on every sample and the
+        // window never closed, hiding a valve that was wide open.
         if (!riseBaseValid_ || in.nowMs - riseBaseMs_ > cfg_.stuckEvalMs ||
-            in.votedBar < riseBaseVal_) {
+            in.votedBar < riseBaseVal_ - cfg_.stuckHystBar) {
             riseBaseValid_ = true;
             riseBaseMs_ = in.nowMs;
             riseBaseVal_ = in.votedBar;
@@ -86,13 +94,15 @@ inj::Output Injector::update(const Input& in) {
         }
     }
 
+    const bool wantPulse = in.autoMode ? demand : testPending_;
+    // Bench/calibration pulses are NOT demand-gated: the pulse cell test
+    // must be able to raise ppO2 on purpose, even above the deadband.
     const bool canStart =
         !stuckLatched_ &&          // suspected open valve: no more O2 until cleared
         !wallBlocked &&
         in.sensorHealthy &&
         pulseRemMs_ == 0 &&
-        (in.autoMode || testPending_) &&
-        demand &&
+        wantPulse &&
         (in.nowMs - lastPulseEndMs_ >= cfg_.minGapMs || lastPulseEndMs_ == 0) &&
         (dutyPct(in.nowMs) + 100.0f * cfg_.pulseMs / cfg_.windowMs
              <= static_cast<float>(cfg_.maxDutyPct));

@@ -142,6 +142,7 @@ public:
         uint8_t baselineSamples = 6;
         uint8_t pulses = 3;
         float riseMinBar = 0.03f;      // per-cell rise to count as responsive
+        uint32_t pulseTimeoutMs = 20000;  // verdict even if duty cap throttles pulses
         uint32_t recoverTimeoutMs = 30000;
         float recoverTolBar = 0.05f;   // back within this of baseline
     };

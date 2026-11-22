@@ -43,6 +43,11 @@ struct Inputs {
     bool stuckOpen = false;
     voting::Result vote{};
     bool haveVote = false;      // false before first sample
+    // Optional (last on purpose — see inj::Input): highest reading any fitted
+    // cell reports, even one excluded from the vote. Two poisoned cells can
+    // agree on 0.50 bar in a loop that is really at 1.6; the honest third must
+    // still be able to raise the high alarm.
+    float highVetoBar = 0.0f;
 };
 
 struct Edge { uint8_t id; bool raised; };

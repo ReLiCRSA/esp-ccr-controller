@@ -28,7 +28,11 @@ struct Config {
     float okMaxSpBar = 0.90f;  // clamp ceiling applied on failure
 };
 
-enum class State : uint8_t { DISABLED, IDLE, ARMED, RUNNING, PASS, FAIL };
+// INACTIVE, not DISABLED: the Arduino core's esp32-hal-gpio.h defines the
+// object-like macro DISABLED, which expands inside an enumerator list even in
+// a scoped enum. Host builds never see it; the ESP32 build breaks. Same reason
+// the alarms namespace is plural (POSIX declares alarm()).
+enum class State : uint8_t { INACTIVE, IDLE, ARMED, RUNNING, PASS, FAIL };
 
 struct Input {
     bool diveActive = false;
@@ -51,10 +55,10 @@ struct Output {
 
 class Engine {
 public:
-    explicit Engine(const Config& cfg) : cfg_(cfg), state_(cfg.enabled ? State::IDLE : State::DISABLED) {}
+    explicit Engine(const Config& cfg) : cfg_(cfg), state_(cfg.enabled ? State::IDLE : State::INACTIVE) {}
     void setConfig(const Config& cfg) { cfg_ = cfg; }
 
-    void diveStarted() { state_ = cfg_.enabled ? State::IDLE : State::DISABLED; unproven_ = 0; }
+    void diveStarted() { state_ = cfg_.enabled ? State::IDLE : State::INACTIVE; unproven_ = 0; }
     void diveEnded() { diveActive_ = false; }
     void override() // diver lifts the clamp after a FAIL (logged by alarm mgr)
     {

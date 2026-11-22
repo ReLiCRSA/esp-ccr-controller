@@ -1,6 +1,6 @@
 #include "alarms.h"
 
-namespace alarm {
+namespace alarms {
 
 void Manager::evaluate(uint8_t bit, bool condition, Level level, Result& res) {
     const bool prevReported = active_[bit];
@@ -69,4 +69,4 @@ void Manager::ack() {
     }
 }
 
-} // namespace alarm
+}  // namespace alarms

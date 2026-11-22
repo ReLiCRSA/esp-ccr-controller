@@ -340,6 +340,12 @@ calibration, cellproof, ZHL-16C, logging, UART protocol — with the hardware
 layer (ADS1115, I2C, GPIO, NVS, WiFi) stubbed. Not a re-implementation.
 
 **Status: built and green (`src/sim/`, `test/test_sim/`, 7 scenarios).**
+The chain itself moved into `ctrl::Loop` (`src/control/loop.{h,cpp}`), which the
+firmware `ControlTask` instantiates unchanged — `sim/rig` is now only the bolt
+between that chain and the gas model. `test/test_loop/` covers what only exists
+between the modules (staleness gating the valve, the output fuse, the AUTO
+lockout, a spiked depth sample vs the bands). Suite total: **97 cases across 16
+native suites**, plus `pio run -e esp32` and `esp32_stalltest` building clean.
 `sim/world.{h,cpp}` is the physics side (loop O₂ content in litres-atm, SAC ×
 ambient consumption, deterministic LCG noise, cell faults DEAD / SATURATE /
 SLOW / STUCK_AT, stuck-open solenoid, diluent flush). `sim/rig.{h,cpp}` wires
@@ -386,7 +392,7 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
 - BMP085 is a **bench stand-in only** — MS5837-30bar before any wet test; the
   driver ships in M3 so there is no last-minute code change before wet testing.
 - **The high wall sees every fitted cell, not the vote** (`inj::Input::highVetoBar`,
-  same veto in `alarm::Inputs`). Found by the simulator: two cells stuck at
+  same veto in `alarms::Inputs`). Found by the simulator: two cells stuck at
   0.55/0.60 keep demanding O₂ while the honest third screams 1.5 — and the drift
   rule may exclude *that* cell as the odd one out. A cell excluded from the vote
   for reading low never loses its veto on the high side. `test_sim` scenario
@@ -399,10 +405,42 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
   (`control/depthfilter.h`), shared by firmware and sim: one spiked pressure
   sample must not move the setpoint by 0.3 bar, and a bare EMA asymptotes toward
   a band threshold without ever crossing it (CellProof then never arms).
-- **Optional struct fields go last** in `inj::Input` / `alarm::Inputs`. These
+- **Optional struct fields go last** in `inj::Input` / `alarms::Inputs`. These
   structs are aggregate-initialised positionally in tests and firmware; adding
   `highVetoBar` in the middle silently re-mapped `nowMs` into it and broke three
   injector tests. New fields append, always with a safe default.
+- **Stale sensing stops injection** (`ii.sensorHealthy = haveVote_ && cellsFresh`).
+  A vote built from frozen ADC samples looks healthy and keeps the loop
+  comfortably wrong; the valve stays shut and `BIT_SENSOR_STALE` says why.
+  `test_loop/test_stale_sensors_stop_injection` is the regression test.
+- **Output fuse on the valve pin** (`inj::Config::maxOnMs`, default 900 ms): the
+  driver layer counts how long the pin has been HIGH and forces it low past the
+  limit, latching as a stuck-open valve — from the diver's side the consequence
+  is identical, so the response must be too. One clear path (`clearStuckOpen`).
+  This is the belt for "the pin is HIGH because something broke", not because a
+  pulse was asked for.
+- **Test-pulse requests are queued, not latched** (`Injector::requestTestPulse(n)`
+  counts). The pulse test asks for one pulse per cycle for 3 cycles; with a
+  boolean flag, gap/duty rules swallowed two of the requests and the verdict
+  only ever came from the test's 20 s timeout — a pre-dive check silently
+  degraded to judging one pulse.
+- **The duty cap must fit the pre-dive cell test**: the injector will not START a
+  pulse whose own width crosses the rolling-window cap, so a cap below
+  `pulses × pulseMs / window` starves the cell test. `defaults.h` now
+  `static_assert`s that relationship (10 % of a 10 s window = 3 × 300 ms).
+- **Names that only break on the ESP32 target**: namespace `alarms` (newlib
+  declares POSIX `alarm(int)`), and `cellproof::State::INACTIVE` instead of
+  `DISABLED` (the Arduino core `#define DISABLED 0x00`, which expands inside an
+  enumerator list even in a scoped enum). Host tests never see either — so the
+  `esp32` build is run alongside `pio test -e native`, never instead of it.
+- **ControlTask ownership of the valve**: SAFE boot never creates the task, so
+  `PIN_SOLENOID` is never taken over from `INPUT_PULLDOWN`. The task's cycle is
+  the supervisor heartbeat, with the tightest stall budget (1.5 s vs 3 s) — a
+  controller that stops deciding stops protecting the loop.
+- **Status-line fields append, never reorder**: `soak_logger.py:HB_RE` parses the
+  leading fields; `vote= sp= al= mode= pulses= sol= ctrl=` were appended. The
+  soak harness and the firmware must stay in step or a 24 h run silently loses
+  its telemetry columns.
 - Solenoid driver circuit must fail **closed** on a floating/pulled-low gate;
   keep firmware max duty low; recommend a hardware manual-inhibit switch in the
   O₂ line that needs zero firmware cooperation.

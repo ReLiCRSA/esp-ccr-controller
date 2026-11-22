@@ -94,7 +94,9 @@ inj::Output Injector::update(const Input& in) {
         }
     }
 
-    const bool wantPulse = in.autoMode ? demand : testPending_;
+    const bool wantDemand = in.autoMode && demand;
+    const bool wantTest = testPending_ > 0;
+    const bool wantPulse = wantDemand || wantTest;
     // Bench/calibration pulses are NOT demand-gated: the pulse cell test
     // must be able to raise ppO2 on purpose, even above the deadband.
     const bool canStart =
@@ -110,7 +112,7 @@ inj::Output Injector::update(const Input& in) {
     if (canStart) {
         pulseRemMs_ = cfg_.pulseMs;
         pulseStartMs_ = in.nowMs;
-        testPending_ = false;
+        if (wantTest) testPending_--;  // this pulse is one of the requested ones
         pulses_++;
         out.pulseStarted = true;
         out.solenoid = true;
@@ -121,6 +123,32 @@ inj::Output Injector::update(const Input& in) {
     }
 
     if (stuckLatched_ || wallBlocked || !in.sensorHealthy) out.refused = out.refused || demand;
+
+    // ---- output fuse: no logic path gets to hold the valve open forever ----
+    // This runs last and overrides everything above: it is the belt for the
+    // case where the pin is HIGH because something broke, not because a pulse
+    // was asked for. Latching it like a stuck-open valve is deliberate — from
+    // the diver's side the consequence is identical.
+    if (out.solenoid) {
+        if (!onRun_) {
+            onRun_ = true;
+            onRunStartMs_ = in.nowMs;
+        } else if (in.nowMs - onRunStartMs_ > cfg_.maxOnMs) {
+            if (pulseRemMs_ > 0) logOn(pulseStartMs_, in.nowMs);
+            pulseRemMs_ = 0;
+            lastPulseEndMs_ = in.nowMs;
+            riseBaseValid_ = false;
+            onRun_ = false;
+            fuseTripped_ = true;
+            stuckLatched_ = true;
+            out.solenoid = false;
+            out.outputFuse = true;
+            out.stuckOpenLatched = true;
+        }
+    } else {
+        onRun_ = false;
+    }
+
     return out;
 }
 

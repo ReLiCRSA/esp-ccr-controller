@@ -97,6 +97,59 @@ void test_test_pulse_works_in_standby_but_walls_apply() {
     TEST_ASSERT_FALSE(started); // high wall beats the bench command
 }
 
+// The cell test asks for N pulses in consecutive cycles; gap and duty rules
+// then decide when they leave. Each request must be kept, not overwritten —
+// with a latched flag, the third request was swallowed and the pulse test only
+// reached its verdict after its own timeout.
+void test_test_pulse_requests_are_queued() {
+    Config c{};
+    c.minGapMs = 200;
+    c.maxDutyPct = 40;  // duty is the subject of another test; keep it out of this one
+    Injector inj{c};
+    uint32_t now = 0;
+    for (int i = 0; i < 3; ++i) inj.requestTestPulse();
+    TEST_ASSERT_EQUAL_UINT8(3, inj.testPulsesPending());
+    for (int i = 0; i < 20; ++i) step(inj, now, 0.30f, 0.40f, /*autoMode*/ false);
+    TEST_ASSERT_EQUAL_UINT32(3, inj.pulsesTotal());
+    TEST_ASSERT_EQUAL_UINT8(0, inj.testPulsesPending());
+
+    inj.requestTestPulse();
+    inj.requestTestPulse();
+    inj.cancelTestPulse();  // the test moved on: nothing may inject later
+    TEST_ASSERT_EQUAL_UINT8(0, inj.testPulsesPending());
+    for (int i = 0; i < 20; ++i)
+        TEST_ASSERT_FALSE(step(inj, now, 0.30f, 0.40f, false).pulseStarted);
+    TEST_ASSERT_EQUAL_UINT32(3, inj.pulsesTotal());
+}
+
+// Output fuse: the driver layer refuses to hold the valve open past maxOnMs,
+// whatever asked for it, and latches like the stuck-open valve it imitates.
+void test_output_fuse_forces_the_valve_off() {
+    Config c{};
+    c.pulseMs = 2000;   // longer than the fuse allows
+    c.maxOnMs = 500;
+    c.maxDutyPct = 40;  // a 2 s pulse needs duty headroom just to start
+    Injector inj{c};
+    uint32_t now = 0;
+    bool fuse = false, onAfterFuse = false;
+    for (int i = 0; i < 40; ++i) {
+        const Output o = step(inj, now, 0.30f, 0.70f);
+        fuse |= o.outputFuse;
+        if (fuse && o.solenoid) onAfterFuse = true;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(fuse, "fuse never tripped");
+    TEST_ASSERT_FALSE_MESSAGE(onAfterFuse, "valve still driven after the fuse");
+    TEST_ASSERT_TRUE(inj.outputFuseTripped());
+    TEST_ASSERT_TRUE(inj.stuckOpenLatched());
+
+    for (int i = 0; i < 20; ++i)
+        TEST_ASSERT_FALSE(step(inj, now, 0.30f, 0.70f).pulseStarted);
+    inj.clearStuckOpen();
+    bool started = false;
+    for (int i = 0; i < 10; ++i) started |= step(inj, now, 0.30f, 0.70f).pulseStarted;
+    TEST_ASSERT_TRUE(started);
+}
+
 void test_unhealthy_sensing_refuses_injection() {
     Injector inj{Config{}};
     uint32_t now = 0;
@@ -186,6 +239,8 @@ int main() {
     RUN_TEST(test_high_wall_and_cutoff_latch);
     RUN_TEST(test_duty_cap_limits_pulses);
     RUN_TEST(test_test_pulse_works_in_standby_but_walls_apply);
+    RUN_TEST(test_test_pulse_requests_are_queued);
+    RUN_TEST(test_output_fuse_forces_the_valve_off);
     RUN_TEST(test_unhealthy_sensing_refuses_injection);
     RUN_TEST(test_stuck_open_detection_and_lockout);
     RUN_TEST(test_descent_rise_is_not_stuck_open);

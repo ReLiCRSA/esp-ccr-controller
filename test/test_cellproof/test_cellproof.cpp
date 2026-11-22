@@ -74,7 +74,7 @@ void test_disabled_and_dive_reset() {
     Config c; c.enabled = false;
     Engine e{c};
     const Output o = e.update(mk(true, 20.0f, 0.9f, 1000));
-    TEST_ASSERT_EQUAL_UINT8(State::DISABLED, o.state);
+    TEST_ASSERT_EQUAL_UINT8(State::INACTIVE, o.state);
     TEST_ASSERT_FALSE(o.requestSpOverride);
 
     Engine e2{Config{}};

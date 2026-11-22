@@ -34,7 +34,7 @@ struct Config {
     voting::Config voting;
     sp::Config sp;
     inj::Config inj;
-    alarm::Config alarms;
+    alarms::Config alarms;
     cellproof::Config cellproof;
     deco::Config deco;
     predive::Config predive;
@@ -62,9 +62,10 @@ struct State {
     bool haveVote = false;
     bool injectionInhibited = false;
     bool stuckOpenLatched = false;
+    bool outputFuse = false;       // solenoid held open longer than allowed
 
     voting::Result vote{};
-    alarm::Result alarms{};
+    alarms::Result alarms{};
     cellproof::Output cellproof{};
     inj::Output injector{};
     bool alarmEdge = false;        // an alarm changed state this tick
@@ -107,10 +108,11 @@ public:
     // ---- telemetry readers -------------------------------------------------
     const voting::Result& vote() const { return vote_; }
     const voting::CellStatus& cell(uint8_t ch) const { return voting_.cell(ch); }
-    const alarm::Result& alarms() const { return alarmRes_; }
+    const alarms::Result& alarms() const { return alarmRes_; }
     uint16_t alarmBits() const { return alarmRes_.bits; }
     const cellproof::Output& cellproof() const { return cpOut_; }
     const inj::Output& injector() const { return injOut_; }
+    bool outputFuseTripped() const { return injector_.outputFuseTripped(); }
     float votedBar() const { return vote_.votedPpo2; }
     float setpointBar() const { return spTarget_; }
     float depthSmoothedM() const { return depthSmooth_; }
@@ -131,7 +133,7 @@ private:
     voting::Engine voting_;
     sp::Engine spEng_;
     inj::Injector injector_;
-    alarm::Manager alarmMgr_;
+    alarms::Manager alarmMgr_;
     cellproof::Engine cpEng_;
     predive::Sequencer predive_;
     deco::Zhl16Ccr deco_;
@@ -153,7 +155,7 @@ private:
     uint32_t ptPulseBase_ = 0;
 
     voting::Result vote_{};
-    alarm::Result alarmRes_{};
+    alarms::Result alarmRes_{};
     cellproof::Output cpOut_{};
     inj::Output injOut_{};
 };

@@ -15,7 +15,11 @@
 #include <cstdint>
 #include "voting.h"
 
-namespace alarm {
+// Namespace is `alarms`, not `alarm`: newlib declares POSIX `alarm(int)` in a
+// header the Arduino core pulls in, and a namespace of the same name collides
+// with it — a build-breaker that only appears on the ESP32 target, not in host
+// tests. Keep the plural.
+namespace alarms {
 
 // Bit positions are protocol-visible (T, FLAGS) — never renumber.
 enum Bit : uint8_t {
@@ -100,4 +104,4 @@ private:
     };
 };
 
-} // namespace alarm
+}  // namespace alarms

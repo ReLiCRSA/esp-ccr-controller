@@ -7,11 +7,11 @@ Output Engine::update(const Input& in) {
 
     // dive lifecycle edges
     if (in.diveActive && !diveActive_) diveStarted();
-    if (!in.diveActive && diveActive_) { diveActive_ = false; diveEnded(); if (state_ != State::DISABLED) state_ = State::IDLE; }
+    if (!in.diveActive && diveActive_) { diveActive_ = false; diveEnded(); if (state_ != State::INACTIVE) state_ = State::IDLE; }
     diveActive_ = in.diveActive;
 
     switch (state_) {
-        case State::DISABLED:
+        case State::INACTIVE:
             break;
         case State::IDLE:
             if (in.diveActive && in.depthM < cfg_.depthM - 1.0f) state_ = State::ARMED;

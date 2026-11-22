@@ -131,11 +131,12 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     ii.autoMode = autoMode_ && !predive_.running();
     ii.depthStable = depthStable;
     // Injection needs a believable ppO2: injecting on a guess is how loops
-    // die, so with no vote at all the valve stays shut (SENSOR_FAIL tells the
-    // diver). A cell excluded from the vote because it reads LOW keeps its
-    // veto on the HIGH side: if it were the honest one, the loop is heading
-    // into oxygen toxicity and its reading still has to stop injection.
-    ii.sensorHealthy = haveVote_;
+    // die, so with no vote at all — or a vote built from frozen, no-longer
+    // fresh samples — the valve stays shut and the alarm tells the diver.
+    // A cell excluded from the vote because it reads LOW keeps its veto on the
+    // HIGH side: if it were the honest one, the loop is heading into oxygen
+    // toxicity and its reading still has to stop injection.
+    ii.sensorHealthy = haveVote_ && in.cellsFresh;
     ii.highVetoBar = ii.votedBar;
     for (int i = 0; i < 3; i++)
         if (cfg_.presentMask & (1u << i)) ii.highVetoBar = std::max(ii.highVetoBar, cellBar_[i]);
@@ -145,7 +146,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     solenoid_ = injOut_.solenoid;
 
     // ---- 7. alarms: the single authority -----------------------------------
-    alarm::Inputs ai;
+    alarms::Inputs ai;
     ai.votedBar = vote_.votedPpo2;
     ai.highVetoBar = ii.highVetoBar;
     ai.cnsPct = static_cast<float>(deco_.cnsPct());
@@ -173,6 +174,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     st.haveVote = haveVote_;
     st.injectionInhibited = injOut_.inhibitedHigh;
     st.stuckOpenLatched = injOut_.stuckOpenLatched;
+    st.outputFuse = injOut_.outputFuse;
     st.vote = vote_;
     st.alarms = alarmRes_;
     st.cellproof = cpOut_;

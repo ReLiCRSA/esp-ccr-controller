@@ -13,11 +13,11 @@
 #include "sim/rig.h"
 
 using namespace sim;
-using alarm::BIT_CELL_DRIFT;
-using alarm::BIT_HIGH_PPO2;
-using alarm::BIT_HYPOXIA;
-using alarm::BIT_LOW_PPO2;
-using alarm::BIT_STUCK_OPEN;
+using alarms::BIT_CELL_DRIFT;
+using alarms::BIT_HIGH_PPO2;
+using alarms::BIT_HYPOXIA;
+using alarms::BIT_LOW_PPO2;
+using alarms::BIT_STUCK_OPEN;
 
 void setUp() {}
 void tearDown() {}

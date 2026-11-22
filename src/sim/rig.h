@@ -69,7 +69,7 @@ public:
     const ctrl::Loop& loop() const { return loop_; }
     const voting::Result& vote() const { return loop_.vote(); }
     const voting::CellStatus& cellStatus(uint8_t ch) const { return loop_.cell(ch); }
-    const alarm::Result& alarmRes() const { return loop_.alarms(); }
+    const alarms::Result& alarmRes() const { return loop_.alarms(); }
     uint16_t alarmBits() const { return loop_.alarmBits(); }
     bool alarmOn(uint8_t bit) const { return loop_.alarmBits() & (1u << bit); }
     cellproof::State cpState() const { return loop_.cellproof().state; }

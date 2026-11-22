@@ -132,6 +132,7 @@ Output Engine::update(const Input& in) {
 
     out.state = state_;
     out.unprovenHighMask = unproven_;
+    out.attempts = attempts_;
     return out;
 }
 

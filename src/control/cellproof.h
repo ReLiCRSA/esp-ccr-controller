@@ -84,6 +84,7 @@ struct Output {
     bool clampActive = false;       // control layer: cap SP at cfg.okMaxSpBar
     uint8_t unprovenHighMask = 0;   // cells that never reached minPass
     Event event = EV_NONE;
+    uint8_t attempts = 0;           // proof runs this dive (handset GET PROOF)
 };
 
 class Engine {
@@ -99,9 +100,10 @@ public:
         lastRunMs_ = 0;
     }
     void diveEnded() { diveActive_ = false; }
-    void override() // diver lifts the clamp after a FAIL (logged by alarm mgr)
+    bool override() // diver lifts the clamp after a FAIL (logged by alarm mgr)
     {
-        if (state_ == State::FAIL) { state_ = State::PASS; overridden_ = true; }
+        if (state_ == State::FAIL) { state_ = State::PASS; overridden_ = true; return true; }
+        return false;
     }
     bool overridden() const { return overridden_; }
     State state() const { return state_; }

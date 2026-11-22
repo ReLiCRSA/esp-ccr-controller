@@ -19,23 +19,23 @@ constexpr size_t TCOUNT = 32;
 // key                  type     default  min      max      flags        str-default
 const Def kTable[TCOUNT] = {
     // setpoints
-    {"SP1", Type::FLOAT, 0.40f, 0.20f, 1.60f, FL_SAFETY, nullptr},
-    {"SP2", Type::FLOAT, 0.70f, 0.20f, 1.60f, FL_SAFETY, nullptr},
-    {"SP3", Type::FLOAT, 1.00f, 0.20f, 1.60f, FL_SAFETY, nullptr},
-    {"SP4", Type::FLOAT, 1.30f, 0.20f, 1.60f, FL_SAFETY, nullptr},
+    {"SP1", Type::FLOAT, 0.40f, 0.20f, 1.60f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"SP2", Type::FLOAT, 0.70f, 0.20f, 1.60f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"SP3", Type::FLOAT, 1.00f, 0.20f, 1.60f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"SP4", Type::FLOAT, 1.30f, 0.20f, 1.60f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     {"D1", Type::FLOAT, 30.0f, 5.0f, 100.0f, FL_NONE, nullptr},
     {"D2", Type::FLOAT, 50.0f, 10.0f, 150.0f, FL_NONE, nullptr},
     {"SP_HYST", Type::FLOAT, 0.5f, 0.1f, 3.0f, FL_NONE, nullptr},
-    // alarms
-    {"ALLO_LOW", Type::FLOAT, 0.18f, 0.05f, 0.40f, FL_SAFETY, nullptr},
-    {"ALLO_HIGH", Type::FLOAT, 1.45f, 1.00f, 1.60f, FL_SAFETY, nullptr},
-    {"ALLO_CUTOFF", Type::FLOAT, 1.60f, 1.50f, 1.80f, FL_SAFETY, nullptr},
-    {"CNS_ALARM", Type::UINT8, 80.0f, 10.0f, 100.0f, FL_SAFETY, nullptr},
+    // alarms (defaults match firmware: alarm 1.40 < injection wall 1.45 < cutoff 1.60)
+    {"ALLO_LOW", Type::FLOAT, 0.18f, 0.05f, 0.40f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"ALLO_HIGH", Type::FLOAT, 1.40f, 1.00f, 1.60f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"ALLO_CUTOFF", Type::FLOAT, 1.60f, 1.50f, 1.80f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"CNS_ALARM", Type::UINT8, 80.0f, 10.0f, 100.0f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     // voting
     {"CELL_DRIFT_BAR", Type::FLOAT, 0.05f, 0.01f, 0.30f, FL_NONE, nullptr},
     // injection
-    {"INJ_PULSE_MS", Type::INT16, 300.0f, 50.0f, 1000.0f, FL_SAFETY, nullptr},
-    {"INJ_MAX_DUTY", Type::UINT8, 5.0f, 1.0f, 25.0f, FL_SAFETY, nullptr},
+    {"INJ_PULSE_MS", Type::INT16, 300.0f, 50.0f, 1000.0f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"INJ_MAX_DUTY", Type::UINT8, 10.0f, 1.0f, 25.0f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     // calibration
     {"CAL_O2_FI", Type::FLOAT, 0.99f, 0.85f, 1.00f, FL_NONE, nullptr},
     {"CAL_O2_TARGET", Type::FLOAT, 0.95f, 0.80f, 1.00f, FL_NONE, nullptr},
@@ -44,10 +44,10 @@ const Def kTable[TCOUNT] = {
     // cellproof
     {"CELLPROOF_EN", Type::BOOL, 1.0f, 0.0f, 1.0f, FL_NONE, nullptr},
     {"CELLPROOF_DEPTH", Type::FLOAT, 10.0f, 3.0f, 30.0f, FL_NONE, nullptr},
-    {"CELLPROOF_SP", Type::FLOAT, 1.10f, 1.00f, 1.40f, FL_SAFETY, nullptr},
-    {"CELLPROOF_MIN", Type::FLOAT, 1.00f, 0.90f, 1.30f, FL_SAFETY, nullptr},
+    {"CELLPROOF_SP", Type::FLOAT, 1.10f, 1.00f, 1.40f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
+    {"CELLPROOF_MIN", Type::FLOAT, 1.00f, 0.90f, 1.30f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     {"CELLPROOF_TIMEOUT", Type::UINT8, 60.0f, 20.0f, 120.0f, FL_NONE, nullptr},
-    {"CELLPROOF_OK_MAXSP", Type::FLOAT, 0.90f, 0.60f, 1.00f, FL_SAFETY, nullptr},
+    {"CELLPROOF_OK_MAXSP", Type::FLOAT, 0.90f, 0.60f, 1.00f, FL_SAFETY | FL_DIVE_LOCK, nullptr},
     // deco
     {"GF_LOW", Type::UINT8, 30.0f, 10.0f, 95.0f, FL_SAFETY, nullptr},
     {"GF_HIGH", Type::UINT8, 85.0f, 50.0f, 100.0f, FL_SAFETY, nullptr},
@@ -56,6 +56,11 @@ const Def kTable[TCOUNT] = {
     {"WATER_DENSITY", Type::FLOAT, 1.025f, 0.990f, 1.100f, FL_NONE, nullptr},
     // battery
     {"VBAT_MIN", Type::FLOAT, 10.5f, 3.0f, 30.0f, FL_SAFETY, nullptr},
+    // dive lock: everything that steers the gas loop or the sensing verdicts
+    // is frozen once a dive starts (the router enforces it for handset AND
+    // web). Tuning that only moves the schedule (D1/D2, SP_HYST, drift,
+    // CAL_*, GF_*, ascent rates) stays writable: GF adjustments mid-dive are
+    // normal diving, re-writing the oxygen setpoints underneath a diver is not.
     // system (strings)
     {"AP_SSID", Type::STRING, 0, 1, 16, FL_DIVE_LOCK, "ESP-CCR"},
     {"AP_PASS", Type::STRING, 0, 8, 31, FL_DIVE_LOCK, "diveonly"},

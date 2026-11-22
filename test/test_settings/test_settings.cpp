@@ -56,7 +56,17 @@ void test_string_bounds_and_dive_lock_flags() {
 
     TEST_ASSERT_TRUE(r.isDiveLocked(r.find("AP_PASS")));
     TEST_ASSERT_TRUE(r.isDiveLocked(r.find("AP_SSID")));
-    TEST_ASSERT_FALSE(r.isDiveLocked(r.find("SP2")));
+    // the gas loop itself is frozen during a dive; schedule tuning is not
+    TEST_ASSERT_TRUE(r.isDiveLocked(r.find("SP2")));
+    TEST_ASSERT_TRUE(r.isDiveLocked(r.find("ALLO_HIGH")));
+    TEST_ASSERT_TRUE(r.isDiveLocked(r.find("INJ_MAX_DUTY")));
+    TEST_ASSERT_TRUE(r.isDiveLocked(r.find("CELLPROOF_SP")));
+    TEST_ASSERT_FALSE(r.isDiveLocked(r.find("D1")));
+    TEST_ASSERT_FALSE(r.isDiveLocked(r.find("GF_HIGH")));
+    TEST_ASSERT_FALSE(r.isDiveLocked(r.find("CELL_DRIFT_BAR")));
+    // registry defaults must equal the firmware constants the soak validated
+    TEST_ASSERT_FLOAT_WITHIN(0.0001, 1.40f, r.def(r.find("ALLO_HIGH")).def);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001, 10.0f, r.def(r.find("INJ_MAX_DUTY")).def);
     // safety flag exists on life-limiting keys (callers event-log writes to them)
     TEST_ASSERT_TRUE(r.def(r.find("ALLO_CUTOFF")).flags & FL_SAFETY);
 }

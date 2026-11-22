@@ -97,9 +97,20 @@ public:
     /// test paths only: no diver-facing command path may call this.
     void setAutoMode(bool on) { autoMode_ = on; }
     void ackAlarms() { alarmMgr_.ack(); }
-    void cellproofOverride() { cpEng_.override(); }
+    bool cellproofOverride() { return cpEng_.override(); }
     void clearStuckOpen() { injector_.clearStuckOpen(); }
     void prediveStart(uint32_t nowMs) { predive_.start(nowMs); }
+    /// Bench / handset `PULSE`: one valve pulse outside AUTO. The high wall,
+    /// cutoff latch, duty cap and output fuse all still apply — a bench command
+    /// is not a bypass.
+    void requestTestPulse() { injector_.requestTestPulse(); }
+    /// Bench / handset `TEST CELLS`: run the cell responsiveness test now,
+    /// outside the pre-dive sequence. Same engine, same walls.
+    void requestCellTest() { cellTest_ = true; }
+    bool cellTestRequested() const { return cellTest_; }
+    float cellBar(uint8_t ch) const { return cellBar_[ch]; }  // calibrated, pre-vote
+    uint8_t cellTestPassMask() const { return pulseTest_.passMask(); }
+    uint8_t cellTestFailMask() const { return pulseTest_.failMask(); }
     bool prediveRunning() const { return predive_.running(); }
     bool predivePassed() const { return predive_.allPassed(); }
     bool prediveFailed() const { return predive_.failed(); }
@@ -153,8 +164,9 @@ private:
     uint32_t lastCycleMs_ = 0;
     bool cycleSeen_ = false;
 
-    // scripted pulse-and-check cell test, executed at the pre-dive solenoid step
-    bool ptActive_ = false, ptDone_ = false;
+    // scripted pulse-and-check cell test: runs at the pre-dive solenoid step,
+    // or standalone on the handset/web `TEST CELLS` command
+    bool ptActive_ = false, ptDone_ = false, cellTest_ = false;
     uint32_t ptPulseBase_ = 0;
 
     voting::Result vote_{};

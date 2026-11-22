@@ -157,6 +157,10 @@ public:
 
     PulseTestOutput update(const PulseTestInput& in);
     TestState state() const { return state_; }
+    /// Which cells reacted / did not, for the handset `TEST CELLS` readout
+    /// (the pre-dive sequence uses the same engine and only needs the verdict).
+    uint8_t passMask() const { return passMask_; }
+    uint8_t failMask() const { return failMask_; }
 
 private:
     Cfg cfg_;

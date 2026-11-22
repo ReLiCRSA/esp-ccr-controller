@@ -16,7 +16,7 @@ and a PC simulator to validate the control/deco logic before hardware trust.
 | ADS1115 DRDY | Not wired on bench → timed non-blocking reads + bus recovery; driver supports DRDY later (`PIN_DRDY=-1` disables) |
 | Cell calibration | **2-point**: air (mandatory, always applied) + high-O₂ plateau at configurable `CAL_O2_FI` (default 0.99); scripted `CAL O2` via solenoid enrichment of a sealed chamber |
 | Mid-dive cell proof | At ~10 m push setpoint to 1.10; vote group must prove >1.0, else clamp all setpoints to ≤0.90 + alarm (diver-overridable, always logged) |
-| Alarms | Low 0.18, high warn 1.45, hard cutoff 1.60, CNS alarm 80% — all configurable |
+| Alarms | Low 0.18, high 1.40, injection wall 1.45, hard cutoff 1.60, CNS alarm 80% — all configurable (alarm **below** the wall: §16) |
 | Setpoints | 4 configurable with depth crossover + hysteresis (defaults 0.40 / 0.70 / 1.00 / 1.30) |
 | Deco | Bühlmann ZHL-16C + gradient factors, GF low/high configurable; UART exposes NDL, total deco time, stop ladder (next stop depth+time) |
 | Handset | ASCII line protocol, defined from scratch, UART2 @ 115200 |
@@ -237,7 +237,15 @@ OK / ERR <why>   command replies
 `DIVE START|END` · `LOG LIST` · `LOG EXPORT <n>` · `WIFI ON|OFF`.
 
 Unknown command → `ERR`; all writes reply `OK`/`ERR <reason>`. The handset and
-web edit the identical settings registry — one code path.
+web edit the identical settings registry — one code path: `comms::CommandRouter`
+(`src/comms/cmd_router.{h,cpp}`, host-tested in `test/test_router/`) executes
+every parsed line and returns hardware side effects as action bits (dive log
+open/close, radio, CAL procedures, log export), so no client grows a second
+path around the pre-dive AUTO lockout, the dive-locked settings or the
+two-step `CAL O2` confirm. Registry defaults are asserted equal to the
+firmware constants (`test_settings`), and everything steering the gas loop
+(SP*, ALLO_*, CNS_ALARM, INJ_*, CELLPROOF_SP/MIN/OK_MAXSP) is `FL_DIVE_LOCK`;
+schedule tuning (D1/D2, GF_*, ascent rates, drift) stays writable mid-dive.
 
 ## 9. Web server (WiFi truly off during dive)
 
@@ -293,9 +301,9 @@ and the web Settings page.
 
 | Group | Keys (defaults) |
 |---|---|
-| Alarms | `ALLO_LOW` 0.18 · `ALLO_HIGH` 1.45 · `ALLO_CUTOFF` 1.60 · `CNS_ALARM` 80 |
+| Alarms | `ALLO_LOW` 0.18 · `ALLO_HIGH` 1.40 · `ALLO_CUTOFF` 1.60 · `CNS_ALARM` 80 |
 | Setpoints | `SP1` 0.40 · `SP2` 0.70 · `SP3` 1.00 · `SP4` 1.30 · `D1` 30 · `D2` 50 · `SP_HYST` 0.5 |
-| Injection | `INJ_PULSE_MS` 300 · `INJ_MAX_DUTY` 5 · deadbands |
+| Injection | `INJ_PULSE_MS` 300 · `INJ_MAX_DUTY` 10 · deadbands |
 | Voting | `CELL_DRIFT_BAR` 0.05 · drift window |
 | Calibration | `CAL_O2_FI` 0.99 · `CAL_O2_TARGET` 0.95 · `CAL_O2_MAX_PPO2` 1.0 · `CAL_SLOPE_BAND` 15 · per-cell cal factors |
 | CellProof | `CELLPROOF_EN` on · `CELLPROOF_DEPTH` 10 · `CELLPROOF_SP` 1.10 · `CELLPROOF_MIN` 1.00 · `CELLPROOF_TIMEOUT` 60 · `CELLPROOF_OK_MAXSP` 0.90 |
@@ -347,7 +355,7 @@ between the modules (staleness gating the valve, the output fuse, the AUTO
 lockout, a spiked depth sample vs the bands). `test/test_divesoak/` is the M6
 exit criterion: **50 seeded dives** (7 of them pre-dive lockouts) with faults
 injected through the world only, asserting per-tick invariants rather than
-expectations. Suite total: **112 cases across 17 native suites**, plus
+expectations. Suite total: **121 cases across 18 native suites**, plus
 `pio run -e esp32` and `esp32_stalltest` building clean.
 
 The soak is checked for **sensitivity, not just greenness**: removing the

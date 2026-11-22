@@ -29,6 +29,7 @@
 #include "comms/settings.h"
 #include "comms/uart_proto.h"
 #include "control/calibration.h"
+#include "control/cellhist.h"
 #include "control/loop.h"
 
 namespace comms {
@@ -74,6 +75,13 @@ public:
     /// True when DIVE START turned the radio off (so dive end knows to restore).
     bool wifiAutoOff() const { return wifiAutoOff_; }
     uint16_t logExportIndex() const { return logExportIdx_; }
+
+    /// The rolling per-cell histograms ControlTask feeds (PLAN 9: the web
+    /// histogram page). Optional: GET HIST without one answers ERR, it does
+    /// not fabricate a shape. Read-only here, and display-only — like the
+    /// other live status keys this samples while the control thread writes
+    /// it; no decision hangs on it (the A5e rule).
+    void setHist(const cellhist::Hist* h) { hist_ = h; }
     /// CAL DEPTH is a one-shot hardware capture; the sensor owner consumes it.
     bool takeDepthCalRequest() {
         const bool w = depthCalPending_;
@@ -103,6 +111,7 @@ private:
     bool wifiOn_ = true;       // diver-visible master switch (WIFI ON|OFF)
     bool wifiAutoOff_ = false; // radio dropped by DIVE START, not by the diver
     bool depthCalPending_ = false;
+    const cellhist::Hist* hist_ = nullptr;
     bool o2Armed_ = false;     // first step of the two-step CAL O2 seen here;
                                // the O2Sequencer itself lives in the firmware
                                // and consumes ACT_CAL_O2_* (cancel included)

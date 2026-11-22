@@ -35,6 +35,7 @@
 #include "comms/settings_apply.h"
 #include "comms/telemetry_bridge.h"
 #include "comms/session.h"
+#include "control/cellhist.h"
 #include "comms/uart2_task.h"
 #include "comms/web_server.h"
 #include "hud.h"
@@ -100,6 +101,12 @@ static volatile bool  g_depthValid = false;
 bridge::Telemetry g_bridgeTel{};
 bridge::EventRing g_bridgeEvents;
 bridge::DiveTotals g_bridgeTotals;
+
+// Rolling per-cell ppO2 histograms for the web histogram page (PLAN 9).
+// One writer: ControlTask, on the control thread, once per cycle -- the
+// same single-writer discipline as the chain itself. The command path only
+// reads this for display (GET HIST), which the A5e rules allow.
+cellhist::Hist g_cellHist;
 
 // Settings + command surface (referenced by comms/uart2_task.cpp).
 settings::Registry g_settings;
@@ -243,6 +250,15 @@ static void controlTask(void*) {
 
         const ctrl::State st = g_loop->cycle(sd, now);
         digitalWrite(PIN_SOLENOID, st.solenoid ? HIGH : LOW);
+
+        // History shape, not just the reading: a cell drifting or a loop
+        // going foul shows in the distribution well before an alarm trips.
+        // Only fresh, fitted cells count -- a frozen ADC sample would
+        // reshape history with a lie.
+        if (sd.cellsFresh)
+            for (int i = 0; i < 3; i++)
+                if (g_ctrlCfg.presentMask & (1u << i))
+                    g_cellHist.sample(i, g_loop->cellBar(i), now);
 
         g_bridgeTel.votedBar = st.votedBar;
         g_bridgeTel.setpointBar = st.setpointBar;
@@ -567,6 +583,7 @@ void setup() {
     } else if (!comms::initSession(*g_loop, g_settings, g_bridgeTel, g_bridgeEvents)) {
         Serial.println("** session NOT initialised: handset and web offline (control still runs)");
     } else {
+        comms::session().setHist(&g_cellHist);   // GET HIST over either client
         if (!comms::startUart2Task())
             Serial.println("** uart2 session NOT started (task create failed)");
         if (!comms::web::start())

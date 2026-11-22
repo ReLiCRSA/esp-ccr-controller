@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "comms/session.h"
+#include "control/cellhist.h"
 
 using comms::Session;
 using namespace ctrl;
@@ -70,6 +71,7 @@ struct Fix {
     bridge::Telemetry tel;
     bridge::EventRing events;
     bridge::DiveTotals totals;
+    cellhist::Hist hist;      // what ControlTask would be filling
     Hooks hk;
     Session ses;
     uint32_t now = 0;
@@ -79,6 +81,7 @@ struct Fix {
         g_hk = &hk;
         g_acquires = g_releases = g_held = g_heldMax = 0;
         TEST_ASSERT_TRUE(ses.begin(loop, reg, tel, events, hw(), lock()));
+        ses.setHist(&hist);   // same source for both clients, one pointer
     }
 
     Session::Lock lock() {
@@ -244,6 +247,40 @@ void test_a_web_command_never_steals_the_handset_events() {
                             "events replayed on the next pump");
 }
 
+// The histogram is display, but it is still the protocol: both clients ask
+// through the same session and must get the same shape, and the folded
+// counts must be the samples that went in. A page drawing a histogram the
+// handset cannot see (or worse, a different one) is how "trust the gauge"
+// dies.
+void test_the_histogram_reaches_both_clients_identically() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fix f;
+    f.hist.sample(0, 0.62f, 1000);
+    f.hist.sample(0, 0.62f, 1100);
+    f.hist.sample(1, 0.30f, 1100);
+
+    f.handset("GET HIST");
+    // One sink call may carry all three lines (the web transport splits it
+    // into frames); count the protocol lines in the joined text.
+    size_t handsetLines = 0;
+    for (const auto& l : out)
+        for (size_t p = 0; (p = l.find("HIST,", p)) != std::string::npos; p += 5) handsetLines++;
+    TEST_ASSERT_EQUAL_MESSAGE(3, (int)handsetLines, "one HIST line per cell");
+    TEST_ASSERT_TRUE(sawAnywhere("HIST,0,60,10,5,0,2,"));   // cell0: two folded
+    TEST_ASSERT_TRUE(sawAnywhere("HIST,1,60,10,5,0,1,"));   // cell1: one
+    TEST_ASSERT_TRUE(sawAnywhere("HIST,2,60,10,5,0,0,"));   // cell2: honest zero
+
+    out.clear();
+    f.web("GET HIST");
+    size_t webLines = 0;
+    for (const auto& l : out)
+        for (size_t p = 0; (p = l.find("HIST,", p)) != std::string::npos; p += 5) webLines++;
+    TEST_ASSERT_EQUAL_MESSAGE(3, (int)webLines,
+                              "the web got a different histogram shape than the handset");
+    TEST_ASSERT_TRUE(sawAnywhere("HIST,0,60,10,5,0,2,"));
+}
+
 void test_reply_marker_is_the_browsers_end_of_answer() {
     char buf[32];
     TEST_ASSERT_EQUAL_UINT32(3, comms::formatReplyMarker(buf, sizeof(buf), 3, false));
@@ -277,6 +314,7 @@ int main() {
     RUN_TEST(test_the_two_step_cal_handshake_is_shared);
     RUN_TEST(test_actions_run_inside_the_session_lock);
     RUN_TEST(test_a_web_command_never_steals_the_handset_events);
+    RUN_TEST(test_the_histogram_reaches_both_clients_identically);
     RUN_TEST(test_reply_marker_is_the_browsers_end_of_answer);
     RUN_TEST(test_a_session_without_a_chain_answers_nothing);
     return UNITY_END();

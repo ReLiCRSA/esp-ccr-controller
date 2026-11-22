@@ -68,6 +68,9 @@ public:
 
     /// Radio bookkeeping shared by every transport (WIFI ON|OFF, dive edges).
     bool wifiEnabled() const { return router_ ? router_->wifiEnabled() : false; }
+    /// Optional histogram source (see CommandRouter::setHist). Safe before or
+    /// after begin(); a session without one answers GET HIST with ERR.
+    void setHist(const cellhist::Hist* h) { if (router_) router_->setHist(h); }
 
     /// Runs `fn` with the session lock held, for work that touches the same
     /// hardware the commands touch (a dive-file export answering an HTTP

@@ -65,6 +65,9 @@ td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}
 th{color:var(--dim);font-weight:600;font-size:13px}
 a{color:var(--accent)}
 canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);border-radius:10px}
+.hist{display:flex;align-items:flex-end;gap:1px;height:130px;margin:6px 0 2px}
+.hist i{flex:1;background:var(--accent);opacity:.85;min-height:2px}
+.hist i.z{visibility:hidden}
 .hint{color:var(--dim);font-size:13px}
 @media(min-width:900px){main{display:grid;grid-template-columns:2fr 1fr;gap:14px;align-items:start}}
 </style>
@@ -76,6 +79,7 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
   <nav id="tabs">
     <button data-v="status" class="on">Status</button>
     <button data-v="check">Checklist</button>
+    <button data-v="hist">Cells</button>
     <button data-v="settings">Settings</button>
     <button data-v="dives">Dives</button>
     <button data-v="console">Console</button>
@@ -123,6 +127,12 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
     <button class="act" data-c="CAL O2 CONFIRM">CAL O2 CONFIRM</button>
     <button class="act" data-c="CAL DEPTH">CAL DEPTH</button>
   </fieldset></div>
+</section>
+<section id="v-hist">
+  <div class="card"><div id="h0"><span class="hint">no cell history yet</span></div></div>
+  <div class="card"><div id="h1"></div></div>
+  <div class="card"><div id="h2"></div></div>
+  <div class="hint" id="hline"></div>
 </section>
 <section id="v-settings"><div id="sets"></div></section>
 <section id="v-dives">
@@ -379,6 +389,29 @@ function refreshDives(){
       b.addEventListener("click",function(){ showDive(+b.dataset.slot); }); });
   });
 }
+// ---- cell histograms (GET HIST, firmware rolling 10-minute windows) -----
+function drawHist(f){
+  var c=+f[1], ws=+f[2], nw=+f[3], bw=+f[4]/100, age=+f[5], n=+f[6];
+  var host=$("h"+c); if(!host) return;
+  var counts=f.slice(7), mx=1;
+  counts.forEach(function(x){ if(+x>mx) mx=+x; });
+  var when=n?("last "+(age/60).toFixed(1)+" min"):("no samples yet");
+  var h='<div class="k">cell '+(c+1)+' &#183; '+when+' &#183; busiest bin '+mx+' smp</div><div class="hist">';
+  for(var i=0;i<counts.length;i++){ var v=+counts[i];
+    h+='<i class="'+(v?"":"z")+'" style="height:'+Math.round(Math.max(0,v)/mx*100)+
+       '%" title="'+(i*bw).toFixed(2)+' .. '+((i+1)*bw).toFixed(2)+' bar: '+v+'"></i>'; }
+  h+='</div><div class="rng">0 .. '+(counts.length*bw).toFixed(2)+' bar ppO2</div>';
+  host.innerHTML=h;
+  if(c===0) $("hline").textContent="samples per "+bw.toFixed(2)+" bar bin, rolling "+
+    nw+" windows of "+ws+" s (firmware-side)";
+}
+function refreshHist(){
+  send("GET HIST").then(function(ls){
+    var got=ls.filter(function(l){return l.indexOf("HIST,")===0});
+    if(!got.length) toast(ls.join(" &#183; ")||"no histogram","bad");
+    got.forEach(function(l){ drawHist(l.split(",")); });
+  });
+}
 function showDive(slot){
   var v=$("diveview"); v.hidden=false; v.innerHTML="loading dive "+slot+"&#8230;";
   fetch("/dive/"+slot+".csv").then(function(r){ return r.text(); }).then(function(txt){
@@ -424,6 +457,7 @@ Array.prototype.forEach.call(document.querySelectorAll("#tabs button"),function(
     document.querySelectorAll("main section").forEach(function(s){
       s.classList.toggle("on",s.id==="v-"+view); });
     if(view==="dives") refreshDives();
+    if(view==="hist") refreshHist();
     if(view==="check") { send("GET PRE"); send("GET CELLS"); }
   });
 });
@@ -451,6 +485,7 @@ setInterval(function(){
 setInterval(function(){ if(sock&&sock.readyState===1) send("GET T"); },600);
 setInterval(function(){ if(sock&&sock.readyState===1&&(view==="status"||view==="check")) send("GET D"); },2400);
 setInterval(function(){ if(sock&&sock.readyState===1&&view==="check"){ send("GET PRE"); send("GET CELLS"); send("GET PROOF"); send("GET FAULT"); } },2400);
+setInterval(function(){ if(sock&&sock.readyState===1&&view==="hist") refreshHist(); },4000);
 connect();
 </script>
 </body></html>

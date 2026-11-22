@@ -240,7 +240,9 @@ OK / ERR <why>   command replies
 
 Display keys (resolved **after** the registry, so a real key like `D1` or
 `CAL_O2_FI` can never be shadowed): `GET T` · `GET D` · `GET CELLS` ·
-`GET PROOF` · `GET PRE` · `GET FAULT` · `GET SCHEMA`.
+`GET PROOF` · `GET PRE` · `GET FAULT` · `GET SCHEMA` · `GET HIST`
+(`HIST,<cell>,<winS>,<windows>,<binWidth×100>,<ageS>,<folded>,<38 counts>`
+per cell — the rolling shape, whole lines or nothing).
 
 Unknown command → `ERR`; all writes reply `OK`/`ERR <reason>`. The handset and
 web edit the identical settings registry — one code path: `comms::CommandRouter`
@@ -292,9 +294,14 @@ older forks' download URLs are dead):
   literal for `pio run -e esp32 -t uploadfs` (one source of truth). Built-in
   page: status, checklist, settings (ranges from `GET SCHEMA`), dives
   (list → inline depth/ppO₂ chart → CSV), console. 23 KB, no CDN, no framework.
-  **Not built yet:** the per-cell histogram page (it needs a firmware-side
-  ~15 Hz accumulator, which is its own tested module, not a page) and the
-  service worker.
+  - **Cell histograms**: `ctrl::cellhist` (`src/control/cellhist.{h,cpp}`) —
+    rolling 10-minute horizon per fitted cell (10 windows × 60 s ring, 38
+    bins of 0.05 bar, fixed static, no heap), fed by ControlTask once per
+    cycle from the calibrated cells (fresh + fitted only — a frozen ADC
+    sample must not reshape history). Served as `GET HIST` through the same
+    session, rendered as the built-in page's Cells tab. Display-only read
+    across threads per the A5e rule: no decision hangs on a chart.
+  **Not built yet:** the service worker.
 - `GET /dive/<n>.csv` answers the same dive file as `LOG EXPORT <n>`, through
   the same session lock, as a file download for the browser.
 - Task layout: `async_tcp` is pinned to **core 0** (with the WiFi driver) so
@@ -409,7 +416,7 @@ between the modules (staleness gating the valve, the output fuse, the AUTO
 lockout, a spiked depth sample vs the bands). `test/test_divesoak/` is the M6
 exit criterion: **50 seeded dives** (7 of them pre-dive lockouts) with faults
 injected through the world only, asserting per-tick invariants rather than
-expectations. Suite total: **150 cases across 23 native suites**, plus
+expectations. Suite total: **157 cases across 24 native suites**, plus
 `pio run -e esp32` and `esp32_stalltest` building clean.
 
 The soak is checked for **sensitivity, not just greenness**: removing the
@@ -477,7 +484,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
 | C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | tool ready, replay-validated — run when the port is free |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
-| — | per-cell histogram page: needs a firmware-side ~15 Hz cell accumulator module first (its own tested module, not a page) | deferred |
+| — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -624,6 +631,13 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   copy when the filesystem is missing, half-written or wiped. Hand-editing the
   data copy guarantees the two versions only drift on the one board that has a
   filesystem.
+- **ID-stamped ring slots must value-initialize.** `cellhist` reuses ring
+  slots only when the stamped window id matches — but the first `Hist` built
+  over a dead one's stack memory inherited matching ids and counts from the
+  previous test (a fresh boot would inherit RAM garbage): the histogram's
+  first "shape" is a ghost that *renders plausibly*. The suite caught it as
+  "expected 100, was 104"; the slots are now `= {}` load-bearingly. Any
+  future id/stamp ring takes the same initializer discipline.
 - **The dive log has one owner but two writers.** ControlTask appends the 30 s
   grid rows, the handset link appends event-driven rows; both go through
   `g_logMtx` in `session_wiring.cpp`, and only the command path opens/closes

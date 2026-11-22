@@ -190,6 +190,14 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         replyText(r, buf, static_cast<size_t>(n));
         return;
     }
+    if (std::strcmp(key, "HIST") == 0) {
+        if (!hist_) { replyErr(r, "no histogram"); return; }
+        char buf[CommandRouter::MAX_REPLY];
+        const size_t n = cellhist::formatLines(*hist_, nowMs_, buf, sizeof(buf));
+        if (!n) { replyErr(r, "hist too long"); return; }
+        replyText(r, buf, n);
+        return;
+    }
     // The web Settings page needs each key's type, range and flags to put a
     // min/max on its inputs and grey out what a dive locks; the handset gets
     // the same view. Additive display key — exec() asks the registry before

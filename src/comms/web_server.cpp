@@ -222,10 +222,14 @@ bool pageInFlash(const char* path) {
 }
 
 void serveIndex(AsyncWebServerRequest* req) {
-    if (pageInFlash("/index.html"))
-        req->send(LittleFS, "/index.html", "text/html");
-    else
-        req->send_P(200, "text/html", kIndexHtml);   // built-in: no page can be missing
+    // Phone browsers cache aggressively; a stale cached page after a firmware
+    // fix is an "I fixed it but nothing changed" bug report every time.
+    AsyncWebServerResponse* rsp =
+        pageInFlash("/index.html")
+            ? req->beginResponse(LittleFS, "/index.html", "text/html")
+            : req->beginResponse_P(200, "text/html", kIndexHtml);  // built-in page
+    rsp->addHeader("Cache-Control", "no-store");
+    req->send(rsp);
 }
 
 void serveAsset(AsyncWebServerRequest* req, const char* path, const char* type) {

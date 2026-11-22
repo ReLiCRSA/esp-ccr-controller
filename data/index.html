@@ -215,6 +215,14 @@ function connect(){
       finish(); return;
     }
     logline(s);
+    // The answer collector: every line between a command and its '#' marker
+    // belongs to the outstanding command. Without this push the collector was
+    // always empty — Settings ("no schema yet"), the Dives list and the Cells
+    // histograms all resolved zero rows; the dashboard only survived because
+    // T/D/CELLS lines render through their own branches above. Callers filter
+    // by prefix (K,, HIST,, L,, KEY=), so unsolicited event lines landing
+    // mid-reply are harmless.
+    if(busy) busy.lines.push(s);
     var f=s.split(",");
     if(f[0]==="T") { T=f; state(); }
     else if(f[0]==="D") { D=f; state(); }

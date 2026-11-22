@@ -188,7 +188,7 @@ void test_cell_death_mid_dive() {
 // ---------------------------------------------------------------------------
 void test_two_lying_cells_veto() {
     RigOpts o = simOpts();
-    o.cp.enabled = false;  // isolate the veto rule from the CellProof layer
+    o.cellproof.enabled = false;  // isolate the veto rule from the CellProof layer
     Rig rig(o);
     rig.setAutoMode(true);
     startAtSurface(rig);

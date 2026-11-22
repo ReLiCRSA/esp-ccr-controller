@@ -77,7 +77,7 @@ static std::vector<uint8_t> adc16(uint32_t v) {
 // C1..C6 = 34982 36352 20328 22354 26646 26146, D1=4958179, D2=6815414
 // expected: 19.81 C, 3999.8 mbar (3.9998 bar)
 // ===========================================================================
-static uint16_t kProm[8] = {0, 34982, 36352, 20328, 22354, 26646, 26146, 0};
+// (the arrays below are built per test so a corrupt-PROM case can shadow them)
 
 static bool loadProm(FakeBus& bus, const uint16_t prom[8]) {
     for (int i = 0; i < 8; ++i)

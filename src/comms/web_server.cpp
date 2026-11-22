@@ -27,6 +27,7 @@
 #include "comms/web_server.h"
 
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -49,6 +50,7 @@ namespace {
 
 AsyncWebServer* g_server = nullptr;
 AsyncWebSocket* g_ws = nullptr;
+DNSServer* g_dns = nullptr;
 bool g_on = false;
 uint32_t g_minHeap = 0xFFFFFFFFu;
 uint32_t g_framesIn = 0, g_framesOut = 0;
@@ -69,24 +71,51 @@ void noteHeap() {
 
 // ---- the sink: protocol lines out to one client ----------------------------
 
+/// Reply batching. The link hands over whole replies — GET SCHEMA is 32
+/// protocol lines in one call — and one WebSocket frame per line used to put
+/// 33 tiny TCP segments on the wire at once. On the bench that burst stalls
+/// AsyncTCP's output for seconds (observed: a >13 s hole mid-telemetry after
+/// a SCHEMA), and the page correctly calls any silence over 3 s "NO DATA".
+/// So lines accumulate into whole frames (the page splits frames on newlines
+/// anyway — protocol unchanged), and the marker after each reply flushes the
+/// batch. Frames per SCHEMA: ~2, not 33.
 struct SinkCtx {
     uint32_t id;
-    uint16_t lines;
+    uint16_t lines = 0;     // PROTOCOL lines emitted (the marker's count)
+    char batch[1024];
+    size_t blen = 0;
+
+    void flush() {
+        if (!blen) return;
+        g_ws->text(id, batch, blen);
+        g_framesOut++;
+        blen = 0;
+    }
+    void add(const char* data, size_t n) {
+        if (!n) return;
+        if (blen + n > sizeof(batch)) flush();
+        if (n > sizeof(batch)) {          // pathological single line: own frame
+            g_ws->text(id, data, n);
+            g_framesOut++;
+            return;
+        }
+        std::memcpy(batch + blen, data, n);
+        blen += n;
+    }
 };
 
-/// One protocol line per frame. The link hands over whole replies, and a
-/// multi-line one (GET *, GET SCHEMA, a dive export) arrives as a single call
-/// with embedded newlines: split it, or the browser's line parser sees one
-/// giant line and the page silently half-works.
-void wsSink(const char* line, void* vctx) {
-    if (!g_ws || !line || !*line) return;
+void wsSink(const char* text, void* vctx) {
+    if (!g_ws || !text || !*text) return;
     SinkCtx& s = *static_cast<SinkCtx*>(vctx);
-    const char* p = line;
+    const char* p = text;
     while (*p) {
         const char* nl = std::strchr(p, '\n');
         const size_t n = nl ? static_cast<size_t>(nl - p) : std::strlen(p);
-        if (n > 0 && n <= 1024 && g_ws->text(s.id, p, n)) s.lines++;
-        g_framesOut++;
+        if (n > 0) {
+            s.add(p, n);
+            s.add("\n", 1);
+            s.lines++;
+        }
         if (!nl) break;
         p = nl + 1;
         while (*p == '\r') p++;
@@ -102,7 +131,8 @@ void sendStatusMarker(uint32_t id, uint16_t lines, bool dropped) {
 
 void runCommand(uint32_t id, const char* line, size_t len, bool overflow) {
     g_framesIn++;
-    SinkCtx out{id, 0};
+    SinkCtx out;
+    out.id = id;
     if (overflow) {
         char buf[48];
         const size_t n = proto::formatErr("line too long", buf, sizeof(buf));
@@ -117,6 +147,7 @@ void runCommand(uint32_t id, const char* line, size_t len, bool overflow) {
     // The shared session: same router, same lockouts, same dive file owner as
     // the handset. millis() because dive edges must land on the chain's clock.
     session().handleLine(line, millis(), wsSink, &out);
+    out.flush();   // the reply's tail leaves as one frame, then the marker
     sendStatusMarker(id, out.lines, false);
     noteHeap();
 }
@@ -288,6 +319,23 @@ bool start() {
         return false;
     }
 
+    // Captive DNS: a joined phone resolves NOTHING until something answers
+    // port 53, so typing any name fails and only a raw IP would work. Answer
+    // every query with the AP itself; onNotFound() then turns the visit into
+    // the page. One query per service() poll — the handset task's 20 ms loop
+    // keeps that responsive, and the radio is off during dives anyway.
+    if (g_dns == nullptr) g_dns = new (std::nothrow) DNSServer();
+    if (g_dns) {
+        g_dns->setErrorReplyCode(DNSReplyCode::NoError);
+        // "*" is the library's wildcard token — an empty domain does NOT
+        // match and answers come back empty (verified on the wire).
+        if (!g_dns->start(53, "*", WiFi.softAPIP())) {
+            Serial.println("** web: captive DNS failed to bind :53");
+            delete g_dns;
+            g_dns = nullptr;
+        }
+    }
+
     if (g_server == nullptr) {
         g_server = new (std::nothrow) AsyncWebServer(80);
         g_ws = new (std::nothrow) AsyncWebSocket("/ws");
@@ -333,6 +381,11 @@ void stop() {
     // callback, and destroying a socket underneath its own handler is how
     // async stacks get use-after-frees. The radio going down ends the
     // connections; start() cleans the leftovers up.
+    if (g_dns) {
+        g_dns->stop();
+        delete g_dns;
+        g_dns = nullptr;  // :53 belongs to nobody while the radio is down
+    }
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_OFF);
     g_on = false;
@@ -343,6 +396,13 @@ void stop() {
 void setRadio(bool on) {
     if (on) start();
     else stop();
+}
+
+void service() {
+    // Polled by the handset task (its loop is the firmware's one general
+    // 20 ms poller). Non-blocking: parsePacket() only moves a datagram if
+    // one is actually waiting, so an idle radio costs one select here.
+    if (g_dns) g_dns->processNextRequest();
 }
 
 bool isOn() { return g_on; }

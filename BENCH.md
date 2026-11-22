@@ -4,6 +4,13 @@ Rules that never expire: **never open `/dev/ttyUSB0` while
 `tools/soak_logger.py` runs** (two readers, both blind), and nothing here
 counts as done until it is *watched happening on the bench*.
 
+**Opening the console port resets the board.** pyserial asserts DTR/RTS on
+`open()`; on this board's classic auto-reset circuit DTR=IO0, RTS=EN, so
+the open is a reset pulse (every "mystery POWERON" during the web debugging
+was the *laptop* opening the port, not the board). Keep one reader, expect
+a boot banner at the start of every capture, and never conclude "the board
+reboots" from a log that begins with one.
+
 ## C2 — flash + acceptance (run first, every flash)
 
 ```
@@ -45,6 +52,28 @@ Then by hand, in this order (each mirrors a sim scenario):
    in `LOG LIST`, `/dive/<n>.csv` downloads and matches `LOG EXPORT <n>`.
 5. `WIFI OFF` from the phone, dive, end dive → radio stays **off** (diver
    outranks the machine's auto-restore).
+
+## C2-e — phone/web findings (2026-11-22 evening, all closed)
+
+* "Password incorrect" **was not the password**: wpa_supplicant completed the
+  4-way handshake with the correct PSK, then `key addition failed` from the
+  kernel — a wedged iwlwifi/Intel 9260 after a kernel update removed the
+  running kernel's modules. Reboot fixed it; the PC then joined `diveonly`
+  first try, and the bare `softAP` probe proved the ESP side honest.
+* **Captive DNS is load-bearing**: with the AP up but nothing answering :53,
+  a phone resolves *nothing* and "the page does not load" — even though the
+  302 redirect and the page itself were perfect. Fixed: DNSServer answers
+  every A query with the AP IP (library wildcard is `"*"`, not `""` —
+  verified empty-domain replies came back malformed on the wire), pumped by
+  hudTask (NOT the handset task: UART2 may be unwired on the bench, task
+  never created).
+* **Reply bursts stall the link**: every ws reply line used to be its own
+  frame — GET SCHEMA put 33 tiny TCP segments on the wire at once, and a
+  >13 s telemetry hole followed. Replies are now batched into ≤1 KB frames
+  (~2 frames for SCHEMA); protocol and `#<n>` marker unchanged; page splits
+  frames on newlines as before. Telemetry pull cadence 600 ms -> 2 s.
+* The SCHEMA fetch is socket-open-only (never re-fetched; saves reuse the
+  cached copy), so reconnects no longer stampede.
 
 ## C3-a — depth sensor (found live on the bench 2026-11-22)
 
@@ -91,8 +120,10 @@ depth — it just refuses to pretend.
 - [ ] All three cell grounds and the ADS1115 GND on one point; handset
       powered from the same rail (UART common ground) — a ground loop here
       fakes exactly the drift the voting layer hunts.
-- [ ] Bench rig with two cells: build with `presentMask = 0b011`;
-      `GET CELLS` / `PROOF` must never report a phantom third cell.
+- [ ] Cell count is a BUILD decision: `CELLS_PRESENT_MASK` in
+      `include/config/defaults.h` (0x07 = three fitted since 2026-11-22 —
+      the dashboard, voting and histograms follow it exactly). Re-check it
+      whenever the rig changes, and run CAL AIR after any change.
 - [ ] Battery: HB `vbat=` within 0.1 V of a meter at three loads;
       `VBAT_MIN` alarm fires with the meter confirming; log the divider
       trim for the build.

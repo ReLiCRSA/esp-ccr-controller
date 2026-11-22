@@ -183,6 +183,10 @@ static void hudTask(void*) {
     for (;;) {
         const uint32_t now = millis();
         hudUpdate(now);
+        // Captive DNS rides here, not on the handset task: UART2 may be
+        // unwired on the bench (task never created), and a phone that cannot
+        // resolve anything is a "page does not load" bug report every time.
+        comms::web::service();
 
         static uint32_t lastStatus = 0;
         if (now - lastStatus >= 5000) {

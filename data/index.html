@@ -482,7 +482,7 @@ setInterval(function(){
   if(stale){ document.body.classList.add("stale"); $("stale").hidden=false; }
   else { document.body.classList.remove("stale"); $("stale").hidden=true; }
 },1000);
-setInterval(function(){ if(sock&&sock.readyState===1) send("GET T"); },600);
+setInterval(function(){ if(sock&&sock.readyState===1) send("GET T"); },2000);
 setInterval(function(){ if(sock&&sock.readyState===1&&(view==="status"||view==="check")) send("GET D"); },2400);
 setInterval(function(){ if(sock&&sock.readyState===1&&view==="check"){ send("GET PRE"); send("GET CELLS"); send("GET PROOF"); send("GET FAULT"); } },2400);
 setInterval(function(){ if(sock&&sock.readyState===1&&view==="hist") refreshHist(); },4000);

@@ -25,7 +25,11 @@
 #define ADS_RECOVERY_WARN_PER_MIN   3
 // Cell presence: bench today = 2 cells on AIN0/AIN1, AIN2 empty.
 // Bit per channel: bit0=AIN0 ... Auto-detection (air cal plausible) lands in M2.
-#define CELLS_PRESENT_MASK          0x03
+// Three cells fitted on the bench as of 2026-11-22 (A0/A1/A2). This mask is
+// what "fitted" means everywhere: ADS polling, voting membership, the
+// dashboard's cell rows and the histogram feed. A wired-but-unmasked cell is
+// invisible BY DESIGN — update this (and CAL AIR) when the rig changes.
+#define CELLS_PRESENT_MASK          0x07
 
 // --- Sensor task ----------------------------------------------------------------
 #define SENSOR_TASK_PERIOD_MS       10

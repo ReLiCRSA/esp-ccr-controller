@@ -482,7 +482,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
-| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board** (`1b8c807` flashed 2026-11-22 22:19, tag `m2-flashed`; AP `ESP-CCR-3828` up, HB lines with the appended ctrl fields). Handset refusal matrix pending: needs the UART2 adapter wired to 16/17. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board**; web half verified over the air from the PC (AP `ESP-CCR-3828`: captive DNS, batched replies, 180 s / 178 replies / 0 socket drops). Reflash chain: `1b8c807` (tag `m2-flashed`) → web-fix build (tag `m2-web-fixes`). Handset refusal matrix pending: needs the UART2 adapter wired to 16/17. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
 
@@ -687,3 +687,24 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   independent implementations before anyone wears it.
 - Bench cells share a common ground referenced to ADS1115 GND; handset powered
   from the same rail (UART common ground).
+- **Captive DNS on the AP is load-bearing.** A phone joined to the hotspot but
+  able to resolve nothing reports "the page does not load" even though the
+  server is perfect; DNSServer now answers every A query with the AP IP, and
+  it is pumped from hudTask — not the handset task, which may never be created
+  when UART2 is unwired. Library quirk (verified on the wire): the wildcard
+  domain is `"*"`; an empty domain answers with a malformed empty packet.
+- **One WebSocket frame per reply line is a burst the radio punishes.** A
+  32-line SCHEMA reply became 33 tiny TCP segments; AsyncTCP's output stalled
+  for >13 s behind them and the page correctly declared NO DATA. Web replies
+  are batched into ≤1 KB frames (marker flushes the tail); the protocol and
+  the `#<n>` completion marker are unchanged.
+- **AsyncTCP's default 5 s ACK watchdog closes live dashboard sockets** on
+  any congested 2.4 GHz link (bench laptop NICs scan channels; a 5 s stall
+  is routine, `AsyncWebSocket::_onTimeout -> close()` made every connection
+  die at 30–70 s). `CONFIG_ASYNC_TCP_MAX_ACK_TIME=30000` in the esp32 build
+  flags: sheds genuinely dead clients, keeps the page alive through stalls —
+  180 s / 178 replies / 0 drops after, vs. a drop every ~40 s before.
+- Opening the console serial port RESETS the board (pyserial asserts DTR/RTS
+  on open; DTR=IO0, RTS=EN on the classic auto-reset circuit). Several "the
+  board reboots by itself" observations during web debugging were the laptop
+  opening `/dev/ttyUSB0`, not the firmware.

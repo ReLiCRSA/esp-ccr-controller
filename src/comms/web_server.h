@@ -35,6 +35,12 @@ void stop();
 /// cannot be implemented differently by different clients.
 void setRadio(bool on);
 
+/// Pump the captive DNS responder once. Non-blocking; call from a periodic
+/// task (the handset task does it every 20 ms). A joined phone resolves
+/// nothing without this, and "the page does not load" is what a missing
+/// port-53 answer looks like on every phone ever built.
+void service();
+
 bool isOn();
 
 /// Live WebSocket clients (the status page shows it; a dive with a browser

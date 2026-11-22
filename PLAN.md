@@ -461,7 +461,7 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
 
 | # | Deliverable | Exit criteria |
 |---|---|---|
-| **M1** | Scaffold, `pins.h`/`defaults.h`, hang-proof ADS1115 driver, I2C bus recovery, 3 watchdog layers, battery sense, HB LED | **24 h soak with SDA/SCL yank fault injection — full recovery without reboot**; SAFE-mode boot verified |
+| **M1** | Scaffold, `pins.h`/`defaults.h`, hang-proof ADS1115 driver, I2C bus recovery, 3 watchdog layers, battery sense, HB LED | **DONE 2026-11-22 (12.49 h soak, ended early by owner decision after 12 h clean)**: 8992 status lines, yank drills = 77 I²C errors absorbed by 38 bus recoveries, **0 boots, 0 SAFE, 0 FATAL, 0 HB gaps**; cells stable ~1490 counts, `fresh=110` all run. Summary: `logs/soak_20261122_094738_summary.json` (regenerated from the raw log after SIGINT skipped the JSON). M1 firmware `0e46252`, tag `m1-soak-flashed` |
 | **M2** | Median voting + health scores, 2-cell bench mode, solenoid LED pulsing, `CAL AIR`, `CAL O2` + `TEST CELLS` sequencers, pre-dive sequence | Bench pre-dive passes with 2 cells; scripted enrichment cal works end-to-end on the bench jar setup |
 | **M3** | BMP085 driver (+ breathe-on-it depth sim), setpoint crossovers + clamps, dive file format, MS5837 driver incl. Errata 2, CellProof | Setpoint crossovers verified by breathing on the BMP085; dive CSV exports correctly |
 | **M4** | **Simulator-first** deco: ZHL-16C + NDL + schedule + CNS → unit tests vs published tables → sim world model + fault injection → DECO LED + `D,` UART line + web ladder | Unit tests match published NDL/deco tables; sim soak runs show no setpoint escapes |
@@ -482,7 +482,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
-| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | tool ready, replay-validated — run when the port is free |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board** (`1b8c807` flashed 2026-11-22 22:19, tag `m2-flashed`; AP `ESP-CCR-3828` up, HB lines with the appended ctrl fields). Handset refusal matrix pending: needs the UART2 adapter wired to 16/17. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
 

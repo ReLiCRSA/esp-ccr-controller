@@ -107,7 +107,15 @@ def grade_boot(lines, expect_web):
 
     if expect_web:
         sl = next((l for l in lines if SETTINGS_LINE.search(l)), None)
-        checks.append(("settings loaded from NVS", sl is not None, sl or ""))
+        if sl is None and any("nvs_open failed: NOT_FOUND" in l for l in lines):
+            # Fresh board: NVS namespace does not exist yet, firmware boots on
+            # compile-time defaults (correct behaviour). The NVS round-trip is
+            # proven by the next acceptance run: after any SET + restart this
+            # line MUST appear.
+            checks.append(("settings: fresh board (no NVS yet)", True,
+                           "defaults in force; recheck after first SET + reboot"))
+        else:
+            checks.append(("settings loaded from NVS", sl is not None, sl or ""))
         cl = next((l for l in lines if CONTROL_LINE.search(l)), None)
         checks.append(("control chain booted", cl is not None, cl or ""))
         wl = next((l for l in lines if WEB_AP_LINE.search(l)), None)
@@ -177,9 +185,14 @@ def main() -> int:
         ser = serial.Serial(args.boot_port, args.baud, timeout=1.0)
         deadline = time.time() + args.boot_wait
         try:
-            ser.setDTR(True)   # ESP32 boards: DTR pulse resets into the boot log
-            time.sleep(0.1)
+            # Classic auto-reset circuit: DTR drives IO0, RTS drives EN.
+            # Pulsing DTR (as first drafted here did) latches the ROM into
+            # download mode — a silent board. Release IO0, pulse EN: run-mode
+            # reset, boot banner included.
             ser.setDTR(False)
+            ser.setRTS(True)
+            time.sleep(0.12)
+            ser.setRTS(False)
             while time.time() < deadline:
                 line = ser.readline().decode(errors="replace").rstrip()
                 if line:

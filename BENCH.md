@@ -46,7 +46,32 @@ Then by hand, in this order (each mirrors a sim scenario):
 5. `WIFI OFF` from the phone, dive, end dive → radio stays **off** (diver
    outranks the machine's auto-restore).
 
-## C3-a — MS5837-30BA swap (before ANY wet test)
+## C3-a — depth sensor (found live on the bench 2026-11-22)
+
+`BMP085 @0x77` on the shared bus (SDA 21 / SCL 22, same bus as the ADS1115)
+**never acknowledged** on the first boot that ever polled it: M1 firmware
+compiled the pressure path out, so the soak never touched it — the very
+first `requestFrom` was tonight. Symptom is one
+`requestFrom(): i2cWriteReadNonStop returned Error -1` every ~4 s with the
+cell side completely healthy (`fresh=110`, `i2cerr=0`).
+
+Before depth means anything on this rig:
+
+- [ ] Confirm the module is fitted at all, and at 0x77 (BMP085) not 0x76
+      (MS5837) — `pins.h` picks by address; the bench is a BMP085 stand-in.
+- [ ] VCC to 3V3 (not a GPIO), SDA→21, SCL→22, common ground with the
+      ADS1115 GND point.
+- [ ] Pull-ups present on 21/22 (the ADS side has them; two devices on one
+      bus must share one pair, ~4.7 k, not two weak pairs).
+- [ ] Then: `control:` line no longer ends in the uncalibrated note and HB
+      `stale=` stays 0 with no periodic Wire error.
+
+Until then the numbers on the depth/ceiling fields are the filter's, not the
+world's: `HB … al=0x0090` includes `BIT_SENSOR_STALE` and `vote=0.210 sp=0.40`
+is air at the surface setpoint. The controller behaves correctly with no
+depth — it just refuses to pretend.
+
+## C3-b — MS5837-30BA swap (before ANY wet test)
 
 - [ ] Potting inspection: gel-filled port free of voids, epoxy not lifted
       at the rim; any wicking under the seal = scrap, not rework.
@@ -61,7 +86,7 @@ Then by hand, in this order (each mirrors a sim scenario):
 - [ ] Firmware still refuses a bad bus: cover the sensor, expect
       `stale`/`SENSOR` alarm, injection stops, valve stays shut.
 
-## C3-b — cells, grounding, battery
+## C3-c — cells, grounding, battery
 
 - [ ] All three cell grounds and the ADS1115 GND on one point; handset
       powered from the same rail (UART common ground) — a ground loop here
@@ -72,7 +97,7 @@ Then by hand, in this order (each mirrors a sim scenario):
       `VBAT_MIN` alarm fires with the meter confirming; log the divider
       trim for the build.
 
-## C3-c — mechanical inhibit (zero firmware cooperation)
+## C3-d — mechanical inhibit (zero firmware cooperation)
 
 - [ ] Actuate the inline manual O₂ inhibit with the board injecting:
       solenoid LED and `pulses=` keep counting, loop ppO₂ falls — the

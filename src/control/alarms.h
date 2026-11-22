@@ -33,7 +33,7 @@ enum class Level : uint8_t { CRITICAL, WARNING };
 
 struct Config {
     float lowBar = 0.18f;
-    float highBar = 1.45f;
+    float highBar = 1.40f;  // below the injection wall: tell the diver first
     float cnsAlarmPct = 80.0f;
     float vbatMin = 10.5f;
 };

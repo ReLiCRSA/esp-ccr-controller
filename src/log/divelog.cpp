@@ -41,7 +41,7 @@ size_t packSnapshot(const Snapshot& s, uint8_t out[SNAPSHOT_SIZE]) {
     for (int i = 0; i < 3; ++i) wr16(p, static_cast<uint16_t>(s.cellX1000[i]));
     wr16(p, static_cast<uint16_t>(s.setpointX1000));
     *p++ = s.mode;
-    *p++ = s.alarmBits;
+    *p++ = static_cast<uint8_t>(s.alarmBits & 0xFF);  // bits 8..9 ride in flags
     *p++ = s.cnsPct;
     wr16(p, static_cast<uint16_t>(s.ceilingCm));
     wr16(p, static_cast<uint16_t>(s.ndlMin));
@@ -49,12 +49,23 @@ size_t packSnapshot(const Snapshot& s, uint8_t out[SNAPSHOT_SIZE]) {
     wr16(p, s.pulses);
     wr16(p, s.battX1000);
     *p++ = static_cast<uint8_t>(s.tempC);
-    *p++ = s.flags;
+    // bits 3..4 of flags carry alarm bits 8..9 (CNS_HIGH, HYPOXIA): the 32 B
+    // snapshot grid has no spare byte and a dive file that cannot record a
+    // hypoxia row is not a dive file.
+    *p++ = static_cast<uint8_t>((s.flags & ~kFLAGS_ALARM_HI) |
+                                (((s.alarmBits >> 8) << 3) & kFLAGS_ALARM_HI));
+    // Per-record CRC: a dive file is written while the diver is underwater, and
+    // a reset mid-write must not turn a torn row into plausible garbage. The
+    // LittleFS reader stops at the first record that fails this check.
+    wr16(p, crc16(out, SNAPSHOT_SIZE - 2));
     return SNAPSHOT_SIZE;
 }
 
 bool unpackSnapshot(const uint8_t in[SNAPSHOT_SIZE], Snapshot& out) {
     if (in[0] != DIVE_VERSION) return false;
+    if (crc16(in, SNAPSHOT_SIZE - 2) !=
+        (uint16_t)(in[SNAPSHOT_SIZE - 2] | (in[SNAPSHOT_SIZE - 1] << 8)))
+        return false;  // torn or overwritten row: the reader stops here
     const uint8_t* p = in + 1;
     out.tSec = rd32(p);
     out.depthCm = static_cast<int32_t>(rd32(p));
@@ -62,7 +73,7 @@ bool unpackSnapshot(const uint8_t in[SNAPSHOT_SIZE], Snapshot& out) {
     for (int i = 0; i < 3; ++i) out.cellX1000[i] = static_cast<int16_t>(rd16(p));
     out.setpointX1000 = static_cast<int16_t>(rd16(p));
     out.mode = *p++;
-    out.alarmBits = *p++;
+    const uint8_t alarmLo = *p++;
     out.cnsPct = *p++;
     out.ceilingCm = static_cast<int16_t>(rd16(p));
     out.ndlMin = static_cast<int16_t>(rd16(p));
@@ -70,7 +81,10 @@ bool unpackSnapshot(const uint8_t in[SNAPSHOT_SIZE], Snapshot& out) {
     out.pulses = rd16(p);
     out.battX1000 = rd16(p);
     out.tempC = static_cast<int8_t>(*p++);
-    out.flags = *p++;
+    const uint8_t rawFlags = *p++;
+    out.flags = static_cast<uint8_t>(rawFlags & ~kFLAGS_ALARM_HI);
+    out.alarmBits = static_cast<uint16_t>(alarmLo |
+                                          (((rawFlags & kFLAGS_ALARM_HI) >> 3) << 8));
     return true;
 }
 
@@ -79,10 +93,14 @@ size_t packEvent(const Event& e, uint8_t out[EVENT_SIZE]) {
     wr32(p, e.tSec);
     wr16(p, static_cast<uint16_t>(e.id));
     wr16(p, e.value);
+    wr16(p, crc16(out, EVENT_SIZE - 2));  // same torn-write rule as snapshots
     return EVENT_SIZE;
 }
 
 bool unpackEvent(const uint8_t in[EVENT_SIZE], Event& out) {
+    if (crc16(in, EVENT_SIZE - 2) !=
+        (uint16_t)(in[EVENT_SIZE - 2] | (in[EVENT_SIZE - 1] << 8)))
+        return false;
     const uint8_t* p = in;
     out.tSec = rd32(p);
     out.id = static_cast<EventId>(rd16(p));

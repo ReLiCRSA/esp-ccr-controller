@@ -62,6 +62,14 @@ public:
     void setPresentMask(uint8_t mask); // bench: 0b011 until 3rd cell fitted
     uint8_t presentMask() const { return present_; }
 
+    /// Evidence from outside this layer (CellProof): cells that have been shown
+    /// not to track high ppO2. Treated like any other exclusion — reported in
+    /// activeMask/disagreement, not allowed to vote — and it stays until the
+    /// mask is cleared by a later proof or the dive ends. The drift hysteresis
+    /// must not quietly re-admit a cell the machine has proof against.
+    void setProofExclusion(uint8_t mask) { proofMask_ = static_cast<uint8_t>(mask & present_); }
+    uint8_t proofExclusion() const { return proofMask_; }
+
     // One update per sensor cycle. ppo2[] in bar; dtMs since previous update.
     Result update(const float ppo2[NCELL], uint32_t dtMs);
 
@@ -73,6 +81,7 @@ private:
 
     Config cfg_;
     uint8_t present_ = 0x7;
+    uint8_t proofMask_ = 0;  // cells excluded on CellProof evidence
     CellStatus st_[NCELL];
     bool seen_[NCELL] = {false, false, false};
 };

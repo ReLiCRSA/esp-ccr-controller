@@ -74,6 +74,7 @@ public:
     bool alarmOn(uint8_t bit) const { return loop_.alarmBits() & (1u << bit); }
     cellproof::State cpState() const { return loop_.cellproof().state; }
     uint8_t cpUnprovenMask() const { return loop_.cellproof().unprovenHighMask; }
+    uint8_t proofExclusion() const { return loop_.proofExclusion(); }
     bool cpClampActive() const { return loop_.cellproof().clampActive; }
     const inj::Output& injOut() const { return loop_.injector(); }
     uint32_t pulseCount() const { return loop_.pulseCount(); }

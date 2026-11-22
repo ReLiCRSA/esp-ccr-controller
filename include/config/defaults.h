@@ -98,10 +98,22 @@
 #define CELLPROOF_MIN_BAR           1.00f
 #define CELLPROOF_TIMEOUT_MS        60000
 #define CELLPROOF_MAXSP_BAR         0.90f
+// Re-arm: cells honest at 10 m can fail at 40 m, and a proof that only runs on
+// first descent cannot see it. The trigger is the machine's own evidence - a
+// cell it has REJECTED reading this much above the vote, held this long. The
+// 50-dive soak showed why it matters: a lying pair stuck above the setpoint
+// keeps the valve shut and starves the loop at depth (vote 0.82, real 0.12).
+#define CELLPROOF_SUSPECT_GAP_BAR   0.10f   // 2x drift bar: contested, not wobbling
+#define CELLPROOF_SUSPECT_MS        20000
+#define CELLPROOF_REARM_COOLDOWN_MS 300000
+#define CELLPROOF_MAX_ATTEMPTS      3
 
 // --- Alarms --------------------------------------------------------------------
 #define PPO2_LOW_ALARM_BAR          0.18f
-#define PPO2_HIGH_ALARM_BAR         1.45f
+// Order matters: ALARM (1.40) < INJ_HIGH_WALL (1.45) < INJ_CUTOFF (1.60).
+// With the alarm at the wall value the wall silently caps enrichment — the
+// loop sits at 1.45 with the diver never told. Found by the 50-dive soak.
+#define PPO2_HIGH_ALARM_BAR         1.40f
 #define CNS_ALARM_PCT               80.0f
 
 // --- Pre-dive (PLAN.md 7) -------------------------------------------------------

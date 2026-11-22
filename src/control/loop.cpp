@@ -111,6 +111,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     ci.votedBar = vote_.votedPpo2;
     for (int i = 0; i < 3; i++) ci.cellsBar[i] = cellBar_[i];
     ci.activeMask = vote_.activeMask;
+    ci.presentMask = cfg_.presentMask;
     ci.nowMs = nowMs;
     cpOut_ = cpEng_.update(ci);
 
@@ -120,6 +121,35 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     spTarget_ = sp.value;
     if (cpOut_.requestSpOverride) spTarget_ = cpCfg_.spBar;  // test demand
     else if (cpOut_.clampActive) spTarget_ = std::min(spTarget_, cpCfg_.okMaxSpBar);
+
+    // ---- 5b. and the proof has teeth ---------------------------------------
+    // A cell that could not prove at the high setpoint may not carry the vote
+    // while the machine is demanding one. Without this the proof is only a note
+    // for the display: a lying pair goes on outvoting the honest cell, and a
+    // vote sitting ABOVE the setpoint means the valve never opens again — the
+    // loop starves at depth while the readout insists it is rich (found by the
+    // 50-dive soak, dive 4: vote 0.82, real loop 0.12 bar at 27 m). The ban
+    // takes effect on the next cycle's vote, and lifts in the shallow bands,
+    // where unproven-at-high cells are good enough and the redundancy is worth
+    // getting back.
+    const uint8_t unproven = cpOut_.unprovenHighMask;
+    float cellLo = 99.0f, cellHi = -99.0f;
+    for (int i = 0; i < 3; i++)
+        if (cfg_.presentMask & (1u << i)) {
+            cellLo = std::min(cellLo, cellBar_[i]);
+            cellHi = std::max(cellHi, cellBar_[i]);
+        }
+    // Gating the ban on the setpoint band alone was wrong: a cell that sits
+    // still while the loop moves is useless at ANY setpoint, and lifting the ban
+    // on the way up through the shallow bands handed the vote back to the liars
+    // (dive 4: 0.82 bar frozen against a loop that was really at 0.42). So the
+    // ban holds while the machine is demanding a high setpoint, and also while
+    // the fitted cells still disagree by more than the drift bar — which is the
+    // same disagreement the voting layer itself refuses to average over.
+    const bool cellsDisagree = (cellHi - cellLo) > cfg_.voting.driftBar;
+    const uint8_t proofBan =
+        (unproven && (spTarget_ > cpCfg_.okMaxSpBar || cellsDisagree)) ? unproven : 0u;
+    voting_.setProofExclusion(proofBan);
 
     // ---- 6. injector -------------------------------------------------------
     inj::Input ii;

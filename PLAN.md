@@ -344,8 +344,20 @@ The chain itself moved into `ctrl::Loop` (`src/control/loop.{h,cpp}`), which the
 firmware `ControlTask` instantiates unchanged — `sim/rig` is now only the bolt
 between that chain and the gas model. `test/test_loop/` covers what only exists
 between the modules (staleness gating the valve, the output fuse, the AUTO
-lockout, a spiked depth sample vs the bands). Suite total: **97 cases across 16
-native suites**, plus `pio run -e esp32` and `esp32_stalltest` building clean.
+lockout, a spiked depth sample vs the bands). `test/test_divesoak/` is the M6
+exit criterion: **50 seeded dives** (7 of them pre-dive lockouts) with faults
+injected through the world only, asserting per-tick invariants rather than
+expectations. Suite total: **112 cases across 17 native suites**, plus
+`pio run -e esp32` and `esp32_stalltest` building clean.
+
+The soak is checked for **sensitivity, not just greenness**: removing the
+per-cell high veto, moving the high alarm back to the wall value, un-binding the
+CellProof verdict from the vote, or dropping the codec's high alarm bits each
+makes it fail. What it deliberately cannot reach: the staleness gate, the depth
+filter and the stuck-open hysteresis (the gas model never makes a sample stale
+or a reading dither) — `test_loop`, `test_depth` and `test_injector` own those.
+Two real firmware bugs and one modelling bug came out of writing it, all
+recorded in §16.
 `sim/world.{h,cpp}` is the physics side (loop O₂ content in litres-atm, SAC ×
 ambient consumption, deterministic LCG noise, cell faults DEAD / SATURATE /
 SLOW / STUCK_AT, stuck-open solenoid, diluent flush). `sim/rig.{h,cpp}` wires
@@ -385,7 +397,7 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
 | **M3** | BMP085 driver (+ breathe-on-it depth sim), setpoint crossovers + clamps, dive file format, MS5837 driver incl. Errata 2, CellProof | Setpoint crossovers verified by breathing on the BMP085; dive CSV exports correctly |
 | **M4** | **Simulator-first** deco: ZHL-16C + NDL + schedule + CNS → unit tests vs published tables → sim world model + fault injection → DECO LED + `D,` UART line + web ladder | Unit tests match published NDL/deco tables; sim soak runs show no setpoint escapes |
 | **M5** | UART protocol complete, web server (status/histogram/settings/checklist/dives, mobile-first), WiFi auto-off | Handset integration on real UART; UI usable on a phone over the AP |
-| **M6** | System sim soak + hardening: 50 scripted dives incl. faults; MS5837 swap/potting checklist; battery redundancy notes | Zero missed alarms / setpoint escapes across the soak suite; production soak harness in CI-ish loop |
+| **M6** | System sim soak + hardening: 50 scripted dives incl. faults; MS5837 swap/potting checklist; battery redundancy notes | **Sim half done:** 50-dive seeded soak green (`test_divesoak`), mutation-checked for sensitivity; it paid for itself with the CellProof 2-vs-1 starvation chain (§16). Bench half pending the port: MS5837 swap + potting checklist, mechanical inhibit bench test. Residual hardening candidate: a scheduled proof (`maxAttempts`/cooldown currently bound the cost) and the diver's own bailout as the physical backstop |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -441,6 +453,57 @@ Still to do here: the `T,`/`D,`/`E,` stdout bridge and the headless web view.
   leading fields; `vote= sp= al= mode= pulses= sol= ctrl=` were appended. The
   soak harness and the firmware must stay in step or a 24 h run silently loses
   its telemetry columns.
+- **Alarm threshold sits BELOW the injection wall** (`alarms::Config::highBar`
+  1.40 < `inj::highWallBar` 1.45 < `inj::cutoffBar` 1.60). With the alarm at the
+  wall value the wall silently caps enrichment: the loop parks at 1.45 and the
+  diver is never told why the setpoint is not being met. Found by the 50-dive
+  soak (dive 26/42); moving the alarm back to 1.60 makes that suite fail.
+- **Dive-file records are fixed-stride and each carries its own CRC16**. The v1
+  codec wrote **34 bytes into a 32-byte record** — appended back to back, every
+  snapshot silently corrupted its neighbour. `SNAPSHOT_SIZE` is 36 (34 B of
+  fields + CRC) and `EVENT_SIZE` 10; `test_logfmt` guards the stride with
+  canary bytes. The alarm set is 10 bits wide and the record has no spare byte,
+  so bits 8..9 (CNS_HIGH, HYPOXIA) ride in bits 3..4 of `flags`
+  (`kFLAGS_ALARM_HI = 0x18`), cleared back out on unpack. `DIVE_VERSION` is 2.
+  The LittleFS reader must **stop at the first record whose CRC fails** — a
+  reset mid-write may truncate a dive, it may not turn it into plausible
+  garbage.
+- **A cell proof is only worth what it changes.** Four separate gaps, all found
+  by the soak (dive 4: vote 0.82 bar, real loop 0.12 bar at 27 m — the loop was
+  being *starved*, not over-enriched):
+  * the verdict is **per cell**, and every *fitted* cell is judged including one
+    the voting layer dropped (requiring the vote to reach the proof level first
+    lets a lying pair hide the honest cell);
+  * a cell proves itself by **tracking** the demand change, not by sitting at a
+    plausible number (`trackMinBar` 0.05, 10× the sim's cell noise) — a cell
+    frozen at 1.20 bar would otherwise "prove" itself in a loop at 1.20;
+  * a PASS **re-arms** when a rejected cell is persistently off the vote in
+    either direction (gap 0.10 = 2× drift bar, cooldown 300 s, 3 attempts per
+    dive). A proof that only runs on first descent cannot see a cell that was
+    honest at 10 m and failed at 40 m. A FAIL does not self-re-arm: the clamp is
+    the safe state and lifting it is the diver's `OVERRIDE`;
+  * and the verdict **must bind the vote** (`ctrl::Loop` step 5b →
+    `voting::Engine::setProofExclusion`) while the setpoint is above `okMaxSpBar`
+    or the fitted cells still disagree. Un-bound, the proof is a display note:
+    the lying pair goes on outvoting the honest cell, a vote above setpoint
+    means the valve never opens, and consumption empties the loop.
+- **A voting ban must never leave the machine with no vote.** If the CellProof
+  exclusion empties the trusted set, a cell excluded on drift alone votes
+  instead (tier 2) and `disagreement` stays set — no vote means no injection, so
+  it has to be the last resort, not the first. Related: drift strikes are a
+  **threshold, capped at `driftWindow`**, not an accumulator, so the documented
+  hysteresis (back after `driftWindow/2` clean samples) stays true however long
+  a cell was out.
+- **Simulator authoring traps** (each one made the suite meaningless rather than
+  failing it): a diver model that descends to chase a rising ceiling loads more
+  tissue and deepens it — the ceiling is an *ascent* floor only (one soak diver
+  ran itself to 208 m); a depth clamp written as an unconditional
+  `if (depth < target) depth = target` after the rate step **teleports** the
+  diver and makes every dive instantaneous; a fault generator must never leave a
+  3-cell rig with no honest channel (asserting detection there is asserting the
+  impossible — that case belongs in `test_sim`, with the third cell left honest
+  on purpose); and a cell "jump" must stay under the plausibility gate
+  (0.5 bar/sample), because the gate is right to reject bigger ones.
 - Solenoid driver circuit must fail **closed** on a floating/pulled-low gate;
   keep firmware max duty low; recommend a hardware manual-inhibit switch in the
   O₂ line that needs zero firmware cooperation.

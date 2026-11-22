@@ -206,7 +206,11 @@ void test_two_lying_cells_veto() {
 
     TEST_ASSERT_TRUE_MESSAGE(alarmSeen(rig, BIT_HIGH_PPO2, 90.0f),
                              "honest cell never raised the high alarm");
-    TEST_ASSERT_TRUE_MESSAGE(rig.injOut().inhibitedHigh, "injector not inhibited at the wall");
+    // The wall is a state, not a moment: the alarm threshold sits below it, so
+    // the alarm arrives first and the wall engages a little later.
+    bool inhibited = false;
+    for (int i = 0; i < 400 && !inhibited; i++) { rig.tick(); inhibited = rig.injOut().inhibitedHigh; }
+    TEST_ASSERT_TRUE_MESSAGE(inhibited, "injector not inhibited at the wall");
     TEST_ASSERT_LESS_THAN_FLOAT_MESSAGE(1.80f, rig.maxTrueSeen,
                                         "injection not vetoed: loop went toxic");
     rig.endDive();

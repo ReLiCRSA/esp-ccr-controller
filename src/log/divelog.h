@@ -4,10 +4,13 @@
 //
 // Wire format (little-endian, versioned, CRC16-protected):
 //   DiveHeader { magic "RBDV", version, meta..., crc16 }
-//   Snapshot   { fixed 32 B, snapshot at dive-grid or event-driven }
-//   Event      { fixed 8 B, timestamped machine event (alarm/ack/mode/cal) }
-// The 32 B snapshot grid is why ~1 h dives cost ~15 KB total — ten dives
-// fit with enormous margin on any flash scheme.
+//   Snapshot   { fixed 36 B, snapshot at dive-grid or event-driven }
+//   Event      { fixed 10 B, timestamped machine event (alarm/ack/mode/cal) }
+// Every record carries its own CRC16, not just the header: the file is written
+// while the diver is underwater, so a reset mid-write must leave the reader a
+// place to stop instead of a row of plausible garbage.
+// The fixed grid is why ~1 h dives cost ~15 KB total — ten dives fit with
+// enormous margin on any flash scheme.
 // ============================================================================
 #pragma once
 
@@ -17,9 +20,13 @@
 namespace logfmt {
 
 constexpr uint32_t DIVE_MAGIC = 0x56444252; // "RBDV" little-endian
-constexpr uint8_t DIVE_VERSION = 1;
-constexpr size_t SNAPSHOT_SIZE = 32;
-constexpr size_t EVENT_SIZE = 8;
+// v2: the snapshot alarm mask widened to 10 bits (see Snapshot::alarmBits).
+// v1 files never left the bench, and a v1 decoder must not misread v2 flags.
+constexpr uint8_t DIVE_VERSION = 2;
+constexpr size_t SNAPSHOT_SIZE = 36;  // 34 B of fields + CRC16, see below
+constexpr size_t EVENT_SIZE = 10;     // 8 B of fields + CRC16
+// flags bits 3..4 are the wire home for alarm bits 8..9 (see Snapshot).
+constexpr uint8_t kFLAGS_ALARM_HI = 0x18;
 
 // Event ids (handset D,/E, lines use the same numbers).
 enum EventId : uint16_t {
@@ -37,7 +44,12 @@ struct Snapshot {
     int16_t cellX1000[3];
     int16_t setpointX1000;
     uint8_t mode;        // 0 standby 1 auto 2 manual 3 safe
-    uint8_t alarmBits;   // bit per active alarm
+    // The alarm set is protocol-visible and has 10 bits (BIT_LOW_PPO2 ..
+    // BIT_HYPOXIA); the snapshot grid has no spare byte, so the wire carries
+    // bits 0..7 inline and borrows bits 3..4 of `flags` for 8..9. The struct
+    // keeps the full mask and unpack clears the borrowed bits out of `flags`,
+    // so a hypoxia or CNS row in a dive file is never silently lost.
+    uint16_t alarmBits;
     uint8_t cnsPct;      // capped 255
     int16_t ceilingCm;
     int16_t ndlMin;      // 480 = effectively unlimited
@@ -46,6 +58,7 @@ struct Snapshot {
     uint16_t battX1000;
     int8_t tempC;
     uint8_t flags;       // b0 sp-clamped, b1..2 voting mode(0 ok,1 2cell,2 single,3 fail)
+                         // (b3..4 are used on the wire only, never by callers)
 };
 
 struct Event {

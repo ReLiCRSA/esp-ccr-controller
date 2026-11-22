@@ -340,6 +340,10 @@ static void buildControlConfig() {
     g_ctrlCfg.cellproof.minPassBar = CELLPROOF_MIN_BAR;
     g_ctrlCfg.cellproof.timeoutMs = CELLPROOF_TIMEOUT_MS;
     g_ctrlCfg.cellproof.okMaxSpBar = CELLPROOF_MAXSP_BAR;
+    g_ctrlCfg.cellproof.suspectGapBar = CELLPROOF_SUSPECT_GAP_BAR;
+    g_ctrlCfg.cellproof.suspectMs = CELLPROOF_SUSPECT_MS;
+    g_ctrlCfg.cellproof.rearmCooldownMs = CELLPROOF_REARM_COOLDOWN_MS;
+    g_ctrlCfg.cellproof.maxAttempts = CELLPROOF_MAX_ATTEMPTS;
 
     g_ctrlCfg.alarms.lowBar = PPO2_LOW_ALARM_BAR;
     g_ctrlCfg.alarms.highBar = PPO2_HIGH_ALARM_BAR;

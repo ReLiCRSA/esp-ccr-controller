@@ -112,6 +112,43 @@ void test_lone_cell_reports_single_mode() {
     TEST_ASSERT_TRUE(last.hypoxiaSuspect);
 }
 
+// CellProof evidence has to bind the vote, and it has to survive the drift
+// layer's own re-admission: a cell the machine has proof against may not slide
+// back in because it happened to agree for a few samples.
+void test_proof_exclusion_outranks_drift_hysteresis() {
+    Engine e{Config{}};
+    for (int i = 0; i < 5; ++i) feedRet(e, 1.20f, 1.20f, 1.45f);
+    e.setProofExclusion(0b011);
+    feedRet(e, 1.20f, 1.20f, 1.45f);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0b100, last.activeMask, "banned cells still voting");
+    TEST_ASSERT_FLOAT_WITHIN(0.005, 1.45, last.votedPpo2);
+    TEST_ASSERT_EQUAL_UINT8(Mode::SINGLE, last.mode);
+    TEST_ASSERT_TRUE(last.disagreement);
+
+    for (int i = 0; i < 30; ++i) feedRet(e, 1.20f, 1.20f, 1.45f);  // steady agreement
+    TEST_ASSERT_EQUAL_UINT8(0b100, last.activeMask);               // still banned
+
+    e.setProofExclusion(0);                                        // re-proved
+    for (int i = 0; i < 15; ++i) feedRet(e, 1.20f, 1.20f, 1.20f);  // readings agree again
+    TEST_ASSERT_EQUAL_UINT8(0b111, last.activeMask);               // redundancy back
+}
+
+// Banning cells must never leave the machine blind: if the ban empties the
+// trusted set, a cell excluded on drift alone votes instead. No vote means no
+// injection, so "no vote" has to be the last resort, not the first.
+void test_ban_that_empties_the_vote_falls_back_to_a_drifted_cell() {
+    Engine e{Config{}};
+    for (int i = 0; i < 20; ++i) feedRet(e, 0.82f, 0.82f, 1.45f);  // drift drops cell 2
+    TEST_ASSERT_EQUAL_UINT8(0b011, last.activeMask);
+
+    e.setProofExclusion(0b011);   // the proof says the pair is the one lying
+    feedRet(e, 0.82f, 0.82f, 1.45f);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0b100, last.activeMask,
+                                    "ban left the machine with no vote at all");
+    TEST_ASSERT_FLOAT_WITHIN(0.005, 1.45, last.votedPpo2);
+    TEST_ASSERT_TRUE(last.disagreement);   // and the diver is still told why
+}
+
 void test_health_scores_degrade_for_bad_cells() {
     Engine e{Config{}};
     feed(e, 0.40f, 0.40f, 0.40f);
@@ -131,5 +168,7 @@ int main() {
     RUN_TEST(test_drifted_cell_excluded_then_returns_with_hysteresis);
     RUN_TEST(test_lone_cell_reports_single_mode);
     RUN_TEST(test_health_scores_degrade_for_bad_cells);
+    RUN_TEST(test_proof_exclusion_outranks_drift_hysteresis);
+    RUN_TEST(test_ban_that_empties_the_vote_falls_back_to_a_drifted_cell);
     return UNITY_END();
 }

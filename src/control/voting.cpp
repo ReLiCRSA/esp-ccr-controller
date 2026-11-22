@@ -80,20 +80,35 @@ Result Engine::update(const float ppo2[NCELL], uint32_t dtMs) {
 
     // ---- (re)activate the base set on first plausible samples --------------
     for (uint8_t i = 0; i < NCELL; ++i) {
-        if ((present_ & (1u << i)) && seen_[i] && st_[i].driftStrikes == 0)
+        if ((present_ & (1u << i)) && seen_[i] && st_[i].driftStrikes == 0 &&
+            !(proofMask_ & (1u << i)))
             st_[i].active = true;
     }
 
     // ---- vote among active cells -------------------------------------------
+    // Two tiers. Trusted cells vote; if the CellProof ban has just emptied the
+    // set, a cell that is out on drift alone votes instead of the machine
+    // admitting it cannot see the loop at all (the reading it tracks is still
+    // the best evidence available, and no-vote means no injection).
     float vals[NCELL];
     int n = 0;
     uint8_t prevActive = 0;
+    uint8_t fallback = 0;
     for (uint8_t i = 0; i < NCELL; ++i) {
-        if (st_[i].active && (present_ & (1u << i)) && seen_[i]) {
-            vals[n++] = st_[i].last;
-            prevActive |= (1u << i);
-        }
+        if (!(present_ & (1u << i)) || !seen_[i]) continue;
+        // CellProof evidence outranks the drift machinery for as long as it
+        // stands: a cell that could not prove at the high setpoint may not
+        // carry a vote while the machine is running a high setpoint.
+        if (proofMask_ & (1u << i)) { st_[i].active = false; continue; }
+        if (st_[i].active) prevActive |= (1u << i);
+        else fallback |= (1u << i);
     }
+    if (prevActive == 0) {
+        prevActive = fallback;
+        if (fallback) res.disagreement = true;  // a lone drifting cell is still news
+    }
+    for (uint8_t i = 0; i < NCELL; ++i)
+        if (prevActive & (1u << i)) vals[n++] = st_[i].last;
     res.activeMask = prevActive;
 
     if (n == 0) {
@@ -116,7 +131,11 @@ Result Engine::update(const float ppo2[NCELL], uint32_t dtMs) {
         st_[i].emaDeviation = st_[i].emaDeviation * 0.95f + dev * 0.05f;
 
         if (dev > cfg_.driftBar) {
-            st_[i].driftStrikes = static_cast<uint16_t>(st_[i].driftStrikes + 1);
+            // Strikes are a threshold, not an accumulator: capping them at
+            // driftWindow keeps the documented hysteresis honest (a cell is
+            // back after driftWindow/2 clean samples, however long it was out).
+            if (st_[i].driftStrikes < cfg_.driftWindow)
+                st_[i].driftStrikes = static_cast<uint16_t>(st_[i].driftStrikes + 1);
             if (st_[i].driftStrikes >= cfg_.driftWindow && st_[i].active) {
                 st_[i].active = false;
                 res.dropoutEvent = false; // not a collapse; slow drift-out
@@ -124,7 +143,7 @@ Result Engine::update(const float ppo2[NCELL], uint32_t dtMs) {
         } else if (dev < cfg_.driftBar * 0.5f) {
             // hysteresis return: driftWindow/2 clean samples inside half-band
             if (st_[i].driftStrikes > 0) st_[i].driftStrikes--;
-            if (st_[i].driftStrikes == 0) st_[i].active = true;
+            if (st_[i].driftStrikes == 0) st_[i].active = !(proofMask_ & (1u << i));
         }
         if (!st_[i].active) res.disagreement = true;
 

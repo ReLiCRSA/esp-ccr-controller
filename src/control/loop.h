@@ -108,6 +108,9 @@ public:
     // ---- telemetry readers -------------------------------------------------
     const voting::Result& vote() const { return vote_; }
     const voting::CellStatus& cell(uint8_t ch) const { return voting_.cell(ch); }
+    /// Diagnostics: which cells are currently barred from the vote on CellProof
+    /// evidence (the handset and web pages show why the count dropped).
+    uint8_t proofExclusion() const { return voting_.proofExclusion(); }
     const alarms::Result& alarms() const { return alarmRes_; }
     uint16_t alarmBits() const { return alarmRes_.bits; }
     const cellproof::Output& cellproof() const { return cpOut_; }

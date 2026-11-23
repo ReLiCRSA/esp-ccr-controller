@@ -193,14 +193,31 @@ lie at depth. CellProof catches exactly this:
 - GF low/high configurable (default 30/85) → ceiling depth, stop ladder
   (depth + time per stop, ~6 stops), total ascent time at `ASC_RATE` (6 m/min)
   with last 3 m at `ASC_RATE_SLOW` (1 m/min).
-- **NDL** = no-stop time remaining at current depth: forward-simulate tissue
-  loading holding depth until GF ceiling exceeds current depth. 0 whenever a
-  ceiling already exists.
+- **NDL** = no-stop time remaining at current depth: can a **direct ascent**
+  (config rates + deco gas assumptions, no stops) still be flown without
+  breaking the ceiling anywhere? That is the dive-computer/published-table
+  meaning. (The first revision asked "when does the ceiling exceed current
+  depth", which never happens at CCR setpoints and reported 480 min at 30 m;
+  fixed 2026-11-23.) 0 whenever a stop is already obligatory.
 - **CNS O₂** single-trigger clock (NOAA table), alarm at 80%.
-- Validated in `test/` against published NDL tables and published deco
-  schedules; invariants checked (NDL monotonic, ceiling continuous, schedule
-  total = stops + ascent). Compared against an independent implementation
-  (Subsurface-derived) in the sim harness.
+- **Cross-validated 2026-11-23** (`test/test_deco/test_published.cpp`):
+  parameters cell-by-cell vs Wikipedia ZH-L16C table and Subsurface
+  `core/deco.cpp`; M-form `M = a + P/b` and ceiling algebra vs Subsurface and
+  repied/paliers `src/gf.ts` (run as an independent oracle under node); stop
+  schedules vs the published "Buhlmann Air Decompression Tables" (Deco_Package,
+  tech-diving.ru) at GF100/100 with the tables' own conventions — 25 entries,
+  mean delta ≈ −2.8 min, fully attributable to ZH-L16 **B**-(tables) vs
+  **C**(engine) scheme and wet vs dry alveolar ppN₂; NDL transitions land on
+  the published ones (30 m: engine 19.7 min, tables flip at 20). Two real
+  bugs fixed on the way: the M-form (was `a + b·P` — inflated deco 2–3×)
+  and the NDL definition above; also the CNS table (NOAA 0.8→450 not 360,
+  0.7→570 not 540).
+- **GF variant, decided:** per-tissue GF interpolation (gfLow→gfHigh over
+  the a-coefficients — the classic dive-computer model, what Shearwater/DJD
+  do). paliers/Subsurface planners interpolate GF by depth instead; at
+  symmetric GFs the variants coincide (that is where the tight cross-impl
+  asserts live), at 30/85 the per-tissue variant is systematically longer —
+  documented band, not an identity claim.
 - Caveat: simulator + unit validation is bench confidence, **not** a dive-
   release certification.
 
@@ -510,6 +527,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board**; web half verified over the air from the PC (AP `ESP-CCR-3828`: captive DNS, batched replies, 180 s / 178 replies / 0 socket drops). Reflash chain: `1b8c807` (tag `m2-flashed`) → web-fix build (tag `m2-web-fixes`). Handset refusal matrix pending: needs the UART2 adapter wired to 16/17. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
+| M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done (this batch) |
 
 ## 16. Design watch-outs (recorded decisions)
 

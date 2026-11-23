@@ -89,10 +89,13 @@ void Zhl16Ccr::step(double dtSec, double pAmbBar, double ppO2Bar) {
 }
 
 double Zhl16Ccr::ceilingBarFrom(const double pt[NCOMP], const float gf[NCOMP]) {
+    // GF condition pt <= P + gf*(M(P) - P) with M(P) = a + P/b, solved for P.
+    // Algebraically identical to Subsurface core/deco.cpp's
+    // (b*T - gf*a*b) / ((1-b)*gf + b) and to (T-a)*b at gf = 1.
     double pc = 0.0;
     for (int i = 0; i < NCOMP; ++i) {
         const double g = gf[i];
-        const double tol = (pt[i] - g * kA[i]) / (1.0 - g * (1.0 - kB[i]));
+        const double tol = kB[i] * (pt[i] - g * kA[i]) / (kB[i] + g * (1.0 - kB[i]));
         pc = std::max(pc, tol);
     }
     return pc;
@@ -106,21 +109,62 @@ double Zhl16Ccr::ceilingM() const {
 }
 
 double Zhl16Ccr::ndlMinutes(double pAmbBar, double ppO2Bar, double maxMin) const {
-    double sim[NCOMP];
-    std::copy(pt_, pt_ + NCOMP, sim);
-    double tMin = 0.0;
-    while (tMin < maxMin) {
-        // advance 1 minute at constant depth
-        const double ppN2 = std::max(0.0, pAmbBar - cfg_.ph2oBar - cfg_.pco2Bar - ppO2Bar);
+    // "No decompression limit": the time that can still be spent HERE before
+    // a direct ascent at the configured rates/gas plan would break the
+    // ceiling somewhere on the way up. Feasibility is monotonic in time at
+    // depth, so binary-search it; ~12 ascent simulations, each ~90 tissue
+    // steps — cheap enough for a 1 Hz telemetry publish.
+    const double ppN2Bottom = std::max(0.0, pAmbBar - cfg_.ph2oBar - cfg_.pco2Bar - ppO2Bar);
+    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665;
+    auto d2b = [&](double m) { return cfg_.pSurfaceBar + m * rhoG / 1e5; };
+
+    auto ascentClears = [&](const double t0[NCOMP]) {
+        double sim[NCOMP];
+        std::copy(t0, t0 + NCOMP, sim);
+        auto ppN2At = [&](double m) {
+            const double p = d2b(m);
+            const double ppO2 = cfg_.decoAirFraction > 0.0f
+                                    ? cfg_.decoAirFraction * (p - cfg_.ph2oBar)
+                                    : (m >= cfg_.deepSwitchM ? cfg_.decoSpDeepBar
+                                                             : cfg_.decoSpShallowBar);
+            return std::max(0.0, p - cfg_.ph2oBar - cfg_.pco2Bar - ppO2);
+        };
+        double depth = barToDepthM(pAmbBar);
+        while (depth > 1e-9) {
+            const double rate = (depth <= cfg_.slowAscentDepthM) ? cfg_.ascentRateSlowM
+                                                                 : cfg_.ascentRateM;
+            if (rate <= 0.0f) return false;  // cannot ascend: never NDL-clear
+            double hSec = 5.0;
+            double drop = rate / 60.0 * hSec;
+            if (drop > depth) { drop = depth; hSec = drop * 60.0 / rate; }
+            const double ppN2 = ppN2At(depth - drop * 0.5);
+            for (int i = 0; i < NCOMP; ++i) {
+                const double k = kLn2 / (kHalfTimeMin[i] * 60.0);
+                sim[i] += (ppN2 - sim[i]) * (1.0 - std::exp(-k * hSec));
+            }
+            depth -= drop;
+            if (ceilingBarFrom(sim, gf_) > d2b(depth) + 1e-4) return false;
+        }
+        return true;
+    };
+
+    auto clearedFor = [&](double minutesAtDepth) {
+        double sim[NCOMP];
         for (int i = 0; i < NCOMP; ++i) {
             const double k = kLn2 / (kHalfTimeMin[i] * 60.0);
-            sim[i] += (ppN2 - sim[i]) * (1.0 - std::exp(-k * 60.0));
+            sim[i] = pt_[i] + (ppN2Bottom - pt_[i]) * (1.0 - std::exp(-k * minutesAtDepth * 60.0));
         }
-        tMin += 1.0;
-        if (barToDepthM(ceilingBarFrom(sim, gf_)) > barToDepthM(pAmbBar) + 0.01)
-            return tMin;
+        return ascentClears(sim);
+    };
+
+    if (!clearedFor(0.0)) return 0.0;   // already obligated: a stop is due now
+    if (clearedFor(maxMin)) return maxMin;
+    double lo = 0.0, hi = maxMin;
+    for (int it = 0; it < 12 && hi - lo > 0.25; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        if (clearedFor(mid)) lo = mid; else hi = mid;
     }
-    return maxMin;
+    return hi;  // conservative: first time at which the direct ascent breaks
 }
 
 Zhl16Ccr::Schedule Zhl16Ccr::schedule(double pAmbBar) const {
@@ -143,7 +187,10 @@ Zhl16Ccr::Schedule Zhl16Ccr::schedule(double pAmbBar) const {
     sched.capped = false;
 
     auto ppO2At = [&](double m) {
-        return m >= cfg_.deepSwitchM ? cfg_.decoSpDeepBar : cfg_.decoSpShallowBar;
+        if (cfg_.decoAirFraction > 0.0f)  // OC gas (published-table replication, bailout planning)
+            return static_cast<double>(cfg_.decoAirFraction) * (d2b(m) - cfg_.ph2oBar);
+        return static_cast<double>(m >= cfg_.deepSwitchM ? cfg_.decoSpDeepBar
+                                                         : cfg_.decoSpShallowBar);
     };
     auto rateAt = [&](double fromM, double toM) {
         return toM <= cfg_.slowAscentDepthM && fromM <= cfg_.slowAscentDepthM + grid
@@ -206,13 +253,16 @@ Zhl16Ccr::Schedule Zhl16Ccr::schedule(double pAmbBar) const {
 }
 
 double Zhl16Ccr::cnsLimitMin(double ppO2) {
-    // NOAA single-exposure limits (min) below ppO2 1.6. Above 1.6 there is no
-    // safe limit; we accumulate at the 1.6 rate (45 min) and the alarm layer
-    // (high ppO2 hard cutoff) owns protection.
+    // NOAA single-exposure limits (min), as published (NOAA Diving Manual;
+    // the same table with matching %CNS/min column in the Deco_Package PDF,
+    // tech-diving.ru — 1/limit equals its %/min column row for row). Below
+    // ppO2 0.6 no accrual is counted (0.6 itself: 720 min). Above 1.6 there
+    // is no safe limit; we accumulate at the 1.6 rate (45 min) and the
+    // alarm layer (high ppO2 hard cutoff) owns protection.
     struct Row { double p; double min; };
     static const Row rows[] = {
-        {0.00, 1e9}, {0.50, 1e9}, {0.60, 720.0}, {0.70, 540.0},
-        {0.80, 360.0}, {0.90, 360.0}, {1.00, 300.0}, {1.10, 240.0},
+        {0.00, 1e9}, {0.50, 1e9}, {0.60, 720.0}, {0.70, 570.0},
+        {0.80, 450.0}, {0.90, 360.0}, {1.00, 300.0}, {1.10, 240.0},
         {1.20, 210.0}, {1.30, 180.0}, {1.40, 150.0}, {1.50, 120.0},
         {1.60, 45.0}, {9.99, 45.0},
     };

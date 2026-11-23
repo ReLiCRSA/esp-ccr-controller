@@ -2,20 +2,28 @@
 // zhl16c.h — Buhlmann ZH-L16C for a CCR: tissue N2, gradient-factor ceiling,
 // NDL, ascent-schedule prediction and CNS O2 clock.
 //
-// Parameter source: Buhlmann, Tauchmedizin (2002) ZH-L16C air/nitrox set,
-// as tabulated in "Buhlmann decompression algorithm" (Wikipedia, accessed
-// 2026) — the LINEAR tolerated-pressure form:
-//     Ptol_i = a_i + b_i * Pamb          (a,b per compartment)
+// Parameter source: Buhlmann ZH-L16C air/nitrox set (a,b,half-times verified
+// cell-by-cell against the published transcription in "Buhlmann decompression
+// algorithm" (Wikipedia, accessed 2026) and the arrays in Subsurface's
+// core/deco.cpp). The LINEAR tolerated-pressure form (Buhlmann 1983/86; the
+// same expression in Subsurface core/deco.cpp and repied/paliers src/gf.ts):
+//     M_i(Pamb) = a_i + Pamb / b_i       (a,b per compartment)
 // Gradient factors scale the tolerated supersaturation (Pti - Pamb):
-//     Pti - Pamb <= gf_i * (a_i - (1-b_i)*Pamb)
-//   => ceiling pressure:  Pamb = (Pti - gf_i*a_i) / (1 - gf_i*(1-b_i))
+//     Pti - Pamb <= gf_i * (M_i(Pamb) - Pamb)
+//   => ceiling pressure:  Pamb = b_i*(Pti - gf_i*a_i) / (b_i + gf_i*(1-b_i))
 // gf_i interpolates gfLow (fastest tissue, largest a) -> gfHigh (slowest).
+// (An earlier revision here used Ptol = a + b*Pamb with these same a,b —
+// WRONG for this parameter set: it puts tolerated pressure BELOW ambient at
+// depth and inflated deco 2-3x. Cross-validated 2026-11-23 against the
+// published Buhlmann air tables and an independent implementation; see
+// test/test_deco. The old form would also assert-fail M >= Pamb.)
 //
 // CCR inert model: alveolar ppN2 = Pamb - ppO2 - pH2O (- pCO2 if configured).
 // pH2O default 0.0627 bar (37 C). pCO2 defaults 0 — omitting it makes ppN2
 // HIGHER (more uptake = more deco): the conservative direction, documented
-// deliberately. Real cross-check against an independent implementation is
-// scheduled in M6; this module's tests pin behavior, not physiology.
+// deliberately. Config.decoAirFraction > 0 switches the SCHEDULE/NDL
+// simulation gas to open-circuit air at that fraction (table validation and
+// OC bailout planning); 0 = CCR setpoint bands.
 //
 // Pure C++ (no Arduino) so it builds on ESP32, PC tests, and the simulator.
 // ============================================================================
@@ -34,7 +42,7 @@ struct Config {
     float pco2Bar = 0.0f;           // alveolar CO2 (0 = conservative default)
 
     float ascentRateM = 6.0f;       // m/min
-    float ascentRateSlowM = 1.0f;   // m/min at or above? no: at or shallower than
+    float ascentRateSlowM = 1.0f;   // m/min at or shallower than slowAscentDepthM
     float slowAscentDepthM = 3.0f;  // ...this depth
     float stopGridM = 3.0f;         // stop depth granularity
 
@@ -42,6 +50,10 @@ struct Config {
     float decoSpDeepBar = 1.3f;     // deeper than deepSwitchM
     float decoSpShallowBar = 0.7f;  // shallower
     float deepSwitchM = 21.0f;
+    // > 0: the simulated ascent breathes OC gas at this O2 fraction
+    // (ppO2 = f*(Pamb - pH2O) at each depth) instead of the SP bands above.
+    // 0.21 reproduces the published Buhlmann AIR tables; default 0 = CCR.
+    float decoAirFraction = 0.0f;
 };
 
 class Zhl16Ccr {
@@ -76,7 +88,12 @@ public:
     double ceilingBar() const;
     double ceilingM() const;              // 0 when no stop demanded
 
-    // NDL = minutes remaining at this depth before the ceiling appears.
+    // NDL = minutes that can still be spent at this depth before a direct
+    // ascent (config rates and deco gas assumptions) would break the ceiling
+    // somewhere on the way up. That is the dive-computer meaning: "time
+    // before any stop becomes obligatory" — NOT "time until the ceiling
+    // exceeds the current depth" (which is essentially never at CCR SPs and
+    // is what the old implementation measured).
     double ndlMinutes(double pAmbBar, double ppO2Bar, double maxMin = 480.0) const;
 
     // Full ascent schedule from current depth with current tissues.

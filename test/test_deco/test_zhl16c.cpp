@@ -1,6 +1,8 @@
-// Unit tests for ZH-L16C CCR deco math. Bands assert behavior sanity and
-// published-model direction; exact schedule cross-validation against an
-// independent implementation is scheduled for M6 (PLAN.md).
+// Unit tests for ZH-L16C CCR deco math: behavior + invariants. The
+// published-table cross-validation lives in test_published.cpp (same suite:
+// done 2026-11-23 vs the Buhlmann air tables and the paliers implementation;
+// the pre-fix bands here were re-banded where the corrected M-form moved
+// behavior, see git history of this file).
 #include <unity.h>
 
 #include <cmath>
@@ -9,6 +11,12 @@
 
 using deco::Config;
 using deco::Zhl16Ccr;
+
+// Published-data suite (test_published.cpp):
+void test_pub_air_table_schedules();
+void test_pub_ndl_structure();
+void test_pub_vs_paliers_cross_impl();
+void test_pub_gf3085_variant_documented();
 
 static Config baseCfg() {
     Config c; // defaults: GF 30/85, sea water, 6 m/min
@@ -63,9 +71,11 @@ void test_ndl_semantics_and_obligation() {
 }
 
 void test_ceiling_monotonic_in_gf() {
-    // Same tissue state, uniformly higher GF -> deeper tolerated ceiling.
-    // GF conservatism is not one axis: lower GF-low buys shorter no-stop
-    // time but shallower first stops; the model must be monotonic in GF.
+    // Same tissue state: LOWER gradient factor tolerates less supersaturation
+    // -> the ceiling it demands is DEEPER (higher pressure), and the stop
+    // schedule is longer. (The first revision of this test asserted the
+    // reverse direction and passed only because the ceiling formula was
+    // wrong; corrected with the M = a + P/b fix.)
     Config g10 = baseCfg(); g10.gfLow = 10; g10.gfHigh = 10;
     Config g50 = baseCfg(); g50.gfLow = 50; g50.gfHigh = 50;
     Config g90 = baseCfg(); g90.gfLow = 90; g90.gfHigh = 90;
@@ -73,14 +83,14 @@ void test_ceiling_monotonic_in_gf() {
     holdAt(a, 40.0f, 1.0f, 35.0f);
     holdAt(b, 40.0f, 1.0f, 35.0f);
     holdAt(c, 40.0f, 1.0f, 35.0f);
-    TEST_ASSERT_TRUE(a.ceilingBar() < b.ceilingBar());
-    TEST_ASSERT_TRUE(b.ceilingBar() < c.ceilingBar());
+    TEST_ASSERT_TRUE(a.ceilingBar() > b.ceilingBar());
+    TEST_ASSERT_TRUE(b.ceilingBar() > c.ceilingBar());
 
     const auto sLo = a.schedule(a.depthToBar(40.0));
     const auto sHi = c.schedule(c.depthToBar(40.0));
     TEST_ASSERT_TRUE(sLo.count > 0 && sHi.count > 0);
     TEST_ASSERT_FALSE(sLo.capped);
-    TEST_ASSERT_TRUE(sLo.stopTimeMin > 0.0f && sHi.stopTimeMin > 0.0f);
+    TEST_ASSERT_TRUE(sLo.stopTimeMin > sHi.stopTimeMin);
 }
 
 void test_schedule_deep_dive_has_ordered_stops_ending_at_3m() {
@@ -101,13 +111,16 @@ void test_schedule_deep_dive_has_ordered_stops_ending_at_3m() {
 
 void test_schedule_short_dive_shallow_stops_only() {
     // GF30/85 is genuinely assertive: even 2 min at 30 m carries a tiny
-    // ceiling. Assert the ceiling stays shallow (<=6 m) and stops are few.
+    // ceiling. With the corrected M-form, GF30 on the fast compartment puts
+    // the ceiling near 8 m right after the descent, so the first stop sits
+    // on the 9 m grid point — still a short, shallow schedule (re-banded
+    // from the pre-fix model, which showed it at <= 6 m).
     Zhl16Ccr d(baseCfg());
     holdAt(d, 30.0f, 0.7f, 2.0f);
     const auto s = d.schedule(d.depthToBar(30.0));
-    TEST_ASSERT_TRUE(s.count <= 2);
+    TEST_ASSERT_TRUE(s.count <= 3);
     for (int i = 0; i < s.count; ++i)
-        TEST_ASSERT_TRUE(s.stops[i].depthM <= 6.01f);
+        TEST_ASSERT_TRUE(s.stops[i].depthM <= 9.01f);
     TEST_ASSERT_TRUE(s.totalTimeMin > 0.0f); // ascent time always accrues
 }
 
@@ -119,6 +132,16 @@ void test_cns_clock_matches_noaa_16() {
     Zhl16Ccr c(baseCfg());
     c.step(60.0 * 60.0, c.depthToBar(5.0), 0.45); // below 0.5 => no accrual
     TEST_ASSERT_FLOAT_WITHIN(0.01, 0.0, c.cnsPct());
+
+    // Corrected NOAA rows (the pre-validation table had 0.8 -> 360 and
+    // 0.7 -> 540; the published table is 450 / 570 and internally
+    // consistent: its %CNS/min column is 1/limit for every row).
+    Zhl16Ccr e(baseCfg());
+    e.step(450.0 * 60.0, e.depthToBar(0.0), 0.8);
+    TEST_ASSERT_FLOAT_WITHIN(2.0, 100.0, e.cnsPct());
+    Zhl16Ccr f(baseCfg());
+    f.step(570.0 * 60.0, f.depthToBar(0.0), 0.7);
+    TEST_ASSERT_FLOAT_WITHIN(2.0, 100.0, f.cnsPct());
 }
 
 void test_pco2_inclusion_is_conservative() {
@@ -141,5 +164,9 @@ int main() {
     RUN_TEST(test_schedule_short_dive_shallow_stops_only);
     RUN_TEST(test_cns_clock_matches_noaa_16);
     RUN_TEST(test_pco2_inclusion_is_conservative);
+    RUN_TEST(test_pub_air_table_schedules);
+    RUN_TEST(test_pub_ndl_structure);
+    RUN_TEST(test_pub_vs_paliers_cross_impl);
+    RUN_TEST(test_pub_gf3085_variant_documented);
     return UNITY_END();
 }

@@ -285,6 +285,15 @@ on it. Per-transport routers looked harmless and were not: each keeps its own
 memory of what the diver asked for, so a handset would bring the radio back at
 dive end because *its* router never heard the phone turn WiFi off.
 
+**The full wire contract, written out for whoever builds the handset:**
+`docs/HANDSET_PROTOCOL.md` (v1) — every command with its exact reply and
+refusal strings, every downlink format, the append-only evolution rules, and
+the current limits stated honestly. Client library `handset/handset_link.h`
+(header-only C++17, transport-agnostic, link-health watchdog), reference
+handset firmware `handset/example_esp32_handset/`, orientation
+`handset/README.md`. Drift guard: `test/test_handset/` feeds the library the
+firmware's own wire literals.
+
 ## 9. Web server (WiFi truly off during dive)
 
 AP `<AP_SSID>-<mac tail>` (default `ESP-CCR-A1B2`) with the WPA2 password from
@@ -528,6 +537,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done (this batch) |
+| M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done (this batch) — **183/183 native**, both esp32 builds clean. Not yet run against a physical handset: C2 refusal matrix still waits on the UART2 adapter on 16/17 |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -787,3 +797,36 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   buses; the transport triggers it after a streak of failed transactions
   (the latched-SDA signature) with a minimum gap so an absent sensor never
   becomes a recovery storm.
+- **`OK` is about the command, not the effect — found while writing the
+  handset contract (2026-11-23).** Enumerating every reply for
+  `docs/HANDSET_PROTOCOL.md` forced the question "what does the diver actually
+  see when this fails?", and three answers were "nothing on the wire":
+  `CAL O2` arm/confirm set action bits that **no firmware object consumes**
+  (`cal::O2Sequencer` is host-tested and never instantiated — the same
+  missing-consumer hole `CAL AIR` had before `cal::AirCal` was wired);
+  `CAL DEPTH` raises `g_calDepthRequest`, which **nothing reads** — no
+  depth-offset trim exists, so the surface tare in §13 is still a design
+  intent, not a behaviour; and `CAL AIR` answers `OK CAL AIR` *before* the
+  control task applies the 120 s warm-up gate, so a too-early call says OK and
+  reports the refusal only on the USB console. Event ids 7/8/11/12/13/14 are
+  the same shape: defined in the log format, never published. A handset built
+  by someone else would have drawn a "calibrated" tick from all of this, so
+  the spec states it plainly (§3 caveats, §4 id table, §8) and the library
+  refuses to invent the missing feedback. Fix on our side: give `CAL O2` and
+  `CAL DEPTH` real consumers (M2/M3 exit criteria), report failure through the
+  protocol (`ERR`, or emit the reserved ids as designed), and keep the reply
+  honest. Small related finding: `session_wiring.cpp` declares
+  `extern bool g_calAirRequest` while `main.cpp` defines it `volatile bool` —
+  the linker cannot see the disagreement and the flag is cross-task, so the
+  qualifier belongs in the declaration.
+- **Uplink overflow does not resynchronise to the newline (found writing the
+  handset contract, 2026-11-23).** `uart2_task.cpp` accepts 64 characters; the
+  65th answers `ERR line too long` (rate-limited to one per 2 s) and resets the
+  buffer — but keeps reading, so the remainder of an overlong line is collected
+  and terminated as a *second* command. Harmless for a well-behaved handset and
+  for the web page, and it is not a security boundary (the router refuses what
+  it refuses regardless of framing), but "a long line is dropped" is not what
+  the code does, so the spec documents what it does. Hardening when this file
+  is next open: on overflow, swallow to the next terminator instead of
+  restarting mid-line. The client library already behaves the way the firmware
+  should (`overflowing_` drops the whole line).

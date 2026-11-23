@@ -738,16 +738,20 @@ void setup() {
 }
 
 void loop() {
-    stackwatch::sample(stackwatch::SLOT_LOOP);
-
     // The radio comes up and down HERE, not in the task that answered the
-    // command. wifi teardown is slow and racy against the driver's own worker;
-    // loopTask is the only task on this machine with nothing else to do, so it
-    // is where a blocking drain is free. See comms::web::setRadio.
-    if (comms::web::radioPending()) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        comms::web::serviceRadio();
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // command: wifi teardown is slow and races the driver's own worker
+    // (comms::web::setRadio). 250 ms tick, not 1 s, because this loop is what
+    // applies that deferred change, and the reason the radio comes down at DIVE
+    // START (PLAN 9: milliamps, and an antenna on the loop) is defeated if the
+    // request can sit pending for a second. Polling here costs a wake-up, and
+    // loopTask is the only task on this machine with nothing else to do.
+    for (int tick = 0; tick < 4; ++tick) {
+        stackwatch::sample(stackwatch::SLOT_LOOP);
+        if (comms::web::radioPending()) {
+            vTaskDelay(pdMS_TO_TICKS(50));   // let the command path finish first
+            comms::web::serviceRadio();
+            break;                            // re-phase the tick after a teardown
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }

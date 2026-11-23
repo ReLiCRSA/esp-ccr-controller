@@ -1016,3 +1016,55 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   `tools/radio_stress.py` — 12 explicit OFF/ON teardown cycles, 0 fault markers.
   A race that "did not happen twice" is not fixed, hence the committed stress
   tool. Not host-testable: `web_server.cpp` is excluded from the native build.
+- **A deferred action is a cancelled action, and the acceptance harness had to
+  be fixed before it could see that (bench, 2026-11-23).** `web::setRadio()` now
+  only records intent, so the radio actually moves when `loopTask` next looks.
+  `hw_accept.py`'s matrix runs in under a second — `DIVE START` at t+22.49 s and
+  `DIVE END` at t+22.94 s — so the OFF intent and the ON intent cancelled each
+  other before any task acted and the radio never came down. `radioPending()`
+  compares *desired* with *current*, which is the right semantics (a dive of
+  0.45 s gains nothing from a radio drop) but it made the new check report
+  "0 radio lines" on perfectly good hardware. Two changes: the matrix now holds
+  the dive open (`dwell:2.0` after `DIVE START`, `dwell:4.0` after `DIVE END`),
+  because a check that demands an event the sequence cannot produce is not a
+  check; and `loopTask`'s radio poll went from 1 s to 250 ms, since "the antenna
+  comes down at DIVE START" (PLAN 9: milliamps, water) is hollow if the request
+  can sit pending for a second. Measured: down in 0.36–0.56 s, AP back in
+  0.31–0.51 s, 8/8 and 12/12 cycles, AP name identical every time, heap drift
+  −192 B over 12 cycles (the 2.5 KB drop on the first cycle is one-time driver
+  allocation, not per-dive).
+- **`esp_wifi_get_mac failed with 12289` on the console is ESP-IDF's, not
+  ours** — and the way it got proved is the useful part. It appears on some
+  teardowns (`12289` = `ESP_ERR_WIFI_NOT_INIT`). The first diagnosis was that our
+  own `WiFi.macAddress()` was being read before `WiFi.mode(WIFI_AP)`; moving the
+  read was plausible, and **wrong**: injecting the old call order back and
+  watching the console put the marker in exactly the same place (always before
+  `web: radio off`, i.e. inside `esp_wifi_stop()`), and `grep` over the Arduino
+  WiFi library shows it never calls `esp_wifi_get_mac` at all (only `WiFiProv`,
+  unused). `WiFi.macAddress()` returns the core's cached address without touching
+  a stopped driver. So the AP name was never fragile the way the comment claimed;
+  the tail is cached. The ordering and the once-only tail cache are kept because
+  they are the defined-to-work order and they keep the name from drifting, but
+  the comment now says what was measured. Both tools report the line as a note
+  and do not fail on it.
+- **Three acceptance checks found this session to be vacuous, which is the
+  pattern to watch.** `GET T` matched an unsolicited `T,` line, so the command
+  that was rebooting the board scored PASS. The stack tripwire reported the
+  minimum across tasks, which belongs to the supervisor and never moves while
+  `uart2` falls over. The radio check demanded a teardown the matrix's 0.45 s
+  dive could never trigger, so it failed good hardware — the mirror image of the
+  same error. Each was fixed by making the assertion about something the harness
+  can actually distinguish: cadence anchoring for replies, a named per-task
+  reading (`u2stk=`), a dwell that lets a deferred action land. The reflex to
+  add: for every new check, ask what a *broken* build would do differently, and
+  if that is not obvious, inject the bug and watch the check fire. That was done
+  here for the MAC regression — and it is what showed the diagnosis was wrong.
+- **`AsyncWebSocket::enable(bool)` is not a socket close** (ESPAsyncWebServer
+  3.12.1: it sets the flag `canHandle()` tests, `AsyncWebSocket.h:346` consumed
+  at `AsyncWebSocket.cpp:1344`). `stop()` was calling `enable(true)`, a no-op
+  that reads like teardown; removed, with the reason written down. Verified
+  against the vendored library rather than from memory, because the call looked
+  plausible and the comment next to it was about something else.
+- **The boot line's AP address was a literal** (`on 192.168.4.1`), while the
+  captive DNS answers with `WiFi.softAPIP()` — the two could drift and the bench
+  would be told to look at an address nothing serves on. Now prints `softAPIP()`.

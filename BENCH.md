@@ -66,13 +66,39 @@ controller, in 2 of 4 acceptance runs. `comms::web::setRadio()` now only records
 the intent; loopTask performs it after a driver drain. Check the ordering with:
 
 ```
-tools/.../python tools/radio_stress.py --cycles 12
+tools/.../python tools/radio_stress.py --cycles 12 --log logs/radio.log
 ```
 
-One `WIFI OFF` is a full `esp_wifi_stop()`; the script watches the console for
-`assert failed` / `Guru` / canary / `SAFE MODE` / `reset reason` throughout and
-exits non-zero if any appear. Run it after any change to `web_server.cpp`'s
-`start()`/`stop()` or to the dive radio logic.
+One `WIFI OFF` is a full `esp_wifi_stop()`; one `WIFI ON` is a full `softAP`.
+The tool does **not** stop at "no crash" — a deferred action needs its
+completion proven, so every cycle is graded on what the firmware itself reports:
+
+| Per cycle | Why |
+|---|---|
+| `web: radio off (dive)` within `--max-down` (default 3 s) of `WIFI OFF` | the intent was recorded *and* carried out |
+| `web: AP "…" on <ip> (heap N)` within `--max-up` (default 6 s) of `WIFI ON` | the diver gets a surface UI back; `OK` on the command means only that the intent was recorded |
+| exactly N down and N up over N cycles | a pending change that gets reversed before loopTask acts is silently cancelled (coalescing), which is correct for a 0.5 s dive and a fault for a real one |
+| identical AP **name** every cycle, and a MAC tail present | a renamed AP, or one without the `-XXXX` tail, is a network the phone that joined before the dive cannot rejoin |
+| heap from each AP line | drift over cycles = a leak on the dive path. Measured: −192 B over 12 cycles, i.e. the 2.5 KB drop on the *first* cycle is one-time driver allocation, not per-dive |
+
+Measured timings: radio down in 0.36–0.56 s, AP back in 0.31–0.51 s. `loopTask`
+polls for a pending radio change every 250 ms (it used to be 1 s) and `stop()`
+drains the driver for 250 ms, so ~0.5 s is the expected worst case.
+
+**Known console noise, not a fault:** `E (nnnnn) wifi_init_default:
+esp_wifi_get_mac failed with 12289` appears on some teardowns. It is ESP-IDF's
+own read inside `esp_wifi_stop()` — the Arduino WiFi library never calls
+`esp_wifi_get_mac` anywhere (`WiFiProv` does, and that is not used here). It was
+proved not-ours by re-injecting the firmware's earlier call order and watching
+the marker land in the same place either way. `hw_accept.py` and
+`radio_stress.py` report it as a note and do not fail on it; a check that fires
+on healthy hardware is worse than no check.
+
+**What no tool on this bench can prove:** that the page and the WebSocket
+actually serve after a radio cycle. Both need a station joined to the AP, so the
+check is manual — after `DIVE END` (or `WIFI ON`), join `ESP-CCR-XXXX` from a
+phone and open `http://192.168.4.1`. Do it after any change to `start()`'s
+`softAP` / DNS-bind / `AsyncWebServer` sequence.
 
 ### The handset link on the bench (no USB-UART adapter in the drawer)
 

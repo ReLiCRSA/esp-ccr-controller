@@ -86,13 +86,21 @@ PROTOCOL_CHECKS = [
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
     ("SET SP2=2.5", r"^ERR", "range refusal"),
-    ("DIVE START", r"^OK DIVE", "dive opens"),
+    # "dwell:2.0" holds the dive OPEN before the next command. Without it the
+    # whole matrix runs in under a second: DIVE START and DIVE END land 0.45 s
+    # apart, the deferred radio teardown (loopTask polls at 1 s, stop() drains
+    # 250 ms) never acts, the two intents cancel, and "did the dive take the
+    # radio down" is unanswerable — measured on the bench 2026-11-23. A real
+    # dive is minutes, so the dwell is what makes the check mean what it says.
+    ("DIVE START", r"^OK DIVE", "dive opens", "dwell:2.0"),
     ("SET SP2=0.40", r"^ERR dive locked", "diver outranks the client"),
     ("WIFI ON", r"^ERR wifi locked in dive", "radio stays down in a dive"),
     ("CAL AIR", r"^ERR cal locked in dive", "calibration never under a diver"),
     ("FROBNICATE", r"^ERR unknown command", "unknown commands do nothing"),
     (OVERLONG, r"^ERR line too long", "line buffer cannot be flooded"),
-    ("DIVE END", r"^OK DIVE", "dive closes"),
+    # dwell covers the re-arm: loopTask applies it within its poll interval and
+    # softAP + captive DNS + server start are all inside that one console line.
+    ("DIVE END", r"^OK DIVE", "dive closes", "dwell:4.0"),
     ("LOG LIST", r"^(OK|L,)", "log store answers"),
 ]
 
@@ -107,6 +115,13 @@ PROTOCOL_CHECKS = [
 # BURST_WINDOW_S of 0.45 leaves ~50 ms of margin against the 500 ms cadence —
 # tight enough that a missing reply fails, loose enough that a reply (written in
 # the same task pass that read the command) never does.
+# One clock for every log this tool writes: the handset transcript and the
+# console watch carry the same t= offsets, so a console line can be placed next
+# to the command that should have caused it. That alignment is what was missing
+# on 2026-11-23 when a radio check failed with "0 lines" and the two logs could
+# not be read against each other. main() re-bases it when the run starts.
+T_ORIGIN = time.time()
+
 BURST_WINDOW_S = 0.45
 BURST_ANCHOR_S = 1.5
 BURST_REPLY_S = 1.0
@@ -193,6 +208,45 @@ def grade_watch(lines, boot_lines=None):
     panic_reset = next((l for l in lines if "reset reason: PANIC" in l), None)
     checks.append(("reset reason stayed clean", panic_reset is None, panic_reset or ""))
 
+    # The matrix opens and closes exactly one dive with the radio up on entry, so
+    # the console must show BOTH halves of the auto-restore: DIVE START drops the
+    # radio (PLAN 9: milliamps, and an antenna on the loop) and DIVE END puts back
+    # what it took. Nothing else in the sequence can produce these lines — the
+    # mid-dive `WIFI ON` is refused. This is protocol-visible: the handset answers
+    # "OK DIVE" either way, so a dive that ended with the radio down would only be
+    # discovered by a diver surfacing to a web page that is not there.
+    downs = sum(1 for l in lines if l.startswith("web: radio off"))
+    ups = sum(1 for l in lines if l.startswith("web: AP "))
+    window = f"{len(lines)} console lines were captured in the watch window"
+    checks.append(("DIVE START took the radio down", downs >= 1,
+                   f"{downs} 'web: radio off' lines; {window}"))
+    checks.append(("DIVE END brought the radio back", ups >= downs and ups >= 1,
+                   f"{downs} down / {ups} up; {window} — a surface with no AP is "
+                   f"a fault the handset reply cannot show"))
+    for marker, meaning in (("softAP failed", "AP would not come up"),
+                            ("captive DNS failed to bind", "captive portal dead")):
+        hit = next((l for l in lines + list(boot_lines or []) if marker in l), None)
+        checks.append((f"no {marker!r} ({meaning})", hit is None, hit if hit else ""))
+
+    # "esp_wifi_get_mac failed with 12289" is NOT a check. ESP-IDF's own
+    # esp_wifi_stop() logs it while taking an AP down — confirmed by injecting
+    # the firmware's pre-fix call order and watching the marker land in the same
+    # place either way, and by the Arduino WiFi library never calling
+    # esp_wifi_get_mac at all. A check that fires on healthy hardware is worse
+    # than none: the next real fault gets waved through. What is checked instead
+    # is the consequence that matters and is observable — the AP name, which must
+    # carry the MAC tail so a phone that joined before a dive can rejoin after.
+    ap_names = [l.split('"')[1] for l in lines + list(boot_lines or [])
+                if l.startswith("web: AP ") and len(l.split('"')) > 1]
+    tails = [n for n in ap_names if re.search(r"-[0-9A-Fa-f]{4}$", n)]
+    checks.append(("AP name carries a MAC tail", bool(ap_names) and len(tails) == len(ap_names),
+                   f"names seen: {sorted(set(ap_names)) or ['(no AP line)']}"))
+    idf_noise = sum(1 for l in lines + list(boot_lines or [])
+                    if "esp_wifi_get_mac failed" in l)
+    if idf_noise:
+        print(f"  note: {idf_noise}x ESP-IDF stop-path MAC line (expected on a "
+              f"healthy board, see BENCH.md)")
+
     worst = {"stk": None, "u2stk": None}
     for l in list(lines) + list(boot_lines or []):
         m = HB_STACK_RE.search(l)
@@ -220,15 +274,15 @@ def grade_watch(lines, boot_lines=None):
     return checks
 
 
-def _read_line(ser, seen, log):
+def _read_line(ser, seen, log, t0):
     line = ser.readline().decode(errors="replace").strip()
     if line:
         seen.append(line)
-        log.append(f"<< {line}")
+        log.append(f"[{time.time() - t0:7.2f}s] << {line}")
     return line
 
 
-def _await_burst(ser, pat, seen, log, send):
+def _await_burst(ser, pat, seen, log, send, t0):
     """True only if the controller ANSWERED, not merely kept streaming.
 
     Waits for a streamed line as a cadence anchor, sends, then looks for a
@@ -238,26 +292,29 @@ def _await_burst(ser, pat, seen, log, send):
     deadline = time.time() + BURST_ANCHOR_S
     anchored = False
     while time.time() < deadline:
-        line = _read_line(ser, seen, log)
+        line = _read_line(ser, seen, log, t0)
         if not line:
             break
         if pat.match(line):
             anchored = True
             break
     if not anchored:
-        log.append(f"(no {pat.pattern!r} line to anchor on: the downlink is dead)")
+        log.append(f"[{time.time() - t0:7.2f}s] (no {pat.pattern!r} line to "
+                   f"anchor on: the downlink is dead)")
         return False
 
     send()
     sent_at = time.time()
+    log.append(f"[{sent_at - t0:7.2f}s] >> (burst resend)")
     while time.time() - sent_at < BURST_REPLY_S:
-        line = _read_line(ser, seen, log)
+        line = _read_line(ser, seen, log, t0)
         if not line:
             break
         if pat.match(line):
             if time.time() - sent_at <= BURST_WINDOW_S:
                 return True
-            log.append("(matching line arrived too late to be the reply)")
+            log.append(f"[{time.time() - t0:7.2f}s] (matching line arrived too "
+                       f"late to be the reply)")
             return False
     return False
 
@@ -276,22 +333,31 @@ def run_protocol(port, baud, log, settle=1.5):
 
     ser = serial.Serial(port, baud, timeout=1.0)
     results = []
+    # Both logs are stamped from the same wall clock: the handset log says what
+    # was sent and when, the console watch says what the board printed and when.
+    # Without that alignment "the console never said the radio went down" cannot
+    # be placed next to the DIVE START that should have caused it.
+    t0 = T_ORIGIN
     try:
         time.sleep(settle)
         ser.reset_input_buffer()
         for check in PROTOCOL_CHECKS:
             cmd, want, why = check[0], check[1], check[2]
             burst = len(check) > 3 and check[3] == "burst"
+            dwell = 0.0
+            if len(check) > 3 and check[3].startswith("dwell:"):
+                dwell = float(check[3].split(":", 1)[1])
             pat = re.compile(want)
             seen = []
             ok = False
             for attempt in (1, 2):
+                log.append(f"[{time.time() - t0:7.2f}s] >> {cmd.strip()}")
                 ser.write((cmd.strip() + "\r\n").encode())
                 ser.flush()
                 if burst:
                     payload = (cmd.strip() + "\r\n").encode()
                     ok = _await_burst(ser, pat, seen, log,
-                                      lambda p=payload: (ser.write(p), ser.flush()))
+                                      lambda p=payload: (ser.write(p), ser.flush()), t0)
                 else:
                     deadline = time.time() + 3.0
                     while time.time() < deadline:
@@ -299,16 +365,21 @@ def run_protocol(port, baud, log, settle=1.5):
                         if not line:
                             break
                         seen.append(line)
-                        log.append(f"<< {line}")
+                        log.append(f"[{time.time() - t0:7.2f}s] << {line}")
                         if pat.match(line):
                             ok = True
                             break
                 if ok or seen:
                     break
-                log.append(f"(no line at all for {cmd!r}: retrying once)")
+                log.append(f"[{time.time() - t0:7.2f}s] (no line at all for "
+                           f"{cmd!r}: retrying once)")
             got = "; ".join(seen[-4:]) if seen else "(no reply in 3 s)"
             results.append((cmd if len(cmd) < 24 else cmd[:20] + "...", ok,
                             f"want {want}, got {got} — {why}"))
+            if dwell:
+                log.append(f"[{time.time() - t0:7.2f}s] (holding {dwell:.1f}s: "
+                           f"deferred actions land in this window)")
+                time.sleep(dwell)
         ser.reset_input_buffer()
     finally:
         ser.close()
@@ -316,6 +387,9 @@ def run_protocol(port, baud, log, settle=1.5):
 
 
 def main() -> int:
+    global T_ORIGIN
+    T_ORIGIN = time.time()
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--boot-port", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
@@ -335,6 +409,7 @@ def main() -> int:
 
     lines = []
     watch = []          # console lines from the protocol phase, see grade_watch
+    watch_stamps = []   # (seconds since the watch started, line) for the log copy
     if args.replay:
         lines = Path(args.replay).read_text(errors="replace").splitlines()
         print(f"replaying {args.replay} ({len(lines)} lines)")
@@ -371,6 +446,7 @@ def main() -> int:
                 # the only way to see a command crash the board. Keep one thread
                 # reading it for the whole run.
                 def _watch():
+                    t0 = T_ORIGIN
                     while True:
                         try:
                             l = ser.readline().decode(errors="replace").rstrip()
@@ -379,7 +455,14 @@ def main() -> int:
                         if not l:
                             continue
                         watch.append(l)
-                        print(f"  ~ {l}")
+                        # The copy written to *_watch.log is prefixed with the
+                        # seconds since the watch started; `watch` itself stays
+                        # plain text so the matchers keep working. Without the
+                        # stamp, "0 'web: radio off' lines" could not be told
+                        # apart from "the harness was not reading then" — same
+                        # symptom, opposite conclusions.
+                        watch_stamps.append((time.time() - t0, l))
+                        print(f"  ~ [{time.time() - t0:6.2f}s] {l}")
                 watcher = threading.Thread(target=_watch, daemon=True)
                 watcher.start()
             else:
@@ -413,7 +496,8 @@ def main() -> int:
         for name, ok, detail in grade_watch(watch, lines):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok else f": {detail}"))
             failures += 0 if ok else 1
-        (logdir / f"accept_{stamp}_watch.log").write_text("\n".join(watch) + "\n")
+        (logdir / f"accept_{stamp}_watch.log").write_text(
+            "\n".join(f"[{t:7.2f}s] {l}" for t, l in watch_stamps) + "\n")
     else:
         print("\n(handset checks skipped: pass --handset PORT)")
 

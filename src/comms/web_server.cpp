@@ -303,20 +303,34 @@ bool start() {
 
     const int ssidIdx = g_settings.find("AP_SSID");
     const int passIdx = g_settings.find("AP_PASS");
-    String ssid = ssidIdx >= 0 ? String(g_settings.getString(ssidIdx)) : String("ESP-CCR");
+    const String base = ssidIdx >= 0 ? String(g_settings.getString(ssidIdx)) : String("ESP-CCR");
     const String pass = passIdx >= 0 ? String(g_settings.getString(passIdx)) : String("diveonly");
 
-    // Suffix with the MAC tail: on a bench with three boards, "which AP is
-    // mine" must be answerable without a label.
-    String mac = WiFi.macAddress();          // "AA:BB:CC:DD:EE:FF"
-    if (mac.length() >= 5) {
-        String tail = mac.substring(mac.length() - 5);
-        tail.replace(":", "");
-        ssid += "-" + tail;
-    }
-
     WiFi.persistent(false);   // a soft AP must never wear flash for a reconnect
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WIFI_AP);       // must precede the MAC read below
+
+    // Suffix with the MAC tail: on a bench with three boards, "which AP is
+    // mine" must be answerable without a label, and a phone that joined once has
+    // to be able to rejoin after every dive.
+    //
+    // Read after WiFi.mode() because that is the order that is defined to work,
+    // and remember it once so the name cannot drift. Measured on the bench
+    // 2026-11-23 rather than assumed: reading the MAC before or after the mode
+    // call makes NO observable difference, because WiFi.macAddress() returns the
+    // core's cached address without touching a stopped driver. So this is not
+    // what causes "esp_wifi_get_mac failed with 12289" on the console — that
+    // line is ESP-IDF's own read inside esp_wifi_stop(); the Arduino WiFi library
+    // never calls esp_wifi_get_mac at all.
+    static String tail;
+    if (tail.length() == 0) {
+        const String mac = WiFi.macAddress();      // "AA:BB:CC:DD:EE:FF"
+        if (mac.length() >= 5) {
+            String hex = mac.substring(mac.length() - 5);
+            hex.replace(":", "");
+            tail = "-" + hex;
+        }
+    }
+    const String ssid = base + tail;
     if (!WiFi.softAP(ssid, pass, 1, false, 4)) {
         WiFi.mode(WIFI_OFF);
         Serial.println("** web: softAP failed");
@@ -374,8 +388,8 @@ bool start() {
     g_ws->cleanupClients();   // sockets that died with the radio on the last dive
     g_on = true;
     noteHeap();
-    Serial.printf("web: AP \"%s\" on 192.168.4.1 (heap %lu)\n", ssid.c_str(),
-                  (unsigned long)ESP.getFreeHeap());
+    Serial.printf("web: AP \"%s\" on %s (heap %lu)\n", ssid.c_str(),
+                  WiFi.softAPIP().toString().c_str(), (unsigned long)ESP.getFreeHeap());
     return true;
 }
 
@@ -401,7 +415,11 @@ void stop() {
     delay(250);
     WiFi.mode(WIFI_OFF);
     g_on = false;
-    g_ws->enable(true);
+    // Deliberately nothing here touches g_ws. Its client list keeps the dead
+    // sockets until start() runs cleanupClients() on the way back up, and
+    // AsyncWebSocket::enable() is NOT a way to close them (in 3.12.1 it only
+    // gates canHandle(), i.e. whether a new upgrade is accepted), so a call to
+    // it here would be a no-op dressed up as teardown.
     Serial.println("web: radio off (dive)");
 }
 

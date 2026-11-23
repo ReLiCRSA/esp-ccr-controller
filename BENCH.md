@@ -29,6 +29,58 @@ dive`; `CAL AIR` mid-dive → `ERR cal locked in dive`; overlong line →
 `ERR line too long`; junk → `ERR unknown command`. Every one of those is a
 host-tested invariant — the bench exists to prove the wire, not the logic.
 
+### The handset link on the bench (no USB-UART adapter in the drawer)
+
+A second **classic ESP32 dev module is a USB-UART adapter** — its USB socket is
+a CP210x/CH340 whose data lines are the module's GPIO3/GPIO1. Two ways to use
+it; both land on `/dev/ttyUSB1` at 115200 8N1 for `--handset`.
+
+**A. Dead-module bridge (no firmware, no code).** Jumper the spare module's
+**EN to GND** so the ESP32 never runs and only its bridge chip lives:
+
+```
+spare GPIO3 (chip TX) → controller GPIO16   (controller RX)
+spare GPIO1 (chip RX) ← controller GPIO17   (controller TX)
+spare GND ─────────────── controller GND
+spare EN  ── GND          (module dead; its pins float, idle-high on the wire)
+```
+
+Hold EN low or the live ESP32 drives GPIO1 itself (ROM boot log on UART0 at
+115200): that fights the controller's TX driver on the same wire and feeds the
+controller junk it dutifully answers `ERR unknown command` about. Remove the
+jumper to flash that board again.
+
+**B. Bridge firmware (`handset/bridge_esp32`, recommended).** The spare board
+runs a byte-for-byte pipe PC↔controller and *observes* the stream with the
+handset client library:
+
+```
+pio run -d handset/bridge_esp32 -t upload
+```
+
+```
+bridge GPIO16 (U2RXD) ← controller GPIO17   (controller TX)
+bridge GPIO17 (U2TXD) → controller GPIO16   (controller RX)
+bridge GND ───────────── controller GND     (power the bridge from its own USB)
+bridge GPIO25 → LED link up        bridge GPIO26 → LED traffic
+```
+
+No pin contention, because the PC side stays on the module's own UART0
+(GPIO3/GPIO1) and the controller sits on UART2 — the bridge's ROM boot log goes
+to the PC, never into the controller. The traffic LED blinks at the `T,` rate
+and the link LED is the **library's** verdict (3 s silence = down), so link
+health is visible at a glance without touching the data stream. Set
+`BRIDGE_MODE MODE_TAP` in the sketch for a readable handset-side console
+(telemetry, `E,` events, link-loss messages) instead of a pipe — that is the
+build for watching a dive from the handset side, and the base for the real
+handset (`handset/example_esp32_handset`, same wiring).
+
+Two bench consequences: **opening this port resets the bridge, never the
+controller** (its DTR/EN only touch the spare board — safer than the console
+port), and the bridge needs ~250 ms to boot after that open, so
+`hw_accept.py` settles 1.5 s and retries a command that got no line at all
+(`--handset-settle 0` for a plain adapter).
+
 Expected boot order (post-A5e firmware):
 
 ```

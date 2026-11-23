@@ -15,8 +15,12 @@ Usage (after the soak ends and the new build is flashed):
       tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
 
   --boot-port PORT   USB-CDC console (default /dev/ttyUSB0)
-  --handset PORT     USB-UART adapter wired to UART2 16/17 (omit to skip
-                     the protocol checks — boot checks still run)
+  --handset PORT     USB-UART adapter (or a second ESP32 running
+                     handset/bridge_esp32) wired to UART2 16/17. Omit to skip
+                     the protocol checks — boot checks still run.
+  --handset-settle S seconds to wait after opening the handset port: that open
+                     resets the board behind it (1.5 is enough for an ESP32
+                     bridge to boot; 0 for a plain adapter)
   --expect-web       require the settings/session/web boot lines (post-A5d
                      firmware; M1 does not print them)
   --boot-wait SECS   console capture window (default 20)
@@ -123,32 +127,43 @@ def grade_boot(lines, expect_web):
     return checks
 
 
-def run_protocol(port, baud, log):
+def run_protocol(port, baud, log, settle=1.5):
     """Open the handset adapter and run PROTOCOL_CHECKS. No pyserial import
-    at module level: the boot/replay path must work without a handset."""
+    at module level: the boot/replay path must work without a handset.
+
+    `settle`: opening the port resets the board behind it. On a plain USB-UART
+    adapter that costs nothing; on a second ESP32 running handset/bridge_esp32
+    (the bench stand-in for an adapter) the open is a reset pulse and the ROM
+    log arrives, so wait for it to boot and flush before the first command.
+    A check that produced NO line at all is sent once more: the first bytes
+    after a reset can be swallowed by the bridge's own bootloader."""
     import serial  # pipx platformio venv has it
 
     ser = serial.Serial(port, baud, timeout=1.0)
     results = []
     try:
-        time.sleep(0.2)
+        time.sleep(settle)
         ser.reset_input_buffer()
         for cmd, want, why in PROTOCOL_CHECKS:
-            ser.write((cmd.strip() + "\r\n").encode())
-            ser.flush()
-            deadline = time.time() + 3.0
-            seen = []
             pat = re.compile(want)
+            seen = []
             ok = False
-            while time.time() < deadline:
-                line = ser.readline().decode(errors="replace").strip()
-                if not line:
+            for attempt in (1, 2):
+                ser.write((cmd.strip() + "\r\n").encode())
+                ser.flush()
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    line = ser.readline().decode(errors="replace").strip()
+                    if not line:
+                        break
+                    seen.append(line)
+                    log.append(f"<< {line}")
+                    if pat.match(line):
+                        ok = True
+                        break
+                if ok or seen:
                     break
-                seen.append(line)
-                log.append(f"<< {line}")
-                if pat.match(line):
-                    ok = True
-                    break
+                log.append(f"(no line at all for {cmd!r}: retrying once)")
             got = "; ".join(seen) if seen else "(no reply in 3 s)"
             results.append((cmd if len(cmd) < 24 else cmd[:20] + "...", ok,
                             f"want {want}, got {got} — {why}"))
@@ -163,6 +178,7 @@ def main() -> int:
     ap.add_argument("--boot-port", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--handset", default=None)
+    ap.add_argument("--handset-settle", type=float, default=1.5)
     ap.add_argument("--expect-web", action="store_true")
     ap.add_argument("--boot-wait", type=float, default=20.0)
     ap.add_argument("--replay", default=None)
@@ -215,7 +231,8 @@ def main() -> int:
     if args.handset:
         print("\n--- handset protocol checks (UART2) ---")
         proto_log = []
-        for name, ok, detail in run_protocol(args.handset, args.baud, proto_log):
+        for name, ok, detail in run_protocol(args.handset, args.baud, proto_log,
+                                             args.handset_settle):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
             failures += 0 if ok else 1
         (logdir / f"accept_{stamp}_handset.log").write_text("\n".join(proto_log) + "\n")

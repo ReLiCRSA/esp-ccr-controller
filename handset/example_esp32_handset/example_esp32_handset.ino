@@ -48,7 +48,10 @@ static const int PIN_BUZZER = 19;    // active-high piezo (or transistor drive)
 static const int PIN_LINK_LED = 21;  // steady = link up
 
 // ---- link -------------------------------------------------------------------
-static hs::Link link;
+// Not called `link`: <unistd.h> (pulled in by Arduino.h) declares
+// `int link(const char*, const char*)`, and a global named `link` collides with
+// it. Renaming the object, not the library — hs::Link itself is fine.
+static hs::Link hsLink;
 
 // Latest protocol picture. Written from the link callbacks, read by draw().
 struct View {
@@ -107,30 +110,36 @@ static void onLinkDown(void* ctx) { static_cast<View*>(ctx)->linkUp = false; }
 static void onLinkUp(void* ctx) { static_cast<View*>(ctx)->linkUp = true; }
 
 // ---- buttons: non-blocking, debounced, edge-detected ------------------------
+// The debounce is a member, not a top-level function, and that is not style:
+// the Arduino build auto-generates prototypes for top-level functions and
+// inserts them *before* the type declarations below, so a top-level
+// `bool pressed(Button&, uint32_t)` fails to compile ("Button was not declared
+// in this scope"). Rule for .ino files: keep top-level signatures over Arduino
+// and library types, or make them members.
 struct Button {
     int pin;
     bool last = true;          // pull-up: idle high
     uint32_t changeMs = 0;
-    bool armed = false;        // for the two-press confirm
-    uint32_t armedMs = 0;
+    bool latched = false;      // this press has already been reported
+    uint32_t armedMs = 0;      // two-press confirm (DIVE button)
+
+    // true once per press, after the contact settled.
+    bool pressed(uint32_t now) {
+        const bool raw = digitalRead(pin) == LOW;
+        if (raw != last) { last = raw; changeMs = now; return false; }
+        if (raw && !latched && now - changeMs > 30) { latched = true; return true; }
+        if (!raw) latched = false;
+        return false;
+    }
 };
 static Button buttons[] = {
     { BTN_ACK }, { BTN_AUTO }, { BTN_MANUAL }, { BTN_CHECK }, { BTN_DIVE },
 };
 
-// true once per press, after the contact settled.
-static bool pressed(Button& b, uint32_t now) {
-    const bool raw = digitalRead(b.pin) == LOW;
-    if (raw != b.last) { b.last = raw; b.changeMs = now; return false; }
-    if (raw && !b.armed && now - b.changeMs > 30) { b.armed = true; return true; }
-    if (!raw) b.armed = false;
-    return false;
-}
-
 // ---- buzzer: a pattern per alarm class, never a blocking tone() -------------
 // Steady piezo at 3 kHz would need PWM; for the example an on/off tick at the
 // loop rate is enough to be heard and to keep this file free of timer setup.
-static uint32_t buzzUntil = 0, buzzGapMs = 0;
+static uint32_t buzzGapMs = 0;
 static uint32_t nextPatternMs = 0;
 
 static void alarmPattern(uint32_t now) {
@@ -224,30 +233,30 @@ void setup() {
     h.onLine = onLine;
     h.onLinkDown = onLinkDown;
     h.onLinkUp = onLinkUp;
-    link.begin(putLine, nullptr, h);
+    hsLink.begin(putLine, nullptr, h);
 
     // Build the settings picture from the controller, not from a hard-coded
     // table (spec §6): a handset that does this keeps working when keys change.
-    link.getSchema();
-    link.getPre();
+    hsLink.getSchema();
+    hsLink.getPre();
     Serial.println("ESP-CCR handset up");
 }
 
 void loop() {
     const uint32_t now = millis();
 
-    while (Serial2.available() > 0) link.feedByte(Serial2.read());
-    link.tick(now);                       // link-health watchdog
+    while (Serial2.available() > 0) hsLink.feedByte(Serial2.read());
+    hsLink.tick(now);                       // link-health watchdog
 
     // buttons
     for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
         Button& b = buttons[i];
-        if (!pressed(b, now)) continue;
+        if (!b.pressed(now)) continue;
         switch (b.pin) {
-            case BTN_ACK:      link.ack(); break;
-            case BTN_AUTO:     link.setAuto(); break;
-            case BTN_MANUAL:   link.setManual(); break;
-            case BTN_CHECK:    link.check(); break;
+            case BTN_ACK:      hsLink.ack(); break;
+            case BTN_AUTO:     hsLink.setAuto(); break;
+            case BTN_MANUAL:   hsLink.setManual(); break;
+            case BTN_CHECK:    hsLink.check(); break;
             case BTN_DIVE: {
                 // Two presses within 3 s: the first arms, the second commits.
                 const bool diving = view.t.mode != 0;   // STANDBY means no dive
@@ -261,8 +270,8 @@ void loop() {
                     // pre-dive passed: show the refusal rather than
                     // pre-empting it, so the handset never disagrees with the
                     // controller about what is safe to start.
-                    if (diving) link.diveEnd();
-                    else link.diveStart();
+                    if (diving) hsLink.diveEnd();
+                    else hsLink.diveStart();
                 }
                 break;
             }
@@ -271,7 +280,7 @@ void loop() {
 
     // periodic housekeeping: keep the pre-dive picture fresh until it passes
     static uint32_t lastPreMs = 0;
-    if (!view.predivePassed && now - lastPreMs > 5000) { lastPreMs = now; link.getPre(); }
+    if (!view.predivePassed && now - lastPreMs > 5000) { lastPreMs = now; hsLink.getPre(); }
 
     alarmPattern(now);
     runBuzzer(now);

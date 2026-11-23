@@ -105,6 +105,20 @@ refusals, which are the part that must not be implemented twice and drift:
 (`--handset` is a USB-UART adapter on the controller's GPIO16/17; omit it to
 run only the boot checks. Exit 0 = every check passed.)
 
+**No adapter in the drawer?** A second classic ESP32 dev module *is* one — its
+USB connector's bridge chip has its data lines on GPIO3/GPIO1. Either jumper
+that module's EN to GND and use the chip directly, or flash the ready bridge:
+
+```
+pio run -d handset/bridge_esp32 -t upload      # PC ↔ controller UART2 pipe
+```
+
+Wiring is the same as the example handset (bridge GPIO16 ← controller GPIO17,
+GPIO17 → GPIO16, GND common). The bridge also runs this library as a
+passive observer, so its two LEDs are the link's real state. Full recipe,
+including why opening that port cannot reset the controller: `../BENCH.md`,
+"The handset link on the bench".
+
 Two bench rules that bite: **never run two readers on one port** (stop
 `tools/soak_logger.py` first), and **opening the USB-CDC console resets the
 board** — pyserial asserts DTR/RTS, and on this board DTR=IO0, RTS=EN, so the
@@ -115,6 +129,19 @@ hardware.
 If you change anything in `handset_link.h` or in the firmware's protocol code,
 `pio test -e native` fails loudly — `../test/test_handset/` pins the library
 against the wire literals both sides promise.
+
+## Two Arduino `.ino` traps that cost a real compile failure here
+
+* **Don't name a global `link`.** `Arduino.h` pulls in `<unistd.h>`, which
+  declares `int link(const char*, const char*)`; a global object called `link`
+  collides with it (`redeclared as different kind of symbol`). The example uses
+  `hsLink`; `hs::Link` itself is fine.
+* **The Arduino build auto-generates prototypes for top-level functions and
+  inserts them before your type declarations.** A top-level
+  `bool pressed(Button&, uint32_t)` therefore fails with "Button was not
+  declared in this scope" even though the struct sits above it in the file.
+  Keep top-level signatures over Arduino/library types, or make the function a
+  member — the example's debounce is `Button::pressed`.
 
 ## Example firmware
 

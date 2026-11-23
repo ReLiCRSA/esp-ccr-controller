@@ -1,5 +1,6 @@
 #include "lps28.h"
 
+#include <cstdio>
 #include <initializer_list>
 
 namespace press {
@@ -41,6 +42,7 @@ bool Lps28::begin(uint32_t nowMs) {
     backoffShift_ = 0;
     bootPhase_ = BootPhase::PROBE;
     state_ = State::READY;
+    std::snprintf(identity_, sizeof(identity_), "LPS28DFW @0x%02X", addr_);
     return true;
 }
 

@@ -1,5 +1,7 @@
 #include "ms5837.h"
 
+#include <cstdio>
+
 namespace press {
 
 // ---------------------------------------------------------------------------
@@ -101,6 +103,9 @@ bool Ms5837::begin(uint32_t nowMs) {
     readFails_ = 0;
     backoffShift_ = 0;
     state_ = State::READY;
+    // Identity = family + unit: the PROM CRC just passed, so these are the
+    // factory coefficients of THIS chip. Stronger than a WHO_AM_I.
+    std::snprintf(identity_, sizeof(identity_), "MS5837-30BA @0x%02X", addr_);
     return true;
 }
 

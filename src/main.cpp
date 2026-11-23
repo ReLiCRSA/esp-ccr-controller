@@ -28,7 +28,9 @@
 #include "control/loop.h"
 #include "sensors/ads1115_bus.h"
 #include "sensors/battery.h"
+#include "sensors/depth_manager.h"
 #include "sensors/lps28.h"
+#include "sensors/ms5837.h"
 #include "sensors/wire_transport.h"
 #include "comms/nvs_store.h"
 #include "comms/settings.h"
@@ -86,8 +88,16 @@ static volatile bool  g_controlRunning = false;
 static cal::Cal g_cellCal[3];
 
 #if PRESSURE_ENABLE
-static press::WireTransport g_pBus;
-static press::Lps28         g_pressure(g_pBus);
+// Depth lives on its own hardware I2C port (Wire1, pins.h): a wet-harness
+// fault or a latched depth chip can never wedge the bus feeding ppO2, and
+// each bus recovers (bit-bang clocks + STOP) on its own pins.
+// The arbiter picks the source at boot by identity — dive-rated MS5837
+// preferred, bench LPS28DFW as fallback — and the choice is LOCKED until
+// the next power cycle. Nothing swaps the depth source mid-dive.
+static press::WireTransport g_pBus(Wire1, PIN_I2C1_SDA, PIN_I2C1_SCL);
+static press::Ms5837        g_ms5837(g_pBus);
+static press::Lps28         g_lps28(g_pBus);
+static press::DepthArbiter  g_depth(g_ms5837, g_lps28);
 #endif
 static volatile float g_depthM = 0.0f;
 static volatile bool  g_depthValid = false;
@@ -141,15 +151,14 @@ static void sensorTask(void*) {
         g_ads.tick(now);
 
 #if PRESSURE_ENABLE
-        // Pressure is polled by the SAME task that owns the ADC driver: one
-        // task, one I2C owner per transaction, so no half-finished transaction
-        // can ever interleave with another driver's. If the ADC driver decides
-        // to recover the bus, the pressure read fails — its own retry/backoff
-        // absorbs that (that exact case is unit-tested in test_pressure).
-        g_pressure.begin(now);   // no-ops once READY, backs off on failure
-        g_pressure.start(now);   // no-ops unless the cycle is idle
-        if (g_pressure.poll(now)) {
-            const float p = g_pressure.pressureBar();
+        // Depth is polled by the SAME task that owns the ADC driver, even
+        // though depth sits on Wire1: one task owns both buses, transactions
+        // are strictly sequential, each capped by its Wire timeout. The
+        // arbiter holds the boot-locked source and drives its state machine.
+        g_depth.begin(now);      // arbitrates until locked; then re-inits on fault
+        g_depth.start(now);      // no-ops unless the cycle is idle
+        if (g_depth.poll(now)) {
+            const float p = g_depth.pressureBar();
             if (p > 0.2f) {      // a sane absolute pressure before deriving depth
                 g_depthM = (p > SURFACE_PRESSURE_BAR)
                                ? (p - SURFACE_PRESSURE_BAR) / BAR_PER_M_SEAWATER
@@ -157,14 +166,18 @@ static void sensorTask(void*) {
                 g_depthValid = true;
             }
         }
-        if (now - g_pressure.lastGoodMs() > PRESSURE_STALE_MS) g_depthValid = false;
-        // Say it once when the depth sensor comes up: address, sanity. A
-        // missing line at boot means the bench check (BENCH.md C3-a) fails.
+        // locked() first: there is no source to go stale before boot-lock.
+        if (g_depth.locked() && now - g_depth.lastGoodMs() > PRESSURE_STALE_MS)
+            g_depthValid = false;
+        // Say it once when the depth sensor comes up: WHICH sensor, address,
+        // sanity. A missing line at boot means the bench check (BENCH.md
+        // C3-a) fails — and which sensor dove must be in the record.
         static bool depthAnnounced = false;
-        if (!depthAnnounced && g_pressure.healthy()) {
+        if (!depthAnnounced && g_depth.healthy()) {
             depthAnnounced = true;
-            Serial.printf("depth: LPS28 @0x%02X ready, %.1f hPa\n",
-                          g_pressure.addr(), g_pressure.pressureBar() * 1000.0f);
+            Serial.printf("depth: %s ready, %.1f hPa\n",
+                          g_depth.source()->identity(),
+                          g_depth.pressureBar() * 1000.0f);
         }
 #endif
 
@@ -534,7 +547,8 @@ void setup() {
     g_ads.begin();
     g_battery.begin();
 #if PRESSURE_ENABLE
-    g_pressure.begin(millis());  // non-blocking; SensorTask keeps retrying
+    g_pBus.begin();                // Wire1: 100 kHz, 50 ms cap, own pin pair
+    g_depth.begin(millis());       // non-blocking; SensorTask keeps retrying
 #endif
 
     // Boot order matters: NVS overlays the compile-time defaults, then ONE

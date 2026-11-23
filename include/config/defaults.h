@@ -144,9 +144,12 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
 #define DIVE_SNAPSHOT_GRID_MS       30000
 
 // --- Depth ---------------------------------------------------------------------
-// Bench stand-in (LPS28DFW, Adafruit #6067) until the MS5837-30bar is fitted
-// (the BMP085 that held this role never ACKed once; removed 2026-11-23):
-// depth is derived from absolute pressure with sea-water density.
+// Depth source is decided at boot by identity, not by build: the dive-rated
+// MS5837-30bar is preferred, the LPS28DFW (Adafruit #6067) is the bench and
+// interim wet-test fallback; both drivers live on Wire1 (pins.h) so a wet
+// harness fault cannot reach the cell bus. The BMP085 that once held this
+// role never ACKed once and was removed 2026-11-23. Depth is derived from
+// absolute pressure with sea-water density.
 #define PRESSURE_ENABLE             1
 #define WATER_DENSITY_KGL           1.025f
 #define SURFACE_PRESSURE_BAR        1.013f

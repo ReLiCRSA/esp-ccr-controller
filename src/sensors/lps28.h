@@ -27,7 +27,7 @@
 
 namespace press {
 
-class Lps28 {
+class Lps28 : public DepthSensor {
 public:
     static constexpr uint8_t ADDR = 0x5C;       // XSA open/LOW (Adafruit default)
     static constexpr uint8_t ADDR_ALT = 0x5D;   // XSA pulled high
@@ -56,14 +56,15 @@ public:
 
     // Multi-tick: probe WHO_AM_I (both addresses), soft-boot, configure
     // FS_MODE + ODR. False = not ready yet (waiting or backing off).
-    bool begin(uint32_t nowMs);
-    void start(uint32_t nowMs);   // arm the next sample window
-    bool poll(uint32_t nowMs);    // true once per completed read
+    bool begin(uint32_t nowMs) override;
+    void start(uint32_t nowMs) override;   // arm the next sample window
+    bool poll(uint32_t nowMs) override;    // true once per completed read
 
-    float pressureBar() const { return pressureBar_; }
-    float temperatureC() const { return tempC_; }
-    uint32_t lastGoodMs() const { return lastGoodMs_; }
-    bool healthy() const { return state_ == State::READY && readFails_ < K_MAX_FAILS; }
+    float pressureBar() const override { return pressureBar_; }
+    float temperatureC() const override { return tempC_; }
+    uint32_t lastGoodMs() const override { return lastGoodMs_; }
+    bool healthy() const override { return state_ == State::READY && readFails_ < K_MAX_FAILS; }
+    const char* identity() const override { return identity_; }  // set at identification
     State state() const { return state_; }
     uint8_t addr() const { return addr_; }   // which address answered
 
@@ -82,6 +83,7 @@ private:
 
     Transport& bus_;
     uint8_t addr_ = ADDR;
+    char identity_[24] = "LPS28 (unidentified)";
     State state_ = State::UNINIT;
     BootPhase bootPhase_ = BootPhase::PROBE;
     bool sampling_ = false;

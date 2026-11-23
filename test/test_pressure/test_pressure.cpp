@@ -7,11 +7,13 @@
 #include <utility>
 #include <vector>
 
+#include "sensors/depth_manager.h"
 #include "sensors/lps28.h"
 #include "sensors/ms5837.h"
 
 using press::Lps28;
 using press::Ms5837;
+using press::DepthArbiter;
 
 void setUp() {}
 void tearDown() {}
@@ -322,6 +324,154 @@ void test_lps28_bus_fault_backoff_and_recovery() {
     TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.01325f, s.pressureBar());
 }
 
+// ===========================================================================
+// DepthArbiter — boot-time arbitration between the dive-rated MS5837 and the
+// bench LPS28DFW. The identity gates (PROM CRC / WHO_AM_I) belong to the
+// drivers and are proven above; what is proven here is the POLICY:
+// prefer, fall back, never claim an unidentified source, hot-plug support,
+// and never change the locked source mid-run.
+// ===========================================================================
+static void seedMs5837(FakeBus& bus) {
+    const uint16_t c1[6] = {34982, 36352, 20328, 22354, 26646, 26146};
+    const uint16_t prom[8] = {findValidCrcWord0(c1), c1[0], c1[1], c1[2],
+                              c1[3], c1[4], c1[5], 0};
+    loadProm(bus, prom);
+}
+
+static bool lockArbiter(DepthArbiter& arb, uint32_t from, uint32_t to, uint32_t& at) {
+    for (uint32_t t = from; t < to; t += 10)
+        if (arb.begin(t)) { at = t; return true; }
+    return false;
+}
+
+void test_arbiter_prefers_ms5837_when_both_fitted() {
+    FakeBus bus;
+    seedMs5837(bus);
+    bus.queueSticky(0x0F, {0xB4});   // an LPS28 is fitted too
+    Ms5837 ms{bus};
+    Lps28 lp{bus};
+    DepthArbiter arb{ms, lp};
+    uint32_t at = 0;
+    TEST_ASSERT_TRUE(lockArbiter(arb, 0, 3000, at));
+    TEST_ASSERT_TRUE(arb.source() == &ms);   // dive-rated part wins
+    TEST_ASSERT_TRUE(arb.healthy());
+    TEST_ASSERT_EQUAL_STRING("MS5837-30BA @0x76", arb.sourceName());
+}
+
+void test_arbiter_falls_back_to_lps28() {
+    FakeBus bus;
+    bus.queueAt(0x5C, 0x0F, {0xB4});   // only an LPS28 answers
+    bus.queueSticky(0x28, {0x00, 0xAA, 0x1F, 0x56, 0x08});
+    Ms5837 ms{bus};
+    Lps28 lp{bus};
+    DepthArbiter arb{ms, lp};
+    uint32_t at = 0;
+    TEST_ASSERT_TRUE(lockArbiter(arb, 0, 10000, at));
+    TEST_ASSERT_TRUE(arb.source() == &lp);
+    // The MS5837 window had to expire first — no silent instant fallback.
+    TEST_ASSERT_TRUE(at >= DepthArbiter::PREFERRED_WINDOW_MS);
+    TEST_ASSERT_EQUAL_STRING("LPS28DFW @0x5C", arb.sourceName());
+
+    bool sampled = false;
+    for (uint32_t t = at; t < at + 2000 && !sampled; t += 10) {
+        arb.start(t);
+        for (uint32_t p = t; p < t + 20 && !sampled; ++p) sampled = arb.poll(p);
+    }
+    TEST_ASSERT_TRUE(sampled);
+    TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.01325f, arb.pressureBar());
+}
+
+void test_arbiter_refuses_unidentified_sources() {
+    // LPS22 lookalike (wrong WHO_AM_I) + MS5837 with corrupted PROM:
+    // both drivers refuse themselves, so the arbiter must stay unlocked
+    // forever — depth with no identity is not depth.
+    FakeBus bus;
+    bus.queueSticky(0x0F, {0xB1});
+    const uint16_t c1[6] = {34982, 36352, 20328, 22354, 26646, 26146};
+    uint16_t bad[8] = {findValidCrcWord0(c1), c1[0], c1[1],
+                       static_cast<uint16_t>(c1[2] + 5), c1[3], c1[4], c1[5], 0};
+    TEST_ASSERT_FALSE(Ms5837::checkPromCrc(bad));
+    loadProm(bus, bad);
+    Ms5837 ms{bus};
+    Lps28 lp{bus};
+    DepthArbiter arb{ms, lp};
+    for (uint32_t t = 0; t < 30000; t += 10) {
+        TEST_ASSERT_FALSE(arb.begin(t));
+        TEST_ASSERT_FALSE(arb.locked());
+        TEST_ASSERT_NULL(arb.source());
+        TEST_ASSERT_FALSE(arb.healthy());
+    }
+}
+
+void test_arbiter_hotplug_then_boot_lock() {
+    FakeBus bus;
+    Ms5837 ms{bus};
+    Lps28 lp{bus};
+    DepthArbiter arb{ms, lp};
+
+    // Nothing fitted: keeps cycling windows, never claims a source.
+    for (uint32_t t = 0; t < 8000; t += 10) {
+        arb.begin(t);
+        TEST_ASSERT_FALSE(arb.locked());
+    }
+
+    // LPS28 fitted mid-run: must come up within one recirculation cycle.
+    bus.queueAt(0x5C, 0x0F, {0xB4});
+    bus.queueSticky(0x28, {0x00, 0xAA, 0x1F, 0x56, 0x08});
+    uint32_t at = 0;
+    TEST_ASSERT_TRUE(lockArbiter(arb, 8000, 20000, at));
+    TEST_ASSERT_TRUE(arb.source() == &lp);
+
+    // Now the MS5837 "arrives" too. Identity is fixed at boot: the locked
+    // source NEVER changes, no matter what shows up later.
+    seedMs5837(bus);
+    for (uint32_t t = at; t < at + 8000; t += 10) {
+        TEST_ASSERT_TRUE(arb.begin(t));          // LPS28 stays READY
+        TEST_ASSERT_TRUE(arb.source() == &lp);
+    }
+}
+
+void test_arbiter_never_switches_midrun() {
+    // Both fitted, MS5837 locked, then the depth bus dies. The arbiter must
+    // fail HONESTLY (healthy false -> sensor-stale alarm) but must not
+    // hand depth to the LPS28 sitting on the same bus: mid-dive sensor
+    // swapping is a lie, not a recovery.
+    FakeBus bus;
+    seedMs5837(bus);
+    bus.queueSticky(0x0F, {0xB4});
+    bus.queueSticky(0x28, {0x00, 0xAA, 0x1F, 0x56, 0x08});
+    Ms5837 ms{bus};
+    Lps28 lp{bus};
+    DepthArbiter arb{ms, lp};
+    uint32_t at = 0;
+    TEST_ASSERT_TRUE(lockArbiter(arb, 0, 3000, at));
+    TEST_ASSERT_TRUE(arb.source() == &ms);
+
+    bus.failReads = 30;                    // depth bus dies
+    bool sawUnhealthy = false;
+    for (uint32_t t = at; t < 20000; t += 10) {
+        arb.begin(t);
+        arb.start(t);                      // keep sampling: the fault must
+        for (uint32_t p = t; p < t + 10; ++p) arb.poll(p);   // actually be met
+        if (!arb.healthy()) sawUnhealthy = true;
+        TEST_ASSERT_TRUE(arb.source() == &ms);               // same source, always
+    }
+    TEST_ASSERT_TRUE(sawUnhealthy);   // the fault was reported honestly...
+
+    // ...the bus then recovers, and re-init re-probes the SAME chip (its
+    // identity gate again) — never the slot. A healthy MS5837 is on the
+    // bus, so health returns to the source that was locked at boot.
+    bus.failReads = 0;
+    bool healed = false;
+    for (uint32_t t = 20000; t < 60000 && !healed; t += 10) {
+        arb.begin(t);
+        TEST_ASSERT_TRUE(arb.source() == &ms);
+        healed = arb.healthy();
+    }
+    TEST_ASSERT_TRUE(healed);
+    TEST_ASSERT_EQUAL_STRING("MS5837-30BA @0x76", arb.sourceName());
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_ms5837_boot_and_datasheet_vector);
@@ -331,5 +481,10 @@ int main() {
     RUN_TEST(test_lps28_wrong_identity_is_refused);
     RUN_TEST(test_lps28_sample_cycle_and_scaling);
     RUN_TEST(test_lps28_bus_fault_backoff_and_recovery);
+    RUN_TEST(test_arbiter_prefers_ms5837_when_both_fitted);
+    RUN_TEST(test_arbiter_falls_back_to_lps28);
+    RUN_TEST(test_arbiter_refuses_unidentified_sources);
+    RUN_TEST(test_arbiter_hotplug_then_boot_lock);
+    RUN_TEST(test_arbiter_never_switches_midrun);
     return UNITY_END();
 }

@@ -12,7 +12,7 @@ and a PC simulator to validate the control/deco logic before hardware trust.
 | Gas config | Nitrox CCR — controller manages O₂ injection only; diluent switching manual |
 | ADC | ADS1115, PGA=16, continuous 16 SPS, cells on A0/A1/A2 single-ended; **bench today: 2 cells on A0/A1, A2 free** |
 | Air reference | 11 mV @ 21% O₂ nominal; per-cell calibration factors in NVS |
-| Depth sensor | **LPS28DFW (Adafruit #6067) for bench**; **MS5837-30bar (CSB→GND, addr 0x76)** for wet prototype; one-constant swap (BMP085 removed 2026-11-23, never ACKed) |
+| Depth sensor | **boot auto-detect, identity-gated, MS5837-30bar preferred**; **LPS28DFW (Adafruit #6067)** bench + interim wet-test fallback (BMP085 removed 2026-11-23, never ACKed) |
 | ADS1115 DRDY | Not wired on bench → timed non-blocking reads + bus recovery; driver supports DRDY later (`PIN_DRDY=-1` disables) |
 | Cell calibration | **2-point**: air (mandatory, always applied) + high-O₂ plateau at configurable `CAL_O2_FI` (default 0.99); scripted `CAL O2` via solenoid enrichment of a sealed chamber |
 | Mid-dive cell proof | At ~10 m push setpoint to 1.10; vote group must prove >1.0, else clamp all setpoints to ≤0.90 + alarm (diver-overridable, always logged) |
@@ -71,7 +71,8 @@ espRebController/
 
 | Function | GPIO | Notes |
 |---|---|---|
-| I2C SDA / SCL | 21 / 22 | shared ADS1115 + LPS28/MS5837, 100 kHz, 4.7 kΩ pull-ups |
+| I2C bus 0 SDA / SCL | 21 / 22 | ADS1115 only (the cell chain), 100 kHz, 4.7 kΩ pull-ups |
+| I2C bus 1 SDA / SCL | 19 / 18 | depth sensors only (LPS28/MS5837), `Wire1`, 100 kHz, own pull-ups |
 | Solenoid drive | 27 | MOSFET gate; **INPUT_PULLDOWN until ControlTask alive**; monitor LED on same net |
 | HB / ERR / DECO LEDs | 2 / 4 / 5 | active-high |
 | Handset UART TX / RX | 17 / 16 | UART2, 115200 |
@@ -370,7 +371,7 @@ and the web Settings page.
 | CellProof | `CELLPROOF_EN` on · `CELLPROOF_DEPTH` 10 · `CELLPROOF_SP` 1.10 · `CELLPROOF_MIN` 1.00 · `CELLPROOF_TIMEOUT` 60 · `CELLPROOF_OK_MAXSP` 0.90 |
 | Deco | `GF_LOW` 30 · `GF_HIGH` 85 · `ASC_RATE` 6 · `ASC_RATE_SLOW` 1 · `WATER_DENSITY` 1.025 |
 | Battery | `VBAT_MIN` · `VBAT_CAL` |
-| System | WiFi AP SSID/pass · telemetry rate · depth sensor select (`LPS28`/`MS5837`) |
+| System | WiFi AP SSID/pass · telemetry rate (depth source is boot auto-detect, not a setting) |
 
 ## 12. HUD (3 LEDs)
 
@@ -382,16 +383,30 @@ and the web Settings page.
 
 ## 13. Depth sensor abstraction
 
-`DepthSensor` interface; `lps28.cpp` (bench, ST LPS28DFW on the Adafruit
-#6067 breakout) and `ms5837.cpp` (wet prototype), selected by one constant.
-The BMP085 that held the bench slot is **removed** (2026-11-23): it never
-ACKed once on the bench, and a sensor that has answered zero transactions in
-its life earns no place in the tree. The LPS28DFW is dual full-scale —
-260–1260 hPa (mode 0) or 260–4060 hPa (mode 1); firmware always sets
-**mode 1**, because mode 0 clips at ~2.4 m of sea water, inside the 10 m
-cell-proof test. Identity is enforced: WHO_AM_I must be `0xB4`; near-relatives
-(LPS22HB/HH, old LPS28HH) are refused, and the 0x5C/0x5D choice made by the
-breakout's XSA pad is resolved by probing both at boot.
+`DepthSensor` interface (`pressure_bus.h`); `ms5837.cpp` (dive-rated wet
+prototype) and `lps28.cpp` (bench + interim wet-test, ST LPS28DFW on the
+Adafruit #6067 breakout). Selection is **boot-time auto-detect, not a build
+constant** (decision 2026-11-23, `depth_manager.h`): the arbiter gives the
+MS5837 the first window (reset + factory PROM CRC-4 must pass), then the
+LPS28 (WHO_AM_I `0xB4` only — LPS22 near-relatives refused); whichever is
+identified owns depth **locked until the next power cycle**, so a sensor
+swap is fit-and-power-cycle with no reflash, and nothing can change the
+depth source mid-dive. Nothing fitted → windows keep recirculating, so a
+hot-fitted sensor appears in seconds and the boot log names the winner
+(`depth: LPS28DFW @0x5C ready …`) — which sensor dove is part of the
+record. The BMP085 that held the bench slot is **removed**: it never ACKed
+once, and a sensor that has answered zero transactions in its life earns no
+place in the tree. The LPS28DFW is dual full-scale — 260–1260 hPa (mode 0)
+or 260–4060 hPa (mode 1); firmware always sets **mode 1**, because mode 0
+clips at ~2.4 m of sea water, inside the 10 m cell-proof test. The 0x5C/0x5D
+choice made by the breakout's XSA pad is resolved by probing both.
+
+Depth lives on **Wire1 (SDA 19 / SCL 18)**, its own pin pair and its own
+4.7 k pull-ups: a wet depth harness short or latched depth chip can never
+wedge the bus feeding ppO2, and the bit-banged bus recovery (`i2c_recovery.h`,
+one mechanism used by BOTH buses) stays local to each bus. One task still
+owns every transaction on both buses; each Wire timeout still caps every
+call.
 
 MS5837-30bar specifics:
 
@@ -733,3 +748,24 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   silently, which is inside the 10 m cell-proof envelope — the exact failure
   mode a diver must never meet as a "shallow" reading. MS5837 stays the wet
   prototype's sensor; nothing about the dive-rated part changes.
+- **Depth selection: boot auto-detect, not build constant, not a setting
+  (2026-11-23).** The bench→wet-LPS28→MS5837 march means three physical
+  sensor changes; a build constant makes each one a reflash (which drops
+  the dive link and the phone), and a settings key would configure what the
+  hardware can simply tell us. The arbiter awards depth to whichever chip
+  passes its OWN identity gate first — MS5837 (PROM CRC-4) preferred, LPS28
+  (WHO_AM_I 0xB4) fallback — and **locks the choice until power cycle**:
+  auto-detect is safe exactly because nothing can switch the depth source
+  while a diver is breathing from the numbers. For M-phase sign-off dives
+  the flashed artifact is still pinned by tag; the boot line records which
+  sensor dove.
+- **Depth gets its own I2C port (Wire1, 18/19) with its own bit-banged
+  recovery.** The coupling on one bus cut both ways: ADC bus recovery
+  interrupted in-flight pressure reads, and a wet depth harness fault could
+  wedge the bus feeding ppO2 — the failure that must NEVER be downstream of
+  another failure. 18/19 are Wire1's factory pair, free on WROOM/WROVER
+  classic (reserved only on 8 MB-flash D*WDH8 — check the module stamp).
+  Recovery is now one shared mechanism (`i2c_recovery.h`) used by both
+  buses; the transport triggers it after a streak of failed transactions
+  (the latched-SDA signature) with a minimum gap so an absent sensor never
+  becomes a recovery storm.

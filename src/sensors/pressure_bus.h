@@ -15,6 +15,28 @@
 
 namespace press {
 
+// The contract every depth source fulfills (PLAN.md 13). Deliberately small:
+// just the lifecycle the SensorTask drives plus the latest numbers. Drivers
+// keep their own richer APIs (state, raw math) for tests and diagnostics.
+class DepthSensor {
+public:
+    virtual ~DepthSensor() = default;
+
+    virtual bool begin(uint32_t nowMs) = 0;   // true = identified and READY
+    virtual void start(uint32_t nowMs) = 0;   // arm one sample cycle
+    virtual bool poll(uint32_t nowMs) = 0;    // true once per completed cycle
+
+    virtual bool healthy() const = 0;
+    virtual float pressureBar() const = 0;
+    virtual float temperatureC() const = 0;
+    virtual uint32_t lastGoodMs() const = 0;
+
+    // Filled ONLY when the chip passed its identity gate (WHO_AM_I / PROM
+    // CRC). The arbiter and the boot log print it; an unidentified chip
+    // never becomes a depth source at all.
+    virtual const char* identity() const = 0;
+};
+
 class Transport {
 public:
     virtual ~Transport() = default;

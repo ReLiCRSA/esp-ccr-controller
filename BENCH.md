@@ -81,29 +81,43 @@ Then by hand, in this order (each mirrors a sim scenario):
   limit, schema marker bumped. Verified on the board: SET -> OK in ~40 ms,
   reboot, boot line `settings: 32 keys from NVS`, values survive.
 
-## C3-a — depth sensor: LPS28DFW on the bench (swap decided 2026-11-23)
+## C3-a — depth sensor: LPS28DFW on its own bus (decided 2026-11-23)
 
 The BMP085 that stood in here **never acknowledged once** — every poll since
 the first boot that tried it was `requestFrom(): Error -1`, and it is now
-removed from the firmware entirely. The bench sensor is the **Adafruit LPS28
-breakout (LPS28DFW, product #6067)**: WHO_AM_I `0xB4`, I2C **0x5C** (XSA open)
-or 0x5D (XSA pulled high — the driver probes both and logs the winner).
+removed from the firmware entirely. Depth is now claimed at **boot by
+identity**, not by build: the dive-rated **MS5837-30BA** is preferred, the
+**Adafruit LPS28 breakout (LPS28DFW, #6067)** is the bench/wet-interim
+fallback. Whichever passes its identity gate (LPS28: WHO_AM_I `0xB4`;
+MS5837: reset + factory PROM CRC-4) owns depth **until the next power
+cycle** — mid-dive the source never changes, and a forged or corrupt chip
+is refused outright. Fit a sensor, power-cycle, read the boot line.
 
-Wiring on the shared bus (SDA 21 / SCL 22, same pair as the ADS1115):
+The depth bus is **Wire1, its own pin pair (SDA 19 / SCL 18)** — off the
+cell bus on purpose: a wet-harness short or latched depth chip can never
+wedge the bus feeding ppO2, and each bus bit-bang-recovers its own pins
+(same rescue, both buses).
+
+Wiring:
 
 - [ ] VIN → **3V3** (the breakout regulates; do not feed 5 V into a 3V3 bus),
-      GND to the ADS1115 GND point, SDA→21, SCL→22. STEMMA QT cable fits.
-- [ ] Pull-ups: the ADS side's 4.7 k pair serves the whole bus — one pair,
-      not two weak ones.
-- [ ] Boot must show `depth: LPS28 @0x5C ready, <n> hPa` once, and then
-      silence: no periodic `requestFrom()` error lines, HB `stale=` drops
-      out of the alarm word, `al` should fall toward `0x0010` (battery only).
+      GND to the ADS1115 GND point, **SDA→19, SCL→18**. STEMMA QT cable fits.
+- [ ] Pull-ups are per-bus now: the 4.7 k pair on 21/22 does **not** serve
+      18/19. The breakout's on-board 10 k works at 100 kHz on the bench;
+      add a 4.7 k pair on 18/19 for the wet harness.
+- [ ] Boot must show `depth: LPS28DFW @0x5C ready, <n> hPa` once (or the
+      MS5837 line if it is fitted — it wins on ties), and then silence: no
+      periodic `requestFrom()` error lines, HB `stale=` drops out of the
+      alarm word, `al` should fall toward `0x0010` (battery only). The
+      sensor that booted is the sensor that dove — the line is part of the
+      build record.
 - [ ] Squeeze test: press the port gently (or breathe through a tube into
       the metal port) — the dashboard depth/pressure must move and come
       back. The driver runs **FS_MODE=1 (260–4060 hPa ≈ 40 m sea water)**
       so the 10 m cell-proof pressurization is inside range; mode 0 would
       clip at ~2.4 m and silently flat-top.
 - [ ] Then `CAL DEPTH` (surface tare) and re-check the pre-dive list.
+      **The tare belongs to sensor+package**: after any sensor swap, re-tare.
 
 Until the sensor is fitted the controller behaves correctly with no depth —
 `HB … al=0x0090` includes `BIT_SENSOR_STALE` — it just refuses to pretend.

@@ -4,11 +4,24 @@
 // ============================================================================
 #pragma once
 
-// --- I2C bus (shared: ADS1115 @0x48, LPS28 @0x5C/0x5D / MS5837 @0x76) -----
+// --- I2C bus 0 (cell chain ONLY: ADS1115 @0x48) ----------------------------
 #define PIN_I2C_SDA       21
 #define PIN_I2C_SCL       22
 // 100 kHz only. 4.7k external pull-ups. Never raise the clock for speed:
 // a faster bus is a bus that eats noise as ppO2 errors.
+
+// --- I2C bus 1 (depth sensors ONLY: LPS28 @0x5C/0x5D, MS5837 @0x76) --------
+// Wire1's factory-default pair (SDA 19 / SCL 18), kept off bus 0 on purpose:
+// a wet depth harness short or a latched depth chip can never wedge the bus
+// feeding ppO2, and the bit-banged recovery each bus runs stays local to its
+// own pair. Pull-ups are per-bus: the 4.7k pair on 21/22 does NOT serve
+// this one (the Adafruit breakout's on-board 10k works at 100 kHz; add a
+// 4.7k pair for the wet harness). 18/19 are free on WROOM-32 and classic
+// WROVER-32 (PSRAM borrows 16/17/26/32/33, not these); they are reserved
+// only on 8 MB-flash D*WDH8 modules — check the shield stamp before fitting
+// a different board.
+#define PIN_I2C1_SDA      19
+#define PIN_I2C1_SCL      18
 
 // --- O2 solenoid drive ------------------------------------------------------
 // External MOSFET driver; circuit MUST be gate-low = valve closed.

@@ -20,7 +20,7 @@
 
 namespace press {
 
-class Ms5837 {
+class Ms5837 : public DepthSensor {
 public:
     static constexpr uint8_t ADDR = 0x76;
 
@@ -42,18 +42,19 @@ public:
 
     // Call on every tick until true (or keep calling; it self-retries with
     // backoff). Loads factory coefficients and verifies the PROM CRC-4.
-    bool begin(uint32_t nowMs);
+    bool begin(uint32_t nowMs) override;
 
     // Sample pipeline: one full cycle = D1 then D2. start(nowMs) kicks it;
     // poll(nowMs) advances; returns true exactly once per completed cycle.
-    void start(uint32_t nowMs);
-    bool poll(uint32_t nowMs);
+    void start(uint32_t nowMs) override;
+    bool poll(uint32_t nowMs) override;
 
     // Latest results
-    float pressureBar() const { return pressureBar_; }
-    float temperatureC() const { return tempC_; }
-    uint32_t lastGoodMs() const { return lastGoodMs_; }
-    bool healthy() const { return state_ == State::READY && readFails_ < K_MAX_FAILS; }
+    float pressureBar() const override { return pressureBar_; }
+    float temperatureC() const override { return tempC_; }
+    uint32_t lastGoodMs() const override { return lastGoodMs_; }
+    bool healthy() const override { return state_ == State::READY && readFails_ < K_MAX_FAILS; }
+    const char* identity() const override { return identity_; }  // set when PROM CRC passes
     State state() const { return state_; }
     uint16_t c1() const { return c_[1]; }
 
@@ -72,6 +73,7 @@ private:
 
     Transport& bus_;
     const uint8_t addr_;
+    char identity_[24] = "MS5837 (unidentified)";
     State state_ = State::UNINIT;
 
     uint16_t c_[7] = {};      // c_[1..6] = C1..C6

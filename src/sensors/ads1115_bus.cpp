@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <algorithm>
 #include "sensors/ads1115_bus.h"
+#include "sensors/i2c_recovery.h"
 #include "config/pins.h"
 #include "config/defaults.h"
 
@@ -65,35 +66,12 @@ bool Ads1115Bus::readReg(uint8_t reg, uint16_t& value) {
 
 // Bit-banged I2C bus recovery: if a slave latched SDA low mid-transaction
 // (the classic lockup), clock SCL until it releases, then issue a STOP.
+// The mechanism is shared with the depth bus (i2c_recovery.h); what stays
+// here is the ADC driver's own bookkeeping around it.
 bool Ads1115Bus::recoverBus() {
     _stats.recoveries++;
 
-    pinMode(PIN_I2C_SCL, OUTPUT);
-    pinMode(PIN_I2C_SDA, INPUT);           // external pull-ups do the pulling
-
-    bool sdaReleased = false;
-    for (int i = 0; i < 16 && !sdaReleased; ++i) {
-        digitalWrite(PIN_I2C_SCL, LOW);
-        delayMicroseconds(5);
-        digitalWrite(PIN_I2C_SCL, HIGH);
-        delayMicroseconds(5);
-        sdaReleased = (digitalRead(PIN_I2C_SDA) == HIGH);
-    }
-
-    // STOP condition: SDA low->high while SCL is high.
-    pinMode(PIN_I2C_SDA, OUTPUT);
-    digitalWrite(PIN_I2C_SDA, LOW);
-    delayMicroseconds(5);
-    digitalWrite(PIN_I2C_SCL, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(PIN_I2C_SDA, HIGH);
-    delayMicroseconds(5);
-
-    // Re-init the Wire master on top of a known-idle bus.
-    Wire.end();
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(100000);
-    Wire.setTimeOut(50);
+    const bool sdaReleased = i2cutil::recoverBus(Wire, PIN_I2C_SDA, PIN_I2C_SCL);
 
     // Restart the channel cycle cleanly and re-program the config register.
     _ch = nextPresentChannel(0xFF);

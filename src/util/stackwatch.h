@@ -43,6 +43,13 @@ uint32_t worstFree(uint8_t* outSlot = nullptr);
 // non-zero entries (0 = not sampled), with the index of the winner.
 uint32_t worstOf(const uint32_t* freeBytes, size_t n, size_t* outSlot);
 
+// Headroom of one named task. Needed because "the tightest on the machine" is
+// not the one you are protecting: with stk= in HB the minimum sits with the
+// supervisor (a 3072-byte task) and NEVER MOVES when the command path is
+// hammered, so a uart2 spike — the task that actually overflowed on 2026-11-23
+// — would be invisible behind it.
+uint32_t freeFor(Slot slot);
+
 const char* name(uint8_t slot);
 
 constexpr uint32_t kSampleMs = 5000;

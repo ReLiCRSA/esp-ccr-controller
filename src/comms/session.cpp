@@ -20,6 +20,14 @@ Session g_session;
 bool Session::begin(ctrl::Loop& loop, settings::Registry& reg, bridge::Telemetry& tel,
                     bridge::EventRing& events, const UartLink::Hardware& hw, const Lock& lock) {
     lock_ = lock;
+    // The schema text belongs to the comms subsystem, so it is rendered here
+    // rather than by whatever boot sequence happens to exist: a call site in
+    // main.cpp was forgettable, and a forgotten one means GET SCHEMA answers
+    // with nothing to enforce. It is rendered now, at init, because this runs
+    // before the small-stack tasks exist — the listing's %g formatting must
+    // never run on the task that answers a handset (util/numfmt.h).
+    primeSchema();
+
     router_ = new (routerMem_) CommandRouter(loop, reg, 0);
     // The link's event ring is the handset's: only pump() drains it. The web
     // transport shares everything else.

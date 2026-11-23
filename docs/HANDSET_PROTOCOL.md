@@ -28,6 +28,27 @@ host suites `test/test_proto/`, `test/test_uartlink/`, `test/test_session/`.
 | Downlink size | every downlink line fits in **1024 bytes**; clients should buffer ≥1024 |
 | Auth / handshake | none on UART. The link is passive: the controller starts pushing telemetry immediately and forever |
 
+### Why this physical layer, and what would replace it
+
+The layer above is transport-agnostic on purpose: everything is lines, and the
+firmment's session object hands each line to a `sink(text, ctx)` callback, so the
+handset port and the browser WebSocket run the identical command path and the
+identical refusals. Changing the wire is therefore a new link, not a new
+protocol — which is why the choice below is about connectors and conductors, not
+about the message formats in this document.
+
+| Option | Verdict |
+|---|---|
+| **UART2, 3 conductors** (chosen) | Full duplex, which the protocol assumes: the controller pushes `T,` at 2 Hz while a command may arrive at any instant. Three wires, no parts, 115200 baud is ~100× the traffic. Hazard: GPIO16/17 are also the WROVER PSRAM pins — the boot heap line is the cross-check (~200 KB means no PSRAM mapped, so the pair is free; ~5 MB would mean this port cannot live there). |
+| RS-485, 2-wire half duplex | Differential and rugged, but **half duplex breaks this protocol**: unprompted downlink plus uplink-at-any-time needs turnaround and collision rules that do not exist here. A 4-wire full-duplex transceiver pair keeps the bytes and the protocol untouched, and is the cheap answer if the problem is cable length or noise. |
+| CAN (TWAI) | The best of the wired alternatives, because CSMA/BA arbitration keeps both ends able to speak unprompted. Classic ESP32 has a TWAI controller and the IDF driver ships in this toolchain. Cost: 8-byte frames, so a 62-byte `T,` line becomes 8 frames and needs a framing annex — chunk header, sequence, end marker, and a rule that turns bus-off into a protocol-visible condition. Worth revisiting for **multiple nodes** (the point-to-point limit is permanent), a console **metres** away, or **galvanic isolation** through the housing. |
+| Single-wire / current loop / optical | Fewer conductors and (for the loop) isolation, at the cost of half duplex again. |
+| BLE | No penetration at all, but 2.4 GHz dies in about ten centimetres of water: this is a **surface** transport, the same class as the web AP, not a handset-on-the-counterlung transport. |
+
+Two of the reasons people reach for CAN or 485 are already covered here:
+link-fault detection (the 2 Hz `T,` stream is a heartbeat; a handset that stops
+seeing `T,` knows within a second) and noise margin on a short hose.
+
 The web transport (`ws://<controller>/ws`) feeds the same lines; it adds one
 WebSocket-only convention: after every command answer, a marker line
 `#<lines>` (or `#<lines> dropped`) is sent so the browser knows the answer is
@@ -142,7 +163,7 @@ is **not running** in that state, and the protocol divides cleanly:
 
 | | behaviour in SAFE mode |
 |---|---|
-| downlink | **unchanged** — `T,`/`D,`/`E,` keep streaming and `T,` carries mode `SAFE`. The sensor task is alive, so a handset can still watch the machine decide. |
+| downlink | **unchanged** — `T,`/`D,`/`E,` keep streaming and `T,` carries mode `SAFE`. The sensor task is alive, so a handset can still watch the machine decide. Note that the mode field is asserted by the link, not by the control chain: the chain is stopped in SAFE and would report whatever it last had, so the router's lockout is the source of truth. |
 | every command except `ACK` | `ERR safe mode` |
 | `ACK` | `OK SAFE RESTART`, then the controller restarts itself cleanly |
 

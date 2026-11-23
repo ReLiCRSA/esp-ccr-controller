@@ -533,7 +533,7 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
-| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board**; web half verified over the air from the PC (AP `ESP-CCR-3828`: captive DNS, batched replies, 180 s / 178 replies / 0 socket drops). Reflash chain: `1b8c807` (tag `m2-flashed`) → web-fix build (tag `m2-web-fixes`). **Boot/console half PASSes; the handset link is now live and it paid for itself immediately.** The first `GET T` over the real link panicked the controller (uart2 stack overflow inside newlib float printf — §16), now fixed structurally (`util/numfmt.cpp`, `util/stackwatch.cpp` + `stk=` appended to HB), together with the SAFE-mode `ACK` the boot log had been promising but never implemented. Refusal-matrix rerun on this build is the next bench action; the `LOG EXPORT` vs `/dive/<n>.csv` mismatch (§16) is a known C2 failure waiting. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board**; web half verified over the air from the PC (AP `ESP-CCR-3828`: captive DNS, batched replies, 180 s / 178 replies / 0 socket drops). Reflash chain: `1b8c807` (tag `m2-flashed`) → web-fix build (tag `m2-web-fixes`). **Both halves PASS on the flashed build: 30/30 checks, 0 failures** (boot console + the refusal matrix over the spare-ESP32 handset bridge, now including `GET T`/`GET D` proven as real replies by cadence anchoring, `GET *`/`GET SCHEMA`/`GET HIST`/`GET FAULT`, and a console watcher that fails the run on any panic, SAFE latch or lost stack headroom). The link paid for itself immediately: the first `GET T` over it panicked the controller (uart2 stack overflow — §16), fixed structurally (`util/numfmt.cpp`, no by-value reply buffers, `stk=`/`u2stk=` in HB) together with the SAFE-mode `ACK` the boot log had been promising but never implemented, now verified on hardware (`ACK` → `OK SAFE RESTART` → clean boot). Still open for C2: `LOG EXPORT` vs `/dive/<n>.csv` row-shape mismatch (§16), and the depth/`CAL O2` legs that need the LPS28DFW on 19/18 and the bench jar. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done (this batch) |
@@ -911,3 +911,108 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   host test that feeds one record set through both and compares bytes. Related
   formatting wart fixed in passing on the way: the hand-rolled `%d.%02d` in
   `dive_store` printed a negative value as `-5.-30`.
+- **Removing float printf did not stop the crash, and the backtrace said why
+  (bench, 2026-11-23, C2).** `GET T` panicked `uart2` a second time, on a build
+  with every `%f` gone. The stack pointers in the new backtrace were the answer:
+  `_svfprintf_r` at 0x3ffca270 under `uart2Task` at 0x3ffcb960 — **5872 of the
+  task's 6144 bytes consumed on the way in**, and the frames were
+  `UartLink::handleLine` 2240 B, `CommandRouter::exec` 1232 B,
+  `Session::handleLine` 1072 B. `Response` contains `char text[MAX_REPLY]`
+  (1024 B) and was **returned by value**, so one command line held three
+  simultaneous copies of it (exec's local, the compiler's hidden return slot, the
+  transport's local) ≈ 3.1 KB, and eight more `char buf[MAX_REPLY]` temporaries
+  sat in the same path — `GET SP2` alone allocated two of them. Float printf was
+  only the last straw; the buffer movement was the leak. Fixed structurally:
+  `exec(line, Response&)` takes caller-owned storage, `Response` is **non-copyable**
+  (the compile error is the guard — it turned every offender into a build failure,
+  in the firmware and in the tests), the transport owns one `Response` and one line
+  scratch in the session's static arena, and the big formatters write straight into
+  the reply buffer via `replyInPlace` instead of into a 1 KB temporary. Measured on
+  the board: `u2stk` 4192 B free idle, **3280 B free after the whole refusal
+  matrix**, against 6144 total — the same chain that used to need 5872+ and trip.
+- **`Response r{}` had been hiding a wire bug for months.** Zero-initialising a
+  fresh reply buffer per command meant the byte after every reply was already
+  `'\0'`, so `formatOk`/`formatErr` never had to terminate. With the buffer
+  **reused**, leftovers from the previous reply are live: the first build after
+  the change answered `ACK` with `OK\n unknown command\n`. Every reply path now
+  goes through one `terminate()` helper, and `test_router` asserts
+  `strlen(text) == len` after every command on a reused buffer — long reply,
+  short reply, repeatedly, because only that order exposes it. A transport sinks
+  `r.text` as a C string, so this was bytes on the wire, not tidiness.
+- **The acceptance harness reported PASS for the command that was crashing the
+  board (found 2026-11-23).** `GET T` answers with a `T,` line and the controller
+  streams `T,` at 2 Hz unprompted, so `want ^T,` matched a line the firmware sent
+  anyway — while the command itself was busy panicking the task. `hw_accept.py`
+  now anchors on the cadence (wait for a streamed line, send immediately after it,
+  require a match within 450 ms — the next unsolicited one cannot arrive for
+  another 500 ms), which proves a reply deterministically; the naive "two matching
+  lines within 400 ms" version I first wrote would have flaked ~20 % of runs,
+  because a reply can land exactly in the slot the next unsolicited line would
+  have used. It also keeps a console reader open through the command phase plus a
+  12 s tail, and fails loudly on `Guru Meditation` / stack canary / `** SAFE MODE`
+  / `!! FATAL` / `PRIOR FAULT` / `reset reason: PANIC`, and on missing or low
+  `stk=`/`u2stk=`. Before that, a mid-matrix crash presented as ten unrelated
+  timeouts and one bogus PASS.
+- **`stk=` alone was the wrong number to watch, and the bench proved it.**
+  Reporting the *minimum* headroom across tasks pins the reading to the smallest
+  task (supervisor, 3072 B), which never moves no matter what a client asks for —
+  it sat at `2132` through the entire command matrix while the task that actually
+  crashed, `uart2` (6144 B), was invisible behind it. HB now appends `u2stk=`
+  alongside `stk=` (append-only, per the HB rule) and the harness requires both to
+  stay ≥512. "Worst on the machine" and "the one that can regress" are different
+  questions.
+- **A bug class that returns once needs a command, not a memory (2026-11-23).**
+  The first fix removed the seven `%f` in the telemetry line and the crash
+  recurred — `%g` was hiding in `GET SCHEMA`. `tools/float_audit.py` (in the
+  pre-flash gate, next to `pio test -e native`) fails on any float format
+  specifier in `src/` that is not marked `/*float-ok: why*/`; exactly one marked
+  exception exists. While fixing that one: `GET SCHEMA` also formatted its 32-key
+  listing **on the task answering a diver**, into a 1 KB temporary, with a guard
+  that could serve a truncated listing as if it were complete. The schema is
+  derived from a compile-time table, so it is now rendered once by
+  `Session::begin()` (not from `main.cpp` — `test_session` immediately caught that
+  a boot-sequence call site is forgettable, which is exactly the failure mode) and
+  every later `GET SCHEMA` is a copy. `test_schema` pins that all 32 keys fit with
+  headroom (858 bytes today) and that the reply is the whole table, never a prefix.
+- **Transport decision, recorded: UART2 stays (bench discussion 2026-11-23).**
+  Weighed CAN/TWAI seriously — the classic ESP32 has a TWAI controller and the IDF
+  driver ships in this toolchain — and RS-485. UART2 wins because the protocol
+  assumes full duplex: the controller pushes `T,` at 2 Hz while a command may
+  arrive at any instant. 2-wire RS-485 is half duplex and would force
+  request/response discipline the compatibility rules make expensive; its
+  4-wire full-duplex mode keeps bytes and protocol untouched and is the cheap
+  answer for cable length or noise. CAN is the best of the wired alternatives
+  (arbitration preserves the model) but a 62-byte `T,` line becomes eight 8-byte
+  frames, needing a framing annex — chunk header, sequence, end marker, bus-off as
+  a protocol condition. **Revisit CAN for multiple nodes (point-to-point is
+  permanent), a console metres away, or galvanic isolation through the housing.**
+  BLE is a surface transport, not an in-water one: 2.4 GHz dies in ~10 cm of
+  water, so it belongs in the same class as the web AP. Two of the usual reasons
+  for CAN/485 are already covered here: the 2 Hz `T,` stream is a link heartbeat
+  (a handset knows the link is dead within a second), and a short hose has no
+  noise margin to buy.
+- **`DIVE START` rebooted the controller inside the WiFi driver — a second,
+  unrelated defect, found only because the harness started watching the console
+  (bench, 2026-11-23).** The refusal matrix had gone green, then failed twice in
+  four runs with the board in SAFE; the console watch named it, and the backtrace
+  was not ours at all:
+
+      assert failed: spinlock_acquire spinlock.h:122 (result == core_id || result == SPINLOCK_FREE)
+      vPortEnterCritical ← semphr_give_wrapper ← ieee80211_ioctl_process ← ppTask
+
+  `web::stop()` ran `softAPdisconnect(true)` + `WiFi.mode(WIFI_OFF)` **on the task
+  that was answering the client**, with a station still associated. The deauth is
+  asynchronous: the driver's own worker is still inside an ioctl when
+  `esp_wifi_stop()` runs, and it asserts on a semaphore it can no longer take.
+  It fires on the dive-start radio drop — the one moment the radio is designed to
+  come down — and it is intermittent, which is why `hw_accept.py` scoring only
+  the handset replies missed it. Fixed with the pattern already used for other
+  hardware side effects (read to answer, post to act): `comms::web::setRadio()`
+  now only records intent, `loopTask` performs the change (`radioPending()` /
+  `serviceRadio()`), and `stop()` drains the driver (250 ms after the deauth)
+  before `esp_wifi_stop()`. Deferred rather than done-inline also keeps a
+  several-hundred-millisecond WiFi teardown from holding the session mutex and
+  stalling the 2 Hz downlink. Verified: 2 full acceptance runs clean, then
+  `tools/radio_stress.py` — 12 explicit OFF/ON teardown cycles, 0 fault markers.
+  A race that "did not happen twice" is not fixed, hence the committed stress
+  tool. Not host-testable: `web_server.cpp` is excluded from the native build.

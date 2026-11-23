@@ -26,11 +26,12 @@ void CommandRouter::replyOk(Response& r, const char* note) {
         r.len = static_cast<size_t>(std::snprintf(r.text, sizeof(r.text), "OK %s\n", note));
     else
         r.len = proto::formatOk(r.text, sizeof(r.text));
-    if (r.len >= sizeof(r.text)) r.len = sizeof(r.text) - 1;  // snprintf truncates safely
+    terminate(r);
 }
 
 void CommandRouter::replyErr(Response& r, const char* why) {
     r.len = proto::formatErr(why, r.text, sizeof(r.text));
+    terminate(r);
 }
 
 void CommandRouter::replyText(Response& r, const char* text, size_t n) {
@@ -39,9 +40,95 @@ void CommandRouter::replyText(Response& r, const char* text, size_t n) {
         return;
     }
     std::memcpy(r.text, text, n);
-    r.text[n] = '\0';
     r.len = n;
+    terminate(r);
 }
+
+// The one rule every reply path must satisfy: r.text is a NUL-terminated C
+// string whose length is exactly r.len, no matter what the buffer held before.
+// The transports hand r.text to a sink that treats it as a string, so a reply
+// that runs into leftover bytes from the previous command puts those bytes on
+// the wire — the failure test_router now guards against.
+void CommandRouter::terminate(Response& r) {
+    const size_t cap = sizeof(r.text);
+    if (r.len >= cap) r.len = cap - 1;      // a formatter overran: keep it short
+    r.text[r.len] = '\0';
+}
+
+void CommandRouter::replyInPlace(Response& r, size_t n) {
+    if (n == 0 || n >= sizeof(r.text)) {   // formatter refused, or no room:
+        replyErr(r, "reply overflow");     // never emit half a line
+        return;
+    }
+    r.len = n;
+    terminate(r);
+}
+
+// ---- the settings schema text, rendered once at boot ------------------------
+//
+// The K, lines describe the settings table, which is fixed at compile time — so
+// every GET SCHEMA reply is the same bytes, and formatting it per command buys
+// nothing. It also cost a 1024-byte stack temporary and three %.6g conversions
+// per key (newlib float printf, the thing that panicked the uart2 task) on the
+// task that answers a diver. It is now rendered once by primeSchema() from
+// setup(), before any small-stack task exists, and every later GET SCHEMA is a
+// copy.
+//
+// The truncation rule is deliberate and loud: a partial list served as if it
+// were complete is worse than a short answer, because a handset that cannot see
+// a key cannot set it and has no way to know why. primeSchema() returns the
+// length, the caller compares it against MAX_SCHEMA, and test_schema proves it
+// fits with room to spare.
+
+namespace {
+
+char g_schema[CommandRouter::MAX_SCHEMA];
+size_t g_schemaLen = 0;
+bool g_schemaReady = false;
+
+size_t renderSchema(char* out, size_t cap) {
+    size_t cnt = 0;
+    const settings::Def* defs = settings::Registry::definitions(cnt);
+    size_t p = 0;
+    for (size_t i = 0; i < cnt; ++i) {
+        char line[96];
+        char tc = '?';
+        switch (defs[i].type) {
+            case settings::Type::FLOAT: tc = 'F'; break;
+            case settings::Type::INT16: tc = 'I'; break;
+            case settings::Type::UINT8: tc = 'U'; break;
+            case settings::Type::BOOL:  tc = 'B'; break;
+            case settings::Type::STRING: tc = 'S'; break;
+        }
+        int n;
+        if (defs[i].type == settings::Type::STRING)
+            n = std::snprintf(line, sizeof(line), "K,%s,%c,%u,%u,%u,%s\n",
+                              defs[i].key, tc, static_cast<unsigned>(defs[i].minv),
+                              (unsigned)defs[i].maxv, defs[i].flags,
+                              defs[i].defStr ? defs[i].defStr : "");
+        else
+            n = std::snprintf(line, sizeof(line),
+                              "K,%s,%c,%.6g,%.6g,%u,%.6g\n",  /*float-ok: compile-time settings table, rendered once by Session::begin before the small-stack tasks exist*/
+                              defs[i].key, tc, static_cast<double>(defs[i].minv),
+                              static_cast<double>(defs[i].maxv), defs[i].flags,
+                              static_cast<double>(defs[i].def));
+        if (n <= 0) continue;                                   // unprintable key
+        if (p + static_cast<size_t>(n) >= cap) return p;        // does not fit
+        std::memcpy(out + p, line, static_cast<size_t>(n));
+        p += static_cast<size_t>(n);
+    }
+    return p;
+}
+
+} // namespace
+
+size_t primeSchema() {
+    g_schemaLen = renderSchema(g_schema, sizeof(g_schema));
+    g_schemaReady = g_schemaLen > 0 && g_schemaLen < sizeof(g_schema);
+    return g_schemaLen;
+}
+
+size_t schemaLen() { return g_schemaLen; }
 
 // ---- shared formatters -------------------------------------------------------
 
@@ -149,18 +236,20 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         t.votedPpo2 = loop_.votedBar();
         for (int i = 0; i < 3; i++) t.cells[i] = loop_.cellBar(i);
         t.setpoint = loop_.setpointBar();
-        t.mode = loop_.diveActive() ? (loop_.autoMode() ? 1 : 2) : 0;
+        // SAFE is a fact about the machine, and the router is the one that
+        // knows it (safeLockout_): the T, line must say SAFE rather than the
+        // STANDBY that a control chain which is not running would report.
+        t.mode = safeLockout_ ? 3 : (loop_.diveActive() ? (loop_.autoMode() ? 1 : 2) : 0);
         t.flags = telemetryFlags(loop_);
         t.battV = loop_.vbatVolts();
-        char buf[128];
-        const size_t n = proto::formatTelemetry(t, buf, sizeof(buf));
-        replyText(r, buf, n);
+        replyInPlace(r, proto::formatTelemetry(t, r.text, sizeof(r.text)));
         return;
     }
     if (std::strcmp(key, "D") == 0) {
-        char buf[CommandRouter::MAX_REPLY];
-        const size_t n = proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()), buf, sizeof(buf));
-        replyText(r, buf, n);
+        // formatted into r.text: a 1024-byte temporary here sat on the uart2
+        // task's stack, on top of the 1024-byte Response copies around it
+        replyInPlace(r, proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()),
+                                          r.text, sizeof(r.text)));
         return;
     }
     if (std::strcmp(key, "CELLS") == 0) { buildCellsLine(r); return; }
@@ -195,10 +284,7 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
     }
     if (std::strcmp(key, "HIST") == 0) {
         if (!hist_) { replyErr(r, "no histogram"); return; }
-        char buf[CommandRouter::MAX_REPLY];
-        const size_t n = cellhist::formatLines(*hist_, nowMs_, buf, sizeof(buf));
-        if (!n) { replyErr(r, "hist too long"); return; }
-        replyText(r, buf, n);
+        replyInPlace(r, cellhist::formatLines(*hist_, nowMs_, r.text, sizeof(r.text)));
         return;
     }
     // The web Settings page needs each key's type, range and flags to put a
@@ -206,31 +292,12 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
     // the same view. Additive display key — exec() asks the registry before
     // it asks here, so it can never shadow a real setting.
     if (std::strcmp(key, "SCHEMA") == 0) {
-        char buf[CommandRouter::MAX_REPLY];
-        size_t cnt = 0;
-        const settings::Def* defs = settings::Registry::definitions(cnt);
-        int p = 0;
-        for (size_t i = 0; i < cnt && p < (int)sizeof(buf) - 48; i++) {
-            char tc = '?';
-            switch (defs[i].type) {
-                case settings::Type::FLOAT: tc = 'F'; break;
-                case settings::Type::INT16: tc = 'I'; break;
-                case settings::Type::UINT8: tc = 'U'; break;
-                case settings::Type::BOOL:  tc = 'B'; break;
-                case settings::Type::STRING: tc = 'S'; break;
-            }
-            if (defs[i].type == settings::Type::STRING)
-                p += std::snprintf(buf + p, sizeof(buf) - p, "K,%s,%c,%u,%u,%u,%s\n",
-                                   defs[i].key, tc, (unsigned)defs[i].minv,
-                                   (unsigned)defs[i].maxv, defs[i].flags,
-                                   defs[i].defStr ? defs[i].defStr : "");
-            else
-                p += std::snprintf(buf + p, sizeof(buf) - p, "K,%s,%c,%.6g,%.6g,%u,%.6g\n",
-                                   defs[i].key, tc, static_cast<double>(defs[i].minv),
-                                   static_cast<double>(defs[i].maxv), defs[i].flags,
-                                   static_cast<double>(defs[i].def));
-        }
-        replyText(r, buf, static_cast<size_t>(p));
+        // answered from the boot-time rendering above
+        if (!g_schemaReady) { replyErr(r, "schema not primed"); return; }
+        if (g_schemaLen >= sizeof(r.text)) { replyErr(r, "reply overflow"); return; }
+        std::memcpy(r.text, g_schema, g_schemaLen);
+        r.len = g_schemaLen;
+        terminate(r);
         return;
     }
 
@@ -239,13 +306,15 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
 
 // ---- dispatch ----------------------------------------------------------------
 
-CommandRouter::Response CommandRouter::exec(const char* line) {
-    Response r{};
+void CommandRouter::exec(const char* line, Response& r) {
+    r.len = 0;
+    r.actions = ACT_NONE;
+    r.text[0] = '\0';
     Command cmd;
     const char* err = nullptr;
     if (!proto::parseCommand(line, cmd, &err)) {
         replyErr(r, err ? err : "bad command");
-        return r;
+        return;
     }
 
     // SAFE mode lockout: checked after parsing (so a malformed line still
@@ -253,29 +322,27 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
     // point is that no command can reach a chain that is not running.
     if (safeLockout_ && cmd.kind != Kind::ACK) {
         replyErr(r, "safe mode");
-        return r;
+        return;
     }
 
     switch (cmd.kind) {
         case Kind::GET:
             if (std::strcmp(cmd.key, "*") == 0) {
-                char buf[MAX_REPLY];
-                const size_t n = reg_.listAll(buf, sizeof(buf));
-                replyText(r, buf, n);
+                replyInPlace(r, reg_.listAll(r.text, sizeof(r.text)));
             } else {
                 // Registry first: real keys (D1, D2, CELLS_..., CAL_...) must
                 // never be shadowed by a display key. Only keys the registry
                 // does not have reach the live-status formatters below.
                 const int idx = reg_.find(cmd.key);
                 if (idx >= 0) {
-                    char val[MAX_REPLY];
+                    char val[settings::MAX_VAL_STR];   // the registry's own cap
                     if (!reg_.valueAsString(idx, val, sizeof(val))) {
-                        replyErr(r, "reply overflow");
+                        replyErr(r, "value too long");
                         break;
                     }
-                    char full[MAX_REPLY];
-                    const int n = std::snprintf(full, sizeof(full), "%s=%s\n", cmd.key, val);
-                    replyText(r, full, static_cast<size_t>(n));
+                    const int n = std::snprintf(r.text, sizeof(r.text), "%s=%s\n",
+                                                cmd.key, val);
+                    replyInPlace(r, n > 0 ? static_cast<size_t>(n) : 0);
                 } else {
                     getSpecial(r, cmd.key);
                 }
@@ -380,12 +447,10 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
             replyOk(r);
             break;
 
-        case Kind::DECO: {
-            char buf[MAX_REPLY];
-            const size_t n = proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()), buf, sizeof(buf));
-            replyText(r, buf, n);
+        case Kind::DECO:
+            replyInPlace(r, proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()),
+                                              r.text, sizeof(r.text)));
             break;
-        }
 
         case Kind::DIVE_START: startDive(r); break;
         case Kind::DIVE_END:   endDive(r);   break;
@@ -409,7 +474,6 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
             replyErr(r, "unknown command");
             break;
     }
-    return r;
 }
 
 } // namespace comms

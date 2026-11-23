@@ -69,6 +69,16 @@ size_t formatEvent(uint32_t tSec, uint16_t id, uint16_t value, char* out, size_t
 inline size_t formatOk(char* out, size_t cap) {
     if (cap < 3) return 0;
     out[0] = 'O'; out[1] = 'K'; out[2] = '\n';
+    // NUL-terminated when there is room. Until 2026-11-23 this did not matter:
+    // the router built its Response with `Response r{}`, which zeroed all 1024
+    // bytes, so the byte after every reply was already '\0'. The reply buffer is
+    // now REUSED (see cmd_router.h: a fresh 1 KB per command was what overflowed
+    // the uart2 task), so leftovers from the previous reply are live memory and
+    // a caller printing the buffer as a C string would emit them. The router's
+    // transports sink r.text as a string, so terminating is a wire correctness
+    // property, not tidiness; test_router asserts strlen(text)==len after every
+    // command on one reused buffer.
+    if (cap >= 4) out[3] = '\0';
     return 3;
 }
 size_t formatErr(const char* reason, char* out, size_t cap);

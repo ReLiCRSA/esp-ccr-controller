@@ -117,6 +117,35 @@ struct Fix {
 void setUp() { g_out = nullptr; g_hk = nullptr; }
 void tearDown() {}
 
+void test_safe_mode_is_visible_on_the_downlink() {
+    // SAFE mode is entered because the machine cannot account for its last
+    // reset. The handset link stays up in that state (the diver needs ACK to
+    // get out), so a handset must be able to SEE it — from the downlink, before
+    // it sends anything, not from an ERR it has not sent yet. The published
+    // snapshot cannot say this by itself: in SAFE the control chain is not
+    // running, so it keeps reporting whatever it last had (STANDBY). The link
+    // knows the truth because the router holds the lockout.
+    std::vector<std::string> out;
+    g_out = &out;
+    Fix f;
+
+    f.pump(500);
+    TEST_ASSERT_TRUE_MESSAGE(saw("H:T,"), "pump produced no telemetry line");
+    TEST_ASSERT_TRUE_MESSAGE(sawAnywhere(",STANDBY,"), "a standing-by machine must say STANDBY");
+
+    out.clear();
+    f.ses.setSafeLockout(true);          // what main.cpp does on an unaccounted reset
+    f.pump(1000);
+    TEST_ASSERT_TRUE_MESSAGE(sawAnywhere(",SAFE,"),
+                             "the T, line did not report SAFE while the router was locked out");
+
+    // and the command side matches the state the downlink advertised
+    out.clear();
+    f.handset("GET T");
+    TEST_ASSERT_TRUE_MESSAGE(saw("H:ERR safe mode"),
+                             "GET T was accepted although the downlink said SAFE");
+}
+
 void test_the_web_gets_identical_refusals() {
     std::vector<std::string> out;
     g_out = &out;
@@ -309,6 +338,7 @@ void test_a_session_without_a_chain_answers_nothing() {
 
 int main() {
     UNITY_BEGIN();
+    RUN_TEST(test_safe_mode_is_visible_on_the_downlink);
     RUN_TEST(test_the_web_gets_identical_refusals);
     RUN_TEST(test_diver_intent_survives_across_transports);
     RUN_TEST(test_the_two_step_cal_handshake_is_shared);

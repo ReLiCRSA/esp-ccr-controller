@@ -39,6 +39,10 @@ uint32_t worstOf(const uint32_t* freeBytes, size_t n, size_t* outSlot) {
     return worst;
 }
 
+uint32_t freeFor(Slot slot) {
+    return slot < SLOT_COUNT ? g_free[slot] : 0;
+}
+
 uint32_t worstFree(uint8_t* outSlot) {
     uint32_t copy[SLOT_COUNT];
     for (size_t i = 0; i < SLOT_COUNT; ++i) copy[i] = g_free[i];

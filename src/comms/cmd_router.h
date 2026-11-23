@@ -34,9 +34,24 @@
 
 namespace comms {
 
+/// Renders the settings schema (the GET SCHEMA K, lines) into the router's
+/// static text and reports its length. Call once at boot, before the small-stack
+/// tasks start: it is the only place the schema's float formatting ever runs.
+/// Returns 0 if the table did not fit MAX_SCHEMA.
+size_t primeSchema();
+
+/// Length of the rendered schema text; 0 before primeSchema() has run, or if the
+/// table does not fit MAX_SCHEMA. Printed at boot so a truncation is visible on
+/// the bench instead of being a handset mystery.
+size_t schemaLen();
+
 class CommandRouter {
 public:
     static constexpr size_t MAX_REPLY = 1024;  // must also fit GET * (32 keys)
+    /// Room for the whole K, schema listing. Sized by test_schema, which
+    /// renders the real table and requires headroom, so this cannot silently
+    /// become a partial list the day someone adds a setting.
+    static constexpr size_t MAX_SCHEMA = 2048;
 
     enum Actions : uint32_t {
         ACT_NONE = 0,
@@ -56,10 +71,23 @@ public:
     };
 
 
+    // The reply buffer lives where the CALLER can afford it, never on a task's
+    // stack as a value. This is not style: on 2026-11-23 `GET T` panicked the
+    // controller with "Stack canary watchpoint triggered (uart2)", and the
+    // backtrace's stack pointers showed why — Response was returned BY VALUE,
+    // so one command line held three simultaneous copies of this 1024-byte
+    // struct (exec's local, the compiler's hidden return slot, the transport's
+    // local) = ~3.1 KB of the uart2 task's 6144, before newlib's _svfprintf_r
+    // spent another ~784 on top. Removing float printf did not save it; the
+    // buffer movement was the leak.
     struct Response {
         char text[MAX_REPLY];
         size_t len = 0;      // 0 = no reply line (silent OK)
         uint32_t actions = ACT_NONE;
+
+        Response() = default;
+        Response(const Response&) = delete;          // enforced by the compiler,
+        Response& operator=(const Response&) = delete;  // so it cannot come back
     };
 
     /// `nowMs` is the monotonic clock the control chain uses (millis() on the
@@ -82,7 +110,14 @@ public:
     bool safeLockout() const { return safeLockout_; }
 
     /// Parses `line` and executes it. Parse refusals never reach the chain.
-    Response exec(const char* line);
+    ///
+    /// `r` is the caller's storage and is reset here (len/actions/text) before
+    /// anything is written; on return it holds exactly one reply line, plus the
+    /// action bits the transport must carry out. Out-parameter rather than a
+    /// return value on purpose — see the Response comment above for the crash
+    /// that decided it. The transport keeps one Response for its lifetime (in
+    /// the session arena, not on a task stack) and reuses it per line.
+    void exec(const char* line, Response& r);
 
     // ---- state the transport / firmware reads ------------------------------
     bool wifiEnabled() const { return wifiOn_; }
@@ -112,6 +147,15 @@ private:
     void replyOk(Response& r, const char* note = nullptr);
     void replyErr(Response& r, const char* why);
     void replyText(Response& r, const char* text, size_t n);
+    /// Adopts a reply a formatter wrote straight into r.text (n = bytes it
+    /// wrote, 0 = it refused). Same all-or-nothing rule as replyText: a
+    /// truncated line is replaced by ERR, never sent short. Used by the big
+    /// formatters (GET *, GET D, GET HIST, SCHEMA) so they never need a
+    /// MAX_REPLY temporary of their own.
+    void replyInPlace(Response& r, size_t n);
+    /// Enforces the reply invariant: text is NUL-terminated and strlen(text) ==
+    /// len. Every reply path calls this; nothing else writes r.len.
+    static void terminate(Response& r);
 
     void applyWifi(Response& r, bool on);
     void startDive(Response& r);

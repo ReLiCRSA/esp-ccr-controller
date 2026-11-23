@@ -391,14 +391,36 @@ void stop() {
         g_dns = nullptr;  // :53 belongs to nobody while the radio is down
     }
     WiFi.softAPdisconnect(true);
+    // Drain, then stop. The deauth of any associated station is asynchronous:
+    // the driver's worker (ppTask) is still inside an ioctl when this returns.
+    // esp_wifi_stop() across that window asserts inside the driver —
+    // `spinlock_acquire` in semphr_give_wrapper — and that is a reboot, not a
+    // warning. Observed on the bench 2026-11-23 from the dive-start radio drop.
+    // The pause belongs here rather than in the caller: this runs on loopTask,
+    // which has no control duty, and never in the task answering a client.
+    delay(250);
     WiFi.mode(WIFI_OFF);
     g_on = false;
     g_ws->enable(true);
     Serial.println("web: radio off (dive)");
 }
 
+// Radio intent is state; the action belongs on loopTask. See web_server.h.
+volatile bool g_radioWanted = true;
+volatile bool g_radioChange = false;
+
 void setRadio(bool on) {
-    if (on) start();
+    g_radioWanted = on;
+    g_radioChange = true;
+}
+
+bool radioPending() { return g_radioChange && (g_radioWanted != g_on); }
+
+void serviceRadio() {
+    if (!g_radioChange) return;
+    g_radioChange = false;
+    if (g_radioWanted == g_on) return;
+    if (g_radioWanted) start();
     else stop();
 }
 

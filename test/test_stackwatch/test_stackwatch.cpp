@@ -40,6 +40,28 @@ void test_ignores_tasks_that_have_not_sampled_yet() {
     TEST_ASSERT_EQUAL_UINT8(stackwatch::SLOT_SENSOR, at);
 }
 
+void test_the_minimum_hides_the_task_you_care_about() {
+    // Why HB carries u2stk= as well as stk=. The supervisor runs on 3072 bytes
+    // and its headroom is flat no matter what a client asks for; the uart2 task
+    // has 6144 and is where the command path lives. Reporting only the minimum
+    // means the number on the bench belongs to a task that cannot regress, and
+    // the one that overflowed on 2026-11-23 is invisible behind it.
+    const uint32_t both[stackwatch::SLOT_COUNT] = {
+        1600, 1900, 1700, 2132, 900, 3000};
+    size_t at = 99;
+    const uint32_t worst = stackwatch::worstOf(both, stackwatch::SLOT_COUNT, &at);
+    TEST_ASSERT_EQUAL_UINT32(900, worst);
+    TEST_ASSERT_EQUAL_UINT8(stackwatch::SLOT_UART2, at);
+
+    // Now the reported situation on the board: uart2 has room, so the minimum
+    // is the supervisor's, and a uart2 reading of 900 would never surface.
+    const uint32_t healthy[stackwatch::SLOT_COUNT] = {
+        1600, 1900, 1700, 2132, 4500, 3000};
+    TEST_ASSERT_EQUAL_UINT32(1600, stackwatch::worstOf(healthy, stackwatch::SLOT_COUNT, &at));
+    TEST_ASSERT_EQUAL_UINT8(stackwatch::SLOT_SENSOR, at);
+    // ...which is exactly why freeFor(SLOT_UART2) needs its own field in HB.
+}
+
 void test_names_are_defined_for_every_slot() {
     for (int i = 0; i < stackwatch::SLOT_COUNT; ++i) {
         const char* n = stackwatch::name(static_cast<uint8_t>(i));
@@ -54,6 +76,7 @@ int main() {
     RUN_TEST(test_unsampled_is_not_plenty_of_room);
     RUN_TEST(test_picks_the_tightest_task);
     RUN_TEST(test_ignores_tasks_that_have_not_sampled_yet);
+    RUN_TEST(test_the_minimum_hides_the_task_you_care_about);
     RUN_TEST(test_names_are_defined_for_every_slot);
     return UNITY_END();
 }

@@ -33,7 +33,23 @@ void stop();
 /// Obeys the router's radio policy: on -> AP + server, off -> radio off.
 /// This is the hook every transport registers, so "WiFi off during a dive"
 /// cannot be implemented differently by different clients.
+/// Ask for the radio to come up or go down. This only RECORDS the request:
+/// the teardown itself runs on loopTask via serviceRadio(). esp_wifi_stop()
+/// called from the task that is answering a client — with a station still
+/// associated and the driver mid-ioctl — races the WiFi driver's own worker
+/// and asserts inside it (`assert failed: spinlock_acquire spinlock.h:122`,
+/// backtrace semphr_give_wrapper <- ieee80211_ioctl_process <- ppTask), which
+/// is how DIVE START rebooted the controller on the bench on 2026-11-23, i.e.
+/// at the one moment the radio is designed to drop.
 void setRadio(bool on);
+
+/// True when a recorded request differs from the current state. loopTask uses
+/// this to poll briskly instead of once a second.
+bool radioPending();
+
+/// Performs a pending radio change. Call from loopTask only: the teardown may
+/// block for a driver drain, and no task with control duty should pay that.
+void serviceRadio();
 
 /// Pump the captive DNS responder once. Non-blocking; call from a periodic
 /// task (the handset task does it every 20 ms). A joined phone resolves

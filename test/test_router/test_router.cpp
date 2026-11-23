@@ -37,10 +37,21 @@ struct Bench {
     uint32_t now = 0;
     CommandRouter router;
 
+    // The reply buffer is storage the CALLER owns, as it is on the target:
+    // CommandRouter::Response is not copyable (see cmd_router.h for the crash
+    // that made it that way), so no test — and no transport — can move one
+    // through a stack frame by value. `resp` is the bench's own buffer; a test
+    // that must hold two replies at once passes its own.
+    CommandRouter::Response resp;
     Bench() : reg(), router(loop, reg, now) { reg.resetToDefaults(); }
-    CommandRouter::Response run(const char* line) {
+    const CommandRouter::Response& run(const char* line) {
         router.setNowMs(now);
-        return router.exec(line);
+        router.exec(line, resp);
+        return resp;
+    }
+    void run(const char* line, CommandRouter::Response& out) {
+        router.setNowMs(now);
+        router.exec(line, out);
     }
     void ticks(float bar, float depth, float seconds) {
         const uint32_t n = static_cast<uint32_t>(seconds * 1000.0f / Loop::kTickMs);
@@ -54,6 +65,14 @@ struct Bench {
         }
     }
 };
+
+// replies are exactly one protocol line; a second '\n' inside the reply means
+// either a leaked tail or a command that answered twice
+size_t countLines(const char* text, size_t len) {
+    size_t n = 0;
+    for (size_t i = 0; i < len; ++i) if (text[i] == '\n') ++n;
+    return n;
+}
 
 bool has(const CommandRouter::Response& r, const char* needle) {
     return std::strstr(r.text, needle) != nullptr;
@@ -83,48 +102,50 @@ struct Plant {
 
 void test_auto_lockout_holds_over_the_router() {
     Bench b;
-    CommandRouter::Response r = b.run("AUTO");
+    CommandRouter::Response r;
+        b.run("AUTO", r);
     TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"), "AUTO accepted with no pre-dive check");
     TEST_ASSERT_FALSE(b.loop.autoMode());
 
     // The raw switch is simulator/factory-only and is NOT reachable from any
     // command line: prove AUTO stays refused even with auto force-set.
     b.loop.setAutoMode(true);
-    r = b.run("MANUAL");
+    b.run("MANUAL", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
     TEST_ASSERT_FALSE(b.loop.autoMode());
-    r = b.run("AUTO");
+    b.run("AUTO", r);
     TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"), "AUTO bypassed the pre-dive lockout");
     TEST_ASSERT_FALSE(b.loop.autoMode());
 }
 
 void test_get_set_round_trip_on_the_shared_registry() {
     Bench b;
-    CommandRouter::Response r = b.run("SET SP2=0.55");
+    CommandRouter::Response r;
+        b.run("SET SP2=0.55", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_SETTINGS);
     TEST_ASSERT_FLOAT_WITHIN(0.0001, 0.55f, b.reg.getFloat(b.reg.find("SP2")));
 
-    r = b.run("GET SP2");
+    b.run("GET SP2", r);
     TEST_ASSERT_TRUE(has(r, "SP2=0.550"));
 
-    r = b.run("SET SP2=2.5");
+    b.run("SET SP2=2.5", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
     TEST_ASSERT_FLOAT_WITHIN(0.0001, 0.55f, b.reg.getFloat(b.reg.find("SP2")));
 
-    r = b.run("GET *");
+    b.run("GET *", r);
     TEST_ASSERT_TRUE(r.len > 300);
     TEST_ASSERT_TRUE(has(r, "SP1=0.400\n"));
 
     // safety-flagged writes answer OK SAFETY so the client event-logs them
-    r = b.run("SET GF_LOW=35");
+    b.run("SET GF_LOW=35", r);
     TEST_ASSERT_TRUE(has(r, "SAFETY"));
 
-    r = b.run("GET NOPE");
+    b.run("GET NOPE", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
-    r = b.run("FROBNICATE");
+    b.run("FROBNICATE", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
-    r = b.run("auto");  // lowercase is not a command
+    b.run("auto", r);  // lowercase is not a command
     TEST_ASSERT_TRUE(has(r, "ERR"));
     TEST_ASSERT_FALSE(b.loop.autoMode());
 }
@@ -134,55 +155,58 @@ void test_dive_locked_keys_refused_mid_dive() {
     TEST_ASSERT_TRUE(has(b.run("DIVE START"), "OK"));
     TEST_ASSERT_TRUE(b.loop.diveActive());
 
-    CommandRouter::Response r = b.run("SET SP2=0.40");
+    CommandRouter::Response r;
+        b.run("SET SP2=0.40", r);
     TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"), "setpoint rewritten under a diver");
-    r = b.run("SET AP_PASS=otherpass");
+    b.run("SET AP_PASS=otherpass", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
     // the refused write must not have landed
     TEST_ASSERT_EQUAL_STRING("diveonly", b.reg.getString(b.reg.find("AP_PASS")));
 
     // schedule tuning stays writable mid-dive (normal diving, not gas control)
-    r = b.run("SET GF_HIGH=90");
+    b.run("SET GF_HIGH=90", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
     TEST_ASSERT_EQUAL(90, b.reg.getInt(b.reg.find("GF_HIGH")));
 
-    r = b.run("DIVE START");
+    b.run("DIVE START", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));  // no double-start
 }
 
 void test_dive_start_drops_the_radio_and_end_restores_it() {
     Bench b;
-    CommandRouter::Response r = b.run("DIVE START");
+    CommandRouter::Response r;
+        b.run("DIVE START", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_DIVE_START);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_WIFI);
     TEST_ASSERT_FALSE(b.router.wifiEnabled());
     TEST_ASSERT_TRUE(b.router.wifiAutoOff());
 
-    r = b.run("WIFI ON");
+    b.run("WIFI ON", r);
     TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"), "radio reopened during a dive");
     TEST_ASSERT_FALSE(b.router.wifiEnabled());
 
-    r = b.run("DIVE END");
+    b.run("DIVE END", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_DIVE_END);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_WIFI);
     TEST_ASSERT_TRUE(b.router.wifiEnabled());
 
     // If the diver had WiFi off before the dive, dive end must NOT turn it on.
-    r = b.run("WIFI OFF");
+    b.run("WIFI OFF", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
-    r = b.run("DIVE START");
+    b.run("DIVE START", r);
     TEST_ASSERT_FALSE(b.router.wifiAutoOff());  // not our doing
-    r = b.run("DIVE END");
+    b.run("DIVE END", r);
     TEST_ASSERT_FALSE(b.router.wifiEnabled());
     TEST_ASSERT_FALSE(r.actions & CommandRouter::ACT_WIFI);
 
-    r = b.run("DIVE END");
+    b.run("DIVE END", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));  // already ended
 }
 
 void test_diver_outranks_the_machine_cellproof_override() {
     Bench b;
-    CommandRouter::Response r = b.run("CELLPROOF OVERRIDE");
+    CommandRouter::Response r;
+        b.run("CELLPROOF OVERRIDE", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));  // nothing to lift: honest answer
 
     // Drive the real chain into a CellProof FAIL: arm shallow, descend past
@@ -197,7 +221,7 @@ void test_diver_outranks_the_machine_cellproof_override() {
     // The diver lifts the clamp. The reply is the proof it happened — the
     // cpOut_ snapshot the UI reads is one cycle stale by design (it is
     // published by Loop::cycle), so confirm through a tick as well.
-    r = b.run("CELLPROOF OVERRIDE");
+    b.run("CELLPROOF OVERRIDE", r);
     TEST_ASSERT_TRUE_MESSAGE(has(r, "CLAMP LIFTED"),
                              "diver could not lift the clamp (diver outranks machine)");
     b.ticks(0.60f, 12.0f, 0.3f);
@@ -205,16 +229,140 @@ void test_diver_outranks_the_machine_cellproof_override() {
     TEST_ASSERT_FALSE(b.loop.cellproof().clampActive);
 
     // A second override has nothing to lift.
-    r = b.run("CELLPROOF OVERRIDE");
+    b.run("CELLPROOF OVERRIDE", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
 
-    r = b.run("CHECK");  // pre-dive checks only on the surface
+    b.run("CHECK", r);  // pre-dive checks only on the surface
     TEST_ASSERT_TRUE(has(r, "ERR"));
+}
+
+void test_safe_mode_lockout_refuses_everything_but_ack() {
+    // SAFE mode = the control chain is not running. A handset that connects and
+    // finds a live, chatty link must still not be able to author anything: each
+    // of these gets the truth, not silence and not a fake OK.
+    Bench b;
+    b.ticks(0.5f, 0.0f, 3.0f);
+    const float sp2Before = b.reg.getFloat(b.reg.find("SP2"));
+    const bool wifiBefore = b.router.wifiEnabled();
+
+    b.router.setSafeLockout(true);
+    const char* const forbidden[] = {
+        "AUTO", "MANUAL", "DIVE START", "SET SP2=0.55", "CAL AIR", "WIFI ON",
+        "WIFI OFF", "CHECK", "GET *", "GET SP2", "LOG EXPORT 1", "CELLPROOF OVERRIDE",
+    };
+    for (const char* line : forbidden) {
+        CommandRouter::Response r;
+        b.run(line, r);
+        TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR safe mode"), line);
+    }
+
+    // refused means refused: no value moved, no radio changed
+    TEST_ASSERT_EQUAL_FLOAT_MESSAGE(sp2Before, b.reg.getFloat(b.reg.find("SP2")),
+                                    "SET landed despite the SAFE lockout");
+    TEST_ASSERT_EQUAL_UINT8(wifiBefore ? 1 : 0, b.router.wifiEnabled() ? 1 : 0);
+    TEST_ASSERT_FALSE(b.loop.diveActive());
+
+    // ACK is the diver's way out, and it has to reach the transport, not just
+    // look like a reply.
+    CommandRouter::Response r;
+        b.run("ACK", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "OK"), "ACK refused in SAFE mode");
+    TEST_ASSERT_TRUE_MESSAGE((r.actions & CommandRouter::ACT_SAFE_ACK) != 0,
+                             "SAFE ACK never reached the transport hook");
+
+    // Parse errors still report the real problem: a broken line is a broken
+    // line before it is a SAFE refusal, or the bench chases the wrong cause.
+    b.run("FROBNICATE", r);
+    TEST_ASSERT_TRUE(has(r, "ERR unknown command"));
+
+    // Out of SAFE, ACK is the ordinary alarm acknowledge again: no restart bit,
+    // because the chain is running and there is nothing to restart.
+    b.router.setSafeLockout(false);
+    b.run("ACK", r);
+    TEST_ASSERT_TRUE(has(r, "OK"));
+    TEST_ASSERT_EQUAL_UINT32(0u, r.actions & CommandRouter::ACT_SAFE_ACK);
+}
+
+void test_schema_lists_every_key_and_fits_the_buffer() {
+    // The schema is rendered once at boot (primeSchema) because it is the one
+    // reply whose formatting uses %g, which has no business running on a
+    // small-stack task. Two things can go wrong and both are loud here: the
+    // listing outgrows its buffer (then GET SCHEMA refuses rather than serving
+    // a prefix as if it were the whole table), or the reply buffer is smaller
+    // than the listing (then a handset gets ERR and cannot configure itself).
+    // A new setting key trips this test, which is the point.
+    const size_t len = comms::primeSchema();
+    size_t keys = 0;
+    settings::Registry::definitions(keys);
+
+    TEST_ASSERT_TRUE_MESSAGE(len > 0, "schema listing did not fit MAX_SCHEMA");
+    TEST_ASSERT_TRUE_MESSAGE(len < CommandRouter::MAX_SCHEMA, "schema at MAX_SCHEMA limit");
+
+    Bench b;
+    CommandRouter::Response r;
+    b.run("GET SCHEMA", r);
+    TEST_ASSERT_EQUAL_HEX32_MESSAGE((uint32_t)len, (uint32_t)r.len,
+                                      "schema reply is a prefix, not the whole table");
+    TEST_ASSERT_EQUAL_HEX32_MESSAGE((uint32_t)keys, (uint32_t)countLines(r.text, r.len),
+                                      "schema line count != key count");
+
+    // and every key really is named in it
+    size_t named = 0;
+    for (const settings::Def* d = settings::Registry::definitions(keys), *p2 = d; p2 < d + keys; ++p2)
+        if (std::strstr(r.text, p2->key)) ++named;
+    TEST_ASSERT_EQUAL_HEX32_MESSAGE((uint32_t)keys, (uint32_t)named,
+                                      "a key is missing from GET SCHEMA");
+}
+
+void test_reused_reply_buffer_never_leaks_the_previous_reply() {
+    // The router no longer builds a fresh zeroed Response per command (that
+    // 1 KB-per-call habit is what overflowed the uart2 task's stack), so one
+    // buffer is reused and whatever the last command wrote is still in it. A
+    // transport hands r.text to a sink that treats it as a C string, so a reply
+    // that is not terminated puts the PREVIOUS reply's tail on the wire. That
+    // happened for real: an ACK answered "OK\n unknown command\n" in the first
+    // build after the change, and only a long reply before a short one exposes
+    // it. Hence: long reply, short reply, every time, and the invariant holds.
+    Bench b;
+    CommandRouter::Response r;
+    const char* seq[] = {
+        "GET *",        // the longest reply the router makes
+        "ACK",          // 3 bytes: this is the one that used to inherit a tail
+        "GET SCHEMA",
+        "OK?" ,
+        "FROBNICATE",
+        "GET T",
+        "SET SP2=0.55",
+        "GET SP2",
+        "MANUAL",
+        "GET D",
+        "PULSE",
+        "LOG LIST",
+        "CELLPROOF OVERRIDE",
+        "GET HIST",
+    };
+    for (const char* line : seq) {
+        b.run(line, r);
+        const size_t sl = std::strlen(r.text);
+        TEST_ASSERT_EQUAL_HEX32_MESSAGE((uint32_t)r.len, (uint32_t)sl, line);  // no stale tail
+        TEST_ASSERT_TRUE_MESSAGE(sl > 0 || r.len == 0, line);     // silent = empty
+        if (r.len) {
+            // Multi-line replies are legal (GET *, GET SCHEMA, GET HIST each
+            // emit several lines), so the rule is not "one line": it is that the
+            // reply is one terminated string — no NUL inside it (a sink writing
+            // a C string would truncate silently), and it ends on a newline.
+            // strlen(text)==len above is what catches a leaked tail.
+            TEST_ASSERT_NULL_MESSAGE(std::memchr(r.text, 0, r.len), line);
+            TEST_ASSERT_EQUAL_MESSAGE('\n', r.text[r.len - 1], line);
+            TEST_ASSERT_TRUE_MESSAGE(countLines(r.text, r.len) >= 1, line);
+        }
+    }
 }
 
 void test_ack_always_honoured() {
     Bench b;
-    CommandRouter::Response r = b.run("ACK");
+    CommandRouter::Response r;
+        b.run("ACK", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
     TEST_ASSERT_EQUAL_STRING("OK\n", r.text);  // no argument, no conditions
     TEST_ASSERT_EQUAL(0u, r.actions);          // and no hidden side effects
@@ -223,10 +371,11 @@ void test_ack_always_honoured() {
 void test_testcells_runs_on_the_bench_and_reports_masks() {
     Bench b;
     b.ticks(0.50f, 0.0f, 3.0f);
-    CommandRouter::Response r = b.run("TEST CELLS");
+    CommandRouter::Response r;
+        b.run("TEST CELLS", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
     TEST_ASSERT_TRUE(b.loop.cellTestRequested());
-    r = b.run("TEST CELLS");
+    b.run("TEST CELLS", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));  // one at a time
 
     Plant plant{b.loop};
@@ -236,7 +385,7 @@ void test_testcells_runs_on_the_bench_and_reports_masks() {
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(0b111, b.loop.cellTestPassMask(),
                                     "responsive cells reported as failed");
 
-    r = b.run("GET CELLS");
+    b.run("GET CELLS", r);
     TEST_ASSERT_TRUE(has(r, "CELLS,4,"));   // DONE
     TEST_ASSERT_TRUE(has(r, "007,"));       // pass mask, all three, octal
 }
@@ -244,24 +393,25 @@ void test_testcells_runs_on_the_bench_and_reports_masks() {
 void test_deco_and_status_lines_come_from_the_chain() {
     Bench b;
     b.ticks(0.55f, 0.0f, 5.0f);
-    CommandRouter::Response r = b.run("DECO");
+    CommandRouter::Response r;
+        b.run("DECO", r);
     // D,<ndl>,<total>,<ceiling>,[stops...],<cns> — at the surface: no stops,
     // zero ceiling, and the total is the literal 0.0, not a stop list.
     TEST_ASSERT_TRUE(r.text[0] == 'D' && r.text[1] == ',');
     TEST_ASSERT_NOT_NULL(std::strchr(r.text, '\n'));
     TEST_ASSERT_NULL(std::strchr(r.text, '|'));  // no stop entries
-    r = b.run("GET D");
+    b.run("GET D", r);
     TEST_ASSERT_TRUE(r.text[0] == 'D' && r.text[1] == ',');
 
-    r = b.run("GET T");
+    b.run("GET T", r);
     TEST_ASSERT_TRUE(r.text[0] == 'T' && r.text[1] == ',');
-    r = b.run("GET PRE");
+    b.run("GET PRE", r);
     TEST_ASSERT_TRUE(has(r, "PRE,"));
-    r = b.run("GET FAULT");
+    b.run("GET FAULT", r);
     TEST_ASSERT_TRUE(has(r, "FAULT,0,0"));  // bench, no faults
 
     // a real key wins over a display key that would otherwise shadow it
-    r = b.run("GET D1");
+    b.run("GET D1", r);
     TEST_ASSERT_TRUE(has(r, "D1=30.000"));
 }
 
@@ -270,7 +420,8 @@ void test_set_actually_moves_the_live_chain() {
     // live loop. Pins that the firmware's single applier actually changes
     // behaviour, not just stored text.
     Bench b;
-    CommandRouter::Response r = b.run("SET ALLO_LOW=0.30");
+    CommandRouter::Response r;
+        b.run("SET ALLO_LOW=0.30", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_SETTINGS);
     TEST_ASSERT_EQUAL_UINT8(comms::CLAMP_NONE, comms::applySettings(b.reg, b.cfg));
     b.loop.setConfig(b.cfg);
@@ -282,39 +433,40 @@ void test_set_actually_moves_the_live_chain() {
 
 void test_log_and_pulse_and_calibration_commands_delegations() {
     Bench b;
-    CommandRouter::Response r = b.run("LOG LIST");
+    CommandRouter::Response r;
+        b.run("LOG LIST", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_LOG_LIST);
-    r = b.run("LOG EXPORT 3");
+    b.run("LOG EXPORT 3", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_LOG_EXPORT);
     TEST_ASSERT_EQUAL_UINT16(3, b.router.logExportIndex());
 
     // PULSE is a bench command, not a bypass: it asks the injector, which
     // still owns wall/cutoff/duty/fuse. Reply is a plain OK.
-    r = b.run("PULSE");
+    b.run("PULSE", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
 
     // two-step CAL O2 handshake, enforced in one place for every client
-    r = b.run("CAL O2 CONFIRM");
+    b.run("CAL O2 CONFIRM", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));  // confirm without arm: refused
-    r = b.run("CAL O2");
+    b.run("CAL O2", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_ARM);
-    r = b.run("CAL O2 CONFIRM");
+    b.run("CAL O2 CONFIRM", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_CONFIRM);
-    r = b.run("CAL O2");
+    b.run("CAL O2", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_ARM);
-    r = b.run("CAL O2");  // bare CAL O2 while armed = back out
+    b.run("CAL O2", r);  // bare CAL O2 while armed = back out
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_CANCEL);
 
-    r = b.run("CAL AIR");
+    b.run("CAL AIR", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_AIR);
-    r = b.run("CAL DEPTH");
+    b.run("CAL DEPTH", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_DEPTH);
     TEST_ASSERT_TRUE(b.router.takeDepthCalRequest());
     TEST_ASSERT_FALSE(b.router.takeDepthCalRequest());  // one-shot
 
     // calibration never runs under a diver
     b.run("DIVE START");
-    r = b.run("CAL AIR");
+    b.run("CAL AIR", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
 }
 
@@ -325,6 +477,9 @@ int main() {
     RUN_TEST(test_dive_locked_keys_refused_mid_dive);
     RUN_TEST(test_dive_start_drops_the_radio_and_end_restores_it);
     RUN_TEST(test_diver_outranks_the_machine_cellproof_override);
+    RUN_TEST(test_schema_lists_every_key_and_fits_the_buffer);
+    RUN_TEST(test_reused_reply_buffer_never_leaks_the_previous_reply);
+    RUN_TEST(test_safe_mode_lockout_refuses_everything_but_ack);
     RUN_TEST(test_ack_always_honoured);
     RUN_TEST(test_testcells_runs_on_the_bench_and_reports_masks);
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);

@@ -15,10 +15,19 @@ reboots" from a log that begins with one.
 
 ```
 pgrep -f soak_logger          # must be empty; kill before touching the port
+pio test -e native            # host gate, currently 201 cases
+tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 pio run -e esp32 -t uploadfs  # page into LittleFS (optional: fallback is in flash)
 tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
 ```
+
+`tools/float_audit.py` is in the gate because the same bug came back once: a
+`%f`/`%g` conversion pulls in newlib's float conversion, which wants kilobytes
+of stack, and the tasks that answer clients have a few. It scans `src/` and
+fails on any float format specifier that is not marked `/*float-ok: why*/`; the
+one marked exception is the settings-schema renderer, which runs once from
+`Session::begin` before the small-stack tasks exist.
 
 `hw_accept.py` checks the boot console (fresh boot banner, ≥2 HB lines
 matching the soak_logger contract, no SAFE/FATAL, `settings: N keys from
@@ -28,6 +37,42 @@ mid-dive → `ERR dive locked`; `WIFI ON` mid-dive → `ERR wifi locked in
 dive`; `CAL AIR` mid-dive → `ERR cal locked in dive`; overlong line →
 `ERR line too long`; junk → `ERR unknown command`. Every one of those is a
 host-tested invariant — the bench exists to prove the wire, not the logic.
+
+Two things the harness did NOT do until 2026-11-23, and both let a real fault
+through:
+
+* **It scored `GET T` as PASS while that command was rebooting the board.**
+  `GET T` answers with a `T,` line, and the controller also streams `T,` at 2 Hz
+  unprompted, so a prefix match proved nothing. `hw_accept.py` now *anchors on
+  the cadence*: it waits for a streamed line, sends immediately after it, and
+  requires a matching line within 450 ms — the next unsolicited one cannot
+  arrive for another 500 ms, so what it finds is the reply. `GET D` (0.5 Hz) is
+  checked the same way.
+* **A crash in the middle of the matrix looked like ten unrelated timeouts.**
+  The console is now kept open with a reader through the whole handset phase, plus
+  `--watch-tail 12` seconds after the last command (the matrix itself runs in ~2 s,
+  and HB beats every 5 s, so without the tail the headroom checks have nothing to
+  read). Any `Guru Meditation`, stack-canary, `** SAFE MODE`, `!! FATAL`,
+  `PRIOR FAULT` or `reset reason: PANIC` in that window is a named FAIL, and the
+  `stk=` / `u2stk=` headroom HB reports must stay at or above 512 bytes.
+
+### The radio drops at DIVE START — stress it, do not trust one clean run
+
+`DIVE START` turns the WiFi off physically (PLAN 9: milliamps and an antenna in
+water), and that teardown is a race against the driver's own worker. On
+2026-11-23 it asserted inside ESP-IDF (`spinlock_acquire` in
+`semphr_give_wrapper <- ieee80211_ioctl_process <- ppTask`) and rebooted the
+controller, in 2 of 4 acceptance runs. `comms::web::setRadio()` now only records
+the intent; loopTask performs it after a driver drain. Check the ordering with:
+
+```
+tools/.../python tools/radio_stress.py --cycles 12
+```
+
+One `WIFI OFF` is a full `esp_wifi_stop()`; the script watches the console for
+`assert failed` / `Guru` / canary / `SAFE MODE` / `reset reason` throughout and
+exits non-zero if any appear. Run it after any change to `web_server.cpp`'s
+`start()`/`stop()` or to the dive radio logic.
 
 ### The handset link on the bench (no USB-UART adapter in the drawer)
 

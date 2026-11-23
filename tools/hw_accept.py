@@ -31,6 +31,7 @@ Exit 0 = every check passed. Non-zero = at least one failed, and the failing
 lines are listed. Raw console capture is kept under logs/.
 """
 import argparse
+import threading
 import re
 import sys
 import time
@@ -64,11 +65,23 @@ MUST_NONE = [
 # refusal ("ERR line too long") — send one char past it, then more.
 OVERLONG = "X" * 120
 
-# (command, expected reply-prefix regex, why it is on the list)
+# (command, expected reply-prefix regex, why it is on the list[, "burst"])
+#
+# "burst" exists because `GET T` and `GET D` answer with a line the controller
+# ALSO sends unprompted, so matching the prefix proves nothing: on 2026-11-23
+# the harness scored `GET T` as PASS while the command was busy panicking the
+# uart2 task, because a 2 Hz unsolicited `T,` line happened to arrive and matched
+# ^T,. A burst check requires TWO matching lines within `burst_window` of each
+# other, which the unsolicited cadence alone cannot produce (2 Hz = 500 ms
+# apart), so a real reply is the only way to satisfy it.
 PROTOCOL_CHECKS = [
     ("DIVE END", r"^(OK|ERR no dive)", "clean slate before the sequence"),
-    ("GET T", r"^T,", "telemetry line parses"),
+    ("GET T", r"^T,", "telemetry line parses", "burst"),
+    ("GET D", r"^D,", "deco picture on request", "burst"),
+    ("GET *", r"^[A-Z0-9_]+=", "full settings listing"),
     ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server"),
+    ("GET HIST", r"^(HIST,|ERR no histogram)", "histogram answer, or the truth"),
+    ("GET FAULT", r"^FAULT,", "fuse/stuck-open/duty on request"),
     ("AUTO", r"^ERR predive required", "AUTO lockout on a cold boot"),
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
@@ -82,6 +95,35 @@ PROTOCOL_CHECKS = [
     ("DIVE END", r"^OK DIVE", "dive closes"),
     ("LOG LIST", r"^(OK|L,)", "log store answers"),
 ]
+
+# `GET T` and `GET D` answer with the same line shape the controller streams
+# unprompted, so a prefix match proves nothing. The fix cannot be "require two
+# matching lines close together": the reply can land exactly where the next
+# unsolicited line would have, and then two lines 500 ms apart look identical to
+# reply+unsolicited. What DOES work is aligning the send to the cadence: wait for
+# one streamed line, send immediately after it, and require a matching line
+# within BURST_WINDOW_S. The next unsolicited line cannot arrive for another
+# ~500 ms (T, at 2 Hz, D, at 0.5 Hz), so anything inside the window is the reply.
+# BURST_WINDOW_S of 0.45 leaves ~50 ms of margin against the 500 ms cadence —
+# tight enough that a missing reply fails, loose enough that a reply (written in
+# the same task pass that read the command) never does.
+BURST_WINDOW_S = 0.45
+BURST_ANCHOR_S = 1.5
+BURST_REPLY_S = 1.0
+
+# A crash in the middle of the command sequence must fail the run LOUDLY. On
+# 2026-11-23 a panic mid-matrix looked like ten unrelated "no reply" failures
+# plus one bogus PASS, and nothing in the report said the board had rebooted.
+CRASH_MARKERS = [
+    ("Guru Meditation", "panic"),
+    ("Stack canary watchpoint", "stack overflow"),
+    ("abort()", "abort"),
+    ("ELF file SHA256", "panic dump"),
+    ("** SAFE MODE", "latched into SAFE"),
+    ("!! FATAL", "supervisor declared a fatal"),
+    ("PRIOR FAULT", "fault record from a previous boot"),
+]
+HB_STACK_RE = re.compile(r"stk=(\d+)(?: u2stk=(\d+))?")
 
 
 def grade_boot(lines, expect_web):
@@ -127,6 +169,99 @@ def grade_boot(lines, expect_web):
     return checks
 
 
+def grade_watch(lines, boot_lines=None):
+    # `boot_lines` contributes to the stack-headroom scan only: HB beats every
+    # 5 s, so the boot capture is usually where the headroom numbers live. A
+    # missing tripwire is a fault wherever it is missing.
+    """Grade what the console said WHILE the commands were being sent.
+
+    The boot checks only see the boot. A command that panics the board resets
+    it, and every later command then fails for a reason the report does not
+    state. So the console stays open through the protocol phase and is graded
+    here: any crash marker is a FAIL, and the stack headroom HB reports
+    (stk= / u2stk=) must stay above the firmware's own warning level.
+    """
+    checks = []
+    for marker, meaning in CRASH_MARKERS:
+        hit = next((l for l in lines if marker in l), None)
+        checks.append((f"no {meaning} during command phase", hit is None, hit or ""))
+
+    safe_hb = next((l for l in lines if re.match(r"^HB st=3", l)), None)
+    checks.append(("no SAFE-state heartbeat during command phase",
+                   safe_hb is None, safe_hb or ""))
+
+    panic_reset = next((l for l in lines if "reset reason: PANIC" in l), None)
+    checks.append(("reset reason stayed clean", panic_reset is None, panic_reset or ""))
+
+    worst = {"stk": None, "u2stk": None}
+    for l in list(lines) + list(boot_lines or []):
+        m = HB_STACK_RE.search(l)
+        if not m:
+            continue
+        for key, val in zip(("stk", "u2stk"), m.groups()):
+            if val is None:
+                continue
+            v = int(val)
+            worst[key] = v if worst[key] is None else min(worst[key], v)
+    if worst["stk"] is None:
+        # The tripwire is not optional: without it a stack regression is
+        # invisible until it reboots the controller mid-dive.
+        checks.append(("HB reports stack headroom (stk=)", False,
+                       "no stk= in any HB line: the tripwire is missing"))
+    else:
+        checks.append((f"stk= headroom >= 512 (worst {worst['stk']})",
+                       worst["stk"] >= 512, "see HB lines"))
+    if worst["u2stk"] is None:
+        checks.append(("HB reports uart2 headroom (u2stk=)", False,
+                       "no u2stk= in any HB line: the task that crashed is unwatched"))
+    else:
+        checks.append((f"u2stk= headroom >= 512 (worst {worst['u2stk']})",
+                       worst["u2stk"] >= 512, "see HB lines"))
+    return checks
+
+
+def _read_line(ser, seen, log):
+    line = ser.readline().decode(errors="replace").strip()
+    if line:
+        seen.append(line)
+        log.append(f"<< {line}")
+    return line
+
+
+def _await_burst(ser, pat, seen, log, send):
+    """True only if the controller ANSWERED, not merely kept streaming.
+
+    Waits for a streamed line as a cadence anchor, sends, then looks for a
+    matching line within BURST_WINDOW_S of the send. See the constants above for
+    why the window separates reply from unsolicited traffic.
+    """
+    deadline = time.time() + BURST_ANCHOR_S
+    anchored = False
+    while time.time() < deadline:
+        line = _read_line(ser, seen, log)
+        if not line:
+            break
+        if pat.match(line):
+            anchored = True
+            break
+    if not anchored:
+        log.append(f"(no {pat.pattern!r} line to anchor on: the downlink is dead)")
+        return False
+
+    send()
+    sent_at = time.time()
+    while time.time() - sent_at < BURST_REPLY_S:
+        line = _read_line(ser, seen, log)
+        if not line:
+            break
+        if pat.match(line):
+            if time.time() - sent_at <= BURST_WINDOW_S:
+                return True
+            log.append("(matching line arrived too late to be the reply)")
+            return False
+    return False
+
+
 def run_protocol(port, baud, log, settle=1.5):
     """Open the handset adapter and run PROTOCOL_CHECKS. No pyserial import
     at module level: the boot/replay path must work without a handset.
@@ -144,27 +279,34 @@ def run_protocol(port, baud, log, settle=1.5):
     try:
         time.sleep(settle)
         ser.reset_input_buffer()
-        for cmd, want, why in PROTOCOL_CHECKS:
+        for check in PROTOCOL_CHECKS:
+            cmd, want, why = check[0], check[1], check[2]
+            burst = len(check) > 3 and check[3] == "burst"
             pat = re.compile(want)
             seen = []
             ok = False
             for attempt in (1, 2):
                 ser.write((cmd.strip() + "\r\n").encode())
                 ser.flush()
-                deadline = time.time() + 3.0
-                while time.time() < deadline:
-                    line = ser.readline().decode(errors="replace").strip()
-                    if not line:
-                        break
-                    seen.append(line)
-                    log.append(f"<< {line}")
-                    if pat.match(line):
-                        ok = True
-                        break
+                if burst:
+                    payload = (cmd.strip() + "\r\n").encode()
+                    ok = _await_burst(ser, pat, seen, log,
+                                      lambda p=payload: (ser.write(p), ser.flush()))
+                else:
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline:
+                        line = ser.readline().decode(errors="replace").strip()
+                        if not line:
+                            break
+                        seen.append(line)
+                        log.append(f"<< {line}")
+                        if pat.match(line):
+                            ok = True
+                            break
                 if ok or seen:
                     break
                 log.append(f"(no line at all for {cmd!r}: retrying once)")
-            got = "; ".join(seen) if seen else "(no reply in 3 s)"
+            got = "; ".join(seen[-4:]) if seen else "(no reply in 3 s)"
             results.append((cmd if len(cmd) < 24 else cmd[:20] + "...", ok,
                             f"want {want}, got {got} — {why}"))
         ser.reset_input_buffer()
@@ -179,12 +321,20 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--handset", default=None)
     ap.add_argument("--handset-settle", type=float, default=1.5)
+    ap.add_argument("--watch-tail", type=float, default=12.0,
+                    help="seconds to keep watching the console after the last "
+                         "command: the command phase itself runs in ~2 s, and HB "
+                         "beats every 5 s, so without a tail the stack-headroom "
+                         "checks have nothing to read. It also covers a crash "
+                         "that lands after the last reply (a SET that breaks the "
+                         "control path shows up on the next tick, not on the wire).")
     ap.add_argument("--expect-web", action="store_true")
     ap.add_argument("--boot-wait", type=float, default=20.0)
     ap.add_argument("--replay", default=None)
     args = ap.parse_args()
 
     lines = []
+    watch = []          # console lines from the protocol phase, see grade_watch
     if args.replay:
         lines = Path(args.replay).read_text(errors="replace").splitlines()
         print(f"replaying {args.replay} ({len(lines)} lines)")
@@ -200,6 +350,7 @@ def main() -> int:
               f"first (pgrep -f soak_logger).")
         ser = serial.Serial(args.boot_port, args.baud, timeout=1.0)
         deadline = time.time() + args.boot_wait
+        watcher = None
         try:
             # Classic auto-reset circuit: DTR drives IO0, RTS drives EN.
             # Pulsing DTR (as first drafted here did) latches the ROM into
@@ -215,7 +366,24 @@ def main() -> int:
                     lines.append(line)
                     print(f"  | {line}")
         finally:
-            ser.close()
+            if args.handset:
+                # Do not close the console before the handset phase: a reader is
+                # the only way to see a command crash the board. Keep one thread
+                # reading it for the whole run.
+                def _watch():
+                    while True:
+                        try:
+                            l = ser.readline().decode(errors="replace").rstrip()
+                        except Exception:
+                            return
+                        if not l:
+                            continue
+                        watch.append(l)
+                        print(f"  ~ {l}")
+                watcher = threading.Thread(target=_watch, daemon=True)
+                watcher.start()
+            else:
+                ser.close()
 
     logdir = Path("logs")
     logdir.mkdir(exist_ok=True)
@@ -236,6 +404,16 @@ def main() -> int:
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
             failures += 0 if ok else 1
         (logdir / f"accept_{stamp}_handset.log").write_text("\n".join(proto_log) + "\n")
+
+        if args.watch_tail > 0:
+            print(f"\n--- watching the console for {args.watch_tail:.0f} s "
+                  f"after the last command ---")
+            time.sleep(args.watch_tail)
+        print("\n--- console watch (during the command phase) ---")
+        for name, ok, detail in grade_watch(watch, lines):
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok else f": {detail}"))
+            failures += 0 if ok else 1
+        (logdir / f"accept_{stamp}_watch.log").write_text("\n".join(watch) + "\n")
     else:
         print("\n(handset checks skipped: pass --handset PORT)")
 

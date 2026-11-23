@@ -18,13 +18,15 @@ void emit(UartLink::Sink sink, void* ctx, char* line, size_t n) {
 } // namespace
 
 void UartLink::handleLine(const char* line, Sink sink, void* ctx) {
-    CommandRouter::Response r = router_.exec(line);
-    if (r.len) {
-        if (r.len < sizeof(r.text)) r.text[r.len] = '\0';
-        sink(r.text, ctx);
+    // resp_ is a member, not a local: exec() fills it in place and nothing here
+    // copies 1 KB of reply through the task's stack.
+    router_.exec(line, resp_);
+    if (resp_.len) {
+        if (resp_.len < sizeof(resp_.text)) resp_.text[resp_.len] = '\0';
+        sink(resp_.text, ctx);
         linesOut_++;
     }
-    applyActions(r.actions, sink, ctx);
+    applyActions(resp_.actions, sink, ctx);
 }
 
 void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
@@ -90,18 +92,22 @@ void UartLink::emitT(Sink sink, void* ctx) {
     if (a & (1u << alarms::BIT_SP_CLAMP))   f |= 1 << 5;
     if (tel_.cpState == static_cast<uint8_t>(cellproof::State::FAIL)) f |= 1 << 6;
     t.flags = f;
+    // SAFE is visible on the wire before the diver tries anything: the router
+    // knows the machine is locked out, and the snapshot published by a control
+    // chain that is not running cannot say it for itself.
+    if (router_.safeLockout()) t.mode = 3;
 
-    char buf[128];
-    const size_t n = proto::formatTelemetry(t, buf, sizeof(buf));
-    emit(sink, ctx, buf, n);
+    const size_t n = proto::formatTelemetry(t, lineBuf_, sizeof(lineBuf_));
+    emit(sink, ctx, lineBuf_, n);
     if (n) linesOut_++;
 }
 
 void UartLink::emitD(Sink sink, void* ctx) {
-    char buf[CommandRouter::MAX_REPLY];
+    // This one runs unprompted twice a second on the uart2 task, 24/7 — the
+    // 1024-byte temporary here was part of the same overflow budget.
     const size_t n = proto::formatDeco(
-        CommandRouter::decoInfoOf(loop_, tel_.haveVote), buf, sizeof(buf));
-    emit(sink, ctx, buf, n);
+        CommandRouter::decoInfoOf(loop_, tel_.haveVote), lineBuf_, sizeof(lineBuf_));
+    emit(sink, ctx, lineBuf_, n);
     if (n) linesOut_++;
 }
 

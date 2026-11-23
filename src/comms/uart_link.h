@@ -89,6 +89,16 @@ private:
     uint32_t lastTMs_ = 0, lastDMs_ = 0;
     uint32_t lastPulseBase_ = 0;
     uint32_t linesOut_ = 0;
+
+    // This transport's reply buffer and its line scratch, deliberately members
+    // rather than locals. A Session is a file-scope global, so these live in
+    // static RAM; the alternative (the pre-2026-11-23 shape) put a 1024-byte
+    // Response copy and a 1024-byte format temporary on whatever task happened
+    // to ask, which is what overflowed the uart2 task's stack. They are used by
+    // one command at a time — the session mutex serialises handset and web —
+    // and never nest, so one buffer serves the whole transport.
+    CommandRouter::Response resp_;
+    char lineBuf_[CommandRouter::MAX_REPLY];
     bool edgePending_ = false;
 };
 

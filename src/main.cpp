@@ -230,6 +230,12 @@ static void hudTask(void*) {
             char vb[16], vt[16], sp[16];
             uint8_t stackSlot = 0;
             const uint32_t stackFree = stackwatch::worstFree(&stackSlot);
+            // uart2 gets its own field rather than being folded into the
+            // minimum: the minimum belongs to the smallest task (supervisor,
+            // 3072 B) and stays flat no matter what a client asks for, so a
+            // command-path spike in the task that actually crashed on
+            // 2026-11-23 would hide behind it. Appended, per the HB rule.
+            const uint32_t uart2Free = stackwatch::freeFor(stackwatch::SLOT_UART2);
             // NOTE: the leading fields are the format soak_logger.py parses.
             // New fields are appended, never reordered or renumbered. `stk=` is
             // appended for exactly that reason, and it is there because of the
@@ -240,7 +246,7 @@ static void hudTask(void*) {
                           "smp=%lu i2cerr=%lu rec=%lu vbat=%s "
                           "stale=%d batlow=%d"
                           " vote=%s sp=%s al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d"
-                          " stk=%u\n",
+                          " stk=%u u2stk=%u\n",
                           static_cast<int>(g_systemState),
                           g_ads.raw(0), g_ads.raw(1), g_ads.raw(2),
                           g_ads.fresh(0, now), g_ads.fresh(1, now),
@@ -255,10 +261,15 @@ static void hudTask(void*) {
                           g_bridgeTel.alarmBits,
                           (int)g_bridgeTel.voteMode, (unsigned long)g_bridgeTel.pulses,
                           (int)g_bridgeTel.solenoid, (int)g_controlRunning,
-                          (unsigned)stackFree);
+                          (unsigned)stackFree, (unsigned)uart2Free);
+            // Shout for the machine overall AND for the handset task by name, so
+            // a command-path regression is named instead of averaged away.
             if (stackFree != 0 && stackFree < stackwatch::kWarnFreeBytes) {
                 Serial.printf("** stack low: %u bytes free in '%s'\n",
                               (unsigned)stackFree, stackwatch::name(stackSlot));
+            }
+            if (uart2Free != 0 && uart2Free < stackwatch::kWarnFreeBytes) {
+                Serial.printf("** stack low: %u bytes free in 'uart2'\n", (unsigned)uart2Free);
             }
         }
 
@@ -710,9 +721,33 @@ void setup() {
         if (!comms::web::start())
             Serial.println("** web AP failed to start: the controller still dives");
     }
+
+    // GET SCHEMA is what a handset or the web page uses to put min/max on its
+    // inputs, so a truncated listing is a real fault, not a cosmetic one: it is
+    // reported at boot where the bench can see it. (Rendered by Session::begin;
+    // see cmd_router.cpp for why it is never rendered on demand.)
+    size_t schemaKeys = 0;
+    settings::Registry::definitions(schemaKeys);
+    const size_t schemaBytes = comms::schemaLen();
+    Serial.printf("schema: %u keys, %u bytes", (unsigned)schemaKeys, (unsigned)schemaBytes);
+    if (schemaBytes == 0)
+        Serial.printf("  ** NOT AVAILABLE: will not fit %u bytes, GET SCHEMA will refuse\n",
+                      (unsigned)comms::CommandRouter::MAX_SCHEMA);
+    else
+        Serial.println();
 }
 
 void loop() {
     stackwatch::sample(stackwatch::SLOT_LOOP);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    // The radio comes up and down HERE, not in the task that answered the
+    // command. wifi teardown is slow and racy against the driver's own worker;
+    // loopTask is the only task on this machine with nothing else to do, so it
+    // is where a blocking drain is free. See comms::web::setRadio.
+    if (comms::web::radioPending()) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        comms::web::serviceRadio();
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }

@@ -144,8 +144,9 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
 #define DIVE_SNAPSHOT_GRID_MS       30000
 
 // --- Depth ---------------------------------------------------------------------
-// Bench stand-in (BMP085) until the MS5837-30bar is fitted: depth is derived
-// from absolute pressure with sea-water density.
+// Bench stand-in (LPS28DFW, Adafruit #6067) until the MS5837-30bar is fitted
+// (the BMP085 that held this role never ACKed once; removed 2026-11-23):
+// depth is derived from absolute pressure with sea-water density.
 #define PRESSURE_ENABLE             1
 #define WATER_DENSITY_KGL           1.025f
 #define SURFACE_PRESSURE_BAR        1.013f

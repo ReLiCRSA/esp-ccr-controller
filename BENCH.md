@@ -81,30 +81,32 @@ Then by hand, in this order (each mirrors a sim scenario):
   limit, schema marker bumped. Verified on the board: SET -> OK in ~40 ms,
   reboot, boot line `settings: 32 keys from NVS`, values survive.
 
-## C3-a — depth sensor (found live on the bench 2026-11-22)
+## C3-a — depth sensor: LPS28DFW on the bench (swap decided 2026-11-23)
 
-`BMP085 @0x77` on the shared bus (SDA 21 / SCL 22, same bus as the ADS1115)
-**never acknowledged** on the first boot that ever polled it: M1 firmware
-compiled the pressure path out, so the soak never touched it — the very
-first `requestFrom` was tonight. Symptom is one
-`requestFrom(): i2cWriteReadNonStop returned Error -1` every ~4 s with the
-cell side completely healthy (`fresh=110`, `i2cerr=0`).
+The BMP085 that stood in here **never acknowledged once** — every poll since
+the first boot that tried it was `requestFrom(): Error -1`, and it is now
+removed from the firmware entirely. The bench sensor is the **Adafruit LPS28
+breakout (LPS28DFW, product #6067)**: WHO_AM_I `0xB4`, I2C **0x5C** (XSA open)
+or 0x5D (XSA pulled high — the driver probes both and logs the winner).
 
-Before depth means anything on this rig:
+Wiring on the shared bus (SDA 21 / SCL 22, same pair as the ADS1115):
 
-- [ ] Confirm the module is fitted at all, and at 0x77 (BMP085) not 0x76
-      (MS5837) — `pins.h` picks by address; the bench is a BMP085 stand-in.
-- [ ] VCC to 3V3 (not a GPIO), SDA→21, SCL→22, common ground with the
-      ADS1115 GND point.
-- [ ] Pull-ups present on 21/22 (the ADS side has them; two devices on one
-      bus must share one pair, ~4.7 k, not two weak pairs).
-- [ ] Then: `control:` line no longer ends in the uncalibrated note and HB
-      `stale=` stays 0 with no periodic Wire error.
+- [ ] VIN → **3V3** (the breakout regulates; do not feed 5 V into a 3V3 bus),
+      GND to the ADS1115 GND point, SDA→21, SCL→22. STEMMA QT cable fits.
+- [ ] Pull-ups: the ADS side's 4.7 k pair serves the whole bus — one pair,
+      not two weak ones.
+- [ ] Boot must show `depth: LPS28 @0x5C ready, <n> hPa` once, and then
+      silence: no periodic `requestFrom()` error lines, HB `stale=` drops
+      out of the alarm word, `al` should fall toward `0x0010` (battery only).
+- [ ] Squeeze test: press the port gently (or breathe through a tube into
+      the metal port) — the dashboard depth/pressure must move and come
+      back. The driver runs **FS_MODE=1 (260–4060 hPa ≈ 40 m sea water)**
+      so the 10 m cell-proof pressurization is inside range; mode 0 would
+      clip at ~2.4 m and silently flat-top.
+- [ ] Then `CAL DEPTH` (surface tare) and re-check the pre-dive list.
 
-Until then the numbers on the depth/ceiling fields are the filter's, not the
-world's: `HB … al=0x0090` includes `BIT_SENSOR_STALE` and `vote=0.210 sp=0.40`
-is air at the surface setpoint. The controller behaves correctly with no
-depth — it just refuses to pretend.
+Until the sensor is fitted the controller behaves correctly with no depth —
+`HB … al=0x0090` includes `BIT_SENSOR_STALE` — it just refuses to pretend.
 
 ## C3-b — MS5837-30BA swap (before ANY wet test)
 

@@ -4,12 +4,13 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <utility>
 #include <vector>
 
-#include "sensors/bmp085.h"
+#include "sensors/lps28.h"
 #include "sensors/ms5837.h"
 
-using press::Bmp085;
+using press::Lps28;
 using press::Ms5837;
 
 void setUp() {}
@@ -18,14 +19,18 @@ void tearDown() {}
 // ---------------------------------------------------------------------------
 // Fake bus: canned per-register read queues + fault injection.
 // A read with nothing queued NACKs — unprogrammed reads must fail loudly,
-// exactly like an absent sensor.
+// exactly like an absent sensor. queueAt() programs a read for ONE address,
+// which is how the LPS28 probe (0x5C vs 0x5D) gets tested honestly.
 // ---------------------------------------------------------------------------
 class FakeBus : public press::Transport {
 public:
     void queue(uint8_t reg, std::vector<uint8_t> bytes) { q_[reg].push_back(std::move(bytes)); }
+    void queueAt(uint8_t addr, uint8_t reg, std::vector<uint8_t> bytes) {
+        qAt_[{addr, reg}].push_back(std::move(bytes));
+    }
     // Sticky response: like PROM — same bytes for every read, never consumed.
     void queueSticky(uint8_t reg, std::vector<uint8_t> bytes) { sticky_[reg] = std::move(bytes); }
-    int failReads = 0, failWrites = 0;
+    int failReads = 0, failWrites = 0, reads = 0;
     std::vector<uint8_t> writes;
 
     bool writeByte(uint8_t, uint8_t v) override {
@@ -39,8 +44,18 @@ public:
         writes.push_back(data);
         return true;
     }
-    bool writeThenRead(uint8_t, uint8_t reg, uint8_t* out, uint8_t n) override {
+    bool writeThenRead(uint8_t addr, uint8_t reg, uint8_t* out, uint8_t n) override {
+        reads++;
         if (failReads > 0) { failReads--; return false; }
+        auto at = qAt_.find({addr, reg});
+        if (at != qAt_.end()) {
+            if (at->second.empty()) return false;
+            const std::vector<uint8_t> resp = at->second.front();
+            at->second.pop_front();
+            if (resp.size() != n) return false;
+            std::memcpy(out, resp.data(), n);
+            return true;
+        }
         auto st = sticky_.find(reg);
         if (st != sticky_.end()) {
             if (st->second.size() != n) return false;
@@ -59,9 +74,15 @@ public:
         for (uint8_t w : writes) if (w == v) return true;
         return false;
     }
+    bool sawWritePair(uint8_t reg, uint8_t data) const {
+        for (size_t i = 0; i + 1 < writes.size(); ++i)
+            if (writes[i] == reg && writes[i + 1] == data) return true;
+        return false;
+    }
 
 private:
     std::map<uint8_t, std::deque<std::vector<uint8_t>>> q_;
+    std::map<std::pair<uint8_t, uint8_t>, std::deque<std::vector<uint8_t>>> qAt_;
     std::map<uint8_t, std::vector<uint8_t>> sticky_;
 };
 
@@ -206,90 +227,99 @@ void test_ms5837_bus_fault_backoff_and_recovery() {
 }
 
 // ===========================================================================
-// BMP085 — datasheet worked example: cal AC1=408 ... MD=2868,
-// UT=27898, UP=23843 (OSS0 raw 16-bit), expected 15.0 C and 69964 Pa.
-// Driver runs OSS=2: same raw bus bytes (UP<<8 in the 24-bit register) must
-// reproduce the same pressure through the OSS-corrected math.
+// LPS28DFW — boot: probe 0x5C then 0x5D by WHO_AM_I (0xB4), soft-boot
+// (BOOT bit + 50 ms self-test), then FS_MODE=1 (4060 hPa) and ODR/AVG.
+// The BOOT resets all registers, so the order of writes is load-bearing.
 // ===========================================================================
-static Bmp085::Cal datasheetCal() {
-    Bmp085::Cal c;
-    c.ac1 = 408; c.ac2 = -72; c.ac3 = -14383;
-    c.ac4 = 32741; c.ac5 = 32757; c.ac6 = 23153;
-    c.b1 = 6190; c.b2 = 4; c.mb = -32768; c.mc = -8711; c.md = 2868;
-    return c;
-}
-
-void test_bmp085_math_datasheet_vector() {
-    const Bmp085::Cal c = datasheetCal();
-    float bar = 0, tc = 0;
-    int32_t b5 = 0;
-    Bmp085::compensate(c, Bmp085::Raw{27898, 23843}, 0, bar, tc, b5);
-    TEST_ASSERT_FLOAT_WITHIN(0.05f, 15.0f, tc);
-    // 69964 Pa expected; C++ zero-trunc division vs datasheet floor gives
-    // intermediate +/-1s -> accept +/-10 Pa.
-    TEST_ASSERT_FLOAT_WITHIN(10.0f, 69964.0f, bar * 100000.0f);
-}
-
-void test_bmp085_sample_cycle_oss2_matches_datasheet() {
+void test_lps28_boot_probe_config_sequence() {
     FakeBus bus;
-    std::vector<uint8_t> calBytes;
-    const int16_t vals[11] = {408, -72, -14383, (int16_t)32741, (int16_t)32757, (int16_t)23153,
-                              6190, 4, -32768, -8711, 2868};
-    for (int16_t v : vals)
-        calBytes.insert(calBytes.end(),
-                        {static_cast<uint8_t>(static_cast<uint16_t>(v) >> 8),
-                         static_cast<uint8_t>(static_cast<uint16_t>(v) & 0xFF)});
-    bus.queue(0xAA, calBytes);
+    // A breakout with XSA pulled high: only 0x5D answers.
+    bus.queueAt(0x5D, 0x0F, {0xB4});
+    Lps28 s{bus};
 
-    Bmp085 sensor{bus};
-    TEST_ASSERT_TRUE(sensor.begin(0));
-    TEST_ASSERT_TRUE(sensor.healthy());
+    TEST_ASSERT_FALSE(s.begin(0));   // probe: 0x5C silent, 0x5D says 0xB4, BOOT issued
+    TEST_ASSERT_TRUE(bus.sawWritePair(0x11, 0x80));   // CTRL_REG2 = BOOT
+    TEST_ASSERT_FALSE(s.begin(20));  // self-test still running
+    TEST_ASSERT_FALSE(s.healthy());
+    TEST_ASSERT_TRUE(s.begin(60));   // self-test done -> configure
+    TEST_ASSERT_TRUE(s.healthy());
+    TEST_ASSERT_EQUAL_UINT8(0x5D, s.addr());
 
-    bus.queue(0xF6, adc16(27898));      // UT
-    bus.queue(0xF6, {0x5D, 0x23, 0x00}); // UP register raw (23843 << 8 = 0x5D2300)
-
-    sensor.start(100);                  // T first (B5 dependency)
-    TEST_ASSERT_FALSE(sensor.poll(103));
-    TEST_ASSERT_FALSE(sensor.poll(106));  // UT read + P conv kicked
-    bool done = false;
-    for (uint32_t t = 106; t < 200 && !done; ++t) done = sensor.poll(t);
-    TEST_ASSERT_TRUE(done);
-
-    TEST_ASSERT_FLOAT_WITHIN(0.05f, 15.0f, sensor.temperatureC());
-    TEST_ASSERT_FLOAT_WITHIN(15.0f, 69964.0f, sensor.pressureBar() * 100000.0f);
-
-    // command framing: ctrl writes 0x2E then 0x34|(OSS<<6)
-    TEST_ASSERT_TRUE(bus.sawWrite(0x2E));
-    TEST_ASSERT_TRUE(bus.sawWrite(0x34 | (Bmp085::OSS << 6)));
+    // Order after BOOT matters: FS_MODE (4060 hPa) then run at ODR 25 Hz.
+    TEST_ASSERT_TRUE(bus.sawWritePair(0x11, 0x40));
+    TEST_ASSERT_TRUE(bus.sawWritePair(0x10, 0x20));
+    TEST_ASSERT_TRUE(s.begin(61));   // idempotent once READY
 }
 
-void test_bmp085_garbage_cal_rejected_and_backoff() {
+void test_lps28_wrong_identity_is_refused() {
+    // A near-relative on the bus (LPS22HB's 0xB1) must NOT be accepted as
+    // our depth sensor: same bus, similar registers, different calibration.
     FakeBus bus;
-    std::vector<uint8_t> zeros(22, 0x00);
-    bus.queue(0xAA, zeros);
-    Bmp085 sensor{bus};
-    TEST_ASSERT_FALSE(sensor.begin(0));   // AC1==0: uncalibrated EPROM
-    TEST_ASSERT_FALSE(sensor.healthy());
-
-    bus.queue(0xAA, std::vector<uint8_t>(22, 0xFF));
-    TEST_ASSERT_FALSE(sensor.begin(1));   // in backoff: bus untouched
+    bus.queueSticky(0x0F, {0xB1});
+    Lps28 s{bus};
     bool booted = false;
-    for (uint32_t t = 2000; t < 6000 && !booted; t += 100) booted = sensor.begin(t);
-    TEST_ASSERT_FALSE(booted);            // AC1==0xFFFF: still garbage
-    TEST_ASSERT_FALSE(sensor.healthy());
+    for (uint32_t t = 0; t < 20000 && !booted; t += 100) booted = s.begin(t);
+    TEST_ASSERT_FALSE(booted);
+    TEST_ASSERT_FALSE(s.healthy());
+    // Nothing was ever commanded to a chip we did not identify:
+    TEST_ASSERT_FALSE(bus.sawWritePair(0x11, 0x80));
+}
 
-    // real cal arrives -> boots
-    std::vector<uint8_t> calBytes;
-    const int16_t vals[11] = {408, -72, -14383, (int16_t)32741, (int16_t)32757, (int16_t)23153,
-                              6190, 4, -32768, -8711, 2868};
-    for (int16_t v : vals)
-        calBytes.insert(calBytes.end(),
-                        {static_cast<uint8_t>(static_cast<uint16_t>(v) >> 8),
-                         static_cast<uint8_t>(static_cast<uint16_t>(v) & 0xFF)});
-    bus.queue(0xAA, calBytes);
-    for (uint32_t t = 6000; t < 12000; t += 100)
-        if (sensor.begin(t)) { booted = true; break; }
-    TEST_ASSERT_TRUE(booted);
+void test_lps28_sample_cycle_and_scaling() {
+    FakeBus bus;
+    bus.queueSticky(0x0F, {0xB4});
+    // 1013.25 hPa at 1/2048 LSB = 2075136 = 0x1FAA00; burst from 0x28 is
+    // XL,L,H then TEMP L,H (auto-increment). 21.34 C = 2134 = 0x0856.
+    bus.queueSticky(0x28, {0x00, 0xAA, 0x1F, 0x56, 0x08});
+    Lps28 s{bus};
+    TEST_ASSERT_FALSE(s.begin(0));   // probe + BOOT
+    TEST_ASSERT_TRUE(s.begin(60));   // self-test over -> configured
+
+    s.start(1000);
+    TEST_ASSERT_FALSE(s.poll(1050));          // window not elapsed
+    TEST_ASSERT_TRUE(s.poll(1100));           // one read, one answer
+    TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.01325f, s.pressureBar());
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 21.34f, s.temperatureC());
+    TEST_ASSERT_EQUAL_UINT32(1100, s.lastGoodMs());
+    TEST_ASSERT_FALSE(s.poll(1200));          // must re-arm via start()
+
+    // FS_MODE=1 scaling directly: full-scale 4060 hPa fits 24-bit signed.
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 4.06f,
+                             Lps28::pressureBarFromRaw(4060 * 2048));
+}
+
+void test_lps28_bus_fault_backoff_and_recovery() {
+    FakeBus bus;
+    bus.queueSticky(0x0F, {0xB4});
+    bus.queueSticky(0x28, {0x00, 0xAA, 0x1F, 0x56, 0x08});
+    Lps28 s{bus};
+    TEST_ASSERT_FALSE(s.begin(0));   // probe + BOOT issued, not READY yet
+    TEST_ASSERT_TRUE(s.begin(60));   // self-test over, configured
+    TEST_ASSERT_FALSE(s.poll(0));
+    s.start(100);
+
+    bus.failReads = 5;                 // bus dies mid-run
+    const int readsAtFault = bus.reads;
+    for (uint32_t t = 200; t < 60000 && s.healthy(); t += 100) {
+        s.start(t);
+        for (uint32_t p = t; p < t + 100; ++p)
+            if (s.poll(p)) break;
+    }
+    TEST_ASSERT_FALSE(s.healthy());
+    // Backoff must be real: ~5 failing reads, not one read per tick for a
+    // minute (that would be 600 reads and a bus held hostage).
+    TEST_ASSERT_TRUE(bus.reads - readsAtFault <= 8);
+
+    // bus recovers: begin re-probes and reboots, samples flow again
+    bool done = false;
+    for (uint32_t t = 60000; t < 90000 && !done; t += 50) {
+        s.begin(t);
+        s.start(t);
+        for (uint32_t p = t; p < t + 200 && !done; ++p) done = s.poll(p);
+    }
+    TEST_ASSERT_TRUE(done);
+    TEST_ASSERT_TRUE(s.healthy());
+    TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.01325f, s.pressureBar());
 }
 
 int main() {
@@ -297,8 +327,9 @@ int main() {
     RUN_TEST(test_ms5837_boot_and_datasheet_vector);
     RUN_TEST(test_ms5837_crc_corruption_is_refused);
     RUN_TEST(test_ms5837_bus_fault_backoff_and_recovery);
-    RUN_TEST(test_bmp085_math_datasheet_vector);
-    RUN_TEST(test_bmp085_sample_cycle_oss2_matches_datasheet);
-    RUN_TEST(test_bmp085_garbage_cal_rejected_and_backoff);
+    RUN_TEST(test_lps28_boot_probe_config_sequence);
+    RUN_TEST(test_lps28_wrong_identity_is_refused);
+    RUN_TEST(test_lps28_sample_cycle_and_scaling);
+    RUN_TEST(test_lps28_bus_fault_backoff_and_recovery);
     return UNITY_END();
 }

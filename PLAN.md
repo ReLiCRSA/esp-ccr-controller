@@ -12,7 +12,7 @@ and a PC simulator to validate the control/deco logic before hardware trust.
 | Gas config | Nitrox CCR — controller manages O₂ injection only; diluent switching manual |
 | ADC | ADS1115, PGA=16, continuous 16 SPS, cells on A0/A1/A2 single-ended; **bench today: 2 cells on A0/A1, A2 free** |
 | Air reference | 11 mV @ 21% O₂ nominal; per-cell calibration factors in NVS |
-| Depth sensor | BMP085 for bench; **MS5837-30bar (CSB→GND, addr 0x76)** for wet prototype; one-constant swap |
+| Depth sensor | **LPS28DFW (Adafruit #6067) for bench**; **MS5837-30bar (CSB→GND, addr 0x76)** for wet prototype; one-constant swap (BMP085 removed 2026-11-23, never ACKed) |
 | ADS1115 DRDY | Not wired on bench → timed non-blocking reads + bus recovery; driver supports DRDY later (`PIN_DRDY=-1` disables) |
 | Cell calibration | **2-point**: air (mandatory, always applied) + high-O₂ plateau at configurable `CAL_O2_FI` (default 0.99); scripted `CAL O2` via solenoid enrichment of a sealed chamber |
 | Mid-dive cell proof | At ~10 m push setpoint to 1.10; vote group must prove >1.0, else clamp all setpoints to ≤0.90 + alarm (diver-overridable, always logged) |
@@ -71,7 +71,7 @@ espRebController/
 
 | Function | GPIO | Notes |
 |---|---|---|
-| I2C SDA / SCL | 21 / 22 | shared ADS1115 + BMP085/MS5837, 100 kHz, 4.7 kΩ pull-ups |
+| I2C SDA / SCL | 21 / 22 | shared ADS1115 + LPS28/MS5837, 100 kHz, 4.7 kΩ pull-ups |
 | Solenoid drive | 27 | MOSFET gate; **INPUT_PULLDOWN until ControlTask alive**; monitor LED on same net |
 | HB / ERR / DECO LEDs | 2 / 4 / 5 | active-high |
 | Handset UART TX / RX | 17 / 16 | UART2, 115200 |
@@ -144,7 +144,7 @@ life-safety issue:
   4. Captures rise time + pulse responsiveness per cell → feeds health scores.
 - **`TEST CELLS`** standalone: the same pulse-and-measure scripted check
   (inject a few seconds, verify all cells respond) without committing a cal.
-- Temperature: BMP085/MS5837 die temp for coarse cell compensation (~2%/°C);
+- Temperature: LPS28/MS5837 die temp for coarse cell compensation (~2%/°C);
   dedicated loop temp sensor deferred to prototype.
 
 ## 4. CellProof — mid-dive high-ppO₂ validation
@@ -370,7 +370,7 @@ and the web Settings page.
 | CellProof | `CELLPROOF_EN` on · `CELLPROOF_DEPTH` 10 · `CELLPROOF_SP` 1.10 · `CELLPROOF_MIN` 1.00 · `CELLPROOF_TIMEOUT` 60 · `CELLPROOF_OK_MAXSP` 0.90 |
 | Deco | `GF_LOW` 30 · `GF_HIGH` 85 · `ASC_RATE` 6 · `ASC_RATE_SLOW` 1 · `WATER_DENSITY` 1.025 |
 | Battery | `VBAT_MIN` · `VBAT_CAL` |
-| System | WiFi AP SSID/pass · telemetry rate · depth sensor select (`BMP085`/`MS5837`) |
+| System | WiFi AP SSID/pass · telemetry rate · depth sensor select (`LPS28`/`MS5837`) |
 
 ## 12. HUD (3 LEDs)
 
@@ -382,11 +382,21 @@ and the web Settings page.
 
 ## 13. Depth sensor abstraction
 
-`DepthSensor` interface; `bmp085.cpp` (bench) and `ms5837.cpp` (wet prototype),
-selected by one constant. MS5837-30bar specifics:
+`DepthSensor` interface; `lps28.cpp` (bench, ST LPS28DFW on the Adafruit
+#6067 breakout) and `ms5837.cpp` (wet prototype), selected by one constant.
+The BMP085 that held the bench slot is **removed** (2026-11-23): it never
+ACKed once on the bench, and a sensor that has answered zero transactions in
+its life earns no place in the tree. The LPS28DFW is dual full-scale —
+260–1260 hPa (mode 0) or 260–4060 hPa (mode 1); firmware always sets
+**mode 1**, because mode 0 clips at ~2.4 m of sea water, inside the 10 m
+cell-proof test. Identity is enforced: WHO_AM_I must be `0xB4`; near-relatives
+(LPS22HB/HH, old LPS28HH) are refused, and the 0x5C/0x5D choice made by the
+breakout's XSA pad is resolved by probing both at boot.
 
-- CSB tied to GND → address `0x76` (avoids collision with BMP085 at 0x77 when
-  both are on the bus during transition testing).
+MS5837-30bar specifics:
+
+- CSB tied to GND → address `0x76` (kept off 0x5C–0x5D/0x48 territory; both
+  bench and wet depth sensors can sit on one bus during transition testing).
 - OSR 4096 (~10 ms) pressure + temperature, interleaved at ~8 Hz; same
   non-blocking command→wait-on-timestamp→timed-read pattern as the ADC driver.
 - Factory coefficients C1–C6 read at init, cached, saved to NVS → a swapped
@@ -400,7 +410,7 @@ selected by one constant. MS5837-30bar specifics:
   tare stored in NVS.
 - Wet-prototype practice: MS5837 must be potted (epoxy) with a vented capillary
   for pressure; the die is not directly submersible. Bench-validate the real
-  driver against the BMP085 side-by-side before potting.
+  driver against the LPS28 side-by-side before potting.
 
 ## 14. Simulator (`sim/`, native PlatformIO target)
 
@@ -714,3 +724,12 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   fails before the bench has to find it again. Renaming a key is legal only
   with a `kSchema` bump (old NVS erased wholesale), and keys are
   protocol-visible to the handset, so rename early or not at all.
+- **BMP085 out, LPS28DFW in for the bench phase (2026-11-23).** The BMP085
+  never ACKed once since the first boot that polled it; keeping a phantom
+  part in the tree buys nothing. The LPS28DFW (Adafruit #6067) is probed at
+  both possible addresses (XSA pad) and accepted only with its own
+  WHO_AM_I `0xB4` — a sensor that isn't identified is not believed. Always
+  run it in FS_MODE=1 (4060 hPa): mode 0 flat-tops at ~2.4 m of sea water,
+  silently, which is inside the 10 m cell-proof envelope — the exact failure
+  mode a diver must never meet as a "shallow" reading. MS5837 stays the wet
+  prototype's sensor; nothing about the dive-rated part changes.

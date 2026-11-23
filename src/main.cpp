@@ -28,7 +28,7 @@
 #include "control/loop.h"
 #include "sensors/ads1115_bus.h"
 #include "sensors/battery.h"
-#include "sensors/bmp085.h"
+#include "sensors/lps28.h"
 #include "sensors/wire_transport.h"
 #include "comms/nvs_store.h"
 #include "comms/settings.h"
@@ -87,7 +87,7 @@ static cal::Cal g_cellCal[3];
 
 #if PRESSURE_ENABLE
 static press::WireTransport g_pBus;
-static press::Bmp085        g_pressure(g_pBus);
+static press::Lps28         g_pressure(g_pBus);
 #endif
 static volatile float g_depthM = 0.0f;
 static volatile bool  g_depthValid = false;
@@ -158,6 +158,14 @@ static void sensorTask(void*) {
             }
         }
         if (now - g_pressure.lastGoodMs() > PRESSURE_STALE_MS) g_depthValid = false;
+        // Say it once when the depth sensor comes up: address, sanity. A
+        // missing line at boot means the bench check (BENCH.md C3-a) fails.
+        static bool depthAnnounced = false;
+        if (!depthAnnounced && g_pressure.healthy()) {
+            depthAnnounced = true;
+            Serial.printf("depth: LPS28 @0x%02X ready, %.1f hPa\n",
+                          g_pressure.addr(), g_pressure.pressureBar() * 1000.0f);
+        }
 #endif
 
         if (now - lastBat >= VBAT_SAMPLE_INTERVAL_MS) {

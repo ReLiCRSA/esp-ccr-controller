@@ -4,7 +4,7 @@
 // ============================================================================
 #pragma once
 
-// --- I2C bus (shared: ADS1115 @0x48, BMP085 @0x77 / MS5837 @0x76) ---------
+// --- I2C bus (shared: ADS1115 @0x48, LPS28 @0x5C/0x5D / MS5837 @0x76) -----
 #define PIN_I2C_SDA       21
 #define PIN_I2C_SCL       22
 // 100 kHz only. 4.7k external pull-ups. Never raise the clock for speed:

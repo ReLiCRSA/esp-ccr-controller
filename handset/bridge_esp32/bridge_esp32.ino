@@ -60,6 +60,44 @@ static const unsigned long BAUD = 115200;
 
 static hs::Link obs;                  // observer: parses, never transmits
 
+// ---- boot-time proof that THIS board's UART2 reaches its pins ---------------
+// Pipe mode is deliberately silent, which is also how a deaf app looks. This
+// test is the difference: 8 bytes out U2TX, counted back on U2RX.
+//   jumper D16 <-> D17 on this board  -> 8/8 (UART2, pins and PC path all fine)
+//   controller wired instead          -> some bytes back, and the controller's
+//                                        console shows it answered ERR unknown
+//                                        command: the UPLINK works, both ways
+//   nothing wired                     -> 0/8 (and that is the only case where
+//                                        0/8 means "fine, nothing attached")
+// Result is printed in TAP mode only. In pipe mode the PC stream is somebody
+// else's protocol, so the verdict goes to the LEDs instead: both LEDs blink 3x
+// = UART2 OK, LED_LINK fast-blinking = no echo. Remove the jumper afterwards:
+// left in, the bridge's TX feeds back into its own RX.
+static int uart2SelfTest() {
+    static const uint8_t kPat[] = {0x55, 0xAA, 'H', 'S', 'L', 'F', 0x0D, 0x0A};
+    Serial2.flush();
+    while (Serial2.available() > 0) Serial2.read();       // flush RX first
+    for (const uint8_t b : kPat) Serial2.write(b);
+    Serial2.flush();
+    const uint32_t deadline = millis() + 100;
+    int got = 0;
+    while (millis() < deadline && got < static_cast<int>(sizeof(kPat))) {
+        if (Serial2.read() >= 0) got++;
+    }
+    return got;
+}
+
+static void ledPattern(int blinks) {
+    for (int i = 0; i < blinks; i++) {
+        digitalWrite(LED_LINK, HIGH);
+        digitalWrite(LED_TRAFFIC, HIGH);
+        delay(120);
+        digitalWrite(LED_LINK, LOW);
+        digitalWrite(LED_TRAFFIC, LOW);
+        delay(120);
+    }
+}
+
 // ---- observer picture (written by callbacks, read by loop) ------------------
 struct View {
     hs::Telemetry t{};
@@ -146,6 +184,21 @@ void setup() {
     pinMode(LED_TRAFFIC, OUTPUT);
     digitalWrite(LED_LINK, LOW);
     digitalWrite(LED_TRAFFIC, LOW);
+
+    const int echo = uart2SelfTest();         // see the comment above the test
+    if (BRIDGE_TAP) {
+        Serial.println("ESP-CCR handset TAP (observe only, no forwarding)");
+        Serial.println("wiring: bridge GPIO16 <- controller GPIO17, GPIO17 -> GPIO16, GND common");
+        Serial.printf("uart2 self-test: %d bytes back on RX from TX: %s\n", echo,
+                      echo ? "OK - this board's UART2 and its pins are good"
+                           : "no echo - jumper on D16/D17 not seen (check the "
+                             "silkscreen: D16/D17, not TX0/RX0)");
+    } else if (echo > 0) {
+        ledPattern(echo >= 8 ? 3 : 2);        // pipe mode: LEDs are the only safe output
+    } else {
+        ledPattern(1);
+    }
+
     // NULL writer: the observer can parse but never put anything on the wire.
     obs.begin(nullptr, nullptr, handlersForMode());
     if (BRIDGE_TAP) {

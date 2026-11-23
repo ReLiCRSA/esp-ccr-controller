@@ -119,6 +119,14 @@ passive observer, so its two LEDs are the link's real state. Full recipe,
 including why opening that port cannot reset the controller: `../BENCH.md`,
 "The handset link on the bench".
 
+**Silent link?** Pipe mode is silent by design, so don't guess — bisect with
+`tools/port_id.py`: `--loopback <port>` with a jumper on the bridge's own D16 ↔
+D17 answers "is the bridge itself working?" with the controller completely out
+of the picture, and the tap build prints a boot-time UART2 self-test verdict.
+The firmware always streams `T,` (first pump, then every 500 ms, no handshake),
+so a missing downlink is a wiring question: controller end must be **GPIO17**,
+not the silkscreen `TX` pin.
+
 Two bench rules that bite: **never run two readers on one port** (stop
 `tools/soak_logger.py` first), and **opening the USB-CDC console resets the
 board** — pyserial asserts DTR/RTS, and on this board DTR=IO0, RTS=EN, so the

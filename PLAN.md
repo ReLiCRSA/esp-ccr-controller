@@ -539,13 +539,13 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done `6c11ac6` — web-fix build `a8cd6bf`, dead page tabs fixed `70049fa` |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done `0d446fc` |
-| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **PASSes on the flashed build: 42 checks 0 failures** (harness `342d2b3`, first green `1257bec` on `1b8c807`, green again on the current build at `b1d8d2e`, tag `m4-radio-cycled`): boot console (fresh-boot banner, HB contract, no SAFE/FATAL, `settings: 32 keys from NVS`, `web: AP "..."`), the refusal matrix over the spare-ESP32 handset bridge (`AUTO` cold, `SET SP2` mid-dive, `WIFI ON` mid-dive, `CAL AIR` mid-dive, overlong, junk), `GET T`/`GET D` proven to be real replies by cadence anchoring, a console watcher that fails the run on any panic, SAFE latch or lost stack headroom, and `stk=`/`u2stk=` headroom at or above 512 bytes. The link paid for itself immediately: the first `GET T` over it panicked the controller (uart2 stack overflow — 16), fixed structurally (`util/numfmt.cpp`, no by-value reply buffers, `stk=`/`u2stk=` in HB) together with the SAFE-mode `ACK` the boot log had been promising but never implemented, now verified on hardware (`ACK` — `OK SAFE RESTART` — clean boot). **Still open for C2:** `LOG EXPORT` vs `/dive/<n>.csv` row-shape mismatch (16); the depth and `CAL O2` legs, which need the LPS28DFW on 19/18 and the bench jar; and no battery-margin or pre-dive conclusion is trustworthy yet, because the pack is unplugged (`vbat` about 1.56 V, `batlow=1`) and `[CELLS UNCALIBRATED: run CAL AIR]` stands. The BMP085 that used to block the depth leg never ACKed on the shared bus and has been replaced on the bench by the LPS28DFW (`1e1e15a`, auto-detect `de97ab9`) |
-| C2w | the surface web stack, verified over a joined station instead of "join a phone and look": `tools/web_probe.py` → page served byte-identical to `data/index.html`, captive DNS answers any name, WebSocket handshake verified against RFC 6455, every `#<n>` marker count matches its answer, each command sent over `/ws` and UART2 **back to back** and compared, and `--dive-cycle` proving `DIVE START` takes the radio out from under an associated client and the surface comes back after `DIVE END` on the other transport | done `1d8f284` (tag `m4-web-verified`) — 37 checks, 0 failures; it found `board_build.filesystem` defaulting to SPIFFS while the firmware mounts LittleFS, so the page in `data/` had never actually been installed (16) |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **PASSes on the flashed build: 48 checks 0 failures** (harness `342d2b3`, first green `1257bec` on `1b8c807`, green at `b1d8d2e` (tag `m4-radio-cycled`) and again at `0256df6`, which added the `log:` boot check and `--dive-persist`): boot console (fresh-boot banner, HB contract, no SAFE/FATAL, `settings: 32 keys from NVS`, `web: AP "..."`), the refusal matrix over the spare-ESP32 handset bridge (`AUTO` cold, `SET SP2` mid-dive, `WIFI ON` mid-dive, `CAL AIR` mid-dive, overlong, junk), `GET T`/`GET D` proven to be real replies by cadence anchoring, a console watcher that fails the run on any panic, SAFE latch or lost stack headroom, and `stk=`/`u2stk=` headroom at or above 512 bytes. The link paid for itself immediately: the first `GET T` over it panicked the controller (uart2 stack overflow — 16), fixed structurally (`util/numfmt.cpp`, no by-value reply buffers, `stk=`/`u2stk=` in HB) together with the SAFE-mode `ACK` the boot log had been promising but never implemented, now verified on hardware (`ACK` — `OK SAFE RESTART` — clean boot). **Closed since that run:** the `LOG EXPORT` vs `/dive/<n>.csv` row-shape mismatch (16) — one row formatter now, columns append-only, and `web_probe.py` compares the two transports on the wire. Asking the question that check should have asked (what would a broken build do differently?) then turned up two worse dive-log defects behind it, both fixed in `0256df6` and both bench-checked (16). **Still open for C2:** the depth and `CAL O2` legs, which need the LPS28DFW on 19/18 and the bench jar; and no battery-margin or pre-dive conclusion is trustworthy yet, because the pack is unplugged (`vbat` about 1.56 V, `batlow=1`) and `[CELLS UNCALIBRATED: run CAL AIR]` stands. The BMP085 that used to block the depth leg never ACKed on the shared bus and has been replaced on the bench by the LPS28DFW (`1e1e15a`, auto-detect `de97ab9`) |
+| C2w | the surface web stack, verified over a joined station instead of "join a phone and look": `tools/web_probe.py` → page served byte-identical to `data/index.html`, captive DNS answers any name, WebSocket handshake verified against RFC 6455, every `#<n>` marker count matches its answer, each command sent over `/ws` and UART2 **back to back** and compared, and `--dive-cycle` proving `DIVE START` takes the radio out from under an associated client and the surface comes back after `DIVE END` on the other transport | done `1d8f284` (tag `m4-web-verified`), extended `0256df6` — 38 checks, 0 failures; the 38th compares `LOG EXPORT n` with `GET /dive/<n>.csv` row for row; it found `board_build.filesystem` defaulting to SPIFFS while the firmware mounts LittleFS, so the page in `data/` had never actually been installed (16) |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done `1b8c807`, page tabs working since `70049fa` |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done `73e004d` (tag `m4-deco-validated`) |
-| M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done `acfada8` — **183/183 native**, both esp32 builds clean. The protocol contract is now verified against real firmware on real wires: the C2 matrix runs over the bench bridge on 16/17 (42 checks), and `web_probe.py` proves the same lines over `/ws`. Never yet flashed: the example handset board itself. |
-| M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `-DBRIDGE_TAP=1` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image | done `233ad2c`, **and the bench link is live**: the bridge is flashed and the C2 refusal matrix has been run over it many times (42 checks, 0 failures), with the client library on the bridge side watching the same stream. Two facts the wiring taught, both now in 16 and `BENCH.md`: opening the bridge's serial port resets it and its boot banner lands in the controller's line buffer, where un-terminated bytes are glued onto the next command, so `hw_accept.py` and `web_probe.py` send a newline first and discard what it draws; and both CP2102s report the same `/dev/serial/by-id`, so an upload must name `--upload-port`. `tools/port_id.py` (`--loopback` jumper test, boot-time UART2 self-test in the tap build) stays as the bisect path if the link ever goes silent again |
+| M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done `acfada8` — **183/183 native**, both esp32 builds clean. The protocol contract is now verified against real firmware on real wires: the C2 matrix runs over the bench bridge on 16/17 (48 checks), and `web_probe.py` proves the same lines over `/ws`. Never yet flashed: the example handset board itself. |
+| M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `-DBRIDGE_TAP=1` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image | done `233ad2c`, **and the bench link is live**: the bridge is flashed and the C2 refusal matrix has been run over it many times (48 checks, 0 failures), with the client library on the bridge side watching the same stream. Two facts the wiring taught, both now in 16 and `BENCH.md`: opening the bridge's serial port resets it and its boot banner lands in the controller's line buffer, where un-terminated bytes are glued onto the next command, so `hw_accept.py` and `web_probe.py` send a newline first and discard what it draws; and both CP2102s report the same `/dev/serial/by-id`, so an upload must name `--upload-port`. `tools/port_id.py` (`--loopback` jumper test, boot-time UART2 self-test in the tap build) stays as the bisect path if the link ever goes silent again |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -920,17 +920,83 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   because a task died, and continuing on a task set that just lost its stack is
   a state nobody can reason about — a second failure mid-dive finds the diver
   already breathing from it. The web AP stays offline in SAFE.
-- **Two writers produce the dive CSV, and they disagree (open, found
-  2026-11-23).** `LOG EXPORT n` (`divelog::toCsv`) emits 17 fields per `S,`
-  row — including `mode`, `temp_c` and `flags` — with alarms decimal and
-  battery in volts. `/dive/<n>.csv` (`dive_store::exportCsv`) emits 14, with
-  alarms as `0x%04X`, ceiling in integer cm, battery in integer mV, and no
-  mode/temp/flags. `BENCH.md` C2 step 4 asserts the download "matches
-  `LOG EXPORT <n>`": it does not, and would fail on the bench. Needs one
-  canonical row shape (the richer one) with both writers calling it, plus a
-  host test that feeds one record set through both and compares bytes. Related
-  formatting wart fixed in passing on the way: the hand-rolled `%d.%02d` in
-  `dive_store` printed a negative value as `-5.-30`.
+- **Two writers produced the dive CSV, and they disagreed (resolved
+  2026-11-23, found 2026-11-23).** `LOG EXPORT n` (`divelog::toCsv`) emitted 17
+  fields per `S,` row — including `mode`, `temp_c` and `flags` — with
+  alarms decimal and battery in volts. `/dive/<n>.csv` (`dive_store::exportCsv`)
+  emitted 14, with alarms as `0x%04X`, ceiling in integer cm, battery in integer
+  mV, and no mode/temp/flags. `BENCH.md` C2 step 4 asserted the download
+  "matches `LOG EXPORT <n>`"; it did not, and nothing had ever compared them.
+  Fixed by making the row shape a documented, versioned contract instead of
+  picking a winner: `logfmt::snapshotCsvLine` / `eventCsvLine` / `metaCsvLine` /
+  `diveCsvLine` are the only row formatters in the project, `DiveStore::exportCsv`
+  streams through `logfmt::emitCsvRows`, and the old `toCsv` (which only tests
+  called) is gone, replaced by `toCsvImage` over a packed file image.
+  **Columns are append-only**, which is the part a maintainer must not undo: the
+  v1 fields keep their positions, order and units (alarms stay `0x%04X`, ceiling
+  stays integer metres, battery stays mV) and v2's additions land on the right
+  (`mode,temp_c,flags,ceiling_cm` on `S,`; `gf_low,gf_high,sp1..sp4` on `M,`);
+  `ROW_FORMAT_VERSION` rides on the `DIVE,` line. Choosing the richer shape
+  instead would have renumbered every field after `setpoint` for anyone with a
+  v1 parser, for no benefit a diver can see. Tripwires: six host tests pin the
+  exact strings, the field counts, the v1 prefix and that both export paths are
+  byte-identical; `tools/web_probe.py` then compares the two transports on the
+  wire, where truncation would show up. Two more defects fell out of the same
+  reading: `exportCsv` formatted rows into a **64-byte `static char line[64]`**
+  (a wide row would have been cut in half and sent as a plausible dive —
+  19 fields needs ~90), and the `LOG EXPORT` parser hard-coded `0..9` while the
+  store holds ten slots, so slot 10 was listed and web-downloadable but not
+  exportable by handset; both bounds now come from `logfmt::MAX_DIVE_SLOTS`.
+  Documentation corrections, all doc errors rather than wire errors: field 2 of
+  `M,` is `max_depth_cm` (always was — the page divides it by 100),
+  `batt` is millivolts, and exported `E,` rows are shape-identical to live
+  `E,` downlinks, which is now said out loud in docs 5. Related formatting wart
+  fixed in passing on the way: the hand-rolled `%d.%02d` in `dive_store`
+  printed a negative value as `-5.-30`.
+
+- **The dive FIFO kept exactly one dive, and the log was unreadable until the
+  first dive of a boot (found and fixed 2026-11-24, `0256df6`).** Two defects
+  that hid each other. `nextSlot()` decided which FIFO slots were taken by
+  opening `/` and matching the directory entries against `diveN.bin`; on this
+  core the scan yielded nothing that matched, so every `DIVE START` concluded the
+  log was empty and wrote slot 1 again. Ten dives requested, one kept, and the
+  symptom was invisible from the surface: `LOG LIST` always answered with the
+  newest dive, which is what a working log looks like until the third dive. The
+  scan is gone — the ten names are probed with `exists()`, which cannot be
+  misread — and the bench now says `before [2, 1]`, after DIVE END
+  `[3, 2, 1]`. Separately, nothing mounted LittleFS until `DIVE START`, so after
+  a boot `LOG LIST` answered `OK` with nothing in it and `GET /dive/<n>.csv`
+  answered `no such dive`, while an esptool `read_flash` of the partition (0x290000)
+  showed `/dive1.bin` sitting there with its records intact. That is why "the dive
+  log vanished on reset" looked true for a session: an unmounted filesystem, a
+  one-slot FIFO and a genuinely lost write all produce the same empty answer, and
+  the firmware reported none of them. It reports all three now: the boot banner
+  says `log: LittleFS mounted, 3 dives, used 36864 of 1441792 bytes`, and
+  `LittleFS.begin(false)` is tried before `begin(true)` because the `true` form
+  answers a failed mount by formatting — erasing every dive — at debug
+  log level, i.e. silently. `hw_accept.py --dive-persist` closes a dive, resets
+  the controller through the console's EN line and requires the same slots and a
+  clean boot banner afterwards; `LOG LIST` is also answered by the handset before
+  any dive has been started this boot. Lesson for the next thin adapter: a
+  persistence claim has to be tested across a reset, by something that counts, or
+  it is a claim about the writer and not about the history.
+
+- **Mounting the log at boot made an installed copy of the web page the one the
+  browser gets (decision open, 2026-11-24).** `serveIndex` prefers
+  `LittleFS:/index.html` when `pageInFlash` says it is there, and until now
+  LittleFS was mounted only after the first `DIVE START` of a boot, so on a fresh
+  surface the preference never resolved and the built-in PROGMEM copy answered.
+  It is mounted at boot now, so the filesystem copy wins — which is fine today
+  (the installed copy is byte-identical, and `web_probe.py`'s byte-exact check is
+  what proves it) and a
+  trap tomorrow: a firmware change to the page with no matching `uploadfs` serves
+  the previous generation, and `uploadfs` is the one operation that erases dive
+  history, because page and dive files share the partition. The clean fix is to
+  make the built-in copy authoritative (the page ships in the firmware image, so
+  it cannot be a generation behind and cannot be half-written), which would also
+  retire the `uploadfs` step from the C2 gate entirely. Not done here because it
+  changes what a diver sees and belongs with the page work, not with the CSV fix.
+
 - **Removing float printf did not stop the crash, and the backtrace said why
   (bench, 2026-11-23, C2).** `GET T` panicked `uart2` a second time, on a build
   with every `%f` gone. The stack pointers in the new backtrace were the answer:

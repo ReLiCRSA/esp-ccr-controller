@@ -49,10 +49,80 @@ Two of the reasons people reach for CAN or 485 are already covered here:
 link-fault detection (the 2 Hz `T,` stream is a heartbeat; a handset that stops
 seeing `T,` knows within a second) and noise margin on a short hose.
 
-The web transport (`ws://<controller>/ws`) feeds the same lines; it adds one
-WebSocket-only convention: after every command answer, a marker line
-`#<lines>` (or `#<lines> dropped`) is sent so the browser knows the answer is
-complete. `#` can never start a protocol line. A UART handset never sees `#`.
+### Un-terminated bytes (verified on the bench, 2026-11-23)
+
+Bytes that arrive without a line terminator **stay in the line buffer** and are
+parsed as part of the NEXT line. Sending `XY`, then `AUTO\r\n`, is answered
+`ERR unknown command` because the controller saw `XYAUTO`; the following
+`AUTO\r\n` answers correctly. So one bad line costs one error reply and the
+parser recovers by itself - a handset does not have to resynchronise.
+
+This matters on the bench more than in the water: opening the handset adapter's
+serial port resets the bridge ESP32, and the boot banner it prints goes out
+straight into the controller's RX. Unless the harness sends a newline first and
+discards the reply, the first command of a run is glued to that banner and fails
+for a reason that has nothing to do with the firmware. `tools/hw_accept.py` and
+`tools/web_probe.py` both flush this way; a bare newline answered
+`ERR unknown command` is the proof that bytes were pending.
+
+Note also that the link is **passive in both directions**: downlink lines
+(`T,` at 2 Hz, `D,` at 0.5 Hz, `E,` as raised) start arriving the moment the
+port is open, before any command has been sent. A client must not treat those as
+replies.
+
+### Over-long lines (read from the code, observed on the bench, 2026-11-23)
+
+A line longer than `proto::MAX_LINE` (64 characters) is handled as it overflows,
+not at the terminator:
+
+* `ERR line too long` is printed **at the moment the limit is passed**.
+* The line buffer is then reset, so **the rest of that same physical line starts
+  a new line** - a 204-character send is therefore answered twice: `ERR line too
+  long` and, at the newline, `ERR unknown command` for the leftover tail.
+* That error is rate limited to **one per 2 s**, so a wall of junk cannot storm
+  the 6 KB-stack UART task with error replies.
+
+**The rate limit currently changes the outcome, not just the message - recorded
+as a defect, not as intended behaviour** (`uart2_task.cpp:63-73`). In the
+suppressed case `len` is *not* reset, so the terminator dispatches the truncated
+first 64 bytes as a command. Verified on the bench 2026-11-23:
+
+| Send (each 204 bytes) | Answer | Effect |
+|---|---|---|
+| `GET SP2 ZZZ…` (fresh 2 s window) | `ERR line too long`, then `ERR unknown command` | refused |
+| the same line again inside that window | `SP2=0.700` | **executed truncated** |
+| `SET SP2=0.33 YYY…` after arming the window | `OK SAFETY`, and `GET SP2` read back `0.330` | **the write landed** |
+| the same `SET` after the window expired | `ERR line too long`, value unchanged | refused |
+
+So the refusal is only guaranteed for the first overflow in two seconds. A
+handset library never sends more than 64 bytes, so this needs a corrupted or
+mangled stream to reach - which is exactly why the rule should be strict:
+rate-limit the *message*, always discard to the next terminator.
+
+The web transport differs in framing only: a WebSocket frame arrives whole, so
+the server answers `ERR line too long` once, marks that answer `#1 dropped`, and
+discards the frame (`web_server.cpp:136-146`). Same session, same router, same
+refusal text - which is why `tools/web_probe.py` compares the eight
+state-neutral commands **byte for byte** and the over-long case only on its
+refusal.
+
+The web transport (`ws://<controller>/ws`) feeds the same lines; it adds
+WebSocket-only conventions:
+
+| Line | When | Meaning |
+|---|---|---|
+| `#<lines>` | after every command answer | answer is complete; `lines` = **exactly** the number of answer lines just sent |
+| `#<lines> dropped` | same, when the **command** was over the frame limit | the reply is `ERR line too long`; the flag tells the page its own command arrived truncated, not that the reply was cut |
+| `#boot <uptimeMs> <freeHeap>` | once, when a socket opens | hello: uptime lets a page that connects after a reboot say so; the free heap rides along. **Not** an answer marker |
+
+`#` can never start a protocol line, so nothing collides. A UART handset never
+sees `#`.
+
+A client must match the marker shape exactly (`#\d+` with an optional
+` dropped`). Treating *any* `#` line as the end of an answer means stopping at
+the `#boot` hello, and then every reply is attributed to the command after the
+one that produced it — which is how `tools/web_probe.py` reported nine
+cross-transport disagreements on firmware that was answering correctly.
 
 ## 2. Downlink cadence (UART; what a handset receives unprompted)
 

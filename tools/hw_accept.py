@@ -341,6 +341,28 @@ def run_protocol(port, baud, log, settle=1.5):
     try:
         time.sleep(settle)
         ser.reset_input_buffer()
+        # reset_input_buffer() only clears OUR side. Un-terminated bytes sitting
+        # in the controller's line buffer are parsed together with the next
+        # command: verified on the bench 2026-11-23 by sending `XY` with no
+        # newline and then `AUTO\r\n`, which came back as `ERR unknown command`
+        # (it saw `XYAUTO`) and recovered on the following line. On this bench
+        # those bytes arrive by themselves: opening the handset port resets the
+        # bridge ESP32, and its boot banner goes out its TX straight into the
+        # controller. So flush the controller's buffer, and report what it drew,
+        # because a bare newline answering `ERR unknown command` is proof there
+        # were stray bytes pending - without it the first check of the run can
+        # fail for a reason that has nothing to do with the firmware.
+        ser.write(b"\r\n")
+        ser.flush()
+        flush_end = time.time() + 0.6
+        drew = []
+        while time.time() < flush_end:
+            l = ser.readline().decode(errors="replace").strip()
+            if l and not l.startswith(("T,", "D,", "E,")):
+                drew.append(l)
+        if drew:
+            log.append(f"[{time.time() - t0:7.2f}s] (flushed stray bytes from the "
+                       f"controller's line buffer: {drew})")
         for check in PROTOCOL_CHECKS:
             cmd, want, why = check[0], check[1], check[2]
             burst = len(check) > 3 and check[3] == "burst"

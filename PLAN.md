@@ -321,6 +321,11 @@ older forks' download URLs are dead):
   literal for `pio run -e esp32 -t uploadfs` (one source of truth). Built-in
   page: status, checklist, settings (ranges from `GET SCHEMA`), dives
   (list → inline depth/ppO₂ chart → CSV), console. 23 KB, no CDN, no framework.
+   Two caveats found on the bench 2026-11-23, both in section 16: the LittleFS
+   copy can be an **older generation than the firmware** (it wins, so a fix can
+   be invisible), and `uploadfs` writes the partition the dive logs share, so it
+   erases dive history. `web_probe.py` compares the served bytes to
+   `data/index.html` to catch the first.
   - **Cell histograms**: `ctrl::cellhist` (`src/control/cellhist.{h,cpp}`) —
     rolling 10-minute horizon per fitted cell (10 windows × 60 s ring, 38
     bins of 0.05 bar, fixed static, no heap), fed by ControlTask once per
@@ -821,16 +826,29 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   the linker cannot see the disagreement and the flag is cross-task, so the
   qualifier belongs in the declaration.
 - **Uplink overflow does not resynchronise to the newline (found writing the
-  handset contract, 2026-11-23).** `uart2_task.cpp` accepts 64 characters; the
-  65th answers `ERR line too long` (rate-limited to one per 2 s) and resets the
-  buffer — but keeps reading, so the remainder of an overlong line is collected
-  and terminated as a *second* command. Harmless for a well-behaved handset and
-  for the web page, and it is not a security boundary (the router refuses what
-  it refuses regardless of framing), but "a long line is dropped" is not what
-  the code does, so the spec documents what it does. Hardening when this file
-  is next open: on overflow, swallow to the next terminator instead of
-  restarting mid-line. The client library already behaves the way the firmware
-  should (`overflowing_` drops the whole line).
+   handset contract, 2026-11-23; measured on the board the same day).**
+   `uart2_task.cpp` accepts 64 characters; the 65th answers `ERR line too long`
+   (rate-limited to one per 2 s) and resets the buffer — but keeps reading, so
+   the remainder of an overlong line is collected and terminated as a *second*
+   command. Harmless for a well-behaved handset and for the web page, but "a long
+   line is dropped" is not what the code does, so the spec documents what it does.
+   **The rate limit makes it worse than framing noise, and this is the part the
+   first version of this entry got wrong: in the suppressed case `len` is *not*
+   reset, so the terminator dispatches the truncated first 64 bytes as a command.**
+   Observed on the bench: over-long `GET SP2 ZZZ...` inside the window answered
+   `SP2=0.700` (executed, not refused); an over-long `SET SP2=0.33` plus 120 junk
+   bytes answered `OK SAFETY` and `GET SP2` read back `0.330`, while the same bytes
+   outside the window were refused and changed nothing (value restored afterwards).
+   So the documented refusal is only guaranteed for the first overflow in two
+   seconds, and an over-long *write* can land. What the first entry asserted
+   alongside this — "not a security boundary: the router refuses what it refuses
+   regardless of framing" — was wrong. Framing decides whether the router sees
+   the command at all. Hardening when this file is next open: on overflow always
+   swallow to the next terminator and rate-limit only the text; and extract the
+   line-assembly loop into `uart_proto`, because inline in an ESP-only task the
+   native suite cannot see the rule at all. The client library already behaves the
+   way the firmware should (`overflowing_` drops the whole line). The lesson for
+   every rate limit in this project: gate the message, never the recovery.
 - **Two identical CP2102 boards make "which port is which" a safety question
   (bench, 2026-11-23).** The handset bridge and the controller are both
   `esp32dev` images on the same hardware, and esptool will happily write either;
@@ -1068,3 +1086,65 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 - **The boot line's AP address was a literal** (`on 192.168.4.1`), while the
   captive DNS answers with `WiFi.softAPIP()` — the two could drift and the bench
   would be told to look at an address nothing serves on. Now prints `softAPIP()`.
+- **`board_build.filesystem` defaults to SPIFFS, and the firmware mounts
+  LittleFS** — so `pio run -e esp32 -t uploadfs` had *never* installed the web
+  page. The image went to the same partition (1 441 792 bytes at 0x290000) in a
+  format nothing reads, `LittleFS.begin(true)` carried on with whatever was
+  already there, and the board served an older generation of the UI while the
+  current one sat unused in app flash. Set explicitly in `platformio.ini`, with
+  the reason written down. The general shape: a build-system default that has to
+  agree with a runtime call in another file is a latent defect with no compile
+  error and no host test — only fetching the URL compares them. `web_probe.py`
+  now asserts **the served bytes equal `data/index.html`**, the only end-to-end
+  check over `web_page.h` → `sync_webdata.py` → `data/` → the router's
+  LittleFS-or-flash choice.
+- **A LittleFS copy can outlive the firmware that generated it.** `serveIndex()`
+  prefers `LittleFS.exists("/index.html")`, so a stale install silently shadows a
+  fix — the "I fixed it but nothing changed" report, from the board's side. Open
+  question, recorded not decided: whether the preference should flip, or whether
+  the page should carry a build marker the bench compares. The byte-exact check
+  is the mitigation for now. Related loose end: `web/` (the Nov-22 multi-page
+  generation) is still tracked and its asset names match nothing in the router
+  (`/style.css` is registered, the repo has never had that file; `/app.css` and
+  the four sub-pages have no routes at all).
+- **The web page and the dive logs share one LittleFS partition**, so `uploadfs`
+  deletes dive history. Observed rather than inferred: slot 1 held a 338-byte
+  dive before the first real install; after it, slot 1 was one of that session's
+  3-record bench dives and slot 2 was empty — had the older dive survived,
+  `nextSlot()` would have taken slot 2. A future filesystem layout should
+  separate the two; until then `uploadfs` is a destructive step and BENCH.md says
+  so.
+- **Un-terminated bytes are glued onto the next command line** (proved by
+  injection, 2026-11-23): send `XY` with no newline, then `AUTO\r\n`, and the
+  controller answers `ERR unknown command` because it parsed `XYAUTO`; the next
+  `AUTO\r\n` is answered correctly. So one bad line costs one error reply and the
+  parser resynchronises without help — worth knowing before anyone writes resync
+  logic for a handset. What makes it a bench problem is that opening the handset
+  adapter's port resets the bridge ESP32 and its boot banner goes straight into
+  the controller's RX, and `reset_input_buffer()` clears only our side. Both
+  harnesses now send a newline first and report what it drew: a bare newline
+  answered `ERR unknown command` is proof bytes were pending. Without that, the
+  first check of a run fails for a reason unrelated to the firmware — which is
+  how this was first mis-read as a cross-transport disagreement.
+- **Cross-transport equality must interleave, not run as two passes.** Proving
+  "one command path, two transports" means the same command twice, and if the web
+  pass runs its whole matrix first, its own writes are still in effect when UART2
+  reads: `GET *` "disagreed" (`SP2=0.550` vs `0.700`) for no reason but ordering.
+  One command, both transports, back to back. The matrix is also ordered
+  refusals-and-reads first and the single write plus its read-back last, so a run
+  is state-neutral up to that point.
+- **`#` is not one vocabulary on the web transport.** `#<n>` means "answer
+  complete"; `#boot <uptimeMs> <freeHeap>` is a hello sent when a socket connects.
+  A client that treats any `#` line as the marker stops reading at the hello and
+  attributes every reply to the *next* command — nine checks failed on good
+  firmware that way. Clients must match the marker shape exactly; both lines are
+  named in `docs/HANDSET_PROTOCOL.md`.
+
+- **A bench tool must not reconfigure the machine it runs on.** An early
+  `web_probe.py` brought a network connection up when the station did not rejoin
+  after a dive, naming a connection profile this project knows nothing about.
+  Joining the AP is the operator's setup; inventing it made the tool fail the
+  moment the operator's own setup was in place. Now the tool talks HTTP and
+  WebSocket to `--host`, only ever *scans* to confirm the AP is broadcasting, and
+  carries three verdicts — a check it cannot observe is "not evaluated", not a
+  failure charged to the firmware.

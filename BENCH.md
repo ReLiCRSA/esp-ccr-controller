@@ -14,13 +14,20 @@ reboots" from a log that begins with one.
 ## C2 — flash + acceptance (run first, every flash)
 
 ```
-pgrep -f soak_logger          # must be empty; kill before touching the port
+fuser /dev/ttyUSB0            # must be empty; a reader here corrupts the run
 pio test -e native            # host gate, currently 201 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
-pio run -e esp32 -t uploadfs  # page into LittleFS (optional: fallback is in flash)
+pio run -e esp32 -t uploadfs  # ONLY if data/ changed: it erases the dive logs
 tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
+tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle
 ```
+
+`uploadfs` needs `--upload-port` on this bench (two identical CP2102s, identical
+`/dev/serial/by-id`) and it writes the whole filesystem partition, which is where
+the dive logs live — so it deletes dive history. It is only needed when the web
+page changes; with no `data/` install the firmware serves the identical built-in
+page out of app flash.
 
 `tools/float_audit.py` is in the gate because the same bug came back once: a
 `%f`/`%g` conversion pulls in newlib's float conversion, which wants kilobytes
@@ -94,11 +101,61 @@ the marker land in the same place either way. `hw_accept.py` and
 `radio_stress.py` report it as a note and do not fail on it; a check that fires
 on healthy hardware is worse than no check.
 
-**What no tool on this bench can prove:** that the page and the WebSocket
-actually serve after a radio cycle. Both need a station joined to the AP, so the
-check is manual — after `DIVE END` (or `WIFI ON`), join `ESP-CCR-XXXX` from a
-phone and open `http://192.168.4.1`. Do it after any change to `start()`'s
-`softAP` / DNS-bind / `AsyncWebServer` sequence.
+**What that tool still cannot prove:** the page and the WebSocket actually
+serving after a radio cycle. `radio_stress.py` never opens the network — it reads
+the console. For that there is `tools/web_probe.py`, next section.
+
+### The surface web stack, with a station joined (`tools/web_probe.py`)
+
+The handset is the in-water transport; the AP is how a diver reads the dive plan,
+changes settings and pulls the CSVs at the surface. Both are supposed to be the
+**same command path with the same refusals**, and until 2026-11-23 nothing on the
+bench had ever proved it — this section used to say "join it from a phone and
+look", which is not a check anyone can run twice and compare.
+
+```
+tools/.../python tools/web_probe.py --host 192.168.4.1 \
+    --handset /dev/ttyUSB1 --dive-cycle
+```
+
+It needs a station already joined to the controller's AP (SSID `ESP-CCR-XXXX`,
+WPA2, password = the `AP_PASS` setting). **Joining is the operator's setup**: the
+tool never connects, disconnects or reconfigures anything on the machine it runs
+on, and only ever *scans* the air to confirm the AP is broadcasting. Checks that
+need a link it does not have report `SKIP` ("not evaluated") rather than failing
+the firmware for the operator's network.
+
+| Phase | What it asserts, and why it matters |
+|---|---|
+| HTTP | `/` serves and is **byte-identical to `data/index.html`**. This is the check that found the stale-page defect below. `/favicon.ico` is 204, unknown paths 302 → `/` (that redirect *is* the captive portal), `/app.js` 404 because the page is one self-contained file |
+| Page | references nothing external (`page links: []`). The AP has no uplink, ever, so any CDN or cross-site reference is a dead page on the day it matters |
+| DNS | any name at all resolves to the AP IP — the other half of the captive portal (C2-e above: without it a phone resolves nothing and "the page does not load") |
+| WebSocket | handshake verified against RFC 6455 (`Sec-WebSocket-Accept` recomputed locally, no library: the point is to verify the server, so a dependency would be verifying itself); the `#boot <uptimeMs> <freeHeap>` hello on connect; then every command's answer must end with a `#<n>` marker whose **n equals the answer's line count** — if it does not, the browser renders half a table |
+| Equality | each command sent twice **back to back** — once over the WebSocket, once on UART2 — with identical non-stream reply lines. That is the project's central claim (PLAN: one command session, not one per transport) |
+| `--dive-cycle` | `DIVE START` from the browser takes the radio out from under the associated client (HTTP stops answering, the socket dies), the dive is then closed over UART2 — the web cannot close the dive that switched itself off, which is itself the argument for the handset being the in-water transport — and the AP is broadcasting again with a fresh WebSocket working |
+
+Measured 2026-11-23, 34 checks, 0 failures: radio unreachable under the client
+0.5–1.0 s after `DIVE START`, AP back and serving 200 after `DIVE END`, page
+25 445 bytes identical to the repo, all eight commands identical on both
+transports, markers matched every answer (`GET *` → 32 lines, `#32`).
+
+Three traps this tool walked into, all of them harness bugs that looked like
+firmware faults — worth re-reading before adding a check:
+
+* **`#` is not one vocabulary.** The server also sends `#boot <uptimeMs> <freeHeap>`
+  when a socket connects. Treating any `#` line as the answer marker stopped
+  reading at the hello, so every reply was attributed to the *next* command and
+  all eight equality checks failed on good firmware. Match the marker shape
+  exactly (`#\d+( dropped)?`).
+* **Two separate passes compare different states.** Running the web matrix and
+  then the UART matrix "disagreed" on `GET *` (`SP2=0.550` vs `0.700`) purely
+  because the web pass had already executed `SET SP2=0.70`. Interleaving is the
+  only correct shape.
+* **Un-terminated bytes sit in the controller's line buffer** and get parsed with
+  the next line, so the first command of a run can be answered `ERR unknown
+  command` for a reason that has nothing to do with the firmware. See the
+  handset-link section below; `hw_accept.py` and `web_probe.py` both flush the
+  controller's buffer, and report what the flush drew.
 
 ### The handset link on the bench (no USB-UART adapter in the drawer)
 
@@ -120,6 +177,31 @@ Hold EN low or the live ESP32 drives GPIO1 itself (ROM boot log on UART0 at
 115200): that fights the controller's TX driver on the same wire and feeds the
 controller junk it dutifully answers `ERR unknown command` about. Remove the
 jumper to flash that board again.
+
+**Bridge firmware (option B) has a side effect every harness must handle.**
+Opening `/dev/ttyUSB1` resets the spare ESP32, and the boot banner it prints goes
+out its TX straight into the controller's RX. Those bytes have no line terminator
+of their own, and the controller **keeps un-terminated bytes in its line buffer
+and parses them together with the next line**: verified on the bench 2026-11-23
+by sending `XY`, then `AUTO\r\n` — answered `ERR unknown command`, because it saw
+`XYAUTO` — and the following `AUTO\r\n` answered correctly. So one bad line costs
+one error reply and the parser resynchronises by itself (also written up in
+`docs/HANDSET_PROTOCOL.md`). `reset_input_buffer()` does **not** help: it clears
+our side, never the controller's. `hw_accept.py` and `web_probe.py` therefore
+send a newline first and discard what it draws; a bare newline answered
+`ERR unknown command` is the proof that bytes were pending, and both tools print
+it instead of letting the first check of the run fail mysteriously.
+
+**Same path, second trap: `ERR line too long` is rate limited to one per 2 s, and
+in the suppressed case the line is not discarded** — the controller dispatches
+the truncated first 64 bytes as a command. So the over-long case in
+`hw_accept.py`'s refusal matrix is only meaningful because the matrix overflows
+once; and an over-long `SET` that lands inside that window **takes effect** —
+observed 2026-11-23 (`SET SP2=0.33` plus 120 junk bytes answered `OK SAFETY` and
+`GET SP2` read back `0.330`; restored afterwards, and refused with the value
+unchanged once the window had expired). Recorded as an open defect in PLAN 16 and
+in `docs/HANDSET_PROTOCOL.md`: rate-limit the message, always discard to the
+terminator.
 
 **B. Bridge firmware (`handset/bridge_esp32`, recommended).** The spare board
 runs a byte-for-byte pipe PC↔controller and *observes* the stream with the
@@ -282,7 +364,46 @@ Then by hand, in this order (each mirrors a sim scenario):
   limit, schema marker bumped. Verified on the board: SET -> OK in ~40 ms,
   reboot, boot line `settings: 32 keys from NVS`, values survive.
 
+## C2-f — the page the board served was not the page in the repo (2026-11-23)
+
+Probing the web stack over a joined station (`tools/web_probe.py`, above) turned
+up a defect that no amount of flashing or code reading would have shown:
+
+* **`board_build.filesystem` was never set**, so PlatformIO built **SPIFFS**
+  images for `uploadfs` while the firmware mounts **LittleFS**
+  (`LittleFS.begin(true)`, `src/log/dive_store.cpp:39`). Every `uploadfs` until
+  this session wrote a SPIFFS-formatted image into the partition LittleFS lives
+  on, so `data/index.html` had *never actually been installed* — and BENCH.md
+  had been calling that step "optional" the whole time. Fixed in `platformio.ini`
+  (`board_build.filesystem = littlefs`); the build log now says
+  `littlefs.bin`, not `spiffs.bin`.
+* **The consequence of "LittleFS first" is a stale page outliving a firmware
+  fix.** `serveIndex()` prefers `LittleFS.exists("/index.html")`, so whatever
+  older generation is in flash wins. The board was serving a 4 219-byte
+  `index.html` plus a 9 114-byte `/app.js` that speak JSON and `/api/status` —
+  an API this firmware has never implemented — from the Nov-22 multi-page
+  layout, while the current 25 445-byte single-file page sat in app flash
+  (`src/comms/web_page.h`) and in the repo, unused. The routes did not match any
+  layout either: `/style.css` is registered and the repo has never had that file,
+  `/app.css` (which `web/index.html` asks for) has no route, and `checklist /
+  dives / histogram / settings` have none.
+* **Page and dive logs share one partition.** `uploadfs` writes that partition's
+  whole image, so it deletes dive history. Observed, not just inferred: a
+  338-byte dive sat in slot 1 before the first real install; after it,
+  `/dive/1.csv` was one of that session's 3-record bench dives and slot 2 was
+  empty — if the older dive had survived, `nextSlot()` would have used slot 2.
+* The check that now catches this class is in `web_probe.py`: **the bytes on the
+  wire must equal the bytes in `data/index.html`**. Cheap, and it is the only
+  assertion that compares the three artifacts (`web_page.h` → `sync_webdata.py`
+  → `data/` → what the router picks) end to end.
+
+Not yet decided (open, cosmetic today): what to do with the superseded `web/`
+directory, still tracked from the Nov-22 generation, and whether `serveIndex()`
+should prefer the built-in page over a LittleFS copy that may predate the
+firmware.
+
 ## C3-a — depth sensor: LPS28DFW on its own bus (decided 2026-11-23)
+
 
 The BMP085 that stood in here **never acknowledged once** — every poll since
 the first boot that tried it was `requestFrom(): Error -1`, and it is now

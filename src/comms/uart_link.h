@@ -45,7 +45,12 @@ public:
         // (surface only) persist to NVS. The firmware wires applySettings +
         // Loop::setConfig here; the link never knows the config's shape.
         void (*onSettings)(void* ctx) = nullptr;
+        // SAFE-mode ACK: the reply has already gone out when this runs, so
+        // the transport may restart the controller from here (it does not
+        // return). Nothing else is attempted after it.
+        void (*onSafeAck)(void* ctx) = nullptr;
     };
+
 
     UartLink(ctrl::Loop& loop, settings::Registry& reg, CommandRouter& router,
              const bridge::Telemetry& tel, bridge::EventRing& events,

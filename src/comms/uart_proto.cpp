@@ -2,7 +2,9 @@
 // uart_proto.cpp — defensive parsing: every malformed line is an ERR with a
 // reason, never a crash, never a silent accept.
 // ============================================================================
-#include "uart_proto.h"
+#include "comms/uart_proto.h"
+
+#include "util/numfmt.h"
 
 #include <cctype>
 #include <cstdarg>
@@ -166,28 +168,43 @@ bool parseCommand(const char* line, Command& out, const char** err) {
 
 size_t formatTelemetry(const Telemetry& t, char* out, size_t cap) {
     static const char* kMode[] = {"STANDBY", "AUTO", "MANUAL", "SAFE"};
-    const int n = emit(out, cap, "T,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,FLAGS0x%02X,%.2f\n",
-                       static_cast<double>(t.depthM), static_cast<double>(t.votedPpo2),
-                       static_cast<double>(t.cells[0]), static_cast<double>(t.cells[1]),
-                       static_cast<double>(t.cells[2]), static_cast<double>(t.setpoint),
-                       kMode[t.mode & 3], t.flags, static_cast<double>(t.battV));
+    // Fixed-point on purpose: %.Nf here would pull newlib's _dtoa_r onto the
+    // uart2 task's stack, which is what panicked the controller on the first
+    // real `GET T` (numfmt.h). The bytes must not change — this line is the
+    // protocol (docs/HANDSET_PROTOCOL.md 4) — and test_numfmt proves the writer
+    // agrees with printf across the ranges below.
+    char d[16], v[16], c0[16], c1[16], c2[16], sp[16], vb[16];
+    const int n = emit(out, cap, "T,%s,%s,%s,%s,%s,%s,%s,FLAGS0x%02X,%s\n",
+                       numfmt::fixed(d, sizeof(d), t.depthM, 2),
+                       numfmt::fixed(v, sizeof(v), t.votedPpo2, 3),
+                       numfmt::fixed(c0, sizeof(c0), t.cells[0], 3),
+                       numfmt::fixed(c1, sizeof(c1), t.cells[1], 3),
+                       numfmt::fixed(c2, sizeof(c2), t.cells[2], 3),
+                       numfmt::fixed(sp, sizeof(sp), t.setpoint, 3),
+                       kMode[t.mode & 3], t.flags,
+                       numfmt::fixed(vb, sizeof(vb), t.battV, 2));
     return (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
 }
 
 size_t formatDeco(const DecoInfo& d, char* out, size_t cap) {
-    int n = emit(out, cap, "D,%d,%.1f,%.2f", d.ndlMin,
-                 static_cast<double>(d.decoTotalMin), static_cast<double>(d.ceilingM));
+    char dt[16], cl[16];
+    int n = emit(out, cap, "D,%d,%s,%s", d.ndlMin,
+                 numfmt::fixed(dt, sizeof(dt), d.decoTotalMin, 1),
+                 numfmt::fixed(cl, sizeof(cl), d.ceilingM, 2));
     if (n <= 0 || static_cast<size_t>(n) >= cap) return 0; // vsnprintf returns
                                                            // NEEDED length:
                                                            // guard before cap-n
     for (int i = 0; i < d.stopCount && i < MAX_STOPS; ++i) {
-        const int m = emit(out + n, cap - n, ",%.0f|%.1f",
-                           static_cast<double>(d.stops[i].depthM),
-                           static_cast<double>(d.stops[i].minutes));
+        char sd[16], sm[16];
+        const int m = emit(out + n, cap - n, ",%s|%s",
+                           numfmt::fixed(sd, sizeof(sd), d.stops[i].depthM, 0),
+                           numfmt::fixed(sm, sizeof(sm), d.stops[i].minutes, 1));
         if (m <= 0 || static_cast<size_t>(n + m) >= cap) return 0;
         n += m;
     }
-    const int m = emit(out + n, cap - n, ",%.1f\n", static_cast<double>(d.cnsPct));
+    char cns[16];
+    const int m = emit(out + n, cap - n, ",%s\n",
+                       numfmt::fixed(cns, sizeof(cns), d.cnsPct, 1));
     if (m <= 0 || static_cast<size_t>(n + m) >= cap) return 0;
     return static_cast<size_t>(n + m);
 }

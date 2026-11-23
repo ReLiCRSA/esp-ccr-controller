@@ -72,6 +72,9 @@ public:
     /// after begin(); a session without one answers GET HIST with ERR.
     void setHist(const cellhist::Hist* h) { if (router_) router_->setHist(h); }
 
+    /// SAFE mode: refuse every command but ACK (see CommandRouter::setSafeLockout).
+    void setSafeLockout(bool on) { if (router_) router_->setSafeLockout(on); }
+
     /// Runs `fn` with the session lock held, for work that touches the same
     /// hardware the commands touch (a dive-file export answering an HTTP
     /// request, say). Anything that must not race with DIVE START|END belongs

@@ -37,6 +37,9 @@
 #include "comms/settings_apply.h"
 #include "comms/telemetry_bridge.h"
 #include "comms/session.h"
+
+#include "util/numfmt.h"
+#include "util/stackwatch.h"
 #include "control/cellhist.h"
 #include "comms/uart2_task.h"
 #include "comms/web_server.h"
@@ -144,6 +147,7 @@ static void sensorTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(200)); // let boot/serial settle
     uint32_t lastBat = 0;
     for (;;) {
+        stackwatch::sample(stackwatch::SLOT_SENSOR);
         const uint32_t now = millis();
 #ifdef TEST_SENSOR_STALL
         // Livelock simulation: keeps feeding TWDT (so the diagnostic layer
@@ -182,9 +186,11 @@ static void sensorTask(void*) {
         static bool depthAnnounced = false;
         if (!depthAnnounced && g_depth.healthy()) {
             depthAnnounced = true;
-            Serial.printf("depth: %s ready, %.1f hPa\n",
+            char hp[16];
+            Serial.printf("depth: %s ready, %s hPa\n",
                           g_depth.source()->identity(),
-                          g_depth.pressureBar() * 1000.0f);
+                          numfmt::fixed(hp, sizeof(hp),
+                                        g_depth.pressureBar() * 1000.0, 1));
         }
 #endif
 
@@ -209,6 +215,7 @@ static void sensorTask(void*) {
 static void hudTask(void*) {
     esp_task_wdt_add(NULL);
     for (;;) {
+        stackwatch::sample(stackwatch::SLOT_HUD);
         const uint32_t now = millis();
         hudUpdate(now);
         // Captive DNS rides here, not on the handset task: UART2 may be
@@ -220,12 +227,20 @@ static void hudTask(void*) {
         if (now - lastStatus >= 5000) {
             lastStatus = now;
             const auto& st = g_ads.stats();
+            char vb[16], vt[16], sp[16];
+            uint8_t stackSlot = 0;
+            const uint32_t stackFree = stackwatch::worstFree(&stackSlot);
             // NOTE: the leading fields are the format soak_logger.py parses.
-            // New fields are appended, never reordered or renumbered.
+            // New fields are appended, never reordered or renumbered. `stk=` is
+            // appended for exactly that reason, and it is there because of the
+            // uart2 panic of 2026-11-23: a stack overflow was invisible on the
+            // host and invisible on the bench until it rebooted the controller.
+            // Free bytes left in the tightest task is now a number we watch.
             Serial.printf("HB st=%d c0=%d c1=%d c2=%d fresh=%d%d%d "
-                          "smp=%lu i2cerr=%lu rec=%lu vbat=%.2f "
+                          "smp=%lu i2cerr=%lu rec=%lu vbat=%s "
                           "stale=%d batlow=%d"
-                          " vote=%.3f sp=%.2f al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d\n",
+                          " vote=%s sp=%s al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d"
+                          " stk=%u\n",
                           static_cast<int>(g_systemState),
                           g_ads.raw(0), g_ads.raw(1), g_ads.raw(2),
                           g_ads.fresh(0, now), g_ads.fresh(1, now),
@@ -233,11 +248,18 @@ static void hudTask(void*) {
                           (unsigned long)st.samples,
                           (unsigned long)st.i2cErrors,
                           (unsigned long)st.recoveries,
-                          g_battery.volts(),
+                          numfmt::fixed(vb, sizeof(vb), g_battery.volts(), 2),
                           g_sensorStale, g_battery.low(),
-                          g_bridgeTel.votedBar, g_bridgeTel.setpointBar, g_bridgeTel.alarmBits,
+                          numfmt::fixed(vt, sizeof(vt), g_bridgeTel.votedBar, 3),
+                          numfmt::fixed(sp, sizeof(sp), g_bridgeTel.setpointBar, 2),
+                          g_bridgeTel.alarmBits,
                           (int)g_bridgeTel.voteMode, (unsigned long)g_bridgeTel.pulses,
-                          (int)g_bridgeTel.solenoid, (int)g_controlRunning);
+                          (int)g_bridgeTel.solenoid, (int)g_controlRunning,
+                          (unsigned)stackFree);
+            if (stackFree != 0 && stackFree < stackwatch::kWarnFreeBytes) {
+                Serial.printf("** stack low: %u bytes free in '%s'\n",
+                              (unsigned)stackFree, stackwatch::name(stackSlot));
+            }
         }
 
         g_hbHud.seq++;
@@ -264,6 +286,7 @@ static void controlTask(void*) {
 
     uint32_t next = millis() + CONTROL_TASK_PERIOD_MS;
     for (;;) {
+        stackwatch::sample(stackwatch::SLOT_CONTROL);
         const uint32_t now = millis();
         if ((int32_t)(now - next) < 0) {  // not due yet
             vTaskDelay(pdMS_TO_TICKS(2));
@@ -312,10 +335,14 @@ static void controlTask(void*) {
                         g_cellCal[i].airBar = CAL_AIR_REF_BAR;
                         g_cellCal[i].hasAir = true;  // slope stays nominal until CAL O2
                     }
-                Serial.printf("cal air: OK  raw cell0=%.0f cell1=%.0f cell2=%.0f"
-                              "  worst spread %.0f  (%u samples)\n",
-                              a.rawAvg[0], a.rawAvg[1], a.rawAvg[2],
-                              a.spreadWorst, (unsigned)a.samples);
+                char r0[16], r1[16], r2[16], ws[16];
+                Serial.printf("cal air: OK  raw cell0=%s cell1=%s cell2=%s"
+                              "  worst spread %s  (%u samples)\n",
+                              numfmt::fixed(r0, sizeof(r0), a.rawAvg[0], 0),
+                              numfmt::fixed(r1, sizeof(r1), a.rawAvg[1], 0),
+                              numfmt::fixed(r2, sizeof(r2), a.rawAvg[2], 0),
+                              numfmt::fixed(ws, sizeof(ws), a.spreadWorst, 0),
+                              (unsigned)a.samples);
             } else if (a.failed) {
                 Serial.printf("cal air: FAILED (%s)\n", a.why);
             }
@@ -431,6 +458,7 @@ static void supervisorTask(void*) {
     uint32_t lastSensorChange = millis(), lastHudChange = millis(), lastControlChange = millis();
 
     for (;;) {
+        stackwatch::sample(stackwatch::SLOT_SUPERVISOR);
         vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS));
         const uint32_t now = millis();
 
@@ -617,17 +645,21 @@ void setup() {
     if (forceSafe) {
         setSystemState(HudState::SAFE);   // solenoid pin stays INPUT_PULLDOWN
         hudSetError(ErrLevel::HARD);
-        Serial.println("** SAFE MODE: acknowledge via handset or power-cycle after fix");
+        Serial.println("** SAFE MODE: acknowledge over the handset link (ACK) or power-cycle after fix");
         Serial.println("**   solenoid pin left failsafe-high-impedance, no control task");
     } else {
         setSystemState(HudState::STANDBY);
-        Serial.printf("control: SP=%.2f/%.2f/%.2f/%.2f cells=%d%d%d wall=%.2f cutoff=%.2f "
+        char bs1[16], bs2[16], bs3[16], bs4[16], bwall[16], bcut[16];
+        Serial.printf("control: SP=%s/%s/%s/%s cells=%d%d%d wall=%s cutoff=%s "
                       "duty=%u%% pulse=%ums warmup=%us%s\n",
-                      (double)g_ctrlCfg.sp.sp[0], (double)g_ctrlCfg.sp.sp[1],
-                      (double)g_ctrlCfg.sp.sp[2], (double)g_ctrlCfg.sp.sp[3],
+                      numfmt::fixed(bs1, sizeof(bs1), g_ctrlCfg.sp.sp[0], 2),
+                      numfmt::fixed(bs2, sizeof(bs2), g_ctrlCfg.sp.sp[1], 2),
+                      numfmt::fixed(bs3, sizeof(bs3), g_ctrlCfg.sp.sp[2], 2),
+                      numfmt::fixed(bs4, sizeof(bs4), g_ctrlCfg.sp.sp[3], 2),
                       (g_ctrlCfg.presentMask >> 0) & 1, (g_ctrlCfg.presentMask >> 1) & 1,
                       (g_ctrlCfg.presentMask >> 2) & 1,
-                      (double)g_ctrlCfg.inj.highWallBar, (double)g_ctrlCfg.inj.cutoffBar,
+                      numfmt::fixed(bwall, sizeof(bwall), g_ctrlCfg.inj.highWallBar, 2),
+                      numfmt::fixed(bcut, sizeof(bcut), g_ctrlCfg.inj.cutoffBar, 2),
                       (unsigned)g_ctrlCfg.inj.maxDutyPct, (unsigned)g_ctrlCfg.inj.pulseMs,
                       (unsigned)(g_ctrlCfg.predive.warmupMs / 1000),
                       g_cellCal[0].hasAir ? "" : "  [CELLS UNCALIBRATED: run CAL AIR]");
@@ -644,13 +676,31 @@ void setup() {
         g_controlRunning = false;
 
     // The handset and web session ride on the chain: no chain, no session.
-    // SAFE mode keeps them offline deliberately — a board that just
+    // SAFE mode keeps the WEB offline deliberately — a board that just
     // watchdog-reset must not be accepting DIVE START from a phone before
-    // anyone knows why it reset. One session object, and both transports are
-    // started over it, so there is no way to end up with a handset that
-    // enforces one set of rules and a browser that enforces another.
+    // anyone knows why it reset. The handset link, though, comes up with the
+    // router locked out to everything but ACK: the diver needs a way to
+    // acknowledge (ACK restarts the machine clean, no housing to open), and the
+    // downlink is still worth watching because the sensor task is alive and the
+    // T, line says SAFE. Anything other than ACK is refused with the truth,
+    // "ERR safe mode". One session object, and both transports are started over
+    // it, so there is no way to end up with a handset that enforces one set of
+    // rules and a browser that enforces another.
     if (forceSafe) {
-        Serial.println("** SAFE MODE: handset (UART2) and web AP stay offline until a clean boot");
+        if (g_loop != nullptr) {
+            if (comms::initSession(*g_loop, g_settings, g_bridgeTel, g_bridgeEvents)) {
+                comms::session().setHist(&g_cellHist);
+                comms::session().setSafeLockout(true);
+                if (!comms::startUart2Task())
+                    Serial.println("** SAFE MODE: handset offline — power-cycle to clear");
+                else
+                    Serial.println("** SAFE MODE: handset link up, ACK only; web AP offline");
+            } else {
+                Serial.println("** SAFE MODE: session failed — handset offline, power-cycle to clear");
+            }
+        } else {
+            Serial.println("** SAFE MODE: no control chain — handset and web offline");
+        }
     } else if (!comms::initSession(*g_loop, g_settings, g_bridgeTel, g_bridgeEvents)) {
         Serial.println("** session NOT initialised: handset and web offline (control still runs)");
     } else {
@@ -663,5 +713,6 @@ void setup() {
 }
 
 void loop() {
+    stackwatch::sample(stackwatch::SLOT_LOOP);
     vTaskDelay(pdMS_TO_TICKS(1000));
 }

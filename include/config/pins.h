@@ -37,6 +37,14 @@
 #define PIN_LED_DECO      5    // deco ceiling demanded
 
 // --- Handset UART (protocol defined in M5) -----------------------------------
+// These two pins carry the in-water transport, so the choice is not casual:
+// GPIO16/17 are also the PSRAM pins on WROVER modules. Free on WROOM and on
+// classic WROVER (PSRAM does not claim them there), but a module with PSRAM
+// mapped would steal the handset port. The boot line's heap size is the
+// cross-check: ~200 KB means no PSRAM mapped, ~5 MB means this pin pair cannot
+// be the handset UART on that board. Never confuse these with the carrier's
+// TX/RX silkscreen either: those are GPIO1/GPIO3, the USB console, and they
+// print HB lines that are not protocol (docs/HANDSET_PROTOCOL.md 7).
 #define PIN_UART_H_TX     17
 #define PIN_UART_H_RX     16
 #define UART_H_BAUD       115200

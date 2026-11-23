@@ -22,6 +22,7 @@
 #include <cstdio>
 
 #include "comms/session.h"
+#include "util/stackwatch.h"
 #include "comms/uart_proto.h"
 #include "config/pins.h"
 
@@ -73,6 +74,10 @@ void uart2Task(void*) {
             }
         }
         session().pump(sinkWrite, nullptr, millis());
+        // The task that overflowed on 2026-11-23 now reports its own headroom
+        // every 5 s (util/stackwatch.h), so the next one shows up in HB before
+        // it becomes a panic.
+        stackwatch::sample(stackwatch::SLOT_UART2);
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(20));
     }

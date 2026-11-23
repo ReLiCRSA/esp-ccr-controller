@@ -8,6 +8,8 @@
 // ============================================================================
 #include "cmd_router.h"
 
+#include "util/numfmt.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -182,11 +184,12 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         return;
     }
     if (std::strcmp(key, "FAULT") == 0) {
-        char buf[64];
-        const int n = std::snprintf(buf, sizeof(buf), "FAULT,%d,%d,%.1f\n",
+        char buf[64], duty[16];
+        const int n = std::snprintf(buf, sizeof(buf), "FAULT,%d,%d,%s\n",
                                     loop_.injector().stuckOpenLatched ? 1 : 0,
                                     loop_.outputFuseTripped() ? 1 : 0,
-                                    static_cast<double>(loop_.solDutyPct(nowMs_)));
+                                    numfmt::fixed(duty, sizeof(duty),
+                                                  loop_.solDutyPct(nowMs_), 1));
         replyText(r, buf, static_cast<size_t>(n));
         return;
     }
@@ -242,6 +245,14 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
     const char* err = nullptr;
     if (!proto::parseCommand(line, cmd, &err)) {
         replyErr(r, err ? err : "bad command");
+        return r;
+    }
+
+    // SAFE mode lockout: checked after parsing (so a malformed line still
+    // reports its real syntax problem) and before anything else, because the
+    // point is that no command can reach a chain that is not running.
+    if (safeLockout_ && cmd.kind != Kind::ACK) {
+        replyErr(r, "safe mode");
         return r;
     }
 
@@ -302,6 +313,14 @@ CommandRouter::Response CommandRouter::exec(const char* line) {
             // Diver outranks the machine. Always honoured, never argued — the
             // machine keeps the condition itself and keeps alarming if it
             // persists; only the latch/silence changes.
+            if (safeLockout_) {
+                // In SAFE there are no alarms latched in a running chain to
+                // silence: here ACK means "I have seen this, get me out", and
+                // the transport turns it into a clean restart.
+                r.actions |= ACT_SAFE_ACK;
+                replyOk(r, "SAFE RESTART");
+                break;
+            }
             loop_.postAckAlarms();
             replyOk(r);
             break;

@@ -124,6 +124,22 @@ int hookExport(int slot, UartLink::Sink sink, void* ctx) {
     return g_diveStore.exportCsv(slot, sink, ctx);
 }
 
+// SAFE mode's acknowledged exit, chosen by the diver at the handset rather than
+// by a power connector that has to come out of a housing. By the time this runs
+// the reply is already in the UART's TX ring; the pause is only so those bytes
+// reach the wire before the chip goes down.
+//
+// esp_restart() is a software reset: the supervisor's forceSafe list watches for
+// PANIC / watchdog / brownout, not SW, and the fault record was cleared at the
+// last boot — so the next boot comes up normally, with the settings from NVS.
+// Deliberately not an exit that resumes control in place: see
+// CommandRouter::setSafeLockout for why.
+void hookSafeAck(void*) {
+    Serial.println("** SAFE acknowledged over the link: restarting clean");
+    delay(60);
+    esp_restart();
+}
+
 UartLink::Hardware makeHardware() {
     UartLink::Hardware hw;
     hw.totals = &g_bridgeTotals;
@@ -135,6 +151,7 @@ UartLink::Hardware makeHardware() {
     hw.onSettings = hookSettings;
     hw.onCalAir = hookCalAir;
     hw.onCalDepth = hookCalDepth;
+    hw.onSafeAck = hookSafeAck;
     hw.listDives = hookListDives;
     hw.exportDive = hookExport;
     return hw;

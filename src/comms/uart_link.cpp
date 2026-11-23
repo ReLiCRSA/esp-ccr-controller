@@ -62,6 +62,12 @@ void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
     if (actions & CommandRouter::ACT_LOG_LIST) streamLogList(sink, ctx);
     if (actions & CommandRouter::ACT_LOG_EXPORT)
         streamLogExport(router_.logExportIndex(), sink, ctx);
+
+    // Absolutely last: the reply and any streamed listing are already on the
+    // wire, and this one does not return — the transport restarts the
+    // controller from here (SAFE mode's acknowledged way out).
+    if (actions & CommandRouter::ACT_SAFE_ACK)
+        if (hw_.onSafeAck) hw_.onSafeAck(hw_.ctx);
 }
 
 void UartLink::emitT(Sink sink, void* ctx) {

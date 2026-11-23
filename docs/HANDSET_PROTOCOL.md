@@ -58,7 +58,7 @@ Refusals are honest `ERR` lines — a handset should display them, not hide them
 |---|---|---|
 | `AUTO` | `OK AUTO` / `ERR predive required` | AUTO is **refused until the pre-dive sequence passed**. No client can bypass it. |
 | `MANUAL` | `OK MANUAL` | always accepted |
-| `ACK` | `OK` | acknowledge/silence current alarms. The diver outranks the machine: the condition persists and keeps alarming if it persists, but the latch/silence is honoured. |
+| `ACK` | `OK` / `OK SAFE RESTART` | acknowledge/silence current alarms. The diver outranks the machine: the condition persists and keeps alarming if it persists, but the latch/silence is honoured. In **SAFE mode** it means something else and bigger — see "SAFE mode" below. |
 | `CHECK` | `OK CHECK` / `ERR dive active` | run the pre-dive sequence |
 | `PULSE` | `OK` | request one test injection pulse (posted to the control task; it is a real pulse, subject to the injector's own duty/stuck-open rules) |
 | `TEST CELLS` | `OK TEST CELLS` / `ERR test running` | start the cell pulse test; watch it via `GET CELLS` |
@@ -133,6 +133,40 @@ a hard-coded table. Section 6 lists today's keys for reference.
 |---|---|
 | `LOG LIST` | `OK` then zero or more `L,<slot>,<epoch>` lines |
 | `LOG EXPORT n` (n = 0..9) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<version>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5.3) |
+
+### SAFE mode (what a handset can and cannot do)
+
+The controller boots into SAFE when it cannot account for its own last reset
+(supervisor-detected task stall, watchdog, brownout, panic). The control chain
+is **not running** in that state, and the protocol divides cleanly:
+
+| | behaviour in SAFE mode |
+|---|---|
+| downlink | **unchanged** — `T,`/`D,`/`E,` keep streaming and `T,` carries mode `SAFE`. The sensor task is alive, so a handset can still watch the machine decide. |
+| every command except `ACK` | `ERR safe mode` |
+| `ACK` | `OK SAFE RESTART`, then the controller restarts itself cleanly |
+
+* `ERR safe mode` is a refusal like any other: match the `ERR` prefix, and treat
+  the reason text as informational — wording may change, the refusal may not.
+* `ACK` here is a **restart**, not an alarm silence, and a handset should label
+  it that way. Why a restart rather than resuming control where it stands: SAFE
+  is entered because a task died, and continuing on a task set that just lost
+  its stack is a state nobody can reason about — a second failure mid-dive would
+  find the diver already breathing from it. A clean boot is the state the
+  firmware was designed to come up in, and it is the same recovery a power-cycle
+  gives, reachable with a button instead of wet hands on a connector.
+* That restart is a software reset: settings come back from NVS, the dive log is
+  intact, and the boot is normal — the fault record is one-shot, so it does not
+  re-latch into SAFE.
+* A malformed line is still reported as a malformed line (`ERR unknown command`)
+  even in SAFE mode: the reason says what is wrong, not merely that the machine
+  is locked.
+* The web AP stays offline in SAFE mode. The handset link is the only client
+  that comes up, and it comes up for `ACK`.
+
+A handset should detect SAFE from the `T,` line's mode field rather than from an
+`ERR` — the downlink never stopped, so the state is visible before the diver
+tries anything.
 
 ## 4. Downlink line formats (exact)
 

@@ -51,7 +51,10 @@ public:
         ACT_CAL_DEPTH = 1 << 8,    // one-shot depth offset capture
         ACT_LOG_LIST = 1 << 9,     // transport streams the dive directory
         ACT_LOG_EXPORT = 1 << 10,  // ...or one dive, logExportIndex()
+        ACT_SAFE_ACK = 1 << 11,    // SAFE-mode ACK: the transport restarts
+                                   // the controller clean (see setSafeLockout)
     };
+
 
     struct Response {
         char text[MAX_REPLY];
@@ -65,6 +68,18 @@ public:
         : loop_(loop), reg_(reg), nowMs_(nowMs) {}
 
     void setNowMs(uint32_t t) { nowMs_ = t; }
+
+    /// SAFE mode: the control chain is NOT running, so a client must not be
+    /// able to author anything. Everything is refused with "ERR safe mode"
+    /// except ACK, which raises ACT_SAFE_ACK: the acknowledged way out of SAFE
+    /// is a clean restart (same recovery as a power-cycle, reachable from the
+    /// handset without opening the housing). Resuming control in place was
+    /// rejected: it continues on a task set that just lost its stack, and a
+    /// second failure mid-dive would find the diver already breathing from it.
+    /// Refusing the rest is what keeps "SAFE" a claim about the machine rather
+    /// than a display state: a handset that sends AUTO gets the truth.
+    void setSafeLockout(bool on) { safeLockout_ = on; }
+    bool safeLockout() const { return safeLockout_; }
 
     /// Parses `line` and executes it. Parse refusals never reach the chain.
     Response exec(const char* line);
@@ -107,6 +122,7 @@ private:
     ctrl::Loop& loop_;
     settings::Registry& reg_;
     uint32_t nowMs_;
+    bool safeLockout_ = false;
 
     bool wifiOn_ = true;       // diver-visible master switch (WIFI ON|OFF)
     bool wifiAutoOff_ = false; // radio dropped by DIVE START, not by the diver

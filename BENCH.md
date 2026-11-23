@@ -69,17 +69,80 @@ No pin contention, because the PC side stays on the module's own UART0
 (GPIO3/GPIO1) and the controller sits on UART2 — the bridge's ROM boot log goes
 to the PC, never into the controller. The traffic LED blinks at the `T,` rate
 and the link LED is the **library's** verdict (3 s silence = down), so link
-health is visible at a glance without touching the data stream. Set
-`BRIDGE_MODE MODE_TAP` in the sketch for a readable handset-side console
-(telemetry, `E,` events, link-loss messages) instead of a pipe — that is the
-build for watching a dive from the handset side, and the base for the real
-handset (`handset/example_esp32_handset`, same wiring).
+health is visible at a glance without touching the data stream. Build it as a
+tap instead with
+
+```
+PLATFORMIO_BUILD_FLAGS="-DBRIDGE_TAP=1" pio run -d handset/bridge_esp32 -t upload
+```
+
+for a readable handset-side console (telemetry, `E,` events, replies, link-loss
+messages) — the build for watching a dive from the handset side, and the base
+for the real handset (`handset/example_esp32_handset`, same wiring). Both modes
+live in one file, chosen by a `constexpr` flag rather than `#if/#else`, because
+the Arduino preprocessor-generated prototypes do not understand conditional
+blocks.
 
 Two bench consequences: **opening this port resets the bridge, never the
 controller** (its DTR/EN only touch the spare board — safer than the console
 port), and the bridge needs ~250 ms to boot after that open, so
 `hw_accept.py` settles 1.5 s and retries a command that got no line at all
 (`--handset-settle 0` for a plain adapter).
+
+### When the link is silent: bisect it, do not reflash at it
+
+Pipe mode is **silent by design**, so silence cannot tell a healthy bridge from
+a deaf one. Three tests, cheapest first, each answering a different question:
+
+```
+tools/port_id.py --listen 8                  # what is each port, really?
+tools/port_id.py --loopback /dev/ttyUSB1     # bridge's own UART2, controller out of the picture
+```
+
+`--loopback` needs one jumper: **D16 ↔ D17 on the bridge board itself** (pins
+labelled D16/D17, never TX0/RX0 — those are GPIO1/GPIO3, the console path).
+Pipe mode hands back byte-for-byte what the PC sends, so an echo proves the PC
+path, the sketch and the board's UART2 are fine and the fault is in the two
+signal wires or the controller end. Remove the jumper afterwards: left in, the
+bridge feeds its own TX back into its RX.
+
+The tap build adds a **boot-time UART2 self-test** for the same question when
+the PC side is not available: 8 bytes out U2TX, counted back on U2RX, printed
+with the banner (`uart2 self-test: 8 bytes back on RX from TX: OK`). In pipe
+mode nothing is printed to the protocol stream, so the verdict is on the LEDs
+instead: 3 double-blinks = echo seen, 1 blink = none.
+
+Firmware says the downlink is unconditional, so a silent handset port is a
+wiring question, not a firmware one: `uart2_task.cpp` calls `Serial2.begin()`
+and `UartLink::pump()` emits `T,` on the **first** pump and every 500 ms
+after, with no handshake and no client required. A missing `T,` therefore means
+the bytes never reached the PC — check, in order: controller end on **GPIO17**
+(not the silkscreen `TX`, which is GPIO1 and prints `HB`), common GND, and the
+bridge end on **D16**.
+
+`tools/port_id.py` also keeps the two identical CP2102 boards apart: it labels a
+port by what it *hears* at its own boot, so a spare that is merely relaying the
+controller's `HB` lines is not mistaken for the controller (that mislabel once
+nearly sent the bridge image into the wrong board — and the reverse mistake
+would destroy a dive controller). Always pass `--upload-port` explicitly.
+
+### Flashing this bench board (why it refuses, and the layout trap)
+
+The board's USB bridge chip drives **EN but not IO0**, so esptool's auto-reset
+cannot reach download mode: expect `Wrong boot mode detected (0x13)` unless the
+**BOOT (GPIO0) button is held** through the attempt, or GPIO0 is jumpered to GND
+and the board is power-cycled. `handset/bridge_esp32/platformio.ini` sets
+`--connect-attempts=200` so you can hold the button whenever convenient instead
+of racing the tool — esptool pulses reset on every attempt and gets in on the
+first one where IO0 is low.
+
+Never hand-write `firmware.bin` at `0x1000`. For a PlatformIO esp32 build that
+file is the **application at 0x10000**; the four images are 0x1000 bootloader,
+0x8000 partitions, 0xe000 otadata, 0x10000 app. Writing the app at 0x1000
+overwrites the bootloader and the board boot-loops in the ROM stage
+(`rst:0x10 (RTCWDT_RTC_RESET)`, never a second `load:` line) — which looks
+exactly like a broken sketch. Use `pio run -d handset/bridge_esp32 -t upload`.
+Do not pipe an upload through `head`: SIGPIPE can kill esptool mid-write.
 
 Expected boot order (post-A5e firmware):
 
@@ -104,6 +167,21 @@ Then by hand, in this order (each mirrors a sim scenario):
    in `LOG LIST`, `/dive/<n>.csv` downloads and matches `LOG EXPORT <n>`.
 5. `WIFI OFF` from the phone, dive, end dive → radio stays **off** (diver
    outranks the machine's auto-restore).
+6. `GET T` over the handset link, then watch `stk=` in HB. On 2026-11-23 this
+   exact command panicked the controller: the `uart2` task's stack canary fired
+   inside newlib's `_dtoa_r` (seven `%f` conversions in one `T,` line, reached
+   through a deeper call chain than the 2 Hz downlink uses). Fixed by formatting
+   every protocol/log/console number in `util/numfmt.cpp` — no float printf on
+   any bounded-stack task. The permanent tripwire is `stk=`: **free bytes in the
+   tightest task**, appended to HB every 5 s. Below 512 the console also shouts
+   `** stack low: N bytes free in '<task>'`. A soak that shows `stk=` trending
+   down is a bug finding even when nothing crashes.
+7. SAFE-mode recovery, with `esp32_stalltest` flashed: the supervisor reboots the
+   board into SAFE (`HB st=3`), the handset link still streams (`T,` says `SAFE`),
+   every command answers `ERR safe mode` — and `ACK` answers `OK SAFE RESTART`
+   and brings the board back in STANDBY (`HB st=0`) without touching the power.
+   That is the diver's escape route; a SAFE state with no reachable way out is a
+   device you cannot recover in the water.
 
 ## C2-e — phone/web findings (2026-11-22 evening, all closed)
 

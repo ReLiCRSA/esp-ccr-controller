@@ -5,6 +5,8 @@
 // ============================================================================
 #include "divelog.h"
 
+#include "util/numfmt.h"
+
 #include <cstdarg>
 #include <cstring>
 #include <cstdio>
@@ -178,23 +180,41 @@ size_t toCsv(const DiveMeta& meta,
     if (!emit(p, rem, "ESP-CCR dive record,%u\n", DIVE_VERSION)) return 0;
     if (!emit(p, rem, "META,duration_s,max_depth_m,min_ppo2,max_ppo2,total_pulses,"
                       "cns_peak,gf_low,gf_high,sp1,sp2,sp3,sp4,snapshots,events\n")) return 0;
-    if (!emit(p, rem, "META,%u,%.2f,%.3f,%.3f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u\n",
-              meta.durationSec, meta.maxDepthCm / 100.0, meta.minVotedX1000 / 1000.0,
-              meta.maxVotedX1000 / 1000.0, meta.totalPulses, meta.cnsPeakPct,
+    // maxDepthCm/votedX1000 are already scaled integers, so fixedScaled prints
+    // them exactly, with no float in the path at all. The setpoints are stored
+    // in thousandths but published at 2 decimals, so those keep the divide and
+    // go through fixed(), which matches printf's rounding (see numfmt.h).
+    char md[16], mn[16], mx[16], s1[16], s2[16], s3[16], s4[16];
+    if (!emit(p, rem, "META,%u,%s,%s,%s,%u,%u,%u,%u,%s,%s,%s,%s,%u,%u\n",
+              meta.durationSec,
+              numfmt::fixedScaled(md, sizeof(md), meta.maxDepthCm, 2),
+              numfmt::fixedScaled(mn, sizeof(mn), meta.minVotedX1000, 3),
+              numfmt::fixedScaled(mx, sizeof(mx), meta.maxVotedX1000, 3),
+              meta.totalPulses, meta.cnsPeakPct,
               meta.gfLow, meta.gfHigh,
-              meta.sp1X1000 / 1000.0, meta.sp2X1000 / 1000.0,
-              meta.sp3X1000 / 1000.0, meta.sp4X1000 / 1000.0,
+              numfmt::fixed(s1, sizeof(s1), meta.sp1X1000 / 1000.0, 2),
+              numfmt::fixed(s2, sizeof(s2), meta.sp2X1000 / 1000.0, 2),
+              numfmt::fixed(s3, sizeof(s3), meta.sp3X1000 / 1000.0, 2),
+              numfmt::fixed(s4, sizeof(s4), meta.sp4X1000 / 1000.0, 2),
               meta.snapshotCount, meta.eventCount)) return 0;
     if (!emit(p, rem, "S,t_s,depth_m,ppo2,cell0,cell1,cell2,setpoint,mode,alarms,"
                       "cns,ceiling_m,ndl_min,deco_min,pulses,batt_v,temp_c,flags\n")) return 0;
     for (size_t i = 0; i < nSnaps; ++i) {
         const Snapshot& s = snaps[i];
-        if (!emit(p, rem, "S,%u,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%.2f,%d,%d,%u,%.2f,%d,%u\n",
-                  s.tSec, s.depthCm / 100.0, s.votedX1000 / 1000.0,
-                  s.cellX1000[0] / 1000.0, s.cellX1000[1] / 1000.0, s.cellX1000[2] / 1000.0,
-                  s.setpointX1000 / 1000.0, s.mode, s.alarmBits, s.cnsPct,
-                  s.ceilingCm / 100.0, s.ndlMin, s.decoTotalMin, s.pulses,
-                  s.battX1000 / 1000.0, s.tempC, s.flags)) return 0;
+        char d[16], v[16], c0[16], c1[16], c2[16], sp[16], cl[16], bv[16];
+        if (!emit(p, rem, "S,%u,%s,%s,%s,%s,%s,%s,%u,%u,%u,%s,%d,%d,%u,%s,%d,%u\n",
+                  s.tSec,
+                  numfmt::fixedScaled(d, sizeof(d), s.depthCm, 2),
+                  numfmt::fixedScaled(v, sizeof(v), s.votedX1000, 3),
+                  numfmt::fixedScaled(c0, sizeof(c0), s.cellX1000[0], 3),
+                  numfmt::fixedScaled(c1, sizeof(c1), s.cellX1000[1], 3),
+                  numfmt::fixedScaled(c2, sizeof(c2), s.cellX1000[2], 3),
+                  numfmt::fixedScaled(sp, sizeof(sp), s.setpointX1000, 3),
+                  s.mode, s.alarmBits, s.cnsPct,
+                  numfmt::fixedScaled(cl, sizeof(cl), s.ceilingCm, 2),
+                  s.ndlMin, s.decoTotalMin, s.pulses,
+                  numfmt::fixed(bv, sizeof(bv), s.battX1000 / 1000.0, 2),
+                  s.tempC, s.flags)) return 0;
     }
     for (size_t i = 0; i < nEvents; ++i) {
         if (!emit(p, rem, "E,%u,%u,%u\n", events[i].tSec,

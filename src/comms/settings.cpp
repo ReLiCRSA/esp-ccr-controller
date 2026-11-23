@@ -5,6 +5,8 @@
 // ============================================================================
 #include "settings.h"
 
+#include "util/numfmt.h"
+
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -156,7 +158,14 @@ bool Registry::valueAsString(int idx, char* out, size_t cap) const {
         case Type::BOOL:   n = std::snprintf(out, cap, "%s", getBool(idx) ? "ON" : "OFF"); break;
         case Type::INT16:
         case Type::UINT8:  n = std::snprintf(out, cap, "%d", getInt(idx)); break;
-        case Type::FLOAT:  n = std::snprintf(out, cap, "%.3f", m_num[idx]); break;
+        case Type::FLOAT: {
+            // no %.3f: see util/numfmt.h (float printf is what panicked the
+            // uart2 task); MAX_VAL_STR is roomy for every float in the table.
+            char b[MAX_VAL_STR];
+            numfmt::fixed(b, sizeof(b), m_num[idx], 3);
+            n = std::snprintf(out, cap, "%s", b);
+            break;
+        }
     }
     return n > 0 && static_cast<size_t>(n) < cap;
 }

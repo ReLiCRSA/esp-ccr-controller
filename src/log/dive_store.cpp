@@ -11,6 +11,8 @@
 // ============================================================================
 #include "dive_store.h"
 
+#include "util/numfmt.h"
+
 #include <LittleFS.h>
 
 namespace {
@@ -169,11 +171,17 @@ void emitCsv(const logfmt::RawRecord& r, void* vctx) {
     if (r.tag == logfmt::REC_SNAPSHOT) {
         logfmt::Snapshot s;
         if (!logfmt::unpackSnapshot(r.bytes, s)) return;   // re-checked, always true here
+        char dd[16], dv[16], dc0[16], dc1[16], dc2[16], dsp[16];
         snprintf(o.line, sizeof(o.line),
-                 "S,%u,%d.%02d,%.3f,%.3f,%.3f,%.3f,%.3f,0x%04X,%u,%d,%d,%d,%u,%u\n",
-                 s.tSec, s.depthCm / 100, s.depthCm % 100, s.votedX1000 / 1000.0f,
-                 s.cellX1000[0] / 1000.0f, s.cellX1000[1] / 1000.0f,
-                 s.cellX1000[2] / 1000.0f, s.setpointX1000 / 1000.0f, s.alarmBits,
+                 "S,%u,%s,%s,%s,%s,%s,%s,0x%04X,%u,%d,%d,%d,%u,%u\n",
+                 s.tSec,
+                 numfmt::fixedScaled(dd, sizeof(dd), s.depthCm, 2),
+                 numfmt::fixedScaled(dv, sizeof(dv), s.votedX1000, 3),
+                 numfmt::fixedScaled(dc0, sizeof(dc0), s.cellX1000[0], 3),
+                 numfmt::fixedScaled(dc1, sizeof(dc1), s.cellX1000[1], 3),
+                 numfmt::fixedScaled(dc2, sizeof(dc2), s.cellX1000[2], 3),
+                 numfmt::fixedScaled(dsp, sizeof(dsp), s.setpointX1000, 3),
+                 s.alarmBits,
                  s.cnsPct, s.ceilingCm / 100, s.ndlMin, s.decoTotalMin, s.pulses,
                  s.battX1000);
     } else if (r.tag == logfmt::REC_EVENT) {
@@ -183,9 +191,11 @@ void emitCsv(const logfmt::RawRecord& r, void* vctx) {
     } else {
         logfmt::DiveMeta m;
         if (!logfmt::unpackMeta(r.bytes, m)) return;
+        char mn[16], mx[16];
         snprintf(o.line, sizeof(o.line),
-                 "M,%u,%d,%.1f,%.1f,%u,%u,%u,%u\n", m.durationSec, m.maxDepthCm,
-                 m.minVotedX1000 / 1000.0f, m.maxVotedX1000 / 1000.0f,
+                 "M,%u,%d,%s,%s,%u,%u,%u,%u\n", m.durationSec, m.maxDepthCm,
+                 numfmt::fixed(mn, sizeof(mn), m.minVotedX1000 / 1000.0, 1),
+                 numfmt::fixed(mx, sizeof(mx), m.maxVotedX1000 / 1000.0, 1),
                  m.totalPulses, m.cnsPeakPct, m.snapshotCount, m.eventCount);
     }
     o.sink(o.line, o.ctx);

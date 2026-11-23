@@ -533,12 +533,12 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done (this batch) |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done (this batch) |
-| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board**; web half verified over the air from the PC (AP `ESP-CCR-3828`: captive DNS, batched replies, 180 s / 178 replies / 0 socket drops). Reflash chain: `1b8c807` (tag `m2-flashed`) → web-fix build (tag `m2-web-fixes`). Handset refusal matrix pending: needs the UART2 link wired — **the missing adapter is no longer the blocker**, `handset/bridge_esp32` turns a spare ESP32 into the handset UART (recipe in BENCH.md). Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **boot/console half PASSes on the board**; web half verified over the air from the PC (AP `ESP-CCR-3828`: captive DNS, batched replies, 180 s / 178 replies / 0 socket drops). Reflash chain: `1b8c807` (tag `m2-flashed`) → web-fix build (tag `m2-web-fixes`). **Boot/console half PASSes; the handset link is now live and it paid for itself immediately.** The first `GET T` over the real link panicked the controller (uart2 stack overflow inside newlib float printf — §16), now fixed structurally (`util/numfmt.cpp`, `util/stackwatch.cpp` + `stk=` appended to HB), together with the SAFE-mode `ACK` the boot log had been promising but never implemented. Refusal-matrix rerun on this build is the next bench action; the `LOG EXPORT` vs `/dive/<n>.csv` mismatch (§16) is a known C2 failure waiting. Note: BMP085 @0x77 (shared bus, first-ever poll — M1 never probed it) does not ACK: bench wiring question, see BENCH.md |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done (this batch) |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done (this batch) |
 | M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done (this batch) — **183/183 native**, both esp32 builds clean. Not yet run against a physical handset: C2 refusal matrix still waits on the UART2 adapter on 16/17 |
-| M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `BRIDGE_MODE MODE_TAP` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image. `hw_accept.py` settles 1.5 s after opening the handset port and retries a silent command once, because that open resets the bridge | done (this batch) — bridge and example handset both compile for the real toolchain (zero warnings); **the C2 refusal matrix still has not been run: needs the 3 wires on 16/17** |
+| M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `-DBRIDGE_TAP=1` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image. `hw_accept.py` settles 1.5 s after opening the handset port and retries a silent command once, because that open resets the bridge | done (this batch) — bridge and example handset both compile for the real toolchain (zero warnings); **the C2 refusal matrix still has not been run**: the bench link is built but silent, and `tools/port_id.py` (`--loopback` jumper test, boot-time UART2 self-test in the tap build) is the bisect path. Firmware side is cleared: `uart2_task` starts and `UartLink::pump` emits `T,` every 500 ms with no handshake, so the fault is in the wires |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -831,3 +831,83 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   is next open: on overflow, swallow to the next terminator instead of
   restarting mid-line. The client library already behaves the way the firmware
   should (`overflowing_` drops the whole line).
+- **Two identical CP2102 boards make "which port is which" a safety question
+  (bench, 2026-11-23).** The handset bridge and the controller are both
+  `esp32dev` images on the same hardware, and esptool will happily write either;
+  writing the bridge into the controller destroys a dive controller. Both boards
+  also report the *same* `/dev/serial/by-id` string, so by-id cannot
+  disambiguate them. Rule: classify first with `tools/port_id.py` (DTR/RTS
+  pre-cleared before `open()`, so listening is passive — the pyserial default is
+  a reset pulse), then pass `--upload-port` explicitly. Classify by what a port
+  hears **at its own boot**: a spare that merely relays the controller's `HB`
+  lines is a wiring mistake, not the controller.
+- **`firmware.bin` is the application at 0x10000, not a whole-flash image.**
+  Hand-writing it at 0x1000 overwrites the 0x1000 bootloader, and the board then
+  boot-loops in the ROM stage (`rst:0x10 (RTCWDT_RTC_RESET)`, never a second
+  `load:` line) — which looks exactly like a broken sketch. PlatformIO's own
+  upload writes the four images (0x1000 / 0x8000 / 0xe000 / 0x10000); use it, and
+  never pipe an upload through `head` (SIGPIPE kills esptool mid-write).
+- **A substring match in a console log is not evidence (my own false positive,
+  2026-11-23).** An "uplink works" verdict matched the boot banner's
+  `[CELLS UNCALIBRATED: run CAL AIR]`, not a `cal air:` reply, and reported a
+  link working that had never carried a byte. Rule for every bench assertion:
+  match the exact string the firmware prints for that action, and assume a boot
+  banner at the start of any capture — opening the console port *is* a reset.
+- **GPIO16/17 are the handset UART *and* the WROVER PSRAM pins.** The handset
+  link is on 16/17 by design (`pins.h`), which is safe on WROOM and on classic
+  WROVER where PSRAM does not claim them; a board with PSRAM active would steal
+  the handset port. The console's `heap 203904` is the evidence that this bench
+  board has no PSRAM mapped, so the pins are free. Cross-check that number
+  before fitting a different controller module: `heap ~5 MB` would mean the
+  handset UART cannot live on 16/17.
+- **The first real handset command crashed the controller (bench, 2026-11-23,
+  C2).** `GET T` tripped the FreeRTOS stack canary in the `uart2` task:
+  `Guru Meditation Error: Core 1 panic'ed ... Stack canary watchpoint triggered
+  (uart2)`, backtrace through `_dtoa_r ← cvt ← _vsnprintf_r ← proto::emit()`.
+  The `T,` line is seven `%f` conversions, and newlib's float printf wants
+  several kilobytes of stack — the task had 6144 B, the largest on the board,
+  and the 2 Hz downlink survived only because it reaches `emit()` through a
+  shallower chain than a routed command does. **The margin was one stack
+  frame.** No host test could see this (`test_router` runs with megabytes), and
+  the bench could not see it until it rebooted the controller into SAFE.
+  Fixed structurally: `src/util/numfmt.cpp` renders every number the device
+  puts on the wire, in a dive log, or on the console with integer digits, so no
+  bounded-stack task ever calls float printf (the image also shrank ~4 KB).
+  `test_numfmt` pins byte-identity against the C library's own `printf` —
+  pinned ties (`0.125`→`0.12`, `2.675`→`2.67`, `12.345`→`12.35`) plus a
+  ~150 000-value differential sweep across every range the protocol carries.
+  That sweep is what found two of my own bugs: fraction digits that never
+  advanced, and a scaling multiply that lies (`0.0105 * 1000.0` is exactly
+  `10.5`, so a naive implementation applies the tie rule to a value that was
+  never a tie — 40 wrong ppO2 digits below 0.4). The exact-product correction
+  via `fma()` is why the sweep passes.
+- **The missing safety net was a number, not a crash report.** `HB` now carries
+  `stk=`: free bytes in the tightest task, self-sampled by each task every 5 s
+  (`src/util/stackwatch.cpp` — `uxTaskGetSystemState` needs
+  `configUSE_TRACE_FACILITY`, which this build does not enable, and it would
+  also drag a ~768 B snapshot buffer onto a 4096 B task). Below 512 the console
+  shouts which task it was. `stk=` is **appended** to HB (never reordered), and
+  both `soak_logger.py` and `hw_accept.py` match HB by prefix, so the soak
+  contract is unchanged. A soak showing `stk=` trending down is a finding even
+  when nothing crashes — which is the point.
+- **SAFE mode advertised an exit that did not exist.** The boot log said
+  "acknowledge via handset" while the next line said the handset is offline
+  until a clean boot. Fixed by building the feature rather than rewording the
+  message: in SAFE the handset link comes up, the downlink keeps streaming (the
+  `T,` line says `SAFE`), every command is refused `ERR safe mode`, and `ACK`
+  answers `OK SAFE RESTART` and restarts the controller cleanly. Resume-control-
+  in-place was **rejected** on the bench decision of 2026-11-23: SAFE is entered
+  because a task died, and continuing on a task set that just lost its stack is
+  a state nobody can reason about — a second failure mid-dive finds the diver
+  already breathing from it. The web AP stays offline in SAFE.
+- **Two writers produce the dive CSV, and they disagree (open, found
+  2026-11-23).** `LOG EXPORT n` (`divelog::toCsv`) emits 17 fields per `S,`
+  row — including `mode`, `temp_c` and `flags` — with alarms decimal and
+  battery in volts. `/dive/<n>.csv` (`dive_store::exportCsv`) emits 14, with
+  alarms as `0x%04X`, ceiling in integer cm, battery in integer mV, and no
+  mode/temp/flags. `BENCH.md` C2 step 4 asserts the download "matches
+  `LOG EXPORT <n>`": it does not, and would fail on the bench. Needs one
+  canonical row shape (the richer one) with both writers calling it, plus a
+  host test that feeds one record set through both and compares bytes. Related
+  formatting wart fixed in passing on the way: the hand-rolled `%d.%02d` in
+  `dive_store` printed a negative value as `-5.-30`.

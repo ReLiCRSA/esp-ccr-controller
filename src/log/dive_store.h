@@ -19,12 +19,24 @@
 
 class DiveStore {
 public:
-    static constexpr int kMaxDives = 10;
+    static constexpr int kMaxDives = logfmt::MAX_DIVE_SLOTS;
 
     /// Mounts LittleFS (formatting once on failure) and finds the next FIFO
     /// slot. Returns false only if the filesystem is unusable — the dive
     /// still runs, it just is not recorded, and the handset gets an ERR.
     bool begin();
+
+    /// True when the last begin() could not mount the partition and had to
+    /// format it, which erases every dive on it. A dive computer that eats its
+    /// own history in silence is worse than one that says the log is offline,
+    /// so the boot banner is allowed to ask (see DiveStore::begin()).
+    bool lastBeginFormatted() const { return formatted_; }
+
+    /// The partition's usage, for the boot banner: after a format these numbers
+    /// are the filesystem's own overhead, and that is how the bench can tell a
+    /// mount that found an empty log from one that just emptied the log.
+    uint32_t usedBytes() const;
+    uint32_t totalBytes() const;
 
     bool recording() const { return (bool)file_; }
 
@@ -57,4 +69,5 @@ private:
     static void pathFor(int slot, char* out, size_t cap);
     File file_;
     bool mounted_ = false;
+    bool formatted_ = false;
 };

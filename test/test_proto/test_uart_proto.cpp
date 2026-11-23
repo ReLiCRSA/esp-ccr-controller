@@ -60,6 +60,11 @@ void test_compound_commands() {
     c = parsed("LOG EXPORT 3");
     TEST_ASSERT_EQUAL_UINT8(Kind::LOG_EXPORT, c.kind);
     TEST_ASSERT_EQUAL_UINT16(3, c.logIndex);
+    // The tenth slot: it has always existed and `LOG LIST` has always shown it,
+    // but the parser's hard-coded 0..9 made it unreachable from a handset.
+    c = parsed("LOG EXPORT 10");
+    TEST_ASSERT_EQUAL_UINT8(Kind::LOG_EXPORT, c.kind);
+    TEST_ASSERT_EQUAL_UINT16(10, c.logIndex);
     c = parsed("WIFI OFF");
     TEST_ASSERT_EQUAL_UINT8(Kind::WIFI, c.kind);
     TEST_ASSERT_EQUAL_STRING("OFF", c.key);
@@ -80,7 +85,8 @@ void test_rejections_are_errs_not_crashes() {
     parsed("CAL BANANA", false);
     parsed("DIVE", false);
     parsed("LOG EXPORT", false);
-    parsed("LOG EXPORT 12", false);      // out of 0..9 range
+    parsed("LOG EXPORT 11", false);      // past the store's slot count
+    parsed("LOG EXPORT 12", false);      // ... and beyond it
     parsed("WIFI MAYBE", false);
     parsed("LAUNCH MISSILES", false);    // unknown verb
     const char* err = nullptr;

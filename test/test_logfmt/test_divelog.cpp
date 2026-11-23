@@ -277,31 +277,174 @@ void test_event_roundtrip() {
     TEST_ASSERT_EQUAL_UINT16(1010, b.value);
 }
 
-void test_csv_output_shape_and_overflow() {
+// ---- the canonical export rows ---------------------------------------------
+//
+// ONE formatter for both divers-facing exports: `LOG EXPORT <n>` on the handset
+// and `GET /dive/<n>.csv` on the web. Before 2026-11-23 there were two writers
+// with two shapes (14 vs 17 fields, alarms hex vs decimal, ceiling m vs cm,
+// battery mV vs V) and BENCH.md step 4, which claims they match, had never
+// compared them. These tests are what keeps that claim true.
+
+static DiveMeta sampleMeta() {
     DiveMeta m{};
     m.durationSec = 120; m.maxDepthCm = 500;
     m.minVotedX1000 = 400; m.maxVotedX1000 = 420;
+    m.totalPulses = 300; m.cnsPeakPct = 12;
     m.gfLow = 30; m.gfHigh = 85;
+    m.sp1X1000 = 400; m.sp2X1000 = 700; m.sp3X1000 = 1000; m.sp4X1000 = 1300;
     m.snapshotCount = 2; m.eventCount = 1;
-    const Snapshot snaps[2] = {sampleSnap(), sampleSnap()};
-    const Event events[1] = {{60, EVT_ALARM_RAISED, 1}};
+    return m;
+}
 
-    char buf[2048];
-    const size_t n = toCsv(m, snaps, 2, events, 1, buf, sizeof(buf));
-    TEST_ASSERT_TRUE(n > 100);
-    {   // the CSV declares the codec version it was written with
-        char want[32];
-        snprintf(want, sizeof(want), "ESP-CCR dive record,%u", logfmt::DIVE_VERSION);
-        TEST_ASSERT_EQUAL_STRING_LEN(want, buf, strlen(want));
+static int countFields(const char* line) {
+    int n = 1;
+    for (const char* c = line; *c; ++c) {
+        if (*c == ',') ++n;
     }
-    TEST_ASSERT_NOT_NULL(std::strstr(buf, "\nS,t_s,depth_m,ppo2,"));
-    TEST_ASSERT_NOT_NULL(std::strstr(buf, "S,3661,40.23,0.402"));
-    TEST_ASSERT_NOT_NULL(std::strstr(buf, "E,60,1,1\n"));
-    TEST_ASSERT_EQUAL('\n', buf[n - 1]);
+    return n;
+}
 
-    // tight buffer must fail cleanly, not overflow
-    char tiny[10];
-    TEST_ASSERT_EQUAL(0, toCsv(m, snaps, 2, events, 1, tiny, sizeof(tiny)));
+static void test_dive_identity_line() {
+    char l[48];
+    const size_t n = diveCsvLine(l, sizeof(l), 7, 1234567);
+    const char* want = "DIVE,7,1234567,3,2\n";   // slot, epoch, codec, row format
+    TEST_ASSERT_EQUAL_STRING(want, l);
+    TEST_ASSERT_EQUAL((int)std::strlen(want), (int)n);
+}
+
+static void test_snapshot_row_is_the_documented_shape() {
+    const Snapshot s = sampleSnap();
+    char l[192];
+    const size_t n = snapshotCsvLine(l, sizeof(l), s);
+    const char* want =
+        "S,3661,40.23,0.402,0.405,-0.012,0.399,0.700,0x0241,37,9,480,12,"
+        "60000,11840,1,-3,5,900\n";
+    TEST_ASSERT_EQUAL_STRING(want, l);
+    TEST_ASSERT_EQUAL((int)std::strlen(want), (int)n);
+    // v1's fifteen fields, in v1's order, byte for byte. The contract is
+    // append-only: a handset written against the 2026-11-22 document still finds
+    // what it expects, and new information only ever arrives on the right.
+    TEST_ASSERT_NOT_NULL(std::strstr(l, "S,3661,40.23,0.402,0.405,-0.012,0.399,"
+                                        "0.700,0x0241,37,9,480,12,60000,11840,"));
+    // tag + 14 v1 + 4 v2 (mode, temp_c, flags, ceiling_cm)
+    TEST_ASSERT_EQUAL(19, countFields(l));
+}
+
+static void test_event_and_meta_rows() {
+    char l[192];
+    const Event e{60, EVT_ALARM_RAISED, 1};
+    TEST_ASSERT_EQUAL_STRING("E,60,1,1\n", eventCsvLine(l, sizeof(l), e) ? l : "");
+
+    const DiveMeta m = sampleMeta();
+    TEST_ASSERT_EQUAL_STRING(
+        "M,120,500,0.400,0.420,300,12,2,1,30,85,0.400,0.700,1.000,1.300\n",
+        metaCsvLine(l, sizeof(l), m) ? l : "");
+    // tag + 8 v1 + 6 v2 (gf_low gf_high sp1..sp4); field 2 is centimetres, as
+    // the firmware has always sent it (the doc once called it metres).
+    TEST_ASSERT_EQUAL(15, countFields(l));
+}
+
+static void test_rows_refuse_rather_than_truncate() {
+    // The store used to format rows into a 64-byte static buffer: a wide row was
+    // cut in half and the diver got a plausible-looking truncated dive.
+    Snapshot s{};
+    s.tSec = 0xFFFFFFFFu;
+    s.depthCm = 2147483647;
+    s.votedX1000 = -32768;
+    for (int i = 0; i < 3; i++) s.cellX1000[i] = -32768;
+    s.setpointX1000 = -32768;
+    s.mode = 255; s.alarmBits = 0xFFFF; s.cnsPct = 255;
+    s.ceilingCm = -32768; s.ndlMin = -32768; s.decoTotalMin = -32768;
+    s.pulses = 65535; s.battX1000 = 65535; s.tempC = -128; s.flags = 255;
+
+    char wide[192], tiny[40];
+    const size_t n = snapshotCsvLine(wide, sizeof(wide), s);
+    TEST_ASSERT_TRUE(n > 0 && n < sizeof(wide));   // the export buffer must fit
+    TEST_ASSERT_EQUAL('\n', wide[n - 1]);          // ... and be a whole row
+    TEST_ASSERT_EQUAL(19, countFields(wide));
+    TEST_ASSERT_EQUAL(0, snapshotCsvLine(tiny, sizeof(tiny), s));
+}
+
+// Both ways of getting rows out of a dive file: the streaming sink, which is
+// exactly what DiveStore::exportCsv does for the handset and the web, and the
+// buffered form. They must produce the same bytes, or the two transports are
+// two writers again by another name.
+struct Collector {
+    char buf[4096];
+    size_t used;
+};
+
+static void collectLine(const char* line, void* v) {
+    Collector& c = *static_cast<Collector*>(v);
+    const size_t n = std::strlen(line);
+    if (c.used + n + 1 <= sizeof(c.buf)) {
+        std::memcpy(c.buf + c.used, line, n);
+        c.used += n;
+        c.buf[c.used] = '\0';
+    }
+}
+
+static void test_both_export_paths_are_the_same_bytes() {
+    Snapshot s1 = sampleSnap(); s1.tSec = 30;
+    Snapshot s2 = sampleSnap(); s2.tSec = 60;
+    const Event ev{45, EVT_MODE_CHANGE, 1};
+    uint8_t sb1[SNAPSHOT_SIZE], sb2[SNAPSHOT_SIZE], eb[EVENT_SIZE];
+    packSnapshot(s1, sb1);
+    packSnapshot(s2, sb2);
+    packEvent(ev, eb);
+
+    // Chronological interleaving, the way the store writes: S, E, S.
+    const ImageRecord recs[] = {
+        {REC_SNAPSHOT, sb1}, {REC_EVENT, eb}, {REC_SNAPSHOT, sb2}};
+    const DiveMeta m = sampleMeta();
+    uint8_t img[512];
+    const size_t len = packImage(img, sizeof(img), 4242, 3, recs, 3, &m);
+    TEST_ASSERT_TRUE(len > 0);
+
+    Collector streamed{};
+    const ScanResult sc = emitCsvRows(img, len, collectLine, &streamed);
+    TEST_ASSERT_TRUE(sc.headerOk);
+    TEST_ASSERT_EQUAL(2, sc.snapshots);
+    TEST_ASSERT_EQUAL(1, sc.events);
+    TEST_ASSERT_TRUE(sc.metaOk);
+
+    char buffered[4096];
+    const size_t n = toCsvImage(img, len, buffered, sizeof(buffered));
+    TEST_ASSERT_EQUAL_STRING(streamed.buf, buffered);
+    TEST_ASSERT_EQUAL((int)streamed.used, (int)n);
+
+    // Identity line first, exactly once, carrying the slot the writer stamped.
+    TEST_ASSERT_EQUAL_STRING_LEN("DIVE,3,4242,3,2\n", buffered, 16);
+    TEST_ASSERT_NULL(std::strstr(buffered + 16, "DIVE,"));
+
+    // Rows in file order (the E row belongs between the two S rows), trailer last.
+    const char* a = std::strstr(buffered, "\nS,30,");
+    const char* b = std::strstr(buffered, "\nE,45,");
+    const char* c = std::strstr(buffered, "\nS,60,");
+    const char* mm = std::strstr(buffered, "\nM,120,");
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_NOT_NULL(c);
+    TEST_ASSERT_NOT_NULL(mm);
+    TEST_ASSERT_TRUE(a < b && b < c && c < mm);
+
+    // A buffer that cannot hold everything reports failure, not half a dive.
+    char tiny[40];
+    TEST_ASSERT_EQUAL(0, toCsvImage(img, len, tiny, sizeof(tiny)));
+    TEST_ASSERT_EQUAL('\0', tiny[0]);
+}
+
+static void test_pack_image_refuses_a_short_buffer() {
+    Snapshot s = sampleSnap();
+    uint8_t sb[SNAPSHOT_SIZE];
+    packSnapshot(s, sb);
+    const ImageRecord recs[] = {{REC_SNAPSHOT, sb}};
+    const DiveMeta m = sampleMeta();
+    uint8_t img[HEADER_SIZE + 1 + SNAPSHOT_SIZE];   // trailer will not fit
+    TEST_ASSERT_EQUAL(0, packImage(img, sizeof(img), 1, 1, recs, 1, &m));
+    // ... and fits exactly when the trailer has room.
+    uint8_t enough[HEADER_SIZE + 1 + SNAPSHOT_SIZE + 1 + 64];
+    TEST_ASSERT_TRUE(packImage(enough, sizeof(enough), 1, 1, recs, 1, &m) > 0);
 }
 
 int main() {
@@ -317,6 +460,11 @@ int main() {
     RUN_TEST(test_scan_rejects_unknown_tags_and_foreign_headers);
     RUN_TEST(test_meta_crc_detects_corruption);
     RUN_TEST(test_event_roundtrip);
-    RUN_TEST(test_csv_output_shape_and_overflow);
+    RUN_TEST(test_dive_identity_line);
+    RUN_TEST(test_snapshot_row_is_the_documented_shape);
+    RUN_TEST(test_event_and_meta_rows);
+    RUN_TEST(test_rows_refuse_rather_than_truncate);
+    RUN_TEST(test_both_export_paths_are_the_same_bytes);
+    RUN_TEST(test_pack_image_refuses_a_short_buffer);
     return UNITY_END();
 }

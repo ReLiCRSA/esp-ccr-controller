@@ -701,10 +701,31 @@ void runDive(int id) {
     hdr[20] ^= 0x40;  // one bit flipped on flash
     if (logfmt::unpackMeta(hdr, back)) FAIL("dive %d: header CRC did not catch corruption", id);
 
+    // The export a diver actually reads: rebuild the tagged byte image a diveN.bin
+    // holds, then run it through the one canonical row writer (the same call the
+    // handset's `LOG EXPORT` and the web's `/dive/n.csv` make on the board).
+    static uint8_t packed[kMaxSnaps * logfmt::SNAPSHOT_SIZE +
+                          kMaxEvents * logfmt::EVENT_SIZE];
+    static logfmt::ImageRecord recs[kMaxSnaps + kMaxEvents];
+    int nRec = 0, used = 0;
+    for (int i = 0; i < nSnap; i++) {
+        logfmt::packSnapshot(snaps[i], packed + used);
+        recs[nRec++] = {logfmt::REC_SNAPSHOT, packed + used};
+        used += logfmt::SNAPSHOT_SIZE;
+    }
+    for (int i = 0; i < nEv; i++) {
+        logfmt::packEvent(evs[i], packed + used);
+        recs[nRec++] = {logfmt::REC_EVENT, packed + used};
+        used += logfmt::EVENT_SIZE;
+    }
+    static uint8_t img[32 * 1024];
+    const size_t len =
+        logfmt::packImage(img, sizeof(img), 0, 1, recs, (size_t)nRec, &meta);
+    if (len == 0) FAIL("dive %d: could not pack the dive image (%d records)", id, nRec);
+
     static char csv[160 * 1024];
-    const size_t n = logfmt::toCsv(meta, snaps, (size_t)nSnap, evs, (size_t)nEv,
-                                   csv, sizeof(csv));
-    if (n == 0) FAIL("dive %d: CSV export overflowed (%d rows)", id, nSnap);
+    const size_t n = logfmt::toCsvImage(img, len, csv, sizeof(csv));
+    if (n == 0) FAIL("dive %d: CSV export overflowed (%d rows)", id, nRec);
 }
 
 }  // namespace

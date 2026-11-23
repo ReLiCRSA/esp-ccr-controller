@@ -219,6 +219,28 @@ int diveLogExportCsv(int slot, void (*sink)(const char*, void*), void* ctx) {
     return o.rc;
 }
 
+int diveLogBoot(char* note, size_t cap) {
+    if (note && cap) note[0] = '\0';
+    if (g_logMtx) xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    const bool mounted = g_diveStore.begin();
+    int n = -1;
+    if (mounted) {
+        static int slots[DiveStore::kMaxDives];
+        n = g_diveStore.list(slots, nullptr, DiveStore::kMaxDives);
+    }
+    const bool formatted = g_diveStore.lastBeginFormatted();
+    if (g_logMtx) xSemaphoreGive(g_logMtx);
+    if (note && cap) {
+        if (!mounted) snprintf(note, cap, "not mounted");
+        else if (formatted) snprintf(note, cap, "mounted after FORMAT: dive history erased");
+    }
+    return n;
+}
+
+long unsigned diveLogUsedBytes() { return (long unsigned)g_diveStore.usedBytes(); }
+long unsigned diveLogTotalBytes() { return (long unsigned)g_diveStore.totalBytes(); }
+bool diveLogMountFormatted() { return g_diveStore.lastBeginFormatted(); }
+
 int diveLogList(int* slots, uint32_t* mtimes, int max) {
     ListCtx o{slots, mtimes, max, 0};
     session().withLock(listUnderLock, &o);

@@ -726,6 +726,23 @@ void setup() {
     // inputs, so a truncated listing is a real fault, not a cosmetic one: it is
     // reported at boot where the bench can see it. (Rendered by Session::begin;
     // see cmd_router.cpp for why it is never rendered on demand.)
+    // The dive log gets its own boot line because the alternative is a silent
+    // lie: with the filesystem mounted only by DIVE START, a browser's Dives tab
+    // and `LOG LIST` on the handset both said "no dives" after every boot,
+    // whether the ten files were on flash or not. `used=`/`total=` is the part
+    // that separates an empty log from one the filesystem could not read: a
+    // LittleFS mount that fails is formatted by begin(), and that is the one
+    // thing about this filesystem a diver must never learn after the dive.
+    char logNote[72];
+    const int logDives = comms::diveLogBoot(logNote, sizeof(logNote));
+    if (logDives < 0)
+        Serial.printf("log: ** LittleFS %s — dives will not be recorded\n", logNote);
+    else
+        Serial.printf("log: LittleFS mounted, %d dive%s, used %lu of %lu bytes%s%s\n",
+                      logDives, logDives == 1 ? "" : "s",
+                      comms::diveLogUsedBytes(), comms::diveLogTotalBytes(),
+                      logNote[0] ? " ** " : "", logNote[0] ? logNote : "");
+
     size_t schemaKeys = 0;
     settings::Registry::definitions(schemaKeys);
     const size_t schemaBytes = comms::schemaLen();

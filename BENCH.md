@@ -15,13 +15,29 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0            # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 201 cases
+pio test -e native            # host gate, currently 206 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 pio run -e esp32 -t uploadfs  # ONLY if data/ changed: it erases the dive logs
-tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
+                                 --dive-persist
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle
 ```
+
+`hw_accept.py --dive-persist` closes one dive, resets the controller through the
+console's EN line and asks `LOG LIST` again: the slots must be the same ones, and
+the fresh boot banner must report the same count with no format warning. Ask for
+it by name — it adds ~35 s and a deliberate reboot, so it is not part of the
+short run. Reading the dive log before the first `DIVE START` of a boot used to be
+blind (the filesystem was only mounted by `DIVE START`), and the FIFO reused slot 1
+for every dive, so the board kept exactly one dive; both are in 16 and both were
+found by asking this question on the bench.
+
+`web_probe.py` also compares `LOG EXPORT <n>` on the handset with
+`GET /dive/<n>.csv` over HTTP, row for row — the C2 claim that "the download
+matches the handset export" had been asserted by hand since it was written and
+was false the whole time (two writers, two shapes). Both now come out of one
+formatter, and the comparison is the tripwire.
 
 `uploadfs` needs `--upload-port` on this bench (two identical CP2102s, identical
 `/dev/serial/by-id`) and it writes the whole filesystem partition, which is where
@@ -38,12 +54,19 @@ one marked exception is the settings-schema renderer, which runs once from
 
 `hw_accept.py` checks the boot console (fresh boot banner, ≥2 HB lines
 matching the soak_logger contract, no SAFE/FATAL, `settings: N keys from
-NVS`, `control: SP=…`, `web: AP "…"`) and then runs the **refusal matrix**
+NVS`, `control: SP=…`, `web: AP "…"`, and `log: LittleFS mounted, N dives,
+used X of Y bytes`) and then runs the **refusal matrix**
 over the wired handset: `AUTO` cold → `ERR predive required`; `SET SP2`
 mid-dive → `ERR dive locked`; `WIFI ON` mid-dive → `ERR wifi locked in
 dive`; `CAL AIR` mid-dive → `ERR cal locked in dive`; overlong line →
 `ERR line too long`; junk → `ERR unknown command`. Every one of those is a
 host-tested invariant — the bench exists to prove the wire, not the logic.
+
+The `log:` boot line is a check, not decoration. A LittleFS mount that fails is
+answered with a format, which erases every dive on the partition, and the core
+does that in silence; the line says how many dives the mount found and warns if
+it had to format. A dive computer that quietly eats its own history is worse
+than one that says the log is offline.
 
 Two things the harness did NOT do until 2026-11-23, and both let a real fault
 through:

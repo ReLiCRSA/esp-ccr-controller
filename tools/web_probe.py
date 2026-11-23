@@ -437,6 +437,83 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
         ser.close()
 
 
+def dive_row_equality(host, port, checks):
+    """`LOG EXPORT n` on the handset and `GET /dive/<n>.csv` on the web are the
+    same bytes.
+
+    This is BENCH.md C2 step 4, which asserted it for a long time without ever
+    comparing anything: two writers produced two different row shapes (14 vs 17
+    fields, alarms hex vs decimal, ceiling m vs cm, battery mV vs V) and the
+    check passed anyway. They share one formatter in the firmware now
+    (`logfmt::snapshotCsvLine` and friends); this proves it on the wire, where
+    truncation by either transport would show up.
+
+    `E,` rows are counted but not compared: an exported event row is
+    indistinguishable on the wire from a live event the controller pushes while
+    the export is in flight (same `E,<t>,<id>,<value>` shape). That ambiguity is
+    in the protocol document; a client that needs the exported events reads the
+    file, not the stream.
+    """
+    import urllib.request
+
+    ser = open_quiet(port)
+    time.sleep(1.2)
+    ser.reset_input_buffer()
+    ser.write(b"\r\n")            # flush the controller's line buffer, not ours
+    ser.flush()
+    time.sleep(0.3)
+    ser.reset_input_buffer()
+
+    ser.write(b"LOG LIST\r\n")
+    ser.flush()
+    slots, end = [], time.time() + 2.5
+    while time.time() < end:
+        l = ser.readline().decode(errors="replace").strip()
+        if l.startswith("L,"):
+            parts = l.split(",")
+            if len(parts) > 1 and parts[1].isdigit():
+                slots.append(int(parts[1]))
+    if not slots:
+        ser.close()
+        checks.append(("dive rows identical on both transports", None,
+                       "no dive on the board to export (open and close one, or "
+                       "run --dive-cycle)"))
+        return
+
+    slot = max(slots)
+    try:
+        with urllib.request.urlopen(f"http://{host}/dive/{slot}.csv", timeout=10) as r:
+            http_rows = [l.strip() for l in r.read().decode(errors="replace").split("\n")
+                         if l.strip()]
+    except Exception as e:                                        # noqa: BLE001
+        ser.close()
+        checks.append(("dive rows identical on both transports", False,
+                       f"GET /dive/{slot}.csv: {type(e).__name__}: {e}"))
+        return
+
+    ser.write(f"LOG EXPORT {slot}\r\n".encode())
+    ser.flush()
+    uart_rows, events, end = [], 0, time.time() + 4.0
+    while time.time() < end:
+        l = ser.readline().decode(errors="replace").strip()
+        if l.startswith(("DIVE,", "S,", "M,")):
+            uart_rows.append(l)
+        elif l.startswith("E,"):
+            events += 1
+    comparable_http = [l for l in http_rows if not l.startswith("E,")]
+    same = comparable_http == uart_rows and len(uart_rows) > 1
+    checks.append(("dive rows identical on both transports", same,
+                   f"slot {slot}: {len(uart_rows)} DIVE/S/M rows on UART2 == "
+                   f"{len(comparable_http)} over HTTP; {events} E, rows on the "
+                   f"wire not compared (live events share the shape)"))
+    if not same:
+        for a, b in zip(comparable_http, uart_rows):
+            if a != b:
+                print(f"      first difference:\n        http: {a}\n        uart: {b}")
+                break
+    ser.close()
+
+
 def sh(cmd):
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True,
@@ -631,6 +708,11 @@ def main() -> int:
         print(f"--- each command twice, back to back: WebSocket then UART2 "
               f"({args.handset})")
         compare_transports(args.host, args.handset, MATRIX, checks)
+        print("--- dive export: handset LOG EXPORT vs web /dive/<n>.csv")
+        before = len(checks)
+        dive_row_equality(args.host, args.handset, checks)
+        for name, ok, detail in checks[before:]:
+            print(f"  [{mark(ok)}] {name}: {detail}")
 
     if args.dive_cycle:
         print(f"--- dive cycle from the browser ({args.host})")

@@ -158,67 +158,184 @@ bool unpackMeta(const uint8_t in[64], DiveMeta& out) {
 }
 
 namespace {
-// snprintf into the remaining buffer; returns false when it would overflow.
-bool emit(char*& out, size_t& remaining, const char* fmt, ...) {
+// One row, into the caller's buffer: bytes written including the newline, 0 if
+// it would not fit. Every export row on every transport comes out of here, so
+// "what the handset is told" and "what the browser downloads" cannot drift.
+size_t row(char* out, size_t cap, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    const int n = std::vsnprintf(out, remaining, fmt, ap);
+    const int n = std::vsnprintf(out, cap, fmt, ap);
     va_end(ap);
-    if (n < 0 || static_cast<size_t>(n) >= remaining) return false;
-    out += n;
-    remaining -= static_cast<size_t>(n);
-    return true;
+    if (n < 0 || static_cast<size_t>(n) >= cap) return 0;
+    return static_cast<size_t>(n);
 }
 } // namespace
 
-size_t toCsv(const DiveMeta& meta,
-             const Snapshot* snaps, size_t nSnaps,
-             const Event* events, size_t nEvents,
-             char* out, size_t outCap) {
-    char* p = out;
-    size_t rem = outCap;
-    if (!emit(p, rem, "ESP-CCR dive record,%u\n", DIVE_VERSION)) return 0;
-    if (!emit(p, rem, "META,duration_s,max_depth_m,min_ppo2,max_ppo2,total_pulses,"
-                      "cns_peak,gf_low,gf_high,sp1,sp2,sp3,sp4,snapshots,events\n")) return 0;
-    // maxDepthCm/votedX1000 are already scaled integers, so fixedScaled prints
-    // them exactly, with no float in the path at all. The setpoints are stored
-    // in thousandths but published at 2 decimals, so those keep the divide and
-    // go through fixed(), which matches printf's rounding (see numfmt.h).
-    char md[16], mn[16], mx[16], s1[16], s2[16], s3[16], s4[16];
-    if (!emit(p, rem, "META,%u,%s,%s,%s,%u,%u,%u,%u,%s,%s,%s,%s,%u,%u\n",
-              meta.durationSec,
-              numfmt::fixedScaled(md, sizeof(md), meta.maxDepthCm, 2),
-              numfmt::fixedScaled(mn, sizeof(mn), meta.minVotedX1000, 3),
-              numfmt::fixedScaled(mx, sizeof(mx), meta.maxVotedX1000, 3),
-              meta.totalPulses, meta.cnsPeakPct,
-              meta.gfLow, meta.gfHigh,
-              numfmt::fixed(s1, sizeof(s1), meta.sp1X1000 / 1000.0, 2),
-              numfmt::fixed(s2, sizeof(s2), meta.sp2X1000 / 1000.0, 2),
-              numfmt::fixed(s3, sizeof(s3), meta.sp3X1000 / 1000.0, 2),
-              numfmt::fixed(s4, sizeof(s4), meta.sp4X1000 / 1000.0, 2),
-              meta.snapshotCount, meta.eventCount)) return 0;
-    if (!emit(p, rem, "S,t_s,depth_m,ppo2,cell0,cell1,cell2,setpoint,mode,alarms,"
-                      "cns,ceiling_m,ndl_min,deco_min,pulses,batt_v,temp_c,flags\n")) return 0;
-    for (size_t i = 0; i < nSnaps; ++i) {
-        const Snapshot& s = snaps[i];
-        char d[16], v[16], c0[16], c1[16], c2[16], sp[16], cl[16], bv[16];
-        if (!emit(p, rem, "S,%u,%s,%s,%s,%s,%s,%s,%u,%u,%u,%s,%d,%d,%u,%s,%d,%u\n",
-                  s.tSec,
-                  numfmt::fixedScaled(d, sizeof(d), s.depthCm, 2),
-                  numfmt::fixedScaled(v, sizeof(v), s.votedX1000, 3),
-                  numfmt::fixedScaled(c0, sizeof(c0), s.cellX1000[0], 3),
-                  numfmt::fixedScaled(c1, sizeof(c1), s.cellX1000[1], 3),
-                  numfmt::fixedScaled(c2, sizeof(c2), s.cellX1000[2], 3),
-                  numfmt::fixedScaled(sp, sizeof(sp), s.setpointX1000, 3),
-                  s.mode, s.alarmBits, s.cnsPct,
-                  numfmt::fixedScaled(cl, sizeof(cl), s.ceilingCm, 2),
-                  s.ndlMin, s.decoTotalMin, s.pulses,
-                  numfmt::fixed(bv, sizeof(bv), s.battX1000 / 1000.0, 2),
-                  s.tempC, s.flags)) return 0;
+// v1 columns first, in their documented order and units, then the v2 additions
+// on the right (docs/HANDSET_PROTOCOL.md 5). No float in any of them: every
+// value is either an integer or a scaled integer rendered by fixedScaled, which
+// is the point of the X1000 fields in `Snapshot`.
+size_t diveCsvLine(char* out, size_t cap, uint8_t slot, uint32_t startEpoch) {
+    return row(out, cap, "DIVE,%u,%u,%u,%u\n", static_cast<unsigned>(slot),
+               static_cast<unsigned>(startEpoch), static_cast<unsigned>(DIVE_VERSION),
+               static_cast<unsigned>(ROW_FORMAT_VERSION));
+}
+
+size_t snapshotCsvLine(char* out, size_t cap, const Snapshot& s) {
+    char d[16], v[16], c0[16], c1[16], c2[16], sp[16];
+    // v1: t_s depth_m voted c0 c1 c2 sp alarms(hex) cns ceiling_m ndl deco_min
+    //     pulses batt(mV)
+    // v2 appended: mode temp_c flags ceiling_cm
+    // `ceiling_m` stays the integer metres a v1 parser expects; the exact value
+    // is the appended `ceiling_cm`, because reformatting an existing column
+    // would break a parser that reads it as an integer.
+    return row(out, cap,
+               "S,%u,%s,%s,%s,%s,%s,%s,0x%04X,%u,%d,%d,%d,%u,%u,%u,%d,%u,%d\n",
+               static_cast<unsigned>(s.tSec),
+               numfmt::fixedScaled(d, sizeof(d), s.depthCm, 2),
+               numfmt::fixedScaled(v, sizeof(v), s.votedX1000, 3),
+               numfmt::fixedScaled(c0, sizeof(c0), s.cellX1000[0], 3),
+               numfmt::fixedScaled(c1, sizeof(c1), s.cellX1000[1], 3),
+               numfmt::fixedScaled(c2, sizeof(c2), s.cellX1000[2], 3),
+               numfmt::fixedScaled(sp, sizeof(sp), s.setpointX1000, 3),
+               static_cast<unsigned>(s.alarmBits),
+               static_cast<unsigned>(s.cnsPct),
+               static_cast<int>(s.ceilingCm) / 100,
+               static_cast<int>(s.ndlMin), static_cast<int>(s.decoTotalMin),
+               static_cast<unsigned>(s.pulses),
+               static_cast<unsigned>(s.battX1000),
+               static_cast<unsigned>(s.mode),
+               static_cast<int>(s.tempC),
+               static_cast<unsigned>(s.flags),
+               static_cast<int>(s.ceilingCm));
+}
+
+size_t eventCsvLine(char* out, size_t cap, const Event& e) {
+    return row(out, cap, "E,%u,%u,%u\n", static_cast<unsigned>(e.tSec),
+               static_cast<unsigned>(e.id), static_cast<unsigned>(e.value));
+}
+
+size_t metaCsvLine(char* out, size_t cap, const DiveMeta& m) {
+    char mn[16], mx[16], s1[16], s2[16], s3[16], s4[16];
+    // v1: duration_s max_depth_cm min_ppo2 max_ppo2 pulses cns_peak_pct
+    //     snapshots events
+    // v2 appended: gf_low gf_high sp1 sp2 sp3 sp4
+    // The doc used to name field 2 `max_depth_m`; the firmware has always put
+    // centimetres there and the web page divides it by 100, so the name was the
+    // error and the bytes are unchanged. ppO2 and setpoints are 3 decimals, the
+    // same as every other ppO2 column in the file: one format for one quantity.
+    return row(out, cap, "M,%u,%d,%s,%s,%u,%u,%u,%u,%u,%u,%s,%s,%s,%s\n",
+               static_cast<unsigned>(m.durationSec), static_cast<int>(m.maxDepthCm),
+               numfmt::fixedScaled(mn, sizeof(mn), m.minVotedX1000, 3),
+               numfmt::fixedScaled(mx, sizeof(mx), m.maxVotedX1000, 3),
+               static_cast<unsigned>(m.totalPulses),
+               static_cast<unsigned>(m.cnsPeakPct),
+               static_cast<unsigned>(m.snapshotCount),
+               static_cast<unsigned>(m.eventCount),
+               static_cast<unsigned>(m.gfLow), static_cast<unsigned>(m.gfHigh),
+               numfmt::fixedScaled(s1, sizeof(s1), m.sp1X1000, 3),
+               numfmt::fixedScaled(s2, sizeof(s2), m.sp2X1000, 3),
+               numfmt::fixedScaled(s3, sizeof(s3), m.sp3X1000, 3),
+               numfmt::fixedScaled(s4, sizeof(s4), m.sp4X1000, 3));
+}
+
+namespace {
+struct RowSink {
+    void (*sink)(const char*, void*);
+    void* ctx;
+    char line[192];
+};
+
+void rowCb(const RawRecord& r, void* vctx) {
+    RowSink& o = *static_cast<RowSink*>(vctx);
+    size_t n = 0;
+    if (r.tag == REC_SNAPSHOT) {
+        Snapshot s;
+        if (unpackSnapshot(r.bytes, s)) n = snapshotCsvLine(o.line, sizeof(o.line), s);
+    } else if (r.tag == REC_EVENT) {
+        Event e;
+        if (unpackEvent(r.bytes, e)) n = eventCsvLine(o.line, sizeof(o.line), e);
+    } else if (r.tag == REC_META) {
+        DiveMeta m;
+        if (unpackMeta(r.bytes, m)) n = metaCsvLine(o.line, sizeof(o.line), m);
     }
-    for (size_t i = 0; i < nEvents; ++i) {
-        if (!emit(p, rem, "E,%u,%u,%u\n", events[i].tSec,
-                  static_cast<unsigned>(events[i].id), events[i].value)) return 0;
+    if (n) o.sink(o.line, o.ctx);
+}
+
+struct Appender {
+    char* out;
+    size_t used;
+    size_t cap;
+    bool ok;
+};
+
+void appendSink(const char* line, void* v) {
+    Appender& a = *static_cast<Appender*>(v);
+    const size_t n = std::strlen(line);
+    if (!a.ok || a.used + n >= a.cap) {   // NUL still has to fit
+        a.ok = false;
+        return;
+    }
+    std::memcpy(a.out + a.used, line, n);
+    a.used += n;
+    a.out[a.used] = '\0';
+}
+} // namespace
+
+ScanResult emitCsvRows(const uint8_t* img, size_t len,
+                       void (*sink)(const char* line, void*), void* ctx) {
+    ScanResult sc = scanRecords(img, len, nullptr, nullptr);
+    if (!sc.headerOk) return sc;
+    uint32_t epoch = 0;
+    uint8_t slot = 0;
+    unpackHeader(img, epoch, slot);
+    char head[48];
+    if (diveCsvLine(head, sizeof(head), slot, epoch)) sink(head, ctx);
+    RowSink rs{sink, ctx, {}};
+    return scanRecords(img, len, rowCb, &rs);
+}
+
+size_t toCsvImage(const uint8_t* img, size_t len, char* out, size_t outCap) {
+    if (outCap == 0) return 0;
+    out[0] = '\0';
+    Appender a{out, 0, outCap, true};
+    emitCsvRows(img, len, appendSink, &a);
+    if (!a.ok) {
+        // A caller that gets 0 must not be able to read a partial export out of
+        // the buffer it handed over: half a dive, printed as if it were one, is
+        // worse than an error.
+        out[0] = '\0';
+        return 0;
+    }
+    return a.used;
+}
+
+size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
+                 const ImageRecord* recs, size_t n, const DiveMeta* meta) {
+    size_t need = HEADER_SIZE + (meta ? 1u + 64u : 0u);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t sz = recs[i].tag == REC_SNAPSHOT ? SNAPSHOT_SIZE
+                        : recs[i].tag == REC_EVENT   ? EVENT_SIZE : 0;
+        if (sz == 0) return 0;                 // unknown tag: caller error
+        need += 1 + sz;
+    }
+    if (cap < need) return 0;
+
+    uint8_t* p = out;
+    uint8_t head[HEADER_SIZE];
+    packHeader(startEpoch, slot, head);
+    std::memcpy(p, head, HEADER_SIZE);
+    p += HEADER_SIZE;
+    for (size_t i = 0; i < n; ++i) {
+        *p++ = recs[i].tag;
+        const size_t sz = recs[i].tag == REC_SNAPSHOT ? SNAPSHOT_SIZE : EVENT_SIZE;
+        std::memcpy(p, recs[i].record, sz);
+        p += sz;
+    }
+    if (meta) {
+        *p++ = REC_META;
+        size_t k = packMeta(*meta, p);
+        p += k;
     }
     return static_cast<size_t>(p - out);
 }

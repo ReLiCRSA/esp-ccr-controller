@@ -52,6 +52,10 @@ RESET_REASON = re.compile(r"^reset reason: ")
 SETTINGS_LINE = re.compile(r"^settings: (\d+) keys from NVS")
 CONTROL_LINE = re.compile(r"^control: SP=[\d.]+/")
 WEB_AP_LINE = re.compile(r'^web: AP "([A-Za-z0-9_-]+)" on 192\.168\.4\.1')
+# `log: LittleFS mounted, 1 dive, used 36864 of 1441792 bytes`. Group 4 is the
+# firmware's warning: it is empty on a clean mount and says so when the mount
+# failed and the partition had to be formatted (which erases dive history).
+LOG_LINE = re.compile(r"^log: LittleFS mounted, (\d+) dives?, used (\d+) of (\d+) bytes(.*)$")
 MUST_NONE = [
     (re.compile(r"SAFE MODE"), "SAFE boot"),
     (re.compile(r"FATAL"), "FATAL line"),
@@ -181,6 +185,15 @@ def grade_boot(lines, expect_web):
         checks.append(("control chain booted", cl is not None, cl or ""))
         wl = next((l for l in lines if WEB_AP_LINE.search(l)), None)
         checks.append(("web AP announced", wl is not None, wl or ""))
+    ll = next((l for l in lines if LOG_LINE.search(l)), None)
+    checks.append(("dive log mounted at boot", ll is not None, ll or ""))
+    if ll:
+        # The suffix is the firmware's own warning. A LittleFS mount that fails
+        # is answered with a format, which erases every dive on the partition;
+        # until 2026-11-23 that happened in silence and was indistinguishable
+        # from a diver who had simply not dived.
+        note = LOG_LINE.search(ll).group(4).strip()
+        checks.append(("dive log mount did not format (history intact)", not note, ll))
     return checks
 
 
@@ -408,6 +421,86 @@ def run_protocol(port, baud, log, settle=1.5):
     return results
 
 
+def run_dive_persist(console, port, baud, watch, settle=1.5):
+    """Does a closed dive survive a reset?
+
+    `dive_store.h` promises "a reset between dives must cost at most the last
+    record, never the dive". Nothing on the bench had ever tested that promise,
+    and when the dive-CSV work asked the question the answer looked like "no":
+    after a boot, `LOG LIST` answered empty and `GET /dive/<n>.csv` answered
+    `no such dive`, while an esptool `read_flash` of the LittleFS partition
+    showed `/dive1.bin` sitting there with its records intact. Two different
+    faults wore that symptom identically — an unreadable filesystem, and a
+    filesystem nobody had mounted yet (the store used to be mounted by DIVE
+    START, so every surface read before the first dive of a boot was blind).
+    The boot banner says which one it is now, and this says whether the bytes
+    outlived the reset.
+    """
+    import serial  # pipx platformio venv has it
+
+    ser = serial.Serial(port, baud, timeout=1.0)
+    checks = []
+    time.sleep(settle)
+
+    def slots():
+        """Slot numbers `LOG LIST` reports, after the standard line-buffer flush
+        (un-terminated bytes in the controller's buffer would be parsed with
+        this command; see the flush comment in run_protocol)."""
+        ser.reset_input_buffer()
+        ser.write(b"\r\n")
+        ser.flush()
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        ser.write(b"LOG LIST\r\n")
+        ser.flush()
+        out, end = [], time.time() + 3.0
+        while time.time() < end:
+            l = ser.readline().decode(errors="replace").strip()
+            if l.startswith("L,"):
+                parts = l.split(",")
+                if len(parts) > 1 and parts[1].isdigit():
+                    out.append(int(parts[1]))
+        return out
+
+    before = slots()
+    ser.write(b"DIVE START\r\n")
+    ser.flush()
+    time.sleep(7.0)                    # one 30 s grid row will not land; event
+    ser.write(b"DIVE END\r\n")        # rows and the header already make a dive
+    ser.flush()
+    time.sleep(3.0)
+    mid = slots()
+
+    mark = len(watch)   # everything the console watcher sees after here is the new boot
+    # Run-mode reset through EN. DTR stays low on purpose: pulsing it drives IO0
+    # and latches the ROM into download mode, which looks like a dead board.
+    console.setDTR(False)
+    console.setRTS(True)
+    time.sleep(0.12)
+    console.setRTS(False)
+    time.sleep(18.0)                   # boot banner + the log line lands
+    after = slots()
+    ser.close()
+
+    new_boot = watch[mark:]
+    ll = next((l for l in new_boot if LOG_LINE.search(l)), None)
+
+    checks.append(("dive closed this run is in LOG LIST",
+                   len(mid) == len(before) + 1,
+                   f"before {before or '[]'}, after DIVE END {mid or '[]'}"))
+    checks.append(("dive history survives a reset",
+                   bool(mid) and set(after) == set(mid),
+                   f"{len(mid)} slots before the reset, {len(after)} after: "
+                   f"{after or '[]'}"))
+    checks.append(("the new boot reports its dive log", ll is not None,
+                   ll or "no `log:` line: the boot banner does not say what the "
+                         "filesystem holds"))
+    if ll:
+        note = LOG_LINE.search(ll).group(4).strip()
+        checks.append(("reset did not format the log (history intact)", not note, ll))
+    return checks
+
+
 def main() -> int:
     global T_ORIGIN
     T_ORIGIN = time.time()
@@ -427,6 +520,11 @@ def main() -> int:
     ap.add_argument("--expect-web", action="store_true")
     ap.add_argument("--boot-wait", type=float, default=20.0)
     ap.add_argument("--replay", default=None)
+    ap.add_argument("--dive-persist", action="store_true",
+                    help="after the protocol checks, close a dive, reset the "
+                         "controller through the console's EN line and ask "
+                         "`LOG LIST` again: dive history must outlive the reset. "
+                         "Adds ~35 s and a deliberate reboot, so it is opt-in.")
     args = ap.parse_args()
 
     lines = []
@@ -522,6 +620,16 @@ def main() -> int:
             "\n".join(f"[{t:7.2f}s] {l}" for t, l in watch_stamps) + "\n")
     else:
         print("\n(handset checks skipped: pass --handset PORT)")
+
+    if args.handset and not args.replay and args.dive_persist:
+        # Last, on purpose: the reset below puts a second boot banner in the
+        # console stream, and the console-watch checks must have graded the
+        # command phase's traffic before it is mixed with a deliberate reset.
+        print("\n--- dive history across a reset ---")
+        for name, ok, detail in run_dive_persist(ser, args.handset, args.baud, watch,
+                                                 args.handset_settle):
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+            failures += 0 if ok else 1
 
     print(f"\n{failures} failure(s)")
     return 1 if failures else 0

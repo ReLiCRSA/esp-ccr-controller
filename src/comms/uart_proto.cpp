@@ -4,6 +4,7 @@
 // ============================================================================
 #include "comms/uart_proto.h"
 
+#include "log/divelog.h"        // MAX_DIVE_SLOTS: one owner for the index range
 #include "util/numfmt.h"
 
 #include <cctype>
@@ -142,7 +143,15 @@ bool parseCommand(const char* line, Command& out, const char** err) {
             char* idx = tok(const_cast<char*>(rest), &rest);
             char* endp = nullptr;
             const long v = std::strtol(idx, &endp, 10);
-            if (endp == idx || *endp || v < 0 || v > 9) { *err = "bad dive index"; return false; }
+            // 0 is accepted on purpose and answered `ERR no such dive` by the
+            // store: that is the documented v1 behaviour for index 0. The upper
+            // bound is the store's own slot count → until 2026-11-23 it was a
+            // hard-coded 9 here, so slot 10 existed, was listed by `LOG LIST` and
+            // was reachable over the web, but could not be exported by a handset.
+            if (endp == idx || *endp || v < 0 || v > logfmt::MAX_DIVE_SLOTS) {
+                *err = "bad dive index";
+                return false;
+            }
             out.kind = Kind::LOG_EXPORT;
             out.logExport = true;
             out.logIndex = static_cast<uint16_t>(v);

@@ -129,4 +129,16 @@ void diveLogAppendGrid(const logfmt::Snapshot& s);
 int diveLogExportCsv(int slot, void (*sink)(const char*, void*), void* ctx);
 int diveLogList(int* slots, uint32_t* mtimes, int max);
 
+/// Mounts the dive log at boot and reports what is on it. Until 2026-11-23 the
+/// filesystem was only mounted by DIVE START, so on the surface `LOG LIST`
+/// answered `OK` with nothing in it and `/dive/<n>.csv` answered `no such dive`
+/// while the dive files sat intact on flash — an empty list and an unmounted
+/// log were indistinguishable from the handset and from the browser. Returns the
+/// readable dive count, or -1 when the log could not be mounted at all; `note`
+/// carries why, for the boot banner.
+int diveLogBoot(char* note, size_t cap);
+long unsigned diveLogUsedBytes();
+long unsigned diveLogTotalBytes();
+bool diveLogMountFormatted();
+
 } // namespace comms

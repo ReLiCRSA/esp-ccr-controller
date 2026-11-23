@@ -29,6 +29,11 @@ constexpr uint32_t DIVE_MAGIC = 0x56444252; // "RBDV" little-endian
 // and one wrong guess desynchronises every row after it. Records produced
 // by pack* are unchanged — the tag belongs to the file, not the codec.
 constexpr uint8_t DIVE_VERSION = 3;
+// The FIFO depth, in one place: the file store, the command parser's index
+// range and the web's /dive/<n>.csv routes all have to agree on it, and two
+// of them are host-compiled while the store is not, so the constant lives
+// here where both can see it.
+constexpr uint8_t MAX_DIVE_SLOTS = 10;
 constexpr uint8_t REC_SNAPSHOT = 'S';
 constexpr uint8_t REC_EVENT = 'E';
 constexpr uint8_t REC_META = 'M';
@@ -103,11 +108,6 @@ constexpr size_t HEADER_SIZE = 16;
 void packHeader(uint32_t startEpoch, uint8_t slot, uint8_t out[HEADER_SIZE]);
 bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch, uint8_t& slot);
 
-// ---- CSV export into caller buffer; returns chars written (0 = overflow) ----
-size_t toCsv(const DiveMeta& meta,
-             const Snapshot* snaps, size_t nSnaps,
-             const Event* events, size_t nEvents,
-             char* out, size_t outCap);
 
 // ---- CRC16-CCITT (used for record integrity on flash) ----
 uint16_t crc16(const uint8_t* data, size_t len);
@@ -136,5 +136,45 @@ struct ScanResult {
 
 ScanResult scanRecords(const uint8_t* img, size_t len,
                        void (*cb)(const RawRecord&, void*), void* ctx);
+
+// ---- CSV export rows: ONE canonical formatter --------------------------------
+// `LOG EXPORT <n>` on the handset and `GET /dive/<n>.csv` on the web are the
+// same rows, produced by the functions below and by nothing else. Until
+// 2026-11-23 there were two writers and they disagreed (14 vs 17 fields, alarms
+// hex vs decimal, ceiling m vs cm, battery mV vs V) — BENCH.md C2 step 4 asserts
+// the two agree, and the check was passing only because nothing compared them.
+//
+// Columns are APPEND-ONLY (docs/HANDSET_PROTOCOL.md 5): never renumber, reorder,
+// remove or re-unit an existing column. A v1 parser reading the first N fields
+// of a v2 row gets exactly what it got in v1; new information goes on the right.
+// `ROW_FORMAT_VERSION` rides on the `DIVE,` line so a reader can tell how many
+// columns to expect without counting.
+constexpr uint8_t ROW_FORMAT_VERSION = 2;
+
+size_t diveCsvLine(char* out, size_t cap, uint8_t slot, uint32_t startEpoch);
+size_t snapshotCsvLine(char* out, size_t cap, const Snapshot& s);
+size_t eventCsvLine(char* out, size_t cap, const Event& e);
+size_t metaCsvLine(char* out, size_t cap, const DiveMeta& m);
+
+// Streams the rows of a whole dive-file image (the bytes a diveN.bin holds)
+// through `sink`, header line first, in file order. This is what the handset and
+// the web actually send. Returns the scan, so the caller can report row counts
+// and whether the dive was complete.
+ScanResult emitCsvRows(const uint8_t* img, size_t len,
+                       void (*sink)(const char* line, void*), void* ctx);
+
+// The same walk, buffered into the caller's buffer. 0 on overflow.
+size_t toCsvImage(const uint8_t* img, size_t len, char* out, size_t outCap);
+
+// Builds a complete dive-file image in memory: 16 B header, tag+record pairs in
+// the order given (the store interleaves snapshots and events chronologically),
+// meta trailer last. The store writes the same bytes incrementally; this exists
+// so the reader's contract can be tested against a byte image directly.
+struct ImageRecord {
+    uint8_t tag;         // REC_SNAPSHOT / REC_EVENT
+    const void* record;  // packed Snapshot or Event, tag excluded
+};
+size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
+                 const ImageRecord* recs, size_t n, const DiveMeta* meta);
 
 } // namespace logfmt

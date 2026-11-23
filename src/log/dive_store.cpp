@@ -19,27 +19,32 @@ namespace {
 
 using logfmt::HEADER_SIZE;
 
-int slotFromFile(const String& name) {
-    // /dive3.bin -> 3
-    if (!name.startsWith("/dive")) return -1;
-    const int slash = name.indexOf('.', 4);
-    if (slash < 0) return -1;
-    const String num = name.substring(5, slash);
-    if (num.length() == 0 || num.length() > 2) return -1;
-    for (unsigned i = 0; i < num.length(); i++)
-        if (num[i] < '0' || num[i] > '9') return -1;
-    const int s = num.toInt();
-    return (s >= 1 && s <= DiveStore::kMaxDives) ? s : -1;
-}
-
 } // namespace
 
 bool DiveStore::begin() {
-    if (!mounted_) {
-        if (!LittleFS.begin(true)) return false;  // true: format once on fail
-        mounted_ = true;
-    }
+    if (mounted_) return true;
+    // Two attempts where there used to be one. `LittleFS.begin(true)` mounts,
+    // and if the mount fails it FORMATS — erasing every dive on the partition —
+    // and prints nothing at the default log level (the core's own "format()
+    // successful" line is a log_d). So until now a mount problem looked exactly
+    // like "the diver has no dives": the bench could not tell an empty log from
+    // an erased one. Mounting without formatting first leaves the history intact
+    // if the mount fails for a reason formatting would not fix, and the second
+    // attempt is remembered so the boot banner can say it out loud.
+    formatted_ = false;
+    if (LittleFS.begin(false)) { mounted_ = true; return true; }
+    formatted_ = true;
+    if (!LittleFS.begin(true)) return false;
+    mounted_ = true;
     return true;
+}
+
+uint32_t DiveStore::usedBytes() const {
+    return mounted_ ? (uint32_t)LittleFS.usedBytes() : 0u;
+}
+
+uint32_t DiveStore::totalBytes() const {
+    return mounted_ ? (uint32_t)LittleFS.totalBytes() : 0u;
 }
 
 void DiveStore::pathFor(int slot, char* out, size_t cap) {
@@ -47,25 +52,31 @@ void DiveStore::pathFor(int slot, char* out, size_t cap) {
 }
 
 int DiveStore::nextSlot() const {
+    // Which slots are taken, asked for BY NAME. The obvious implementation —
+    // open "/" and match the directory entries against `diveN.bin` — was what
+    // this used to do, and on this core the scan produced nothing that matched:
+    // every DIVE START therefore concluded the FIFO was empty and wrote slot 1
+    // again. Ten dives were requested, one was kept, and nothing anywhere looked
+    // wrong — `LOG LIST` always answered with the newest dive, which is exactly
+    // what a diver would expect from a working log until the third dive. Measured
+    // on the bench 2026-11-24: a boot reporting `1 dive`, a DIVE START/END cycle,
+    // and the boot after it reporting `1 dive` again.
+    //
+    // Ten stat()s cost microseconds and cannot be misread, so the FIFO no longer
+    // depends on how a directory iterator spells a name. Eviction still needs the
+    // start epoch, so an occupied slot is opened and its header read anyway: that
+    // is where "the oldest dive" comes from when the FIFO is full.
     int freeSlot = 0, oldest = 0;
     uint32_t oldestTime = 0xFFFFFFFFu;
-    bool occupied[DiveStore::kMaxDives + 1] = {};
-
-    File dir = LittleFS.open("/");
-    if (dir && dir.isDirectory()) {
-        for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
-            const int s = slotFromFile(String(e.name()));
-            if (s > 0) occupied[s] = true;
-            e.close();
-        }
-        dir.close();
-    }
     for (int s = 1; s <= DiveStore::kMaxDives; s++) {
-        if (!occupied[s]) { if (freeSlot == 0) freeSlot = s; continue; }
         char p[24];
         pathFor(s, p, sizeof(p));
+        if (!LittleFS.exists(p)) {
+            if (freeSlot == 0) freeSlot = s;
+            continue;
+        }
         File f = LittleFS.open(p, "r");
-        if (!f) continue;
+        if (!f) continue;   // present but unreadable: not a slot to reuse
         uint8_t head[HEADER_SIZE];
         uint32_t epoch = 0xFFFFFFFFu;
         if (f.read(head, sizeof(head)) == (int)sizeof(head)) {
@@ -142,6 +153,12 @@ int DiveStore::list(int* slotOut, uint32_t* mtimeOut, int max) const {
     for (int s = kMaxDives; s >= 1 && n < max; s--) {  // newest-written first
         char p[24];
         pathFor(s, p, sizeof(p));
+        // stat before opening: an open of a missing file is an error the Arduino
+        // VFS prints at E level, so probing ten FIFO slots by open used to put
+        // nine "dive9.bin does not exist" lines in every boot log. On a bench
+        // where the console is the instrument, that much noise hides the one
+        // line that matters.
+        if (!LittleFS.exists(p)) continue;
         File f = LittleFS.open(p, "r");
         if (!f) continue;
         uint8_t head[HEADER_SIZE];
@@ -158,48 +175,6 @@ int DiveStore::list(int* slotOut, uint32_t* mtimeOut, int max) const {
 }
 
 namespace {
-
-// CSV/scan context for exportCsv: one line buffer, one sink.
-struct CsvSink {
-    void (*sink)(const char*, void*);
-    void* ctx;
-    char line[200];
-};
-
-void emitCsv(const logfmt::RawRecord& r, void* vctx) {
-    CsvSink& o = *static_cast<CsvSink*>(vctx);
-    if (r.tag == logfmt::REC_SNAPSHOT) {
-        logfmt::Snapshot s;
-        if (!logfmt::unpackSnapshot(r.bytes, s)) return;   // re-checked, always true here
-        char dd[16], dv[16], dc0[16], dc1[16], dc2[16], dsp[16];
-        snprintf(o.line, sizeof(o.line),
-                 "S,%u,%s,%s,%s,%s,%s,%s,0x%04X,%u,%d,%d,%d,%u,%u\n",
-                 s.tSec,
-                 numfmt::fixedScaled(dd, sizeof(dd), s.depthCm, 2),
-                 numfmt::fixedScaled(dv, sizeof(dv), s.votedX1000, 3),
-                 numfmt::fixedScaled(dc0, sizeof(dc0), s.cellX1000[0], 3),
-                 numfmt::fixedScaled(dc1, sizeof(dc1), s.cellX1000[1], 3),
-                 numfmt::fixedScaled(dc2, sizeof(dc2), s.cellX1000[2], 3),
-                 numfmt::fixedScaled(dsp, sizeof(dsp), s.setpointX1000, 3),
-                 s.alarmBits,
-                 s.cnsPct, s.ceilingCm / 100, s.ndlMin, s.decoTotalMin, s.pulses,
-                 s.battX1000);
-    } else if (r.tag == logfmt::REC_EVENT) {
-        logfmt::Event e;
-        if (!logfmt::unpackEvent(r.bytes, e)) return;
-        snprintf(o.line, sizeof(o.line), "E,%u,%u,%u\n", e.tSec, (unsigned)e.id, e.value);
-    } else {
-        logfmt::DiveMeta m;
-        if (!logfmt::unpackMeta(r.bytes, m)) return;
-        char mn[16], mx[16];
-        snprintf(o.line, sizeof(o.line),
-                 "M,%u,%d,%s,%s,%u,%u,%u,%u\n", m.durationSec, m.maxDepthCm,
-                 numfmt::fixed(mn, sizeof(mn), m.minVotedX1000 / 1000.0, 1),
-                 numfmt::fixed(mx, sizeof(mx), m.maxVotedX1000 / 1000.0, 1),
-                 m.totalPulses, m.cnsPeakPct, m.snapshotCount, m.eventCount);
-    }
-    o.sink(o.line, o.ctx);
-}
 
 // Dive files are ~15 KB/hour by design; a whole file fits a one-shot heap
 // buffer with room to spare. Export runs only on request (handset/web at
@@ -231,18 +206,14 @@ int DiveStore::exportCsv(int slot, void (*sink)(const char*, void*), void* ctx) 
     size_t len = 0;
     if (!slurp(p, img, len)) return -1;
 
-    const logfmt::ScanResult sc = logfmt::scanRecords(img, len, nullptr, nullptr);
-    if (!sc.headerOk) { free(img); return -1; }
-
-    static char line[64];
-    snprintf(line, sizeof(line), "DIVE,%d,%u,%d\n", slot,
-             (unsigned)sc.startEpoch, logfmt::DIVE_VERSION);
-    sink(line, ctx);
-
-    CsvSink out{sink, ctx, {}};
-    logfmt::scanRecords(img, len, emitCsv, &out);
+    // One canonical row formatter for the whole project (see logfmt's CSV
+    // section): the handset's `LOG EXPORT n` and the web's `/dive/<n>.csv` are
+    // the same bytes out of the same code. They were two writers with two
+    // different shapes until 2026-11-23, and the bench check that claimed they
+    // matched had never compared them.
+    const logfmt::ScanResult sc = logfmt::emitCsvRows(img, len, sink, ctx);
     free(img);
-    return sc.snapshots + sc.events;
+    return sc.headerOk ? sc.snapshots + sc.events : -1;
 }
 
 int DiveStore::exportRaw(int slot, uint8_t* buf, size_t cap) const {

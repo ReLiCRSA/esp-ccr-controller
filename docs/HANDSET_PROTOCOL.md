@@ -223,7 +223,7 @@ a hard-coded table. Section 6 lists today's keys for reference.
 | Command | Answer |
 |---|---|
 | `LOG LIST` | `OK` then zero or more `L,<slot>,<epoch>` lines |
-| `LOG EXPORT n` (n = 0..9) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<version>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5.3) |
+| `LOG EXPORT n` (n = 1..10) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<codec_version>,<row_format>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5) |
 
 ### SAFE mode (what a handset can and cannot do)
 
@@ -374,15 +374,48 @@ K,<key>,<T>,<min>,<max>,<flags>,<default>   settings schema; T ∈ F I U B S (ST
 
 ## 5. Dive export rows (`LOG EXPORT n`)
 
+One formatter produces these rows in the firmware (`logfmt::snapshotCsvLine` and
+friends in `src/log/divelog.{h,cpp}`), and `GET /dive/<n>.csv` on the web sends
+exactly the same bytes. They used to be two writers with two shapes;
+`tools/web_probe.py` compares them on the bench now.
+
 ```
-DIVE,<slot>,<start_epoch>,<format_version>
-S,<t_s>,<depth_m>,<voted>,<c0>,<c1>,<c2>,<sp>,0x<alarm16>,<cns>,<ceiling_m>,<ndl>,<deco_min>,<pulses>,<batt>
+DIVE,<slot>,<start_epoch>,<codec_version>,<row_format>
+S,<t_s>,<depth_m>,<voted>,<c0>,<c1>,<c2>,<sp>,0x<alarm16>,<cns>,<ceiling_m>,<ndl>,<deco_min>,<pulses>,<batt>,<mode>,<temp_c>,<flags>,<ceiling_cm>
 E,<t_s>,<id>,<value>
-M,<duration_s>,<max_depth_m>,<min_ppo2>,<max_ppo2>,<pulses>,<cns_peak_pct>,<snapshots>,<events>
+M,<duration_s>,<max_depth_cm>,<min_ppo2>,<max_ppo2>,<pulses>,<cns_peak_pct>,<snapshots>,<events>,<gf_low>,<gf_high>,<sp1>,<sp2>,<sp3>,<sp4>
 ```
+
+The `S,` and `M,` rows carry the `row_format` version in the `DIVE,` line, and
+columns are **append-only**: field 1 is always the tag, fields 2-15 of an `S,`
+row are always the v1 set in the v1 order and units, and new information only
+ever arrives on the right. A parser written against v1 reads the first fifteen
+fields of a v2 row and gets what it got before.
+
+| version | `S,` fields | `M,` fields | added |
+|---|---|---|---|
+| v1 (2026-11-22) | 14 | 8 | the original contract |
+| v2 (2026-11-23) | 19 | 15 | `mode`, `temp_c`, `flags`, `ceiling_cm`; `gf_low`, `gf_high`, `sp1`…`sp4` |
+
+Two corrections worth knowing, both of which were documentation errors rather
+than wire errors:
+
+* `max_depth_cm` — the field was always named `max_depth_m` in this document,
+  but the firmware has always put **centimetres** there and the web page divides
+  it by 100. The bytes never changed; the name was wrong.
+* `ceiling_m` stays integer metres (a v1 parser reads it as an integer), which is
+  why the exact value is the appended `ceiling_cm` instead of a reformat.
+* `batt` is millivolts (`11840` = 11.84 V), not volts.
+
 Snapshots land on a 30 s grid plus event-driven ones. Handsets can ignore the
 export rows entirely (the web page renders them); the format is documented so
 a handset *can* offer a dump-to-host feature.
+
+**`E,` rows are ambiguous inside an export, on purpose and by shape.** An
+exported event row is `E,<t_s>,<id>,<value>` — byte-identical to the live event
+the controller pushes unprompted (§2). A client that needs the exported event
+list reads the file (`/dive/<n>.csv`), not the UART stream. `tools/web_probe.py`
+counts exported `E,` rows but does not compare them for this reason.
 
 ## 6. Settings keys (today; the runtime truth is `GET SCHEMA`)
 
@@ -444,10 +477,11 @@ not.
 
 * `SET` values are truncated to 23 characters by the command parser, even
   though `AP_PASS` allows 31 — keep passphrases ≤23 for now.
-* `LOG EXPORT n`: `n` is the slot number itself. The parser accepts 0..9 and
-  slots run 1..10, so `LOG EXPORT 0` answers `ERR no such dive` and slot 10
-  is currently unreachable from the protocol (it remains visible in
-  `LOG LIST` and on the web dives page).
+* `LOG EXPORT n`: `n` is the slot number itself, 0..10. `LOG EXPORT 0` answers
+  `ERR no such dive` (deliberate: that is what v1 did). The upper bound is the
+  firmware's own `logfmt::MAX_DIVE_SLOTS`, not a number copied into the parser:
+  until 2026-11-23 the parser had a hard-coded 0..9, so slot 10 existed, showed up
+  in `LOG LIST` and downloaded over the web, but a handset could not export it.
 * `E,` ring is 32 deep: a burst can drop events (the controller counts drops);
   a handset should not treat `E,` as a reliable archive — the dive file is.
 * **Uplink overflow does not resynchronise to the next newline.** At 65

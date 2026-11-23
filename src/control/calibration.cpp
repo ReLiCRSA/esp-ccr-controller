@@ -45,6 +45,97 @@ void Solver::solveO2(const Config& cfg,
 // ---------------------------------------------------------------------------
 // CAL O2 enrichment sequencer
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// CAL AIR: the disciplined averaging window (see header for the rules).
+// ---------------------------------------------------------------------------
+void AirCal::resetWindow(uint32_t nowMs) {
+    n_ = 0;
+    for (int i = 0; i < 3; i++) sum_[i] = lo_[i] = hi_[i] = 0.0f;
+    nextSampleMs_ = nowMs;  // the next update() may sample immediately
+}
+
+void AirCal::start(uint32_t nowMs) {
+    st_ = St::RUN;
+    deadlineMs_ = nowMs + cfg_.timeoutMs;
+    resetWindow(nowMs);
+}
+
+AirCalOutput AirCal::update(const AirCalInput& in) {
+    AirCalOutput o;
+    if (st_ != St::RUN) return o;
+    o.running = true;
+
+    if (in.diving) {
+        st_ = St::IDLE;
+        o.running = false;
+        o.failed = true;
+        o.why = "diving: CAL AIR is a pre-dive act";
+        return o;
+    }
+    if (in.nowMs >= deadlineMs_) {
+        st_ = St::IDLE;
+        o.running = false;
+        o.failed = true;
+        o.why = "timeout: cells never settled in the spread band";
+        return o;
+    }
+    if (in.injecting) {
+        // A pulse enriches the loop: everything sampled around it is not air.
+        resetWindow(in.nowMs);
+        o.samples = 0;
+        return o;
+    }
+    if (!in.fresh || in.nowMs < nextSampleMs_) {
+        o.samples = n_;
+        return o;
+    }
+    nextSampleMs_ = in.nowMs + cfg_.samplePeriodMs;
+
+    if (n_ == 0) {
+        for (int i = 0; i < 3; i++) sum_[i] = lo_[i] = hi_[i] = in.cellsRaw[i];
+    } else {
+        for (int i = 0; i < 3; i++) {
+            sum_[i] += in.cellsRaw[i];
+            if (in.cellsRaw[i] < lo_[i]) lo_[i] = in.cellsRaw[i];
+            if (in.cellsRaw[i] > hi_[i]) hi_[i] = in.cellsRaw[i];
+        }
+    }
+    n_++;
+
+    float worst = 0.0f;
+    bool any = false, unstable = false;
+    for (int i = 0; i < 3; i++) {
+        if (!(in.presentMask & (1u << i))) continue;  // absent cell: its raw is someone else's
+        any = true;
+        const float spread = hi_[i] - lo_[i];
+        if (spread > worst) worst = spread;
+        if (spread > cfg_.spreadMax) unstable = true;
+    }
+    if (!any) {  // mask empty: programming error, refuse rather than average nothing
+        st_ = St::IDLE;
+        o.running = false;
+        o.failed = true;
+        o.why = "no cells present";
+        return o;
+    }
+    if (unstable) {  // give the cell a chance to settle; count restarts
+        resetWindow(in.nowMs);
+        o.samples = 0;
+        return o;
+    }
+
+    o.samples = n_;
+    if (n_ >= cfg_.samples) {
+        st_ = St::IDLE;
+        o.running = false;
+        o.done = true;
+        o.spreadWorst = worst;
+        for (int i = 0; i < 3; i++) o.rawAvg[i] = sum_[i] / static_cast<float>(n_);
+    }
+    return o;
+}
+
+// ---------------------------------------------------------------------------
 bool O2Sequencer::arm() {
     if (!airReady_ || state_ == O2State::ENRICHING || state_ == O2State::SETTLING)
         return false;

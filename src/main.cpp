@@ -87,6 +87,13 @@ static volatile bool  g_controlRunning = false;
 // air check) is what makes those numbers trustworthy.
 static cal::Cal g_cellCal[3];
 
+// CAL AIR sampler (cal::AirCal): the command path only raises a request
+// flag; the window runs here, in ControlTask, which owns the raw snapshot,
+// the dive state and the solenoid.
+static cal::AirCal g_airCal{cal::AirCal::Cfg{
+    CAL_AIR_PERIOD_MS, static_cast<uint8_t>(CAL_AIR_SAMPLES),
+    CAL_AIR_SPREAD_MAX, CAL_AIR_TIMEOUT_MS}};
+
 #if PRESSURE_ENABLE
 // Depth lives on its own hardware I2C port (Wire1, pins.h): a wet-harness
 // fault or a latched depth chip can never wedge the bus feeding ppO2, and
@@ -275,6 +282,44 @@ static void controlTask(void*) {
 
         const ctrl::State st = g_loop->cycle(sd, now);
         digitalWrite(PIN_SOLENOID, st.solenoid ? HIGH : LOW);
+
+        // CAL AIR: sample the raw cells at air, commit the air point.
+        // Refused before warmup: an un-polarised cell's "average" is fiction.
+        if (g_calAirRequest) {
+            g_calAirRequest = false;
+            if (now < PREDIVE_WARMUP_MS) {
+                Serial.printf("cal air: REFUSED - cells still warming up (%u s left)\n",
+                              (unsigned)((PREDIVE_WARMUP_MS - now) / 1000u));
+            } else {
+                g_airCal.start(now);
+                Serial.println("cal air: sampling (1 Hz x 12, spread-limited)");
+            }
+        }
+        if (g_airCal.running()) {
+            cal::AirCalInput ai;
+            ai.diving = st.diveActive;
+            ai.injecting = st.solenoid;
+            ai.fresh = sd.cellsFresh;
+            ai.presentMask = g_ctrlCfg.presentMask;
+            for (int i = 0; i < 3; i++)
+                ai.cellsRaw[i] = static_cast<float>(g_ads.raw(i));
+            ai.nowMs = now;
+            const cal::AirCalOutput a = g_airCal.update(ai);
+            if (a.done) {
+                for (int i = 0; i < 3; i++)
+                    if (g_ctrlCfg.presentMask & (1u << i)) {
+                        g_cellCal[i].rawAir = a.rawAvg[i];
+                        g_cellCal[i].airBar = CAL_AIR_REF_BAR;
+                        g_cellCal[i].hasAir = true;  // slope stays nominal until CAL O2
+                    }
+                Serial.printf("cal air: OK  raw cell0=%.0f cell1=%.0f cell2=%.0f"
+                              "  worst spread %.0f  (%u samples)\n",
+                              a.rawAvg[0], a.rawAvg[1], a.rawAvg[2],
+                              a.spreadWorst, (unsigned)a.samples);
+            } else if (a.failed) {
+                Serial.printf("cal air: FAILED (%s)\n", a.why);
+            }
+        }
 
         // History shape, not just the reading: a cell drifting or a loop
         // going foul shows in the distribution well before an alarm trips.

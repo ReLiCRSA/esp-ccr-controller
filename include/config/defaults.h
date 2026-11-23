@@ -55,6 +55,16 @@
 #define CAL_AIR_REF_BAR             0.21f
 #define CELL_DEFAULT_SLOPE          (CAL_AIR_REF_BAR / CELL_AIR_RAW_NOMINAL)
 
+// --- CAL AIR sampling window (cal::AirCal) ---------------------------------
+// 1 Hz x 12 raw samples; every PRESENT cell must hold within CAL_AIR_SPREAD_MAX
+// ADC counts across the window, or the count restarts. A cell drifting more
+// than that in 12 s is warm-up drift or a bad connection — averaging it
+// would commit a lie as the air point.
+#define CAL_AIR_SAMPLES             12
+#define CAL_AIR_PERIOD_MS           1000
+#define CAL_AIR_SPREAD_MAX          40.0f
+#define CAL_AIR_TIMEOUT_MS          90000
+
 // --- Control task -------------------------------------------------------------
 // One control cycle every 100 ms. The cycle is what feeds the supervisor
 // heartbeat, so a stalled controller reboots the MCU into SAFE.

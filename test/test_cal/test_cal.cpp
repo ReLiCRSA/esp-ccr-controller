@@ -1,5 +1,7 @@
 #include <unity.h>
 
+#include <cstring>
+
 #include "control/calibration.h"
 
 using cal::Cal;
@@ -172,6 +174,147 @@ void test_pulse_test_flags_dead_cell() {
     TEST_ASSERT_EQUAL_UINT8(0b011, o.passMask);
 }
 
+// ---------------------------------------------------------------------------
+// AirCal — the CAL AIR averaging window. Raw scale here matches the bench
+// (air ~1490 counts). The rules under test: only fresh data counts, an
+// injection pulse discards the window, a drifting cell never completes,
+// absent cells are ignored, and diving is refused outright.
+// ---------------------------------------------------------------------------
+static cal::AirCal::Cfg airCfg() {
+    cal::AirCal::Cfg c;  // header defaults: 1 s period, 12 samples, 40 counts
+    return c;
+}
+
+static void feed(cal::AirCal& ac, uint32_t& t, uint32_t untilMs,
+                 const float raw[3], bool injecting = false, bool diving = false) {
+    for (; t < untilMs; t += 100) {
+        cal::AirCalInput in;
+        in.nowMs = t;
+        in.fresh = true;
+        in.injecting = injecting;
+        in.diving = diving;
+        in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        ac.update(in);
+    }
+}
+
+void test_aircal_stable_window_completes_with_means() {
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    const float base[3] = {1490.0f, 1502.0f, 1487.0f};
+    float raw[3];
+    uint32_t t = 0;
+    cal::AirCalOutput done{};
+    // jitter each cell +-5 counts between samples; 12 samples at 1 Hz take
+    // ~11 s, so the feed loop must outlast them.
+    for (int i = 0; i < 200 && !done.done; i++) {
+        for (int c = 0; c < 3; c++)
+            raw[c] = base[c] + ((i & 1) ? 5.0f : -5.0f);
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        done = ac.update(in);
+        t += 100;
+    }
+    TEST_ASSERT_TRUE(done.done);
+    TEST_ASSERT_EQUAL_UINT8(12, done.samples);
+    TEST_ASSERT_TRUE(done.spreadWorst <= 10.0f);
+    // 6 highs then 6 lows alternate: the mean sits at base +/- 0 for an
+    // even window; the exact per-cell means must sit near base regardless.
+    for (int c = 0; c < 3; c++)
+        TEST_ASSERT_FLOAT_WITHIN(6.0f, base[c], done.rawAvg[c]);
+    // terminal is one-shot: a further update says nothing
+    cal::AirCalInput in{};
+    in.nowMs = t; in.fresh = true;
+    const cal::AirCalOutput after = ac.update(in);
+    TEST_ASSERT_FALSE(after.done || after.failed || after.running);
+}
+
+void test_aircal_stale_data_never_counts() {
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    const float raw[3] = {1500.0f, 1500.0f, 1500.0f};
+    uint32_t t = 0;
+    // 30 s of FROZEN, stale readings: the window must not advance at all
+    for (; t < 30000; t += 100) {
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = false; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        const cal::AirCalOutput o = ac.update(in);
+        TEST_ASSERT_EQUAL_UINT8(0, o.samples);
+        TEST_ASSERT_FALSE(o.done);
+    }
+    TEST_ASSERT_TRUE(ac.running());
+}
+
+void test_aircal_injection_discards_the_window() {
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    const float air[3] = {1500.0f, 1510.0f, 1495.0f};
+    const float enriched[3] = {2200.0f, 2210.0f, 2195.0f};  // mid-pulse: not air
+    uint32_t t = 0;
+    feed(ac, t, 6000, air);           // 6 clean samples banked
+    feed(ac, t, 6400, enriched, true);  // solenoid fires: window must reset
+    cal::AirCalOutput done{};
+    for (; t < 30000 && !done.done; t += 100) {
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, air, sizeof(air));
+        done = ac.update(in);
+    }
+    TEST_ASSERT_TRUE(done.done);
+    // If any enriched sample had leaked in, the mean would sit ~350 high.
+    for (int c = 0; c < 3; c++) TEST_ASSERT_FLOAT_WITHIN(1.0f, air[c], done.rawAvg[c]);
+}
+
+void test_aircal_drifting_cell_never_completes() {
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    // one cell ramps: spread crosses 40 counts every window, forever
+    uint32_t t = 0;
+    bool failed = false;
+    cal::AirCalOutput last{};
+    for (uint32_t i = 0; i < 1100 && !failed; i++, t += 100) {
+        float raw[3] = {1500.0f + static_cast<float>(i) * 2.0f, 1500.0f, 1500.0f};
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        last = ac.update(in);
+        failed = last.failed;
+    }
+    TEST_ASSERT_TRUE(failed);
+    TEST_ASSERT_NOT_NULL(last.why);
+    TEST_ASSERT_FALSE(ac.running());
+}
+
+void test_aircal_diving_is_refused_and_absent_cells_ignored() {
+    cal::AirCal divingAc{airCfg()};
+    divingAc.start(0);
+    const float raw[3] = {1500.0f, 1510.0f, 9999.0f};  // cell 2: garbage (absent)
+    cal::AirCalInput in;
+    in.nowMs = 100; in.fresh = true; in.diving = true; in.presentMask = 0b011;
+    std::memcpy(in.cellsRaw, raw, sizeof(raw));
+    const cal::AirCalOutput o = divingAc.update(in);
+    TEST_ASSERT_TRUE(o.failed);
+    TEST_ASSERT_FALSE(divingAc.running());
+
+    // same raws, two present cells: wild garbage on the absent channel
+    // must not pollute the spread check or the mean.
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    cal::AirCalOutput done{};
+    for (uint32_t tt = 0; tt < 30000 && !done.done; tt += 100) {
+        cal::AirCalInput i2;
+        i2.nowMs = tt; i2.fresh = true; i2.presentMask = 0b011;
+        std::memcpy(i2.cellsRaw, raw, sizeof(raw));
+        done = ac.update(i2);
+    }
+    TEST_ASSERT_TRUE(done.done);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1500.0f, done.rawAvg[0]);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1510.0f, done.rawAvg[1]);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_solver_accepts_good_pair);
@@ -179,5 +322,10 @@ int main() {
     RUN_TEST(test_o2_seq_needs_air_then_two_step_then_solves);
     RUN_TEST(test_o2_seq_ceiling_abort_and_dive_interlock);
     RUN_TEST(test_pulse_test_flags_dead_cell);
+    RUN_TEST(test_aircal_stable_window_completes_with_means);
+    RUN_TEST(test_aircal_stale_data_never_counts);
+    RUN_TEST(test_aircal_injection_discards_the_window);
+    RUN_TEST(test_aircal_drifting_cell_never_completes);
+    RUN_TEST(test_aircal_diving_is_refused_and_absent_cells_ignored);
     return UNITY_END();
 }

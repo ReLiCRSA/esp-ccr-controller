@@ -49,8 +49,6 @@ struct Cal {
 // ---- per-procedure results -------------------------------------------------
 enum CellVerdict : uint8_t { CV_OK = 0, CV_SLOPE_OUT, CV_NO_RISE, CV_NO_AIR };
 
-struct AirResult { bool ok; float rawAvg[3]; };
-
 struct O2Result {
     bool aborted = false;          // ceiling breach or timeout
     const char* abortReason = nullptr;
@@ -65,6 +63,71 @@ struct Solver {
                         const float rawO2[3],
                         const Cal prev[3], float defaultSlope,
                         Cal out[3], O2Result& res);
+};
+
+// ---- CAL AIR sampler --------------------------------------------------------
+// The averaging window over raw ADC readings at the air point. ControlTask
+// owns the raw snapshot, the dive state and the solenoid, and it commits the
+// result into cal::Cal — this class is only the disciplined window:
+//
+//   * refuses to run while diving (a pre-dive act, decided where it runs);
+//   * an injection pulse discards the window: ppO2 mid-pulse is not air;
+//   * stale ADC data does not advance the window (never average a lie);
+//   * every PRESENT cell must hold within spreadMax raw counts across the
+//     window — a cell drifting more than that is warm-up drift or a bad
+//     connection, and an average of it would lie. Absent cells are ignored
+//     entirely: their raw register holds another channel's last value.
+//
+// One sample per samplePeriodMs, `samples` of them; a spread violation
+// restarts the count (the cell gets a chance to settle), the wall-clock
+// timeout is the outer patience.
+struct AirCalInput {
+    bool diving = false;
+    bool injecting = false;       // solenoid actually fired this tick
+    bool fresh = false;           // ADC channels fresh (not stale)
+    uint8_t presentMask = 0x7;
+    float cellsRaw[3] = {0, 0, 0};
+    uint32_t nowMs = 0;
+};
+
+struct AirCalOutput {
+    bool running = false;
+    bool done = false;            // set in the one call that completes
+    bool failed = false;          // set in the one call that gives up
+    float rawAvg[3] = {0, 0, 0};  // valid when done
+    float spreadWorst = 0.0f;     // worst per-cell spread, raw counts
+    uint8_t samples = 0;          // progress
+    const char* why = nullptr;    // failure reason (English, log-bound)
+};
+
+class AirCal {
+public:
+    struct Cfg {
+        uint32_t samplePeriodMs = 1000;
+        uint8_t samples = 12;
+        float spreadMax = 40.0f;       // raw counts per cell across the window
+        uint32_t timeoutMs = 90000;    // patience before declaring failure
+    };
+    explicit AirCal(const Cfg& cfg) : cfg_(cfg) {}
+    void setConfig(const Cfg& cfg) { cfg_ = cfg; }
+
+    void start(uint32_t nowMs);
+    void abort() { st_ = St::IDLE; }
+    bool running() const { return st_ == St::RUN; }
+
+    // Call every control tick while running (cheap when idle). done/failed
+    // arrive exactly once, in the output of the tick that decides them.
+    AirCalOutput update(const AirCalInput& in);
+
+private:
+    enum class St : uint8_t { IDLE, RUN };
+    void resetWindow(uint32_t nowMs);
+
+    Cfg cfg_;
+    St st_ = St::IDLE;
+    float sum_[3] = {0, 0, 0}, lo_[3] = {0, 0, 0}, hi_[3] = {0, 0, 0};
+    uint8_t n_ = 0;
+    uint32_t nextSampleMs_ = 0, deadlineMs_ = 0;
 };
 
 // ---- CAL O2 enrichment state machine ----------------------------------------

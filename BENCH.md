@@ -162,6 +162,13 @@ Until the sensor is fitted the controller behaves correctly with no depth —
 1. `CHECK` → `PRE,` steps pass, `AUTO` unlocks (a cold boot refuses it).
 2. `TEST CELLS` on the jar → masks `007` with three live cells.
 3. `CAL AIR` in air; `CAL O2` two-step on the bench jar at `CAL_O2_FI`.
+   *Done 2026-11-23, firmware `m2-depth-detect`+cal air:* first bench CAL
+   AIR — the command had been acknowledged by the router but nothing in the
+   firmware consumed it; the sampler (`cal::AirCal`, 1 Hz × 12, spread-limited)
+   closed the gap. Result recorded: raw cell0=1503 cell1=1506 cell2=1511
+   counts, worst spread 12 (band 40), vote then 0.210–0.212 = true air.
+   Refused before warmup (120 s); the air point is volatile by design —
+   CAL AIR belongs to every dive session, and CAL O2 (slope) comes later.
 4. Descend the jar: SP bands cross at the right depths (±0.2 m),
    CellProof arms >`CELLPROOF_DEPTH` and passes with honest cells.
 5. Fault drills the sim already proves the firmware should survive:

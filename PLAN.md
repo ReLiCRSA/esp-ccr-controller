@@ -321,11 +321,10 @@ older forks' download URLs are dead):
   literal for `pio run -e esp32 -t uploadfs` (one source of truth). Built-in
   page: status, checklist, settings (ranges from `GET SCHEMA`), dives
   (list → inline depth/ppO₂ chart → CSV), console. 23 KB, no CDN, no framework.
-   Two caveats found on the bench 2026-11-23, both in section 16: the LittleFS
-   copy can be an **older generation than the firmware** (it wins, so a fix can
-   be invisible), and `uploadfs` writes the partition the dive logs share, so it
-   erases dive history. `web_probe.py` compares the served bytes to
-   `data/index.html` to catch the first.
+   One caveat found on the bench 2026-11-23, in section 16: `uploadfs` writes
+   the partition the dive logs share, so it erases dive history.
+   `web_probe.py` compares the served bytes to `data/index.html` so a page
+   install that did not land cannot pass unnoticed.
   - **Cell histograms**: `ctrl::cellhist` (`src/control/cellhist.{h,cpp}`) —
     rolling 10-minute horizon per fitted cell (10 windows × 60 s ring, 38
     bins of 0.05 bar, fixed static, no heap), fed by ControlTask once per
@@ -1090,23 +1089,24 @@ Nothing below is flashed or bench-tested until the soak ends (~09:45 on
   LittleFS** — so `pio run -e esp32 -t uploadfs` had *never* installed the web
   page. The image went to the same partition (1 441 792 bytes at 0x290000) in a
   format nothing reads, `LittleFS.begin(true)` carried on with whatever was
-  already there, and the board served an older generation of the UI while the
-  current one sat unused in app flash. Set explicitly in `platformio.ini`, with
-  the reason written down. The general shape: a build-system default that has to
+  already in the partition, and whatever older copy the bench happened to be
+  holding is what got served. Set explicitly in `platformio.ini`, with the
+  reason written down. The general shape: a build-system default that has to
   agree with a runtime call in another file is a latent defect with no compile
   error and no host test — only fetching the URL compares them. `web_probe.py`
   now asserts **the served bytes equal `data/index.html`**, the only end-to-end
   check over `web_page.h` → `sync_webdata.py` → `data/` → the router's
   LittleFS-or-flash choice.
-- **A LittleFS copy can outlive the firmware that generated it.** `serveIndex()`
-  prefers `LittleFS.exists("/index.html")`, so a stale install silently shadows a
-  fix — the "I fixed it but nothing changed" report, from the board's side. Open
-  question, recorded not decided: whether the preference should flip, or whether
-  the page should carry a build marker the bench compares. The byte-exact check
-  is the mitigation for now. Related loose end: `web/` (the Nov-22 multi-page
-  generation) is still tracked and its asset names match nothing in the router
-  (`/style.css` is registered, the repo has never had that file; `/app.css` and
-  the four sub-pages have no routes at all).
+- **`web/` is a superseded page generation whose assets match nothing in the
+  router** — housekeeping, not a defect. `/style.css` is registered and the repo has
+  never had that file; `/app.css` and the four sub-pages (`checklist`, `dives`,
+  `histogram`, `settings`) have no routes at all. The live page is the single
+  file in `src/comms/web_page.h`, extracted to `data/index.html`. Either delete
+  `web/` or route it; today it is only a trap for the next reader.
+  (Recorded and closed 2026-11-23: the worry that a LittleFS install could
+  shadow a firmware fix was **an artifact of the mismatched installs on this
+  bench**, not evidence about the design — owner decision, do not carry it until it
+  is seen again.)
 - **The web page and the dive logs share one LittleFS partition**, so `uploadfs`
   deletes dive history. Observed rather than inferred: slot 1 held a 338-byte
   dive before the first real install; after it, slot 1 was one of that session's

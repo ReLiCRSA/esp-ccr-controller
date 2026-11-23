@@ -127,7 +127,7 @@ the firmware for the operator's network.
 
 | Phase | What it asserts, and why it matters |
 |---|---|
-| HTTP | `/` serves and is **byte-identical to `data/index.html`**. This is the check that found the stale-page defect below. `/favicon.ico` is 204, unknown paths 302 → `/` (that redirect *is* the captive portal), `/app.js` 404 because the page is one self-contained file |
+| HTTP | `/` serves and is **byte-identical to `data/index.html`**. This is the check that found the page had never actually been installed (C2-f below). `/favicon.ico` is 204, unknown paths 302 → `/` (that redirect *is* the captive portal), `/app.js` 404 because the page is one self-contained file |
 | Page | references nothing external (`page links: []`). The AP has no uplink, ever, so any CDN or cross-site reference is a dead page on the day it matters |
 | DNS | any name at all resolves to the AP IP — the other half of the captive portal (C2-e above: without it a phone resolves nothing and "the page does not load") |
 | WebSocket | handshake verified against RFC 6455 (`Sec-WebSocket-Accept` recomputed locally, no library: the point is to verify the server, so a dependency would be verifying itself); the `#boot <uptimeMs> <freeHeap>` hello on connect; then every command's answer must end with a `#<n>` marker whose **n equals the answer's line count** — if it does not, the browser renders half a table |
@@ -377,16 +377,16 @@ up a defect that no amount of flashing or code reading would have shown:
   had been calling that step "optional" the whole time. Fixed in `platformio.ini`
   (`board_build.filesystem = littlefs`); the build log now says
   `littlefs.bin`, not `spiffs.bin`.
-* **The consequence of "LittleFS first" is a stale page outliving a firmware
-  fix.** `serveIndex()` prefers `LittleFS.exists("/index.html")`, so whatever
-  older generation is in flash wins. The board was serving a 4 219-byte
-  `index.html` plus a 9 114-byte `/app.js` that speak JSON and `/api/status` —
-  an API this firmware has never implemented — from the Nov-22 multi-page
-  layout, while the current 25 445-byte single-file page sat in app flash
-  (`src/comms/web_page.h`) and in the repo, unused. The routes did not match any
-  layout either: `/style.css` is registered and the repo has never had that file,
-  `/app.css` (which `web/index.html` asks for) has no route, and `checklist /
-  dives / histogram / settings` have none.
+* What was in the partition at the time — a 4 219-byte `index.html` plus a
+  9 114-byte `/app.js` that speak JSON and `/api/status`, an API this firmware
+  has never implemented — was **leftover from the mismatched installs, i.e. an
+  artifact of testing, not a design defect**: owner decision 2026-11-23, drop the
+  "LittleFS could shadow a firmware fix" worry unless it shows up again. The
+  `web_probe.py` byte-exact check stays, because that is what noticed it. Real
+  housekeeping that came out of the same look: `web/` is a superseded page
+  generation whose assets match nothing in the router (`/style.css` is
+  registered and the repo never had that file; `/app.css` and the four
+  sub-pages have no routes).
 * **Page and dive logs share one partition.** `uploadfs` writes that partition's
   whole image, so it deletes dive history. Observed, not just inferred: a
   338-byte dive sat in slot 1 before the first real install; after it,
@@ -397,10 +397,10 @@ up a defect that no amount of flashing or code reading would have shown:
   assertion that compares the three artifacts (`web_page.h` → `sync_webdata.py`
   → `data/` → what the router picks) end to end.
 
-Not yet decided (open, cosmetic today): what to do with the superseded `web/`
-directory, still tracked from the Nov-22 generation, and whether `serveIndex()`
-should prefer the built-in page over a LittleFS copy that may predate the
-firmware.
+So: `uploadfs` matters only when the page changes, and when it runs it must say
+`littlefs.bin` in the build log. If a served page ever again disagrees with
+`data/index.html` after a correct install, reopen the LittleFS-preference
+question then; there is no evidence for it today.
 
 ## C3-a — depth sensor: LPS28DFW on its own bus (decided 2026-11-23)
 

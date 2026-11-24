@@ -154,6 +154,35 @@ bool diveLogSeqRange(uint32_t& lo, uint32_t& hi);
 /// readable dive count, or -1 when the log could not be mounted at all; `note`
 /// carries why, for the boot banner.
 int diveLogBoot(char* note, size_t cap);
+
+// ---- surface log: calibration and pre-dive records (PLAN 16) ---------------
+// A calibration verdict and a pre-dive result are facts about the machine, not
+// about a dive, so they cannot live in a dive file: the dive that a failed
+// pre-dive check prevents never gets a file to hold the row. They get their own
+// record stream (/surface.bin), read over the web and nowhere else — no handset
+// commands exist for it, which is a stated cost of not re-publishing `LOG LIST`
+// with a second class of record welded onto it (docs/HANDSET_PROTOCOL.md §8).
+
+/// Appends one record. The caller fills the payload (id, value, raw counts);
+/// the epoch, the clock-carried flag and the sequence are filled here, because
+/// only this file knows the wall clock's state and only the log itself knows the
+/// sequence — the same division the dive header uses, for the same reason: a
+/// record dated from a caller's guess is worse than one dated 0 and exported as
+/// `clock-unset`. `r.seq` comes back filled, so the console line and the
+/// exported row cannot disagree about which record they describe.
+bool surfaceLogAppend(logfmt::SurfaceRecord& r);
+
+/// What the boot banner prints: readable record count, plus the sequence range
+/// (0/0 when empty). Call after diveLogBoot(), which is what mounts LittleFS.
+/// A surface log that cannot be read is reported by the banner's count being
+/// absent, never by a silence that looks like an empty log.
+int surfaceLogBoot(uint32_t& seqLo, uint32_t& seqHi);
+
+/// Streams the whole log to a line sink (the web's /surface.csv). Returns records
+/// emitted, 0 for an empty log. Takes the log mutex: a compaction must not move
+/// records between the pass that writes the identity row and the pass that
+/// streams them, or the header and the rows would describe different files.
+int surfaceLogExportCsv(void (*sink)(const char*, void*), void* ctx);
 // ---- wall clock: the dive log's timestamp ---------------------------------
 // No RTC chip, no NTP through an AP with no uplink: the time comes from a client
 // at the surface (`TIME SET <epoch>`, or the built-in page posting the phone's

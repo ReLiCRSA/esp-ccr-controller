@@ -122,6 +122,56 @@ def mark(ok):
 EXTERNAL = re.compile(r"""https?://|//cdn|integrity\s*=""")
 
 
+def grade_surface_body(body):
+    """The exported surface log, graded against itself.
+
+    Three things have to hold, and each is a lie the export could tell:
+      * the identity row's count equals the rows delivered (a truncated file
+        presented as complete);
+      * the sequence range actually spans the rows (a header describing a
+        different file than the rows);
+      * every row's id matches the name in its own row, and an id this build does
+        not name renders as `id<n>` rather than being dropped (an appended id
+        silently disappearing is how an append-only log stops being one).
+    """
+    head, rows = None, []
+    for line in body.decode(errors="replace").splitlines():
+        f = line.split(",")
+        if f[0] == "SURFACE" and len(f) > 4:
+            head = f
+        elif f[0] == "R":
+            rows.append(f)
+    checks = []
+    checks.append(("surface.csv has an identity row before any record", head is not None,
+                   body.decode(errors="replace").splitlines()[:1] and
+                   body.decode(errors="replace").splitlines()[0] or "empty body"))
+    if head is None:
+        return checks
+    n, lo, hi = int(head[2]), int(head[3]), int(head[4])
+    checks.append(("surface.csv identity count matches the rows delivered", n == len(rows),
+                   f"SURFACE says {n}, {len(rows)} rows arrived"))
+    checks.append(("surface.csv rows all carry the 13 documented columns",
+                   all(len(r) == 13 for r in rows),
+                   next((str(r) for r in rows if len(r) != 13), "all rows are 13 columns")))
+    if rows:
+        checks.append(("surface.csv seq range spans the rows",
+                       lo <= int(rows[0][1]) and hi >= int(rows[-1][1]),
+                       f"header {lo}..{hi}, rows {rows[0][1]}..{rows[-1][1]}"))
+        # id and name must agree, in both directions.
+        KNOWN = {"7": "cal_air", "13": "pre_dive_pass", "16": "pre_dive_fail"}
+        mismatch = [r for r in rows
+                    if KNOWN.get(r[4]) is not None and r[5] != KNOWN[r[4]]]
+        checks.append(("surface.csv id and name agree", not mismatch,
+                       str(mismatch[0]) if mismatch else "every known id carries its name"))
+        unnamed = [r for r in rows if r[4] not in KNOWN and r[5] != f"id{r[4]}"]
+        checks.append(("surface.csv names unknown ids instead of hiding them",
+                       not unnamed, str(unnamed[0]) if unnamed else "none needed"))
+        undated = [r for r in rows if r[2] == "0" and r[3] != "clock-unset"]
+        checks.append(("surface.csv says so when a record has no date", not undated,
+                       str(undated[0]) if undated else "records without a clock read clock-unset"))
+    return checks
+
+
 def http_probe(host, out):
     """Status line for each URL that matters. Returns the list of (url, ok, detail)."""
     import urllib.error
@@ -131,6 +181,7 @@ def http_probe(host, out):
     got = {}
     for path, want in (("/", "200"), ("/favicon.ico", "204"),
                        ("/no-such-path", "302 -> /"), ("/dive/99.csv", "302 -> /"),
+                       ("/surface.csv", "200 + identity row"),
                        ("/app.js", "404 (no such asset any more)")):
         _ = want
         req = urllib.request.Request(f"http://{host}{path}")
@@ -157,6 +208,15 @@ def http_probe(host, out):
             ok = code == 200 and body.lstrip().lower().startswith(b"<!doctype html") \
                 and b"<html" in head
             detail = f"{code}, {len(body)} bytes, html"
+        elif path == "/surface.csv":
+            # The surface log's ONLY export path: calibration and pre-dive records,
+            # which no dive file can hold and no handset command can read. The
+            # first line must be the identity row — a file that starts with a data
+            # row has no count and no sequence range, and a reader cannot tell a
+            # shed history from a complete one.
+            first = body.split(b"\n", 1)[0].decode(errors="replace")
+            ok = code == 200 and first.startswith("SURFACE,")
+            detail = f"{code}, {len(body)} bytes, first line {first!r}"
         elif path == "/app.js":
             ok = code == 404
             detail = f"{code} - correct: the page is one self-contained file"
@@ -168,6 +228,13 @@ def http_probe(host, out):
             detail = f"{code} Location: {loc or '(none)'}"
         checks.append((path, ok, detail))
         out.append(f"  GET {path:<14} {detail}")
+
+    # ---- the surface log's own honesty --------------------------------------
+    surf = got.get("/surface.csv")
+    if surf is None:
+        checks.append(("surface.csv body was fetched", False, "no response captured"))
+    else:
+        checks.extend(grade_surface_body(surf))
 
     served = got.get("/", b"")
     page = served.decode(errors="replace")
@@ -230,6 +297,25 @@ def http_probe(host, out):
                    renders.group(0) if renders else
                    "the CALAIR status field is never read: the page would show a "
                    "number, or nothing, where a diver needs words"))
+
+    # The surface log is web-only by decision, so the page is the only way to read
+    # it: a controller that records verdicts nobody can retrieve has not recorded
+    # them. And the page must say what a verdict MEANS, not print a code.
+    surf_ref = re.search(r'"/?surface\.csv"', page) or re.search(r'surface\.csv', page)
+    checks.append(("page can read the surface log", bool(surf_ref),
+                   surf_ref.group(0) if surf_ref else
+                   "no /surface.csv in the page: the calibration and pre-dive records "
+                   "would be unreadable by anyone but a serial console"))
+    # Both patterns are taken from the surface renderer's own wording, chosen so
+    # they cannot be satisfied by the rest of the page: "pre-dive checks" alone is
+    # in the CHECK button's label, and "no calibration since power-up" is on the
+    # checklist view already, so either one on its own would pass on a page with no
+    # surface log at all (checked against the previous page, where they did).
+    words = [w for w in ("shed by capacity", "pre_dive_fail") if re.search(w, page)]
+    checks.append(("page renders surface records as words, not bare codes",
+                   len(words) == 2,
+                   ", ".join(words) if len(words) == 2 else
+                   f"missing wording for a capacity-shed log or a failed step: {words or 'none'}"))
 
     linked = sorted(set(re.findall(r'(?:href|src)="([^"]+)"', page)))
     out.append(f"  page links: {linked}")

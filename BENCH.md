@@ -14,13 +14,14 @@ reboots" from a log that begins with one.
 ## C2 — flash + acceptance (run first, every flash)
 
 ```
-fuser /dev/ttyUSB0            # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 233 cases
+fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
+pio test -e native            # host gate, currently 242 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
-                                 --cal-air --dive-persist
-tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle
+                                 --cal-air --predive --dive-persist    # 115 checks
+tools/.../python tools/hw_accept.py --selftest   # the surface-log graders, no board
+tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
 ```
 
 There is no `uploadfs` step. The web page is compiled into the app image and
@@ -87,7 +88,8 @@ one marked exception is the settings-schema renderer, which runs once from
 `hw_accept.py` checks the boot console (fresh boot banner, ≥2 HB lines
 matching the soak_logger contract, no SAFE/FATAL, `settings: N keys from
 NVS`, `control: SP=…`, `web: AP "…"`, `log: LittleFS mounted, N dives,
-seq a..b, used X of Y bytes`, and a `clock:` line) and then runs the
+seq a..b, used X of Y bytes`, a `surface: N records, seq a..b` line and a
+`clock:` line) and then runs the
 **refusal matrix**
 over the wired handset: `AUTO` cold → `ERR predive required`; `SET SP2`
 mid-dive → `ERR dive locked`; `WIFI ON` mid-dive → `ERR wifi locked in
@@ -100,6 +102,16 @@ answered with a format, which erases every dive on the partition, and the core
 does that in silence; the line says how many dives the mount found and warns if
 it had to format. A dive computer that quietly eats its own history is worse
 than one that says the log is offline.
+
+The `surface:` line is a check for the same reason and a newer one. The surface
+log (calibration verdicts and pre-dive results, `/surface.bin`, §"The surface log"
+below) has no dive file and **no handset command**, so that boot line plus
+`GET /surface.csv` are the only two ways anyone can see it after the moment the
+verdict happened. It prints in all three states — records with a seq range,
+`no records yet`, or `** /surface.bin will not read` — because an unreadable log
+and an empty one otherwise look identical, which is the exact confusion the line
+exists to prevent. Absence of the line is a FAIL, and a replay of a pre-feature
+build's console log proves the check can fail.
 
 Two things the harness did NOT do until 2026-11-23, and both let a real fault
 through:
@@ -183,14 +195,17 @@ the firmware for the operator's network.
 
 | Phase | What it asserts, and why it matters |
 |---|---|
-| HTTP | `/` serves and is **byte-identical to `data/index.html`**. This is the check that found the page had never actually been installed (C2-f below). `/favicon.ico` is 204, unknown paths 302 → `/` (that redirect *is* the captive portal), `/app.js` 404 because the page is one self-contained file |
-| Page | references nothing external (`page links: []`). The AP has no uplink, ever, so any CDN or cross-site reference is a dead page on the day it matters |
+| HTTP | `/` serves and is **byte-identical to `data/index.html`**. This is the check that found the page had never actually been installed (C2-f below). `/favicon.ico` is 204, unknown paths 302 → `/` (that redirect *is* the captive portal), `/app.js` 404 because the page is one self-contained file, `/surface.csv` 200 whose **first line is the `SURFACE,` identity row** (a file that starts with a data row has no count and no seq range, so a shed history reads as a complete one) |
+| Surface log | the export graded against itself: identity count equals the rows delivered, the seq range spans them, every row carries all 13 columns, each known id carries its own name, an unknown id arrives as `id<n>` rather than being dropped, and a record with epoch 0 renders `clock-unset` instead of a 1970 date. Captured 2026-11-24: `SURFACE,1,11,1,11` over 11 rows, two of them `pre_dive_fail` at step 2, three `cal_air` rows with `value 0` — those are the history the mutated build (see below) wrote, and the export shows them rather than hiding them |
+| Page (surface) | it can read the surface log (`/surface.csv` is referenced) and renders a record as words — `shed by capacity` and `pre_dive_fail` both present — because a page that shows a bare `16,4` has recorded the fact and lost the meaning |
+| Page (self-contained) | references nothing external but itself. The AP has no uplink, ever, so any CDN or cross-site reference is a dead page on the day it matters |
 | DNS | any name at all resolves to the AP IP — the other half of the captive portal (C2-e above: without it a phone resolves nothing and "the page does not load") |
 | WebSocket | handshake verified against RFC 6455 (`Sec-WebSocket-Accept` recomputed locally, no library: the point is to verify the server, so a dependency would be verifying itself); the `#boot <uptimeMs> <freeHeap>` hello on connect; then every command's answer must end with a `#<n>` marker whose **n equals the answer's line count** — if it does not, the browser renders half a table |
 | Equality | each command sent twice **back to back** — once over the WebSocket, once on UART2 — with identical non-stream reply lines. That is the project's central claim (PLAN: one command session, not one per transport) |
 | `--dive-cycle` | `DIVE START` from the browser takes the radio out from under the associated client (HTTP stops answering, the socket dies), the dive is then closed over UART2 — the web cannot close the dive that switched itself off, which is itself the argument for the handset being the in-water transport — and the AP is broadcasting again with a fresh WebSocket working |
 
-Measured 2026-11-23, 34 checks, 0 failures: radio unreachable under the client
+Measured 2026-11-24 with the surface log, 62 checks, 0 failures; on 2026-11-23,
+34 checks, 0 failures: radio unreachable under the client
 0.5–1.0 s after `DIVE START`, AP back and serving 200 after `DIVE END`, page
 25 445 bytes identical to the repo, all eight commands identical on both
 transports, markers matched every answer (`GET *` → 32 lines, `#32`).
@@ -353,6 +368,93 @@ byte for byte, and it fails the run if the served page still offers a button for
 fault, so the page carries `CAL AIR` plus `CAL AIR status` and shows the verdict
 in words. It leaves the cells calibrated until the next reset, which changes what
 the pre-dive list says — expect that, do not chase it.
+
+### The surface log: a verdict that outlives the moment (`--predive`, `--selftest`)
+
+A failed pre-dive check is the cleanest case in the project for "the machine must
+write it down": the dive it prevents never happens, so there is **no dive file**
+that could hold the row, and until 2026-11-24 the only trace of "the cells were
+refused for warm-up" or "the checks failed on battery" was a console line nobody
+keeps. The records live in `/surface.bin`, export over `GET /surface.csv`, and are
+**web/HTTP only** — there is deliberately no handset command for them (PLAN 16,
+spec §5.1 and §8 state the cost rather than hiding it). So the bench has to check
+the flash, not just the wire.
+
+```
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 --cal-air --predive
+```
+
+`--cal-air` ends by reading `/surface.csv` back and requiring that the newest
+`cal_air` record carries **the same numbers as the `CALAIR,` line the handset was
+answered with** — value, samples, spread and all three raw counts — plus a date
+(the run stamps the clock first, so `clock-unset` here means the record was made
+by a machine that had lost its clock). `--predive` then runs the pre-dive checks
+for real, reads the verdict twice (polled `PRE,` on the handset, then the row out
+of flash) and requires both to name **the same failing step**. It pulses the
+solenoid on the bench, so the jar and the wiring must be as you want them; run it
+after `--cal-air` and the 120 s warm-up is already paid for.
+
+The sequence aborts at its first failure, so the step it names is whichever one
+the bench actually defeats. As configured today (no pressure rig on the solenoid,
+battery pack unplugged) the verdict is `pre_dive_fail` at **step 2, solenoid** —
+the battery step never runs, so do not go looking for a battery row. That is the
+honest state of the machine, not a harness fault: what is graded is that the
+record and the protocol name the same step, not that the check passed.
+
+Four records of one event, and the checks are that they are the same event:
+
+```
+~ [154.82s] surface: record 10 id 7 value 2       <- console; its seq is the join key
+CALAIR,2,1,12,13,1514,1518,1521,0                 <- handset answer
+E,129,7,2                                         <- unprompted protocol row
+R,10,1795528182,2026-11-24T13:49:42Z,7,cal_air,2,1514,1518,1521,13,12,0  <- /surface.csv
+```
+
+The seq is read back off the file (max + 1) rather than kept in RAM, so the
+console's number *is* the CSV row's number, and the join is on the number rather
+than on "some record was written this run".
+
+**`--selftest` grades lying logs, no board needed.** Twelve cases of a
+surface export that is wrong in exactly one known way — header claims 3 records
+and 2 arrive, no identity row at all, a seq range describing a different file,
+this run wrote nothing, `raw0` disagreeing with the wire, a warm-up refusal
+recorded as OK, a failure filed under the pass id, an appended id with no name,
+a record with no clock rendered as a date, the console never reporting the write,
+and the console reporting a *different* record number. Run it after touching the
+graders or the record format; a case that stops failing means that check is
+decoration.
+
+Two harness bugs it caught on the day, both of which read as firmware faults:
+
+* **Anchoring `SURFACE_LINE` with `$`.** The empty-log line goes on to name the
+  export — `surface: no records yet (GET /surface.csv will be empty)` — so an
+  anchored pattern matched **none of the three forms** and the run reported the
+  boot as silent. Unanchored, with the reason written down at the pattern.
+* **A page-honesty regex that the page satisfied without the feature.** "renders
+  records as words, not codes" passed on the *previous* page, where `pre-dive
+  checks` came from the CHECK button's label and `no calibration since power-up`
+  from the checklist view. Tightened to `shed by capacity` + `pre_dive_fail`,
+  and verified against `git show HEAD:data/index.html` — the old page must make
+  it red, which is the whole test.
+
+The firmware side is mutation-proven on hardware, not just in host tests: with
+`r.value = 0` in `surfaceCalAir`, exactly one bench check goes red —
+`surface log: the cal_air record carries the same numbers as the wire: value=0
+want 2` — and the record's own id/name row still passes, because the row is
+internally consistent. That is the check that earns its place. The same is true of
+the persistence leg: with `SurfaceStore::append` opening `"w"` instead of `"a"`
+(so every write truncates the log to its newest record), exactly one check goes
+red —
+
+```
+[FAIL] every surface record written before the reset survived it: boot after reset:
+'surface: 1 record, seq 23..23'; the first boot said 19 records and this run wrote
+4 (seq 20..23), want at least 23
+```
+
+— and every other surface check stays green, because the one surviving record is
+internally consistent. A log that quietly keeps only its last row is invisible to
+anything that reads the file; only the boot banner's own arithmetic sees it.
 
 ### When the link is silent: bisect it, do not reflash at it
 

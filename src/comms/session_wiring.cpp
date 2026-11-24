@@ -9,7 +9,10 @@
 //     ControlTask hands over the 30 s grid rows and the handset link hands
 //     over event-driven rows. Both appends take the same log mutex, because
 //     two tasks writing one FILE* is exactly the kind of thing that corrupts
-//     a life-support log quietly.
+//     a life-support log quietly. The surface log (/surface.bin, calibration
+//     and pre-dive records) deliberately shares that mutex rather than having
+//     its own: the ordering number its records carry is read back off the file,
+//     so a second lock would let two appends write the same sequence.
 //   * Nothing in this file may block on anything a diver is waiting for. The
 //     session lock is held only while a command executes; every hook is a
 //     bounded, non-blocking action (flag set, record appended, radio moved).
@@ -26,6 +29,7 @@
 #include "comms/web_server.h"
 #include "config/defaults.h"
 #include "log/dive_store.h"
+#include "log/surface_store.h"
 
 // The chain, the registry and the bridge belong to main.cpp; the session must
 // drive the very same objects the sensors and the HUD use.
@@ -64,6 +68,7 @@ RTC_NOINIT_ATTR struct ClockCarry {
 namespace {
 
 DiveStore g_diveStore;
+SurfaceStore g_surfaceStore;
 SemaphoreHandle_t g_sessionMtx = nullptr;
 SemaphoreHandle_t g_logMtx = nullptr;
 uint32_t g_diveStartMs = 0;
@@ -353,6 +358,49 @@ bool diveLogSeqRange(uint32_t& lo, uint32_t& hi) {
     lo = o.lo;
     hi = o.hi;
     return o.any;
+}
+
+// ---- surface log: the calibration and pre-dive record stream ---------------
+// Same mutex as the dive file, deliberately: the sequence a surface record
+// carries is read back off the file (max + 1), so two tasks appending at once
+// would write the same seq and the log would lose the only thing that orders its
+// rows on a board with no clock. Reads take it too — an export scans the file for
+// its identity row and then streams it, and a compaction between those two passes
+// would report a header and rows from different files.
+//
+// The clock fields are read outside the mutex, exactly as `GET TIME` reads them:
+// they are scalars the command task writes, and ControlTask must not take the
+// session lock (a command can hold it while it writes NVS). The cost is that a
+// record written in the instant a `TIME SET` lands can carry the new epoch with
+// the old source flag, i.e. a date off by however wrong the previous clock was.
+// Stated rather than papered over: no lock here can make the clock and the record
+// one atomic fact, and the record says which clock it believes.
+
+bool surfaceLogAppend(logfmt::SurfaceRecord& r) {
+    if (!g_logMtx) return false;
+    r.epoch = wallclock::epoch(g_clock, millis());
+    r.flags = (g_clock.source == wallclock::CARRIED)
+                  ? logfmt::SURF_FLAG_CLOCK_CARRIED : 0u;
+    xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    const bool ok = g_surfaceStore.append(r);
+    xSemaphoreGive(g_logMtx);
+    return ok;
+}
+
+int surfaceLogBoot(uint32_t& seqLo, uint32_t& seqHi) {
+    seqLo = seqHi = 0u;
+    if (g_logMtx) xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    const int n = g_surfaceStore.records(&seqLo, &seqHi);   // one pass, one scan line
+    if (g_logMtx) xSemaphoreGive(g_logMtx);
+    return n;
+}
+
+int surfaceLogExportCsv(void (*sink)(const char*, void*), void* ctx) {
+    if (!g_logMtx) return -1;
+    xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    const int n = g_surfaceStore.exportCsv(sink, ctx);
+    xSemaphoreGive(g_logMtx);
+    return n;
 }
 
 } // namespace comms

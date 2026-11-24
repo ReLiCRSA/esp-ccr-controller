@@ -305,6 +305,36 @@ void serveDiveCsv(AsyncWebServerRequest* req, int slot) {
     noteHeap();
 }
 
+// ---- surface log CSV download ----------------------------------------------
+// /surface.csv: the calibration and pre-dive records, the same rows the log's own
+// formatter produces. This is the ONLY export path for that log — there are no
+// handset commands for it — so a wired handset cannot read its own machine's
+// history, which the spec states rather than leaves to be discovered.
+void serveSurfaceCsv(AsyncWebServerRequest* req) {
+    // 256 records at ~90 B is ~23 KB; 64 KB also covers a log that grew past
+    // capacity because a compaction could not get a file handle, so the file a
+    // diver downloads is complete rather than quietly short.
+    constexpr size_t kCap = 64 * 1024;
+    char* buf = static_cast<char*>(std::malloc(kCap));
+    if (!buf) {
+        req->send(503, "text/plain", "no memory for export");
+        return;
+    }
+    CsvCollect c{buf, kCap, 0};
+    buf[0] = '\0';
+    const int records = surfaceLogExportCsv(collectLine, &c);
+    if (records < 0) {
+        std::free(buf);
+        req->send(503, "text/plain", "surface log will not read");
+        return;
+    }
+    AsyncWebServerResponse* r = req->beginResponse(200, "text/csv", buf);
+    r->addHeader("Content-Disposition", "attachment; filename=surface.csv");
+    req->send(r);
+    std::free(buf);
+    noteHeap();
+}
+
 void onNotFound(AsyncWebServerRequest* req) {
     // Phones type half a URL; send them to the page rather than an error.
     req->redirect("/");
@@ -396,6 +426,7 @@ bool start() {
         g_server->on("/dive/8.csv", HTTP_GET, [](AsyncWebServerRequest* r) { serveDiveCsv(r, 8); });
         g_server->on("/dive/9.csv", HTTP_GET, [](AsyncWebServerRequest* r) { serveDiveCsv(r, 9); });
         g_server->on("/dive/10.csv", HTTP_GET, [](AsyncWebServerRequest* r) { serveDiveCsv(r, 10); });
+        g_server->on("/surface.csv", HTTP_GET, serveSurfaceCsv);
         g_server->onNotFound(onNotFound);
     }
     g_server->begin();

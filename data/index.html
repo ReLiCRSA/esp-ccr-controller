@@ -85,6 +85,7 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
     <button data-v="hist">Cells</button>
     <button data-v="settings">Settings</button>
     <button data-v="dives">Dives</button>
+    <button data-v="surface">Surface</button>
     <button data-v="console">Console</button>
   </nav>
 </header>
@@ -146,6 +147,17 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
     <div class="hint">Ten most recent dives, oldest overwritten.</div></div>
   <div class="card" id="divelist"></div>
   <div class="card" id="diveview" hidden></div>
+</section>
+<section id="v-surface">
+  <div class="card"><button class="act big" id="surfreq">Load surface log</button>
+    <a class="act" style="display:inline-block;padding:12px" href="/surface.csv">download csv</a>
+    <div class="hint">Every calibration verdict and pre-dive result the controller has
+      recorded, newest first. These are not dive rows: a pre-dive failure prevents the
+      dive, so there is no dive file to put it in, and a calibration verdict is a fact
+      about the machine. A wired handset has no command for this history &#8212; it can
+      only be listening when the verdict happens &#8212; so this page is the only way to
+      read it back.</div></div>
+  <div class="card" id="surflog"><span class="hint">not loaded yet</span></div>
 </section>
 <section id="v-console">
   <div class="card"><pre id="log"></pre>
@@ -349,6 +361,10 @@ function state(){
   diveActive=(mode==="AUTO"||mode==="MANUAL");
   lockSettings();
 }
+var CALAIRW=["no calibration since power-up","sampling","calibrated",
+             "refused: cells still warming up","aborted: a dive started",
+             "failed: cells never settled inside the spread band","failed: no cells fitted"];
+var PRESTEPW=["warm-up","air","solenoid","depth","battery"];
 function check(){
   if(!PRE) { $("pre").innerHTML='<span class="hint">no check data yet</span>'; return; }
   var names=["warmup","air","solenoid","depth","battery"], txt=["pending","running","PASS","FAIL"];
@@ -370,10 +386,8 @@ function check(){
   // fouled one.
   if(CALAIR){
     var c=+CALAIR[1];
-    var st=["no calibration since power-up","sampling &#8212; "+CALAIR[3]+" of 12 samples",
-            "calibrated","refused: cells still warming up","aborted: a dive started",
-            "failed: cells never settled inside the spread band","failed: no cells fitted"][c]
-         ||("code "+c);
+    var st=c===1?("sampling &#8212; "+CALAIR[3]+" of 12 samples"):
+            (CALAIRW[c]||("code "+c));
     var kind=c===2?"ok":(c===0||c===1)?"":"bad";
     var det="";
     if(c===2) det=" raw "+CALAIR[5]+"/"+CALAIR[6]+"/"+CALAIR[7]+"  worst spread "+CALAIR[4]+
@@ -470,6 +484,66 @@ function refreshDives(){
       b.addEventListener("click",function(){ showDive(+b.dataset.slot); }); });
   });
 }
+// ---- surface log: the machine's own calibration / pre-dive record ---------
+// Fetched over HTTP, not the socket: /surface.csv is the log's only export path,
+// the same rows the firmware's own CSV formatter produces. Rendered newest first,
+// because that is the order a human reads it in, even though the file is stored
+// oldest first so the record just made can never be the one that is lost.
+function refreshSurface(){
+  var host=$("surflog"); host.innerHTML="loading&#8230;";
+  fetch("/surface.csv").then(function(r){ return r.text(); }).then(function(txt){
+    var head=null, rows=[];
+    txt.split("\n").forEach(function(l){
+      var f=l.split(",");
+      if(f[0]==="SURFACE"&&f.length>4) head=f;
+      else if(f[0]==="R"&&f.length>12) rows.push(f);
+    });
+    if(!head){
+      host.innerHTML='<span class="hint">the controller sent no SURFACE identity row '+
+                     '&#8212; the log did not read</span>'; return;
+    }
+    if(!rows.length){
+      host.innerHTML='<span class="hint">no surface records yet &#8212; nothing calibrated '+
+                     'and no pre-dive check finished since this log began</span>'; return;
+    }
+    var n=+head[2], lo=+head[3], hi=+head[4], lost=(hi-lo+1)-n;
+    // The identity row's own count and sequence range are compared with the rows
+    // actually delivered: a file whose header says 256 records and streams 200 is
+    // truncated, and saying so is better than showing a short list as the truth.
+    var bad=(n!==rows.length)?" &#183; <b>header says "+n+" records, "+rows.length+
+                              " arrived: file truncated</b>":"";
+    var h='<div class="hint">'+rows.length+" record"+(rows.length===1?"":"s")+
+          " &#183; seq "+lo+".."+hi+
+          (lost>0?(" &#183; "+lost+" older record"+(lost===1?"":"s")+
+                   " shed by capacity"):" &#183; none shed")+bad+"</div>"+
+          '<table><tr><th>seq</th><th>when</th><th>what</th>'+
+          '<th>result</th><th>numbers</th></tr>';
+    rows.reverse().forEach(function(f){
+      var seq=f[1], when=f[3], id=+f[4], name=f[5], val=+f[6];
+      var raw=[f[7],f[8],f[9]], spread=f[10], samples=f[11], flags=+f[12];
+      var what=name==="cal_air"?"air calibration":
+                name==="pre_dive_pass"?"pre-dive checks":
+                name==="pre_dive_fail"?"pre-dive checks":name;
+      var res="", nums="", kind="";
+      if(name==="cal_air"){
+        res=CALAIRW[val]||("code "+val);
+        kind=val===2?"ok":(val===0||val===1)?"":"bad";
+        if(val===2) nums="raw "+raw.join("/")+" &#183; worst spread "+spread+
+                        " &#183; "+samples+" samples";
+      } else if(name==="pre_dive_fail"){
+        res="failed at "+(PRESTEPW[val]||("step "+val)); kind="bad";
+      } else if(name==="pre_dive_pass"){ res="passed"; kind="ok"; }
+      else res="value "+val;
+      // Same pill the checks view uses, so "calibrated" and "passed" look like the
+      // thing they describe instead of being another row of black text.
+      h+="<tr><td>"+seq+"</td><td>"+when+(flags&1?" <span class='hint'>(carried, unverified)</span>":"")+
+         "</td><td>"+what+"</td><td><span class='pill"+(kind?" on "+kind:"")+"'>"+res+
+         "</span></td><td class='hint'>"+nums+"</td></tr>";
+    });
+    host.innerHTML=h+"</table>";
+  }).catch(function(){ host.innerHTML='<span class="hint">could not read /surface.csv</span>'; });
+}
+
 // ---- cell histograms (GET HIST, firmware rolling 10-minute windows) -----
 function drawHist(f){
   var c=+f[1], ws=+f[2], nw=+f[3], bw=+f[4]/100, age=+f[5], n=+f[6];
@@ -538,6 +612,7 @@ Array.prototype.forEach.call(document.querySelectorAll("#tabs button"),function(
     document.querySelectorAll("main section").forEach(function(s){
       s.classList.toggle("on",s.id==="v-"+view); });
     if(view==="dives") refreshDives();
+    if(view==="surface") refreshSurface();
     if(view==="hist") refreshHist();
     if(view==="check") { send("GET PRE"); send("GET CELLS"); send("GET CALAIR"); }
   });
@@ -556,6 +631,7 @@ $("cmdform").addEventListener("submit",function(e){
   $("cline").value=""; send(v);
 });
 $("refresh").addEventListener("click",refreshDives);
+$("surfreq").addEventListener("click",refreshSurface);
 
 // ---- cadence --------------------------------------------------------------
 setInterval(function(){

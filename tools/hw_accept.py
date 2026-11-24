@@ -62,6 +62,24 @@ LOG_LINE = re.compile(
     r"^log: LittleFS mounted, (?P<dives>\d+) dives?"
     r"(?:, seq (?:n/a|(?P<seqlo>\d+)\.\.(?P<seqhi>\d+)))?"
     r", used (?P<used>\d+) of (?P<total>\d+) bytes(?P<note>.*)$")
+# `surface: 7 records, seq 3..9` / `surface: no records yet` /
+# `surface: ** /surface.bin will not read ...`. The calibration and pre-dive
+# records have no dive file and no handset command, so this line is the only
+# view of that log the bench gets before someone downloads it, and the seq range
+# is the capacity evidence (same reasoning as the dive FIFO's `seq a..b`).
+SURFACE_LINE = re.compile(
+    r"^surface: (?:(?P<n>\d+) records?, seq (?P<lo>\d+)\.\.(?P<hi>\d+)"
+    r"|no records yet|(?P<bad>\*\*.*))")
+# No `$` on that pattern: the empty-log line goes on to name the export
+# (`no records yet (GET /surface.csv will be empty)`), and an anchored version
+# matched none of the three forms — which read as a firmware bug for one run.
+# One record as the machine reports writing it: `surface: record 12 id 7 value 2`.
+# The seq in it is the join key to the CSV row, so a console line, a flash record
+# and an HTTP row can be compared as the same event instead of as three claims.
+SURFACE_RECORD = re.compile(r"^surface: record (?P<seq>\d+) id (?P<id>\d+)"
+                            r"(?: value (?P<value>\d+))?(?: .*)?$")
+SURFACE_FAIL = re.compile(r"^surface: record NOT written")
+
 # `clock: 2026-11-24T09:12:03Z (set 41 s ago)`, or `unset: ...`, or a value
 # `carried across a reset, not verified since`. The boot must always state it:
 # a dive log whose dates nobody can account for is the defect this replaced.
@@ -233,6 +251,16 @@ def grade_boot(lines, expect_web):
         checks.append(("web AP announced", wl is not None, wl or ""))
     ll = next((l for l in lines if LOG_LINE.search(l)), None)
     checks.append(("dive log mounted at boot", ll is not None, ll or ""))
+    # The surface log states itself at boot, in all three states: records with a
+    # seq range, "no records yet", or a warning that it exists but will not read.
+    # A missing line is a failure because the absence is indistinguishable from an
+    # empty log — which is the exact confusion this line exists to prevent.
+    sl = next((l for l in lines if SURFACE_LINE.search(l)), None)
+    checks.append(("surface log stated at boot", sl is not None,
+                   sl or "no `surface:` line: an unreadable surface log would look "
+                         "like an empty one"))
+    if sl:
+        checks.append(("surface log is readable", not SURFACE_LINE.search(sl).group("bad"), sl))
     if ll:
         # The suffix is the firmware's own warning. A LittleFS mount that fails
         # is answered with a format, which erases every dive on the partition;
@@ -244,6 +272,204 @@ def grade_boot(lines, expect_web):
     checks.append(("wall clock stated at boot", cl is not None,
                    cl or "no `clock:` line: the boot does not say whether dives "
                          "will carry a date"))
+    return checks
+
+
+def fetch_surface_csv(base, timeout=12.0):
+    """GET /surface.csv. urllib only: the bench tools must not need anything the
+    pipx PlatformIO python does not already have.
+
+    This is the log's ONLY export path — there are no handset commands for it — so
+    it is also the only way the gate can see a surface record after the moment it
+    happened."""
+    import urllib.request
+
+    req = urllib.request.Request(base.rstrip("/") + "/surface.csv")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.headers.get("Content-Type", ""), r.read().decode("utf-8", "replace")
+
+
+def parse_surface_csv(text):
+    """(identity row fields, [row fields]). `R,` needs all 13 columns: a short row
+    is a truncated file, and grading it as a row would hide that."""
+    head, rows = None, []
+    for line in text.splitlines():
+        f = line.split(",")
+        if f[0] == "SURFACE" and len(f) > 4:
+            head = f
+        elif f[0] == "R" and len(f) > 12:
+            rows.append(f)
+    return head, rows
+
+
+# `R,` columns by name, in the order the firmware writes them. Everything in this
+# tool reads the export through this table — the grader's own checks and the
+# expectations each phase builds — because a column index typed twice is two
+# chances to be wrong, and a wrong index makes a real log read as a lying one (or
+# the reverse). Order is append-only: new columns go on the right.
+SURF_COL = {"seq": 1, "epoch": 2, "iso": 3, "id": 4, "name": 5, "value": 6,
+            "raw0": 7, "raw1": 8, "raw2": 9, "spread": 10, "samples": 11,
+            "flags": 12}
+
+
+def grade_surface_csv(text, want_rows, boot_hi, console_lines):
+    """Cross-checks the exported surface log against what the machine said.
+
+    `want_rows`: what the run just did, as (name, {field: expected}) — the raw
+    counts and spread of a calibration must match, field for field, the `CALAIR,`
+    line the handset was answered with. `console_lines`: the console's own
+    `surface: record <seq> ...` lines, whose seq is the join key.
+
+    Four records of one event — the console line, the record on flash, the CSV row
+    and the protocol answer — and the check is that they are the same event."""
+    checks = []
+    head, rows = parse_surface_csv(text)
+    checks.append(("surface.csv carries its identity row", head is not None,
+                   text.splitlines()[0] if text.strip() else "empty response"))
+    if head is None:
+        return checks
+    # id <-> name must agree, both ways: a pre-dive failure filed under the pass id
+    # (or an appended id left unlabelled) is the log claiming something the machine
+    # never recorded. The three ids below are the whole vocabulary so far; anything
+    # else must arrive as `id<n>`, never as a row with a name it did not earn.
+    KNOWN = {"7": "cal_air", "13": "pre_dive_pass", "16": "pre_dive_fail"}
+    mismatch = [r for r in rows
+                if KNOWN.get(r[SURF_COL["id"]]) and r[SURF_COL["name"]] != KNOWN[r[SURF_COL["id"]]]]
+    checks.append(("id and name agree", not mismatch,
+                   str(mismatch[0]) if mismatch else "every known id carries its name"))
+    unnamed = [r for r in rows
+               if r[SURF_COL["id"]] not in KNOWN
+               and r[SURF_COL["name"]] != f"id{r[SURF_COL['id']]}"]
+    checks.append(("unknown ids are named, not hidden", not unnamed,
+                   str(unnamed[0]) if unnamed else "none needed"))
+    # A pass has no step to name. If one does, the row is a failure wearing a
+    # pass's label — the one mutation an id/name table cannot catch, because the
+    # row is internally consistent.
+    bogus = [r for r in rows
+             if r[SURF_COL["name"]] == "pre_dive_pass" and r[SURF_COL["value"]] != "0"]
+    checks.append(("a pass names no failing step", not bogus,
+                   str(bogus[0]) if bogus else "no pass carries a step"))
+    undated = [r for r in rows
+               if r[SURF_COL["epoch"]] == "0" and r[SURF_COL["iso"]] != "clock-unset"]
+    checks.append(("a record with no clock says so", not undated,
+                   str(undated[0]) if undated else "epoch 0 renders as clock-unset"))
+    n, lo, hi = int(head[2]), int(head[3]), int(head[4])
+    checks.append(("identity row's count matches the rows delivered", n == len(rows),
+                   f"SURFACE says {n}, {len(rows)} rows arrived: a truncated file "
+                   f"must not read as a complete log"))
+    checks.append(("seq range spans the rows", bool(rows) and lo <= int(rows[0][SURF_COL["seq"]]) and
+                   hi >= int(rows[-1][SURF_COL["seq"]]),
+                   f"header {lo}..{hi}, rows {rows[0][SURF_COL['seq']]}..{rows[-1][SURF_COL['seq']]}"
+                   if rows else "no rows"))
+    if boot_hi is not None:
+        checks.append(("this run's records joined the log", hi > boot_hi,
+                       f"boot said seq up to {boot_hi}, the log now ends at {hi}: "
+                       f"the verdict was never recorded"))
+
+    for name, want in want_rows:
+        got = next((r for r in reversed(rows) if r[SURF_COL["name"]] == name), None)
+        checks.append((f"a {name} record is in the export", got is not None,
+                       f"names seen: {[r[SURF_COL['name']] for r in rows]}"
+                       if rows else "no rows"))
+        if not got:
+            continue
+        bad = [f"{k}={got[v]} want {w}" for k, v, w in want
+               if got[v] != str(w)]
+        checks.append((f"the {name} record carries the same numbers as the wire",
+                       not bad, "; ".join(bad) or str(got)))
+        # The console's own line, joined on seq: the record the machine says it
+        # wrote IS the row that came back over HTTP.
+        recs = [SURFACE_RECORD.match(re.sub(r"^\[\d\d:\d\d:\d\d\]\s*", "", l))
+                for l in console_lines]
+        recs = [m for m in recs if m]
+        joined = next((m for m in recs
+                       if int(m.group("seq")) == int(got[SURF_COL["seq"]])), None)
+        checks.append((f"the console reported writing record {got[1]}", joined is not None,
+                       f"console records: {[m.group(0) for m in recs] or 'none'}"))
+    return checks
+
+
+GOOD_SURFACE_CSV = (
+    "SURFACE,1,2,3,4\n"
+    "R,3,1795518150,2026-11-24T11:02:30Z,7,cal_air,2,1514,1519,1528,21,12,0\n"
+    "R,4,1795518200,2026-11-24T11:03:20Z,16,pre_dive_fail,4,0,0,0,0,0,0\n")
+GOOD_CONSOLE = ["surface: record 3 id 7 value 2", "surface: record 4 id 16"]
+CAL_WANT = [("value", SURF_COL["value"], 2), ("samples", SURF_COL["samples"], 12),
+            ("spread", SURF_COL["spread"], 21), ("raw0", SURF_COL["raw0"], 1514),
+            ("raw1", SURF_COL["raw1"], 1519), ("raw2", SURF_COL["raw2"], 1528)]
+
+
+def selftest():
+    """Proves the surface-log graders can fail.
+
+    Every case below is a log that lies in exactly one known way. A case that
+    does NOT fail means the check is decoration — which is the lesson already
+    learned on this bench, when a check was hunting an `E,` row its own line
+    filter was throwing away and could never have passed. Run it after touching
+    the graders or the export format (`hw_accept.py --selftest`).
+    """
+    # (what the log claims, the bytes, the expected verdict: (failing check name,
+    #  or None for "must pass clean"))
+    cases = [
+        ("a complete, honest log", GOOD_SURFACE_CSV, None),
+        ("header says 3 records, 2 arrive (truncated file)",
+         GOOD_SURFACE_CSV.replace("SURFACE,1,2,3,4", "SURFACE,1,3,3,4"),
+         "identity row's count matches"),
+        ("identity row missing entirely",
+         GOOD_SURFACE_CSV.split("\n", 1)[1], "identity row"),
+        ("seq range narrower than the rows (header describes another file)",
+         GOOD_SURFACE_CSV.replace("SURFACE,1,2,3,4", "SURFACE,1,2,4,4"),
+         "seq range spans the rows"),
+        ("this run wrote nothing (seq did not move)",
+         GOOD_SURFACE_CSV, "check-hi"),
+        ("the calibration record disagrees with the wire (raw0 wrong)",
+         GOOD_SURFACE_CSV.replace("1514,1519,1528", "1414,1519,1528"),
+         "same numbers as the wire"),
+        ("the verdict code disagrees with the wire (OK vs warm-up)",
+         GOOD_SURFACE_CSV.replace(",7,cal_air,2,", ",7,cal_air,3,"),
+         "same numbers as the wire"),
+        ("a pre-dive failure filed as a pass",
+         GOOD_SURFACE_CSV.replace(",16,pre_dive_fail,4,", ",13,pre_dive_pass,4,"),
+         "record is in the export"),
+        ("an appended id with no name (silently unlabelled)",
+         GOOD_SURFACE_CSV.replace(",7,cal_air,", ",21,cal_air,"),
+         "unknown ids are named"),
+        ("a record with no clock rendered as a date",
+         GOOD_SURFACE_CSV.replace(",1795518150,2026-11-24T11:02:30Z,", ",0,2026-11-24T11:02:30Z,"),
+         "says so"),
+        ("the console never said it wrote the record",
+         GOOD_SURFACE_CSV, "console-noise"),
+        ("the console's record number is a different record",
+         GOOD_SURFACE_CSV, "console-seq"),
+    ]
+    checks = []
+    for name, body, expect in cases:
+        rows_want = [("cal_air", CAL_WANT), ("pre_dive_fail", [("value", 6, 4)])]
+        hi = 2 if expect != "check-hi" else 4
+        if expect == "console-seq":
+            # Same verdict, wrong seq: the join must be on the number, not on "some
+            # record was written this run".
+            console = ["surface: record 9 id 7 value 2", "surface: record 4 id 16"]
+        else:
+            console = GOOD_CONSOLE if expect != "console-noise" else []
+        if expect == "check-hi":
+            rows_want = [("cal_air", CAL_WANT)]
+        if expect == "console-noise":
+            rows_want = [("cal_air", CAL_WANT)]
+        got = grade_surface_csv(body, rows_want, hi, console)
+        failed = [c[0] for c in got if not c[1]]
+        if expect is None:
+            checks.append((name, not failed, f"unexpected failures: {failed}"))
+            continue
+        if expect == "check-hi":
+            checks.append((name, "this run's records joined the log" in "".join(failed),
+                           f"failures seen: {failed}"))
+        elif expect in ("console-noise", "console-seq"):
+            checks.append((name, any("console reported writing" in f for f in failed),
+                           f"failures seen: {failed}"))
+        else:
+            checks.append((name, any(expect in f for f in failed),
+                           f"no failure matching {expect!r}; failures seen: {failed}"))
     return checks
 
 
@@ -623,7 +849,8 @@ def run_framing(port, baud, log, settle=1.5):
     return checks
 
 
-def run_cal_air(console, port, baud, watch, settle=1.5, log=None):
+def run_cal_air(console, port, baud, watch, settle=1.5, log=None,
+                web_host=None, boot_hi=None):
     """The air calibration, end to end, with its numbers on the wire.
 
     The matrix proves the REFUSAL half (a warm-up refusal becomes a protocol row).
@@ -741,12 +968,168 @@ def run_cal_air(console, port, baud, watch, settle=1.5, log=None):
         # successful calibration would mean the record never updated.
         checks.append(("the newest verdict replaced the earlier refusal",
                        code == 2, f"newest answer: {verdict}"))
+
+        # And the durable copy. Everything above proves the verdict reached a client
+        # that was listening; only this proves the machine WROTE it down, which is
+        # the half a handset cannot check (it has no command for this log) and the
+        # half the whole surface log exists for.
+        if web_host and ok and len(f) == 9:
+            try:
+                status, ctype, text = fetch_surface_csv(web_host)
+            except Exception as e:                      # noqa: BLE001 - report, do not crash
+                checks.append(("GET /surface.csv answers", False, f"{type(e).__name__}: {e}"))
+            else:
+                checks.append(("GET /surface.csv answers 200 text/csv",
+                               status == 200 and ctype.startswith("text/csv"),
+                               f"{status} {ctype!r}"))
+                # `CALAIR,<code>,<age>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<left>`
+                # against the record's columns, by name from one table.
+                wire = dict(zip(("code", "age", "samples", "spread", "raw0", "raw1",
+                                 "raw2", "left"), f[1:9]))
+                want = [(k, SURF_COL[k], wire[v]) for k, v in
+                        (("value", "code"), ("samples", "samples"), ("spread", "spread"),
+                         ("raw0", "raw0"), ("raw1", "raw1"), ("raw2", "raw2"))]
+                for name, ok_, detail in grade_surface_csv(
+                        text, [("cal_air", want)], boot_hi, watch):
+                    checks.append((f"surface log: {name}", ok_, detail))
+                _, rows = parse_surface_csv(text)
+                newest = next((r for r in reversed(rows)
+                               if r[SURF_COL["name"]] == "cal_air"), None)
+                # The matrix stamps the clock before this phase, so a record made
+                # now has a real date. Epoch 0 here means the record was written by
+                # a machine that had lost its clock, which the CSV renders honestly
+                # as `clock-unset` — and this run would have had no way to know.
+                checks.append(("surface log: the record carries a date",
+                               newest is not None and int(newest[SURF_COL["epoch"]]) > 0 and
+                               newest[SURF_COL["iso"]] != "clock-unset",
+                               str(newest) if newest else "no cal_air row"))
     finally:
         ser.close()
     return checks
 
 
-def run_dive_persist(console, port, baud, watch, settle=1.5):
+def run_predive(port, baud, watch, settle=1.5, log=None, web_host=None, boot_hi=None):
+    """The pre-dive verdict, on flash.
+
+    A failed pre-dive check is the clearest case for a surface log: the dive it
+    prevents never happens, so there is no dive file that could hold the row, and
+    until now the only trace was a `PRE,` line a client had to be polling at that
+    moment. This phase runs the checks (the `--cal-air` phase, run first, has
+    already carried the board past the 120 s warm-up, so this one is short), reads
+    the verdict twice — polled on the handset, then read back out of flash over
+    HTTP — and requires them to agree on the step that failed.
+
+    The sequence aborts at its first failure, so the step named here is whichever
+    one the bench actually defeats. As configured (no pressure rig on the solenoid,
+    pack unplugged) the verdict is `pre_dive_fail` at step 2, solenoid, and the
+    battery step never runs. That is the honest state of the machine, not a harness
+    fault: what is graded is that the record says the same thing the protocol does,
+    not that the check passed.
+    """
+    import serial
+
+    ser = serial.Serial(port, baud, timeout=1.0)
+    log = log if log is not None else []
+    checks = []
+    t0 = T_ORIGIN
+
+    def ask(cmd, window=2.0):
+        ser.write((cmd + "\r\n").encode())
+        ser.flush()
+        out, end = [], time.time() + window
+        while time.time() < end:
+            l = ser.readline().decode(errors="replace").strip()
+            if not l:
+                break
+            if not l.startswith(("T,", "D,")):
+                log.append(f"[{time.time() - t0:7.2f}s] << {l}")
+                out.append(l)
+        return out
+
+    try:
+        time.sleep(settle)
+        ser.reset_input_buffer()
+        ser.write(b"\r\n")
+        ser.flush()
+        end = time.time() + 0.6
+        while time.time() < end:
+            ser.readline()
+
+        ask("CHECK")
+        pre = None
+        asked = time.time()
+        while time.time() - asked < 200.0:
+            for l in ask("GET PRE", window=2.0):
+                if l.startswith("PRE,"):
+                    pre = l
+            if pre:
+                f = pre.split(",")
+                if len(f) > 6 and (f[6] == "1" or any(x == "3" for x in f[1:6])):
+                    break
+        f = pre.split(",") if pre else []
+        checks.append(("the pre-dive sequence reached a verdict",
+                       len(f) > 6 and (f[6] == "1" or any(x == "3" for x in f[1:6])),
+                       f"last answer: {pre}"))
+        if len(f) <= 6:
+            return checks
+
+        passed = f[6] == "1"
+        step = next((i for i in range(5) if f[1 + i] == "3"), None)
+        checks.append(("a pre-dive failure names the step that failed",
+                       passed or step is not None,
+                       f"{pre} — no step reports FAIL, so the record could not say "
+                       f"what to fix"))
+        verdict = ("pre_dive_pass", 0) if passed else ("pre_dive_fail", step)
+
+        # The console's own line, with the record's seq: that seq is what joins the
+        # machine's claim to the row that comes back out of flash.
+        rec = None
+        said = time.time()
+        while time.time() - said < 10.0:
+            for l in watch:
+                m = SURFACE_RECORD.match(l)
+                if m and int(m.group("id")) in (13, 16):
+                    rec = m
+            if rec or any(SURFACE_FAIL.match(l) for l in watch):
+                break
+            time.sleep(0.5)
+        checks.append(("the console reported writing the pre-dive record", rec is not None,
+                       "no `surface: record N id 13|16` line — the verdict was never "
+                       "written down" if rec is None else rec.group(0)))
+        checks.append(("the record was not refused by the log",
+                       not any(SURFACE_FAIL.match(l) for l in watch),
+                       next((l for l in watch if SURFACE_FAIL.match(l)), "")))
+
+        if web_host:
+            try:
+                status, ctype, text = fetch_surface_csv(web_host)
+            except Exception as e:                      # noqa: BLE001
+                checks.append(("GET /surface.csv answers", False, f"{type(e).__name__}: {e}"))
+            else:
+                checks.append(("GET /surface.csv answers 200 text/csv",
+                               status == 200 and ctype.startswith("text/csv"),
+                               f"{status} {ctype!r}"))
+                want = [("value", SURF_COL["value"], verdict[1])]
+                for name, ok_, detail in grade_surface_csv(
+                        text, [(verdict[0], want)], boot_hi, watch):
+                    checks.append((f"surface log: {name}", ok_, detail))
+                _, rows = parse_surface_csv(text)
+                both = {r[SURF_COL["name"]] for r in rows}
+                # A FAIL record must not be filed as a pass, and the other way
+                # round: this is the check that a `value` means what the protocol
+                # says it means, not just that some row exists.
+                checks.append(("surface log: the verdict is filed under the right id",
+                               verdict[0] in both and
+                               ((verdict[0] == "pre_dive_pass") ==
+                                any(r[SURF_COL["name"]] == "pre_dive_pass" and
+                                    int(r[SURF_COL["value"]]) == 0 for r in rows)),
+                               f"verdict {verdict}, names: {sorted(both)}"))
+    finally:
+        ser.close()
+    return checks
+
+
+def run_dive_persist(console, port, baud, watch, settle=1.5, boot_n=None):
     """Does a closed dive survive a reset?
     record, never the dive". Nothing on the bench had ever tested that promise,
     and when the dive-CSV work asked the question the answer looked like "no":
@@ -874,6 +1257,31 @@ def run_dive_persist(console, port, baud, watch, settle=1.5):
                    cl is not None and ("unset" in cl or "carried" in cl),
                    cl or "no `clock:` line: dives after a power cycle would be "
                          "undated in silence"))
+    # The surface log gets the same persistence question as the dives, and the boot
+    # banner is the ONLY way to ask it: there is no handset command that reads that
+    # log back, so "did the calibration verdict outlive the power-down?" has no
+    # other answer on the bench. Graded on both numbers the line prints: the count
+    # (a log that came back with one record when five were written this run has
+    # lost four) and the top seq (a compaction never renumbers, so a lower top seq
+    # means the NEWEST ones went, which are the ones a diver cares about). Skipped
+    # when nothing was written this run: a fresh filesystem with no calibration is
+    # a legitimately empty log, not a lost one.
+    sl2 = next((l for l in new_boot if SURFACE_LINE.search(l)), None)
+    checks.append(("the new boot reports its surface log", sl2 is not None,
+                   sl2 or "no `surface:` line after the reset: an unreadable surface "
+                          "log reads exactly like an empty one"))
+    wrote = [int(m.group("seq")) for l in watch[:mark]
+             if (m := SURFACE_RECORD.match(l))]
+    if wrote:
+        m2 = SURFACE_LINE.search(sl2) if sl2 else None
+        want_n = (boot_n or 0) + len(wrote)
+        detail = (f"boot after reset: {sl2!r}; the first boot said {boot_n} records and "
+                  f"this run wrote {len(wrote)} (seq {min(wrote)}..{max(wrote)}), "
+                  f"want at least {want_n}")
+        checks.append(("every surface record written before the reset survived it",
+                       bool(m2 and m2.group("n")) and int(m2.group("n")) >= want_n
+                       and bool(m2.group("hi")) and int(m2.group("hi")) >= max(wrote),
+                       detail))
     return checks
 
 
@@ -901,6 +1309,18 @@ def main() -> int:
                          "row) and matches the console. Adds ~2 min — it has to "
                          "wait out the 120 s cell warm-up — and leaves the cells "
                          "calibrated until the next reset.")
+    ap.add_argument("--predive", action="store_true",
+                    help="run the pre-dive checks for real and require their verdict "
+                         "in the surface log (console line + /surface.csv row naming "
+                         "the step that failed). Adds ~1 min after --cal-air, less "
+                         "without it: the checks wait out the same 120 s cell warm-up. "
+                         "Pulses the solenoid on the bench.")
+    ap.add_argument("--web-host", default="http://192.168.4.1",
+                    help="base URL for /surface.csv, used by --cal-air and --predive")
+    ap.add_argument("--selftest", action="store_true",
+                    help="grade known-lying surface logs (no board needed) to prove "
+                         "the export graders can fail. Run it after touching the "
+                         "graders or the record format.")
     ap.add_argument("--replay", default=None)
     ap.add_argument("--dive-persist", action="store_true",
                     help="after the protocol checks, close a dive, reset the "
@@ -908,6 +1328,15 @@ def main() -> int:
                          "`LOG LIST` again: dive history must outlive the reset. "
                          "Adds ~35 s and a deliberate reboot, so it is opt-in.")
     args = ap.parse_args()
+
+    if args.selftest:
+        # No board, no ports: this section is about the grader, not the machine.
+        fails = 0
+        for name, ok_, detail in selftest():
+            print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
+            fails += 0 if ok_ else 1
+        print(f"\n{fails} failure(s)")
+        return 1 if fails else 0
 
     lines = []
     watch = []          # console lines from the protocol phase, see grade_watch
@@ -1017,16 +1446,39 @@ def main() -> int:
         # request having started something. So the window is marked here.
         cal_mark = len(watch)
 
+        # The boot banner's surface seq range is the baseline: the records this run
+        # makes must extend it, which is the only way to tell "written" from
+        # "already there from last time".
+        surf_boot = next((l for l in lines if SURFACE_LINE.search(l)), None)
+        surf_hi = surf_n = None
+        if surf_boot:
+            m = SURFACE_LINE.search(surf_boot)
+            surf_hi = int(m.group("hi")) if m.group("hi") else 0
+            surf_n = int(m.group("n")) if m.group("n") else 0
+
         if args.cal_air and not args.replay:
             # Before dive-persist: that phase resets the board, and this one has
             # two minutes of waiting that a reset would throw away.
             print("\n--- the air calibration's verdict (CALAIR, + E,*,7 rows) ---")
             cal_log = []
             for name, ok_, detail in run_cal_air(ser, args.handset, args.baud, watch,
-                                                 args.handset_settle, cal_log):
+                                                 args.handset_settle, cal_log,
+                                                 args.web_host if args.expect_web else None,
+                                                 surf_hi):
                 print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
                 failures += 0 if ok_ else 1
             (logdir / f"accept_{stamp}_calair.log").write_text("\n".join(cal_log) + "\n")
+
+        if args.predive and not args.replay:
+            print("\n--- the pre-dive verdict, durable (surface log) ---")
+            pre_log = []
+            for name, ok_, detail in run_predive(args.handset, args.baud, watch,
+                                                 args.handset_settle, pre_log,
+                                                 args.web_host if args.expect_web else None,
+                                                 surf_hi):
+                print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
+                failures += 0 if ok_ else 1
+            (logdir / f"accept_{stamp}_predive.log").write_text("\n".join(pre_log) + "\n")
 
         if args.watch_tail > 0:
             print(f"\n--- watching the console for {args.watch_tail:.0f} s "
@@ -1048,7 +1500,7 @@ def main() -> int:
         # command phase's traffic before it is mixed with a deliberate reset.
         print("\n--- dive history across a reset ---")
         for name, ok, detail in run_dive_persist(ser, args.handset, args.baud, watch,
-                                                 args.handset_settle):
+                                                 args.handset_settle, surf_n):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
             failures += 0 if ok else 1
 

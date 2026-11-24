@@ -284,6 +284,65 @@ static void hudTask(void*) {
 }
 
 // ---------------------------------------------------------------------------
+// Surface log records (PLAN 16) — the durable copy of a verdict
+//
+// A calibration verdict and a pre-dive result are facts about the machine, not
+// about a dive, so they cannot live in a dive file: the dive that a failed
+// pre-dive check prevents never gets a file to hold the row. They get a record in
+// /surface.bin, which the web can export. The handset sees them live
+// (`E,<t>,7,<code>`) but has no command to ask for the history — a stated cost,
+// recorded in docs/HANDSET_PROTOCOL.md §8, not an oversight.
+//
+// Two or three flash writes per power-up, never one per control cycle, so the
+// control loop's cost is the same class as the dive log's 30 s grid row (a missed
+// beat at worst, which the loop's own `skip a beat, never pile up` guard absorbs).
+// CAL AIR aborted by a dive (code 4) does land mid-dive; the dive's own grid rows
+// are already being written there, so this adds a record, not a new kind of risk.
+// ---------------------------------------------------------------------------
+static void surfaceCalAir(uint8_t code, const cal::AirCalOutput& a) {
+    logfmt::SurfaceRecord r{};
+    r.id = logfmt::EVT_CAL_AIR;
+    // The code, not a boolean: "it failed" is not a diagnosis, and the diver does
+    // something different for warm-up, for a dive that started under it and for
+    // cells that never settled. Same numbers as `CALAIR,` and `E,*,7,`.
+    r.value = code;
+    r.samples = a.samples;
+    int16_t spread = 0, raw[3] = {0, 0, 0};
+    bool nums = logfmt::countsFromFloat(a.spreadWorst, spread);
+    for (int i = 0; i < 3; i++)
+        nums = logfmt::countsFromFloat(a.rawAvg[i], raw[i]) && nums;
+    if (nums) {
+        r.spread = static_cast<uint16_t>(spread);
+        for (int i = 0; i < 3; i++) r.raw[i] = raw[i];
+    }
+    // The seconds left in the warm-up gate are deliberately NOT recorded: they
+    // count down, so a reader months later cannot act on them. The record says a
+    // calibration was refused for warm-up at this instant, which is the fact that
+    // stays true. `GET CALAIR` still carries the countdown for whoever asks now.
+    const bool ok = comms::surfaceLogAppend(r);
+    if (!ok)
+        Serial.println("surface: record NOT written - surface log offline");
+    else
+        Serial.printf("surface: record %lu id 7 value %u\n",
+                      (unsigned long)r.seq, static_cast<unsigned>(code));
+}
+
+static void surfacePredive(bool passed, uint16_t failedStep) {
+    logfmt::SurfaceRecord r{};
+    r.id = passed ? logfmt::EVT_PREPASS : logfmt::EVT_PREFAIL;
+    // Which step, for a failure: 0 warm-up, 1 air, 2 solenoid, 3 depth,
+    // 4 battery — the same order the `PRE,` line prints its five fields in, so a
+    // diver reading the CSV and a handset reading PRE, are counting the same list.
+    r.value = passed ? 0u : failedStep;
+    const bool ok = comms::surfaceLogAppend(r);
+    if (!ok)
+        Serial.println("surface: record NOT written - surface log offline");
+    else
+        Serial.printf("surface: record %lu id %u\n", (unsigned long)r.seq,
+                      static_cast<unsigned>(r.id));
+}
+
+// ---------------------------------------------------------------------------
 // ControlTask — core 1, priority below the sensor task (which must never be
 // starved) and above the HUD. Copies the latest driver samples, runs exactly
 // one ctrl::Loop cycle, writes the solenoid pin. Nothing here may block: every
@@ -337,6 +396,10 @@ static void controlTask(void*) {
                               (unsigned)left);
                 bridge::publishCalAirRefused(g_calAirStatus, bridge::CALAIR_WARMUP,
                                              left, now, calTSec, g_bridgeEvents);
+                // And the durable row: this is the fact that used to exist only
+                // as the console line above, which nobody keeps.
+                cal::AirCalOutput none;
+                surfaceCalAir(g_calAirStatus.code, none);
             } else {
                 g_airCal.start(now);
                 Serial.println("cal air: sampling (1 Hz x 12, spread-limited)");
@@ -356,6 +419,12 @@ static void controlTask(void*) {
             ai.nowMs = now;
             const cal::AirCalOutput a = g_airCal.update(ai);
             bridge::publishCalAir(g_calAirStatus, a, now, calTSec, g_bridgeEvents);
+            // Terminal verdict -> the surface log too. `g_calAirStatus.code` is
+            // read back rather than re-derived here: the mapping from a failure
+            // reason to a published code lives in one place, so the console line,
+            // the `E,` row, the `CALAIR,` answer and the flash record cannot each
+            // have their own opinion of what happened.
+            if (a.done || a.failed) surfaceCalAir(g_calAirStatus.code, a);
             if (a.done) {
                 for (int i = 0; i < 3; i++)
                     if (g_ctrlCfg.presentMask & (1u << i)) {
@@ -422,6 +491,30 @@ static void controlTask(void*) {
         // cellproof, vote membership): the handset E, lines and the dive
         // log's event rows both come from this one publication.
         bridge::publishEvents(st, (now - diveStartMs) / 1000u, g_bridgeEvents, pub);
+
+        // A pre-dive PASS or FAIL becomes a surface record on its rising edge.
+        // Edges, not levels: the check runs once and its verdict stands until
+        // someone restarts it, so a level would write a row per control cycle —
+        // the same reason the `E,` rows are edges. A FAIL record carries the step
+        // that failed, which is the part a diver can act on ("battery", not
+        // "check failed"), and it is the only durable trace there is when the
+        // dive it prevented never happened.
+        static bool prevPrePass = false, prevPreFail = false;
+        const bool prePass = g_loop->predivePassed();
+        const bool preFail = g_loop->prediveFailed();
+        if (preFail && !prevPreFail) {
+            uint16_t step = static_cast<uint16_t>(g_loop->prediveSeq().current());
+            for (int s = 0; s < predive::S_COUNT; ++s)
+                if (g_loop->prediveStatus(static_cast<predive::Step>(s)) == predive::FAIL) {
+                    step = static_cast<uint16_t>(s);
+                    break;
+                }
+            surfacePredive(false, step);
+        } else if (prePass && !prevPrePass) {
+            surfacePredive(true, 0);
+        }
+        prevPrePass = prePass;
+        prevPreFail = preFail;
 
         if (st.diveActive) {
             // running totals for the dive meta (max/min/total only: cheap)
@@ -784,6 +877,22 @@ void setup() {
                       comms::diveLogUsedBytes(), comms::diveLogTotalBytes(),
                       logNote[0] ? " ** " : "", logNote[0] ? logNote : "");
     }
+
+    // The surface log (calibration + pre-dive records). It gets its own line even
+    // when it is empty, because "no records" and "cannot read the records" are
+    // different facts and a silence looks like the first one. The seq range is the
+    // capacity evidence: 256 records at seq 41..300 says 44 were shed, 1..256 says
+    // nothing was (the same reasoning as the dive FIFO's `seq a..b`).
+    uint32_t surfLo = 0, surfHi = 0;
+    const int surfRecords = comms::surfaceLogBoot(surfLo, surfHi);
+    if (surfRecords < 0)
+        Serial.println("surface: ** /surface.bin will not read — surface history at risk");
+    else if (surfRecords == 0)
+        Serial.println("surface: no records yet (GET /surface.csv will be empty)");
+    else
+        Serial.printf("surface: %d record%s, seq %lu..%lu\n", surfRecords,
+                      surfRecords == 1 ? "" : "s",
+                      (unsigned long)surfLo, (unsigned long)surfHi);
 
     Serial.printf("clock: %s\n", clockNote);
 

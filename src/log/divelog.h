@@ -65,6 +65,17 @@ enum EventId : uint16_t {
     // and "this dive has no date" has to travel with it. Event ids are
     // append-only, so this is a new number, never a re-used one.
     EVT_CLOCK_UNSET = 15,
+    // 16: a pre-dive check FAILED, `value` being the step that failed (the same
+    // order as the five `PRE,` fields: 0 warm-up, 1 air, 2 solenoid, 3 depth,
+    // 4 battery). It is the twin of 13, and both live only in the surface log
+    // (see SurfaceRecord): a pre-dive result is a fact about the machine at the
+    // surface, so an event row inside a dive file cannot speak for it — the dive
+    // that follows a failure never happens, and the check that failed is the
+    // thing a diver wants written down. Adding 16 rather than overloading 13's
+    // value is the append-only rule doing its job: a client that knows 13 still
+    // reads a pass correctly, and one that does not know 16 loses one row rather
+    // than misreading a pass as a failure.
+    EVT_PREFAIL = 16,
 };
 
 struct Snapshot {
@@ -243,5 +254,91 @@ struct ImageRecord {
 size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
                  uint32_t seq, const ImageRecord* recs, size_t n,
                  const DiveMeta* meta);
+
+// ---- the surface log: fixed-stride records of what happened at the surface --
+// A calibration verdict and a pre-dive result are facts about the machine, not
+// about a dive, so they cannot live in a dive file: the dive that a failed
+// pre-dive check prevents never gets a file to hold the row. Until 2026-11-24
+// the only durable record of "the cells were refused for warm-up" or "the
+// pre-dive failed on battery" was the console stream, which nobody keeps.
+//
+// One file, /surface.bin, a flat stream of fixed 24 B records, each carrying its
+// own version byte and CRC16 — the same torn-write contract as the dive files: a
+// reader stops at the first record that fails, so a reset mid-write costs that
+// record and not the log. No file header on purpose: with one flat stream there
+// is no per-file identity to carry, and a header would be the one place where a
+// torn first write could lose everything.
+//
+// THIS LOG IS WEB/HTTP ONLY (PLAN 16, decided 2026-11-24): it has no handset
+// commands. That is a stated cost, not an oversight — a wired handset, the
+// in-water transport, cannot read its own machine's history; it can only be
+// listening when the event happens (`E,*,7,<code>`). The reason is the
+// append-only rule: `LOG LIST`/`LOG EXPORT` already mean "the dive log", their
+// `L,` row shape is already published, and bolting a second class of record onto
+// them would re-validate every existing client's parser for a shape it already
+// consumes. A second command pair (`SLOG LIST`/`SLOG EXPORT`) is what a handset
+// would need, and it is not built yet; when it is, it lands as spec + client
+// library + example firmware + README + conformance suite in one commit.
+constexpr uint8_t SURFACE_REC_VERSION = 1;
+constexpr size_t SURFACE_RECORD_SIZE = 24;
+
+// Capacity. 256 records x 24 B = 6 KB, which at a couple of records per power-up
+// is months of surface history, and the eviction policy is the dive log's:
+// oldest goes first. Full is not an error — see compactSurface.
+constexpr int SURFACE_MAX_RECORDS = 256;
+
+struct SurfaceRecord {
+    uint32_t epoch;    // wall clock at the record; 0 = no clock, renders kNoClock
+    uint32_t seq;      // 1..SEQ_MAX, monotonic across boots, derived from the file
+    uint16_t id;       // logfmt::EventId (7 cal air, 13 pre-dive pass, 16 fail)
+    uint16_t value;    // id-specific: 7 = bridge::CalAirCode, 16 = failing Step
+    // Raw ADC counts, the numbers that tell a dead cell from a fouled one. They
+    // are integers here because the protocol already publishes them as integers
+    // (`CALAIR,` prints 0 decimals); storing a float would imply a precision the
+    // wire never carried. Zero for records that are not about the cells.
+    int16_t raw[3];
+    uint16_t spread;   // worst per-cell spread across the window, raw counts
+    uint8_t samples;   // samples in the window
+    uint8_t flags;     // bit0: epoch was carried across a reset, unverified since
+};
+constexpr uint8_t SURF_FLAG_CLOCK_CARRIED = 0x01;
+
+size_t packSurface(const SurfaceRecord& r, uint8_t out[SURFACE_RECORD_SIZE]);
+// false on a CRC failure or a version this build does not understand — both mean
+// "stop here", never "guess at the fields".
+bool unpackSurface(const uint8_t in[SURFACE_RECORD_SIZE], SurfaceRecord& out);
+
+// Stable name for an id, for the CSV export. Unknown ids render `id<n>`: an
+// appended id must never become a row a reader silently drops or mislabels.
+size_t surfaceName(char* out, size_t cap, uint16_t id);
+
+// ---- CSV export rows: ONE canonical formatter (as for dives) ---------------
+// Identity row, then one `R,` row per record in file order (oldest first).
+// `count` and the seq range are what let a reader see that history was shed: a
+// log whose seq_hi - seq_lo + 1 exceeds count has dropped records, and says so
+// rather than presenting itself as complete. Columns are append-only: new
+// information goes on the right of `R,`, nothing existing moves.
+constexpr uint8_t SURFACE_ROW_FORMAT_VERSION = 1;
+
+size_t surfaceCsvHeader(char* out, size_t cap, int count, uint32_t seqLo,
+                        uint32_t seqHi);
+size_t surfaceCsvLine(char* out, size_t cap, const SurfaceRecord& r);
+
+// The record's raw/spread columns hold whole ADC counts, and the console line and
+// the `CALAIR,` line render the same floats with numfmt::fixed(v, 0). Converting
+// through that formatter — rather than writing a `(int16_t)(x + 0.5f)` here — is
+// what guarantees the three surfaces cannot disagree by one count: the rounding
+// rule (nearest, ties to even, like printf) lives in one place, and a 12-sample
+// average lands on an exact .5 often enough to be reachable. Returns false if the
+// value will not render, or does not fit the column, so the caller says "the
+// record has no number" instead of storing a wrong one.
+bool countsFromFloat(double v, int16_t& out);
+
+// ---- capacity policy (pure, so the host can test the whole of it) ----------
+// Records to drop from the FRONT of the log to make room for one more: 0 while
+// there is space, n - capacity + 1 when full. Oldest-first is the whole policy —
+// the newest record must always survive, because it is the one just measured —
+// and dropping never renumbers anything, so a reader can still see the gap.
+int compactSurface(int n, int capacity);
 
 } // namespace logfmt

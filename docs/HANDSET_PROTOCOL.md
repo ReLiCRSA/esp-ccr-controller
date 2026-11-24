@@ -412,14 +412,21 @@ the split: only the marked ids are actually published by today's firmware.
 | 10 | cellproof FAIL | 0 | yes |
 | 11 | setpoint clamp ON (cellproof FAIL capped the setpoints) | 0 | yes (edge: once per clamp, not once per cycle) |
 | 12 | setpoint clamp OFF | 1 = lifted by the diver's `CELLPROOF OVERRIDE` | yes |
-| 13 | pre-dive PASS | 0 | **no** (reserved) |
+| 13 | pre-dive PASS | 0 | **not on the wire**: recorded in the surface log instead (§5.1), where a pre-dive result is a fact about the machine rather than about a dive |
 | 14 | controller reset | — | **no** (reserved) |
+| 16 | pre-dive FAIL | the step that failed: 0 warm-up, 1 air, 2 solenoid, 3 depth, 4 battery — the same order as the five `PRE,` fields | **not on the wire**: surface log only (§5.1) |
 | 15 | dive started with no wall clock | 0 | dive **file** only (written into the dive at `DIVE START`; not streamed live) |
 
 Do not build a "pre-dive passed" *notification* on the remaining reserved ids —
 it never arrives. Learn the same facts from what is live now: `GET PRE` (poll,
 `PRE,` line), `GET PROOF` / the `T,` FLAGS clamp bit (5) for a clamp, and
 `GET CALAIR` or `E,*,7,<code>` for the air calibration.
+
+Ids 13 and 16 are the interesting middle case: the firmware **does** record a
+pre-dive verdict durably, but in the surface log rather than on this stream,
+because the dive a failure prevents never happens and so there is no dive file to
+put the row in. A handset that wants that history today has no command for it
+(§8); it can only poll `PRE,` while it is listening.
 
 Ids 11/12 are published as **edges**: a FAIL lasts hundreds of control cycles,
 and one row each is what the dive file needs (id 10 says the verdict, id 11 says
@@ -517,6 +524,45 @@ the controller pushes unprompted (§2). A client that needs the exported event
 list reads the file (`/dive/<n>.csv`), not the UART stream. `tools/web_probe.py`
 counts exported `E,` rows but does not compare them for this reason.
 
+### 5.1 The surface log rows (`GET /surface.csv`) — web/HTTP only
+
+Calibration verdicts and pre-dive results are recorded on the controller in
+`/surface.bin`: fixed 24-byte records, each with its own version byte and CRC16,
+read by a reader that stops at the first bad record. Same torn-write contract as
+the dive files, for the same reason.
+
+There is **no handset command for this log** — `LOG LIST` and `LOG EXPORT` mean
+"the dives", their `L,` and `DIVE,` shapes are already published, and welding a
+second class of record onto them would make every existing client re-validate a
+shape it already consumes. The rows below are what `GET /surface.csv` answers over
+the AP (see §8 for what that costs a wired handset). If a handset command pair is
+added later (`SLOG LIST` / `SLOG EXPORT`), it arrives as new commands with new
+line tags, never as a new field inside `L,`.
+
+```
+SURFACE,<row_format>,<count>,<seq_lo>,<seq_hi>
+R,<seq>,<epoch>,<iso_utc>,<id>,<name>,<value>,<raw0>,<raw1>,<raw2>,<spread>,<samples>,<flags>
+```
+
+| field | meaning |
+|---|---|
+| `count`, `seq_lo`, `seq_hi` | records delivered, and the sequence range on the log. `seq_hi - seq_lo + 1 > count` **means history was shed** by capacity: the log admits the gap instead of presenting a short list as the whole story |
+| `seq` | 1, 2, 3 … monotonic across reboots, derived from the log itself (this board has no clock to order records with). A compaction never renumbers |
+| `epoch`, `iso_utc` | wall clock at the record; `0` and `clock-unset` when nothing had set one. `flags` bit 0 says the clock was carried across a reset, i.e. not verified since |
+| `id`, `name` | the same event ids as §4 (`7` cal air, `13` pre-dive pass, `16` pre-dive fail) with a stable name beside them; an id this build cannot name is written `id<n>`, never dropped |
+| `value` | id-specific: for 7, the `CALAIR,` code (§3); for 16, the failing step in `PRE,` order |
+| `raw0..2`, `spread`, `samples` | raw ADC counts, worst per-cell spread, samples in the window — the numbers that tell a dead cell from a fouled one. Zero for records that are not about the cells. They are integers because the protocol already publishes them as integers |
+| `flags` | bit 0 = clock carried across a reset. Append-only like every other column |
+
+Columns are append-only as everywhere in this document: nothing existing moves or
+changes units, new information goes on the right of `R,`.
+
+Capacity is 256 records; the oldest are shed first by rewriting the file without
+them. That rewrite is staging-then-swap (`/surface.tmp` then rename), so an
+interrupted compaction cannot leave a half-written log — at the cost of a small
+window in which a power cut loses the surface history (never a dive).
+
+
 ## 6. Settings keys (today; the runtime truth is `GET SCHEMA`)
 
 Type chars: F float, I int16, U uint8, B bool (accepts ON/OFF/YES/NO/TRUE/
@@ -594,6 +640,17 @@ not.
   send a line the library has not length-checked. (The library itself drops an
   oversized *downlink* line whole, which is the behaviour a handset wants from a
   corrupt stream — the firmware now behaves the same way.)
+* **The surface log is web/HTTP only: a wired handset cannot read its own
+  machine's history.** A calibration verdict and a pre-dive result are recorded
+  durably (§5.1), and `GET /surface.csv` exports them; on UART2 the air-calibration
+  verdict is live (`E,*,7,<code>`, §3) but a pre-dive verdict can only be polled
+  (`GET PRE`) while something is listening, and nothing on either transport can
+  ask "what did the checks say an hour ago". The reason is the append-only rule,
+  not laziness: `LOG LIST`/`LOG EXPORT` already mean dives, and a second record
+  class inside `L,` would force every published client to re-validate a shape it
+  already consumes. Two costs follow and are not hidden: a handset in the water is
+  the one client that cannot read them, and a record cannot say which power-up it
+  belongs to (no session-start record is written, by the same decision).
 * **`OK` means "the command was accepted", not "the effect happened"** — and for
   calibration the effect is now reported separately instead of being implied.
   Fixed 2026-11-24: `CAL O2` and `CAL DEPTH` answer `ERR not implemented` (they

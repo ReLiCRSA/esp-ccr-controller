@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "log/divelog.h"
+#include "util/numfmt.h"
 
 using namespace logfmt;
 
@@ -583,6 +584,260 @@ static void test_pack_image_refuses_a_short_buffer() {
     TEST_ASSERT_TRUE(packImage(enough, sizeof(enough), 1, 1, 1, recs, 1, &m) > 0);
 }
 
+// ---- the surface log -------------------------------------------------------
+// /surface.bin holds what the machine did at the surface: a calibration verdict,
+// a pre-dive pass or failure. Those facts have no dive file to live in — a failed
+// pre-dive check prevents the dive that would have held the row — so they have a
+// record of their own, and this is the only thing standing between that record and
+// a future edit moving a field. The offsets below are the format.
+
+static SurfaceRecord calAirOk() {
+    // The bench's own verdict, captured 2026-11-24 as
+    // `CALAIR,2,2,12,21,1514,1519,1528,0` on the handset link.
+    SurfaceRecord r{};
+    r.epoch = 1795518150u;  // 2026-11-24T11:02:30Z, the bench PC's clock
+    r.seq = 3;
+    r.id = EVT_CAL_AIR;
+    r.value = 2;            // bridge::CALAIR_OK
+    r.raw[0] = 1514; r.raw[1] = 1519; r.raw[2] = 1528;
+    r.spread = 21;
+    r.samples = 12;
+    r.flags = 0;
+    return r;
+}
+
+void test_surface_record_roundtrip_and_stride() {
+    const SurfaceRecord a = calAirOk();
+    // Padded box first: a packer that writes one byte past its record is worse
+    // than a wrong field — it corrupts whatever the caller put next to it, and on
+    // the target that is a stack frame. This is what reddens when a field is
+    // widened without shrinking another.
+    uint8_t box[SURFACE_RECORD_SIZE + 8];
+    std::memset(box, 0xAA, sizeof(box));
+    TEST_ASSERT_EQUAL(SURFACE_RECORD_SIZE, packSurface(a, box));
+    for (size_t i = SURFACE_RECORD_SIZE; i < sizeof(box); i++)
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0xAA, box[i], "packSurface wrote past its record");
+    TEST_ASSERT_EQUAL(24, SURFACE_RECORD_SIZE);   // the stride the store allocates
+
+    uint8_t bytes[SURFACE_RECORD_SIZE];
+    std::memcpy(bytes, box, SURFACE_RECORD_SIZE);
+
+    SurfaceRecord b{};
+    TEST_ASSERT_TRUE(unpackSurface(bytes, b));
+    TEST_ASSERT_EQUAL_UINT32(a.epoch, b.epoch);
+    TEST_ASSERT_EQUAL_UINT32(a.seq, b.seq);
+    TEST_ASSERT_EQUAL_UINT16(a.id, b.id);
+    TEST_ASSERT_EQUAL_UINT16(a.value, b.value);
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT_EQUAL_INT_MESSAGE(a.raw[i], b.raw[i], "raw counts must survive exactly");
+    TEST_ASSERT_EQUAL_UINT16(a.spread, b.spread);
+    TEST_ASSERT_EQUAL_UINT8(a.samples, b.samples);
+    TEST_ASSERT_EQUAL_UINT8(a.flags, b.flags);
+
+    // int16, so a negative raw count (a channel reading below zero at air — the
+    // sign a fouled cell can show) is not silently made positive by an unsigned
+    // field. That sign is how an installer spots a dead channel.
+    SurfaceRecord neg = a;
+    neg.raw[1] = -37;
+    neg.flags = SURF_FLAG_CLOCK_CARRIED;
+    packSurface(neg, bytes);
+    TEST_ASSERT_EQUAL(SURFACE_RECORD_SIZE, packSurface(neg, box));
+    for (size_t i = SURFACE_RECORD_SIZE; i < sizeof(box); i++)
+        TEST_ASSERT_EQUAL_UINT8(0xAA, box[i]);
+    unpackSurface(bytes, b);
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-37, b.raw[1], "negative raw count lost its sign");
+    TEST_ASSERT_EQUAL_UINT8(SURF_FLAG_CLOCK_CARRIED, b.flags);
+}
+
+// Every field's byte offset, spelled out and decoded from hand-written bytes, so
+// a future edit that inserts or widens a field cannot quietly re-label what is
+// already on a diver's flash. seq is 3 bytes because SEQ_MAX is one definition
+// (0x00FFFFFF) shared with the dive header: writing 4 here would land the CRC at
+// the wrong offset, and this is the test that would notice.
+void test_surface_record_offsets_are_the_documented_bytes() {
+    uint8_t bytes[SURFACE_RECORD_SIZE] = {};
+    bytes[0] = SURFACE_REC_VERSION;              // 1
+    bytes[1] = 0xC6; bytes[2] = 0x6E; bytes[3] = 0x05; bytes[4] = 0x6B;  // epoch 1795518150 LE
+    bytes[5] = 0x39; bytes[6] = 0x05; bytes[7] = 0x00;                   // seq = 1337
+    bytes[8] = 0x07; bytes[9] = 0x00;                                    // id
+    bytes[10] = 0x03; bytes[11] = 0x00;                                  // value = warm-up
+    bytes[12] = 0x0A; bytes[13] = 0x00;                                  // raw0 = 10
+    bytes[14] = 0x0B; bytes[15] = 0x00;                                  // raw1 = 11
+    bytes[16] = 0x0C; bytes[17] = 0x00;                                  // raw2 = 12
+    bytes[18] = 0x15; bytes[19] = 0x00;                                  // spread = 21
+    bytes[20] = 12;                                                      // samples
+    bytes[21] = SURF_FLAG_CLOCK_CARRIED;                                 // flags
+    const uint16_t crc = crc16(bytes, SURFACE_RECORD_SIZE - 2);
+    bytes[22] = static_cast<uint8_t>(crc);
+    bytes[23] = static_cast<uint8_t>(crc >> 8);
+
+    SurfaceRecord r{};
+    TEST_ASSERT_TRUE_MESSAGE(unpackSurface(bytes, r), "hand-written record rejected");
+    TEST_ASSERT_EQUAL_UINT32(1795518150u, r.epoch);   // the same value calAirOk() writes
+    TEST_ASSERT_EQUAL_UINT32(1337u, r.seq);
+    TEST_ASSERT_EQUAL_UINT16(EVT_CAL_AIR, r.id);
+    TEST_ASSERT_EQUAL_UINT16(3u, r.value);
+    TEST_ASSERT_EQUAL_INT(10, r.raw[0]);
+    TEST_ASSERT_EQUAL_INT(11, r.raw[1]);
+    TEST_ASSERT_EQUAL_INT(12, r.raw[2]);
+    TEST_ASSERT_EQUAL_UINT16(21u, r.spread);
+    TEST_ASSERT_EQUAL_UINT8(12, r.samples);
+    TEST_ASSERT_EQUAL_UINT8(SURF_FLAG_CLOCK_CARRIED, r.flags);
+}
+
+void test_surface_record_crc_and_version_gates() {
+    uint8_t bytes[SURFACE_RECORD_SIZE];
+    packSurface(calAirOk(), bytes);
+
+    // A torn write: one byte flipped mid-record. The reader must stop, not
+    // decode a plausible-looking calibration with different raw counts.
+    bytes[14] ^= 0xFF;
+    SurfaceRecord r{};
+    TEST_ASSERT_FALSE_MESSAGE(unpackSurface(bytes, r), "surface CRC did not catch the edit");
+
+    // A layout this build does not know. The CRC is recomputed so the only thing
+    // that can reject this is the version gate: without it, a v2 record's fields
+    // would be read as v1 and the numbers would be wrong but convincing.
+    packSurface(calAirOk(), bytes);
+    bytes[0] = SURFACE_REC_VERSION + 1;
+    const uint16_t crc = crc16(bytes, SURFACE_RECORD_SIZE - 2);
+    bytes[22] = static_cast<uint8_t>(crc);
+    bytes[23] = static_cast<uint8_t>(crc >> 8);
+    TEST_ASSERT_FALSE_MESSAGE(unpackSurface(bytes, r), "unknown surface version was accepted");
+}
+
+void test_surface_names_are_stable_and_unknown_ids_keep_their_number() {
+    char n[24];
+    TEST_ASSERT_EQUAL_STRING("cal_air", (surfaceName(n, sizeof(n), EVT_CAL_AIR), n));
+    TEST_ASSERT_EQUAL_STRING("pre_dive_pass", (surfaceName(n, sizeof(n), EVT_PREPASS), n));
+    TEST_ASSERT_EQUAL_STRING("pre_dive_fail", (surfaceName(n, sizeof(n), EVT_PREFAIL), n));
+    // An id appended by a future build still gets a label: a row without a name
+    // is a row a reader drops, which is how append-only logs start lying.
+    TEST_ASSERT_EQUAL_STRING("id99", (surfaceName(n, sizeof(n), 99), n));
+    TEST_ASSERT_EQUAL(0, surfaceName(n, 4, EVT_CAL_AIR));   // 4 cannot hold "cal_air"
+}
+
+// The exported rows, byte for byte. `GET /surface.csv` is the only export path, so
+// these strings ARE the format a diver's spreadsheet sees.
+void test_surface_rows_are_the_documented_shape() {
+    char line[128];
+
+    surfaceCsvLine(line, sizeof(line), calAirOk());
+    TEST_ASSERT_EQUAL_STRING(
+        "R,3,1795518150,2026-11-24T11:02:30Z,7,cal_air,2,1514,1519,1528,21,12,0\n", line);
+
+    // A failure at the surface with no clock: the date column says so instead of
+    // rendering 1970, and `value` names the step that failed (4 = battery), the
+    // same order as the five `PRE,` fields.
+    SurfaceRecord f{};
+    f.seq = 4; f.id = EVT_PREFAIL; f.value = 4;
+    surfaceCsvLine(line, sizeof(line), f);
+    TEST_ASSERT_EQUAL_STRING(
+        "R,4,0,clock-unset,16,pre_dive_fail,4,0,0,0,0,0,0\n", line);
+
+    // A date carried across a reset is not a verified date, and the flags column
+    // is what says which is which months later.
+    SurfaceRecord p = calAirOk();
+    p.seq = 5; p.epoch = 1795517641u; p.id = EVT_PREPASS; p.value = 0;
+    p.raw[0] = p.raw[1] = p.raw[2] = 0; p.spread = 0; p.samples = 0;
+    p.flags = SURF_FLAG_CLOCK_CARRIED;
+    surfaceCsvLine(line, sizeof(line), p);
+    TEST_ASSERT_EQUAL_STRING(
+        "R,5,1795517641,2026-11-24T10:54:01Z,13,pre_dive_pass,0,0,0,0,0,0,1\n", line);
+
+    // Identity row: count plus the seq range, so a log that shed history admits
+    // it (5..9 with only 3 records is two records gone) instead of presenting
+    // itself as the whole story.
+    surfaceCsvHeader(line, sizeof(line), 3, 5, 9);
+    TEST_ASSERT_EQUAL_STRING("SURFACE,1,3,5,9\n", line);
+    // The rows themselves still carry their original seq across a compaction.
+    SurfaceRecord g = calAirOk();
+    g.seq = 5;
+    surfaceCsvLine(line, sizeof(line), g);
+    TEST_ASSERT_EQUAL(0, std::strncmp("R,5,", line, 4));
+}
+
+void test_surface_rows_refuse_rather_than_truncate() {
+    char line[16];
+    TEST_ASSERT_EQUAL(0, surfaceCsvLine(line, sizeof(line), calAirOk()));
+    TEST_ASSERT_EQUAL(0, surfaceCsvLine(line, 40, calAirOk()));   // one byte short
+    char big[64];
+    TEST_ASSERT(surfaceCsvHeader(big, sizeof(big), 1, 1, 1) > 0);
+    TEST_ASSERT_EQUAL(0, surfaceCsvHeader(big, 8, 1, 1, 1));
+}
+
+// The record columns hold whole ADC counts, and the console line and the
+// `CALAIR,` line print the same floats. If the record rounded differently, the
+// spreadsheet row and the console would disagree by one count about the same
+// calibration — small, and exactly the kind of drift the calibration work exists
+// to kill. A 12-sample average lands on an exact .5 often enough (sum = 12k+6)
+// for the tie rule to be reachable, so these pin ties to even, like printf.
+void test_surface_counts_round_the_way_the_wire_prints_them() {
+    const struct { double v; int want; } cases[] = {
+        {1514.0, 1514}, {1519.0, 1519},
+        {1514.4, 1514}, {1514.6, 1515},
+        {0.5, 0}, {1.5, 2}, {2.5, 2},        // ties to even, not away from zero
+        {1514.5, 1514}, {1515.5, 1516},
+        {-37.0, -37}, {-37.6, -38},
+        {21.0, 21},                          // a worst-spread value from the bench
+    };
+    char wire[24], again[24];
+    // -0.5 is left out of the table on purpose: numfmt renders negative zero as
+    // "-0" (printf's signbit rule) and an integer column cannot hold a sign with
+    // no value behind it. Asserted separately below rather than quietly skipped.
+    for (const auto& c : cases) {
+        int16_t got = 0;
+        TEST_ASSERT_TRUE_MESSAGE(logfmt::countsFromFloat(c.v, got), "count refused");
+        TEST_ASSERT_EQUAL_INT_MESSAGE(c.want, static_cast<int>(got), "count rounding");
+        // And the stored number prints back as the same bytes the console used.
+        numfmt::fixed(wire, sizeof(wire), c.v, 0);
+        std::snprintf(again, sizeof(again), "%d", static_cast<int>(got));
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(again, wire, "stored count is not what the wire prints");
+    }
+
+    int16_t z = 7;
+    TEST_ASSERT_TRUE(logfmt::countsFromFloat(-0.5, z));
+    TEST_ASSERT_EQUAL_INT(0, static_cast<int>(z));
+    numfmt::fixed(wire, sizeof(wire), -0.5, 0);
+    TEST_ASSERT_EQUAL_STRING("-0", wire);   // the one place the two may differ
+}
+
+void test_surface_counts_refuse_what_they_cannot_hold() {
+    int16_t got = 0;
+    TEST_ASSERT_FALSE(logfmt::countsFromFloat(40000.0, got));    // past int16
+    TEST_ASSERT_FALSE(logfmt::countsFromFloat(-40000.0, got));
+    TEST_ASSERT_FALSE(logfmt::countsFromFloat(1e30, got));       // no fixed rendering
+    TEST_ASSERT_FALSE(logfmt::countsFromFloat(0.0 / 0.0, got));  // nan
+    TEST_ASSERT_FALSE(logfmt::countsFromFloat(1.0 / 0.0, got));  // inf
+}
+
+void test_surface_capacity_keeps_the_newest_and_never_renumbers() {
+    // Room: rewrite nothing. Rewriting a whole file to add one record is how a
+    // log ends up lost when the rewrite is interrupted.
+    TEST_ASSERT_EQUAL(0, compactSurface(0, SURFACE_MAX_RECORDS));
+    TEST_ASSERT_EQUAL(0, compactSurface(SURFACE_MAX_RECORDS - 1, SURFACE_MAX_RECORDS));
+    // Full: exactly one goes, the oldest.
+    TEST_ASSERT_EQUAL(1, compactSurface(SURFACE_MAX_RECORDS, SURFACE_MAX_RECORDS));
+    // Overflow by k (records written while the rewrite failed): k + 1.
+    TEST_ASSERT_EQUAL(11, compactSurface(SURFACE_MAX_RECORDS + 10, SURFACE_MAX_RECORDS));
+    // A nonsense capacity sheds nothing rather than everything: losing the whole
+    // history is worse than one oversized file.
+    TEST_ASSERT_EQUAL(0, compactSurface(50, 0));
+    TEST_ASSERT_EQUAL(0, compactSurface(50, -1));
+
+    // Applied to a real sequence: the newest survives, the oldest goes, and no
+    // record is renumbered — a reader can still see the gap in the seq range.
+    constexpr int kN = 10, kCap = 4;
+    uint32_t seq[kN];
+    for (int i = 0; i < kN; ++i) seq[i] = static_cast<uint32_t>(i + 1);
+    const int drop = compactSurface(kN, kCap);
+    TEST_ASSERT_EQUAL(7, drop);
+    const int kept = kN - drop;
+    TEST_ASSERT_EQUAL(kCap - 1, kept);          // room for the record being written
+    TEST_ASSERT_EQUAL(8u, seq[drop]);           // oldest kept
+    TEST_ASSERT_EQUAL(10u, seq[kN - 1]);        // newest kept, same number it was born with
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_snapshot_roundtrip_and_size);
@@ -607,5 +862,14 @@ int main() {
     RUN_TEST(test_rows_refuse_rather_than_truncate);
     RUN_TEST(test_both_export_paths_are_the_same_bytes);
     RUN_TEST(test_pack_image_refuses_a_short_buffer);
+    RUN_TEST(test_surface_record_roundtrip_and_stride);
+    RUN_TEST(test_surface_record_offsets_are_the_documented_bytes);
+    RUN_TEST(test_surface_record_crc_and_version_gates);
+    RUN_TEST(test_surface_names_are_stable_and_unknown_ids_keep_their_number);
+    RUN_TEST(test_surface_rows_are_the_documented_shape);
+    RUN_TEST(test_surface_rows_refuse_rather_than_truncate);
+    RUN_TEST(test_surface_counts_round_the_way_the_wire_prints_them);
+    RUN_TEST(test_surface_counts_refuse_what_they_cannot_hold);
+    RUN_TEST(test_surface_capacity_keeps_the_newest_and_never_renumbers);
     return UNITY_END();
 }

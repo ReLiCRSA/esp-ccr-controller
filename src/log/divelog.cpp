@@ -8,6 +8,7 @@
 #include "util/numfmt.h"
 
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 
@@ -514,6 +515,123 @@ ScanResult scanRecords(const uint8_t* img, size_t len,
         if (tag == REC_META) break;       // trailer terminates the dive
     }
     return res;
+}
+
+// ---- the surface log -------------------------------------------------------
+namespace {
+void wr24(uint8_t*& p, uint32_t v) {
+    *p++ = static_cast<uint8_t>(v);
+    *p++ = static_cast<uint8_t>(v >> 8);
+    *p++ = static_cast<uint8_t>(v >> 16);
+}
+uint32_t rd24(const uint8_t*& p) {
+    const uint32_t v = p[0] | (static_cast<uint32_t>(p[1]) << 8) |
+                       (static_cast<uint32_t>(p[2]) << 16);
+    p += 3;
+    return v;
+}
+} // namespace
+
+size_t packSurface(const SurfaceRecord& r, uint8_t out[SURFACE_RECORD_SIZE]) {
+    uint8_t* p = out;
+    std::memset(out, 0, SURFACE_RECORD_SIZE);
+    *p++ = SURFACE_REC_VERSION;
+    wr32(p, r.epoch);
+    // 3 bytes, like the dive header's seq: SEQ_MAX is one definition (0x00FFFFF F)
+    // and a fourth byte would be a stride change for a number that will saturate
+    // long before it needs one. A compaction never renumbers, so the seq a reader
+    // sees here is the one the record was born with.
+    wr24(p, r.seq);
+    wr16(p, r.id);
+    wr16(p, r.value);
+    for (int i = 0; i < 3; ++i) wr16(p, static_cast<uint16_t>(r.raw[i]));
+    wr16(p, r.spread);
+    *p++ = r.samples;
+    *p++ = r.flags;
+    // Same torn-write rule as every other record on this partition: the CRC is
+    // per record, so a reset between two writes costs that record and leaves the
+    // reader a clean place to stop.
+    wr16(p, crc16(out, SURFACE_RECORD_SIZE - 2));
+    return SURFACE_RECORD_SIZE;
+}
+
+bool unpackSurface(const uint8_t in[SURFACE_RECORD_SIZE], SurfaceRecord& out) {
+    if (crc16(in, SURFACE_RECORD_SIZE - 2) !=
+        (uint16_t)(in[SURFACE_RECORD_SIZE - 2] |
+                   (in[SURFACE_RECORD_SIZE - 1] << 8)))
+        return false;
+    if (in[0] != SURFACE_REC_VERSION) return false;  // unknown layout: stop, do not guess
+    const uint8_t* p = in + 1;
+    out.epoch = rd32(p);
+    out.seq = rd24(p);
+    out.id = rd16(p);
+    out.value = rd16(p);
+    for (int i = 0; i < 3; ++i) out.raw[i] = static_cast<int16_t>(rd16(p));
+    out.spread = rd16(p);
+    out.samples = *p++;
+    out.flags = *p++;
+    return true;
+}
+
+size_t surfaceName(char* out, size_t cap, uint16_t id) {
+    // Names are for the CSV a human opens; the id stays in its own column, so a
+    // rename here could never break a parser. `id<n>` for anything this build
+    // does not know: an appended id must not become a row without a label.
+    const char* n = nullptr;
+    switch (id) {
+        case EVT_CAL_AIR:  n = "cal_air"; break;
+        case EVT_PREPASS:  n = "pre_dive_pass"; break;
+        case EVT_PREFAIL:  n = "pre_dive_fail"; break;
+        default: break;
+    }
+    if (n) {
+        const size_t l = std::strlen(n);
+        if (cap < l + 1) return 0;
+        std::memcpy(out, n, l + 1);
+        return l;
+    }
+    const int w = std::snprintf(out, cap, "id%u", static_cast<unsigned>(id));
+    return (w < 0 || static_cast<size_t>(w) >= cap) ? 0 : static_cast<size_t>(w);
+}
+
+size_t surfaceCsvHeader(char* out, size_t cap, int count, uint32_t seqLo,
+                        uint32_t seqHi) {
+    return row(out, cap, "SURFACE,%u,%d,%u,%u\n",
+               static_cast<unsigned>(SURFACE_ROW_FORMAT_VERSION), count,
+               static_cast<unsigned>(seqLo), static_cast<unsigned>(seqHi));
+}
+
+// Columns, append-only: seq, epoch, ISO date (or `clock-unset`), id, name,
+// value, raw0..2, spread, samples, flags. `flags` is there because a date that
+// was carried across a reset is not a verified date, and a diver reading this
+// file months later cannot otherwise tell the two apart.
+size_t surfaceCsvLine(char* out, size_t cap, const SurfaceRecord& r) {
+    char iso[24], name[24];
+    if (!isoUtc(iso, sizeof(iso), r.epoch)) return 0;
+    if (!surfaceName(name, sizeof(name), r.id)) return 0;
+    return row(out, cap, "R,%u,%u,%s,%u,%s,%u,%d,%d,%d,%u,%u,%u\n",
+               static_cast<unsigned>(r.seq), static_cast<unsigned>(r.epoch), iso,
+               static_cast<unsigned>(r.id), name, static_cast<unsigned>(r.value),
+               static_cast<int>(r.raw[0]), static_cast<int>(r.raw[1]),
+               static_cast<int>(r.raw[2]), static_cast<unsigned>(r.spread),
+               static_cast<unsigned>(r.samples), static_cast<unsigned>(r.flags));
+}
+
+int compactSurface(int n, int capacity) {
+    if (capacity <= 0 || n < capacity) return 0;   // room: rewrite nothing
+    return n - capacity + 1;                      // oldest goes first, newest stays
+}
+
+bool countsFromFloat(double v, int16_t& out) {
+    char b[24];
+    numfmt::fixed(b, sizeof(b), v, 0);
+    if (b[0] == '\0') return false;        // nan / inf / unrepresentable: no number
+    char* end = nullptr;
+    const long l = std::strtol(b, &end, 10);
+    if (end == b || (end && *end != '\0')) return false;   // "inf" or anything odd
+    if (l < -32768L || l > 32767L) return false;           // will not fit the column
+    out = static_cast<int16_t>(l);
+    return true;
 }
 
 } // namespace logfmt

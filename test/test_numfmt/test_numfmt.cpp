@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <string>
 
 #include "util/numfmt.h"
 
@@ -154,6 +156,234 @@ void test_awkward_step_values() {
     }
 }
 
+// ---- scaled(): the one way a physical value becomes a stored integer -------
+
+namespace {
+
+struct StoreCase { float v; int decimals; long long want; };
+
+// Every `want` is hand-worked: the count of thousandths (or hundredths) a diver
+// reads off the same value on the wire. Computed expectations would only prove
+// the helper agrees with itself.
+const StoreCase kStore[] = {
+    // ppO2, setpoint, cells: thousandths — stored scaled(v,3), printed %.3f
+    {0.0f, 3, 0},      {0.01f, 3, 10},     {0.05f, 3, 50},    {0.10f, 3, 100},
+    {0.15f, 3, 150},   {0.21f, 3, 210},    {0.25f, 3, 250},   {0.29f, 3, 290},
+    {0.30f, 3, 300},   {0.35f, 3, 350},    {0.40f, 3, 400},   {0.45f, 3, 450},
+    {0.50f, 3, 500},   {0.55f, 3, 550},    {0.60f, 3, 600},   {0.66f, 3, 660},
+    {0.70f, 3, 700},   {0.75f, 3, 750},    {0.80f, 3, 800},   {1.60f, 3, 1600},
+    {0.0004f, 3, 0},   {0.0006f, 3, 1},
+    // depth and ceiling: centimetres — stored scaled(v,2), printed %.2f
+    {0.0f, 2, 0},      {0.29f, 2, 29},     {2.53f, 2, 253},   {5.07f, 2, 507},
+    {11.15f, 2, 1115}, {20.30f, 2, 2030},  {40.0f, 2, 4000},  {99.99f, 2, 9999},
+    {-0.29f, 2, -29},  {-11.15f, 2, -1115}, {-0.004f, 2, 0},
+    // battery: millivolts
+    {11.9f, 3, 11900}, {12.6f, 3, 12600},  {16.8f, 3, 16800},
+    // whole counts: gf pairs, CNS %
+    {35.0f, 0, 35},    {12.9f, 0, 13},     {12.1f, 0, 12},
+};
+
+// Values the renderer needs fma() to get right — the stored integer has to land
+// on the same side of the tie that fixed() prints.
+const double kAwkward[] = {0.0105, 1.005, 2.675, 0.125, 0.375, 0.005, 0.55, 1.305};
+
+std::string readFile(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return "";
+    std::string out;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+} // namespace
+
+void test_scaled_lands_on_the_count_the_diver_reads() {
+    for (const StoreCase& c : kStore) {
+        const long long got = numfmt::scaled(c.v, c.decimals);
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "scaled(%.4f, %d) -> %lld, want %lld",
+                      static_cast<double>(c.v), c.decimals, got, c.want);
+        TEST_ASSERT_EQUAL_INT64_MESSAGE(c.want, got, msg);
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(30, static_cast<int>(sizeof(kStore) / sizeof(kStore[0])),
+                                             "the storage table shrank below the point of the case");
+}
+
+void test_a_bare_cast_is_where_the_dive_file_went_wrong() {
+    // Pinned, not illustrative: these are the expressions the firmware used, and
+    // the numbers it therefore wrote on 2026-11-24. If someone "simplifies" the
+    // helper back into a cast, this is the case that says what the cast does.
+    const float depth = 20.30f;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(2029, static_cast<int>(static_cast<int32_t>(depth * 100.0f)),
+                                  "(int32_t)(depth * 100.0f) no longer loses the count");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(2030, numfmt::scaled(depth, 2),
+                                    "the helper must store 2030 cm for a depth printed 20.30");
+
+    const float ceiling = 11.15f;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1114, static_cast<int>(static_cast<int16_t>(ceiling * 100.0)),
+                                  "a DOUBLE literal used to promote the float and land low");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(1115, numfmt::scaled(ceiling, 2),
+                                    "this bench's measured ceiling of 11.15 m must store 1115 cm");
+
+    const float vote = 0.29f;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(289, static_cast<int>(static_cast<int16_t>(vote * 1000.0)),
+                                  "0.29 bar through a double multiply stored 289 thousandths");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(290, numfmt::scaled(vote, 3),
+                                    "and the handset was answered 0.290 for the same sample");
+
+    // And the nuance that let this survive review: a FLOAT multiply re-rounds the
+    // product to the nearest float, which usually lands back on the integer, so
+    // 0.15f * 1000.0f is exactly 150.0f and the old cast looked fine. The double
+    // literal above is what actually broke, on most decimals, and the float path
+    // still fails often enough (20.30 m) that "it works on the values I tried"
+    // was never a safe answer. Both halves are pinned here so nobody re-derives
+    // it: the float multiply is safe for 0.15, and unsafe for 20.30.
+    const float sp = 0.15f;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(150, static_cast<int>(static_cast<int16_t>(sp * 1000.0f)),
+                                  "a float multiply re-rounds: 0.15 was never a miss");
+}
+
+void test_stored_and_printed_never_disagree() {
+    // The invariant the whole helper exists for: storing then rendering must give
+    // the bytes the handset was answered for the same sample. Two rounding rules
+    // in one file is how a digit gets between them.
+    int compared = 0;
+    int neg_zero = 0;
+    for (const StoreCase& c : kStore) {
+        const long long sc = numfmt::scaled(c.v, c.decimals);
+        char printed[64], round_tripped[64];
+        numfmt::fixed(printed, sizeof(printed), c.v, c.decimals);
+        numfmt::fixedScaled(round_tripped, sizeof(round_tripped), sc, c.decimals);
+        if (sc == 0 && std::signbit(c.v)) {
+            // printf spells a small negative "-0.00" and there is no integer for
+            // that. Counted, not compared — and the count is asserted, so this
+            // branch cannot quietly become the whole test.
+            ++neg_zero;
+            continue;
+        }
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "%.4f at %d decimals: fixed '%s' vs stored-then-printed '%s'",
+                      static_cast<double>(c.v), c.decimals, printed, round_tripped);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(printed, round_tripped, msg);
+        ++compared;
+    }
+    for (double v : kAwkward) {
+        for (int d = 2; d <= 4; ++d) {
+            const long long sc = numfmt::scaled(v, d);
+            char printed[64], round_tripped[64];
+            numfmt::fixed(printed, sizeof(printed), v, d);
+            numfmt::fixedScaled(round_tripped, sizeof(round_tripped), sc, d);
+            TEST_ASSERT_EQUAL_STRING_MESSAGE(printed, round_tripped,
+                                             "an awkward value's stored count disagrees with its printed one");
+            ++compared;
+        }
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(40, compared,
+                                             "the agreement walk compared too few values to mean anything");
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(1, neg_zero,
+                                             "no negative-rounds-to-zero case reached the walk: "
+                                             "the excluded branch is untested");
+}
+
+void test_ties_go_to_the_even_side_like_the_renderer() {
+    // NOT lround(): the renderer's rule is nearest-with-ties-to-even, because it
+    // matches printf, so the storage helper has to use the same rule or the pair
+    // differs on a tie. 0.5 -> 0, 1.5 -> 2, 2.5 -> 2 (lround gives 1, 2, 3).
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(0, numfmt::scaled(0.5, 0), "0.5 ties to the even 0");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(2, numfmt::scaled(1.5, 0), "1.5 ties to the even 2");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(2, numfmt::scaled(2.5, 0), "2.5 ties to the even 2");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(-2, numfmt::scaled(-2.5, 0), "the sign comes back");
+    // A scaled tie at the storage step: 0.125 at 2 decimals is "0.12" on the wire,
+    // so the stored count must be 12, not 13.
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(12, numfmt::scaled(0.125, 2), "0.125 stores 12 hundredths");
+    TEST_ASSERT_EQUAL_INT64_MESSAGE(38, numfmt::scaled(0.375, 2), "0.375 stores 38 hundredths");
+}
+
+void test_scaled_refuses_rather_than_wrapping() {
+    // Documented contract: 0 for a value that cannot be held, never a plausible
+    // wrap. These are not expected inputs — depth, bar and volts are far inside
+    // range — but a sensor fault must not become a plausible wrong dive row.
+    TEST_ASSERT_EQUAL_INT64(0, numfmt::scaled(std::numeric_limits<double>::quiet_NaN(), 3));
+    TEST_ASSERT_EQUAL_INT64(0, numfmt::scaled(std::numeric_limits<double>::infinity(), 3));
+    TEST_ASSERT_EQUAL_INT64(0, numfmt::scaled(1e30, 3));
+    // Out-of-range decimals clamp the same way fixed() does rather than overflow.
+    TEST_ASSERT_EQUAL_INT64(290, numfmt::scaled(0.29f, 3));
+    TEST_ASSERT_EQUAL_INT64(0, numfmt::scaled(0.0, 99));
+}
+
+void test_stored_values_go_through_the_helper() {
+    // The structural claim, enforced on the text — the same trick that keeps one
+    // depth formula in one file. main.cpp and session_wiring.cpp are not
+    // host-compiled, so a scan is the only way the native suite can see them, and
+    // a scan that shrugs when a file will not open is decoration: a missing file
+    // fails loudly.
+    const char* kUsers[] = {"src/main.cpp", "src/comms/session_wiring.cpp",
+                            "src/comms/telemetry_bridge.cpp", "src/control/cellhist.cpp"};
+    int calls = 0;
+    for (const char* path : kUsers) {
+        const std::string src = readFile(path);
+        TEST_ASSERT_MESSAGE(!src.empty(),
+                            (std::string("cannot read ") + path +
+                             " — run the native tests from the project root").c_str());
+        TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(src.c_str(), "numfmt::scaled"),
+                                     (std::string(path) + " stores a scaled value without "
+                                      "util/numfmt.h").c_str());
+
+        // No hand-rolled scaling or rounding left in a file that stores values:
+        // no `* 100` / `* 1000` product and no `+ 0.5` tie-hack outside comments.
+        // This is what catches the NEXT field, the one nobody has thought about.
+        int lineno = 0;
+        size_t pos = 0;
+        while (pos <= src.size()) {
+            size_t eol = src.find('\n', pos);
+            const std::string line = src.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+            ++lineno;
+            const size_t first = line.find_first_not_of(" \t");
+            const std::string t = (first == std::string::npos) ? std::string() : line.substr(first);
+            // Full-line comments are exempt: explaining the old defect is allowed to
+            // name it. Code with a trailing comment is not exempt, so a defect cannot
+            // hide after a `;` on a line that starts with code.
+            if (!t.empty() && t.rfind("//", 0) != 0) {
+                for (const char* forbidden : {"* 100", "* 1000", "+ 0.5"}) {
+                    TEST_ASSERT_NULL_MESSAGE(std::strstr(line.c_str(), forbidden),
+                                             (std::string(path) + ":" + std::to_string(lineno) +
+                                              " scales or rounds by hand (" + forbidden +
+                                              "); go through numfmt::scaled").c_str());
+                }
+            }
+            for (size_t at = src.find("numfmt::scaled(", pos);
+                 at != std::string::npos && at < (eol == std::string::npos ? src.size() : eol + 1);
+                 at = src.find("numfmt::scaled(", at + 1))
+                ++calls;
+            if (eol == std::string::npos) break;
+            pos = eol + 1;
+        }
+    }
+    // A scan is only as good as the number of sites it found.
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(12, calls,
+                                             "fewer than 12 scaled() call sites: someone removed "
+                                             "the conversions the scan exists to police");
+
+    // And there must still be exactly one rounding engine, used by both entry
+    // points — otherwise "one rule" is a comment, not a fact.
+    const std::string helper = readFile("src/util/numfmt.cpp");
+    TEST_ASSERT_MESSAGE(!helper.empty(), "cannot read src/util/numfmt.cpp");
+    int engine = 0;
+    for (size_t at = helper.find("roundExact"); at != std::string::npos; at = helper.find("roundExact", at + 1))
+        ++engine;
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(3, engine,
+                                             "numfmt.cpp no longer shares one rounding between "
+                                             "fixed() and scaled()");
+    for (const char* forbidden : {"lround", "std::round", "+ 0.5"}) {
+        TEST_ASSERT_NULL_MESSAGE(std::strstr(helper.c_str(), forbidden),
+                                 (std::string("util/numfmt.cpp grew a second rounding rule (") +
+                                  forbidden + ")").c_str());
+    }
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_ties_round_half_to_even);
@@ -165,5 +395,11 @@ int main() {
     RUN_TEST(test_scaled_integers_match_the_divide_they_replace);
     RUN_TEST(test_decimals_are_clamped_not_crashed);
     RUN_TEST(test_awkward_step_values);
+    RUN_TEST(test_scaled_lands_on_the_count_the_diver_reads);
+    RUN_TEST(test_a_bare_cast_is_where_the_dive_file_went_wrong);
+    RUN_TEST(test_stored_and_printed_never_disagree);
+    RUN_TEST(test_ties_go_to_the_even_side_like_the_renderer);
+    RUN_TEST(test_scaled_refuses_rather_than_wrapping);
+    RUN_TEST(test_stored_values_go_through_the_helper);
     return UNITY_END();
 }

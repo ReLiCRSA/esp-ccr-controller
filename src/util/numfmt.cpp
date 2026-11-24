@@ -25,6 +25,37 @@ char* empty(char* buf) {
     return buf;
 }
 
+// The one rounding engine: scales a NON-NEGATIVE, finite magnitude by `scale` and
+// rounds to nearest, ties to EVEN, deciding the tie on the EXACT product.
+//
+// Two things here are load-bearing. (1) The tie rule is printf's, because
+// fixed() has to match printf("%.Nf") byte for byte and scaled() has to agree
+// with fixed() — one rule, or the stored integer and the printed digits part
+// company on a tie. (2) The multiply must be exact, not merely rounded: 0.0105
+// is stored slightly ABOVE 0.0105, but `0.0105 * 1000.0` rounds to exactly 10.5,
+// so a naive implementation sees a tie where there was none and emits "0.010"
+// where printf says "0.011" (test_awkward_step_values found 40 such values under
+// 0.4 bar). fma() supplies the exact residual so the comparison below decides on
+// the value the caller actually has.
+//
+// Returns false when the scaled magnitude cannot be held; the caller then refuses
+// (fixed) or returns 0 (scaled), never a plausible wrong number.
+bool roundExact(double mag, double scale, long long* out) {
+    if (!(mag * scale < static_cast<double>(std::numeric_limits<long long>::max() / 8)))
+        return false;
+    const double hi = mag * scale;
+    const double lo = std::fma(mag, scale, -hi);   // exact product is hi + lo
+    double fl = std::floor(hi);
+    double r = (hi - fl) + lo;
+    if (r < 0.0) { fl -= 1.0; r += 1.0; }          // hi rounded up past an integer
+    else if (r >= 1.0) { fl += 1.0; r -= 1.0; }
+    long long s = static_cast<long long>(fl);
+    if (r > 0.5) s += 1;
+    else if (r == 0.5 && (s & 1)) s += 1;          // tie: to the EVEN neighbour
+    *out = s;
+    return true;
+}
+
 // Shared digit writer: '-' if neg, then whole, then '.' + `decimals` digits of
 // frac (frac is in [0, 10^decimals)). Refuses rather than emitting a partial
 // number, because a truncated ppO2 field is worse than a missing line.
@@ -106,36 +137,21 @@ char* fixed(char* buf, std::size_t cap, double v, int decimals) {
     const double scale = static_cast<double>(ipow10(decimals));
     const double mag = std::fabs(v);
 
-    // Beyond this the scaled value cannot be held, and no float fallback is
-    // allowed (that is the whole point of this file). Refuse instead of lying.
-    if (!(mag * scale < static_cast<double>(std::numeric_limits<long long>::max() / 8))) {
-        return empty(buf);
-    }
-
-    // printf rounds the exact binary value to nearest, ties to EVEN. llround()
-    // rounds ties away from zero and would print a different byte on a tie, so
-    // the tie rule is spelled out here: 0.125 at %.2f is "0.12", 1.5 at %.0f is
-    // "2" (1 is odd), 0.5 at %.0f is "0" (0 is even).
-    //
-    // The scaling multiply must be EXACT, not merely rounded, or the tie rule
-    // gets applied to a value that was never a tie: 0.0105 is stored slightly
-    // ABOVE 0.0105, but `0.0105 * 1000.0` rounds to exactly 10.5, so a naive
-    // implementation sees a tie and emits "0.010" where printf says "0.011" — a
-    // ppO2 field off by one digit, for values that happen to land there
-    // (test_awkward_step_values found 40 under 0.4). fma() supplies the exact
-    // residual of the product so the comparison below decides on the true value.
-    const double hi = mag * scale;
-    const double lo = std::fma(mag, scale, -hi);   // exact product is hi + lo
-    double fl = std::floor(hi);
-    double r = (hi - fl) + lo;
-    if (r < 0.0) { fl -= 1.0; r += 1.0; }          // hi rounded up past an integer
-    else if (r >= 1.0) { fl += 1.0; r -= 1.0; }
-    long long scaled = static_cast<long long>(fl);
-    if (r > 0.5) scaled += 1;
-    else if (r == 0.5 && (scaled & 1)) scaled += 1;
+    long long scaled = 0;
+    if (!roundExact(mag, scale, &scaled)) return empty(buf);
 
     return render(buf, cap, neg, scaled / static_cast<long long>(scale),
                   scaled % static_cast<long long>(scale), decimals);
+}
+
+long long scaled(double v, int decimals) {
+    if (decimals < 0) decimals = 0;
+    if (decimals > kMaxDecimals) decimals = kMaxDecimals;
+    if (!std::isfinite(v)) return 0;
+    const double scale = static_cast<double>(ipow10(decimals));
+    long long out = 0;
+    if (!roundExact(std::fabs(v), scale, &out)) return 0;
+    return std::signbit(v) ? -out : out;
 }
 
 } // namespace numfmt

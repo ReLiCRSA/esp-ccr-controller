@@ -15,7 +15,7 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 262 cases
+pio test -e native            # host gate, currently 269 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
@@ -437,6 +437,93 @@ esp32 SUCCESS, float audit clean. Stack headroom was the thing to watch, because
 `Command` is a value on the uart2 task's stack: `u2stk=` bottomed at **3088** in this
 run and **3088** in the run before it, and `stk=` at 1040 in both, so the 16 extra bytes
 are invisible against a 512-byte floor — measured, not assumed.
+
+### A stored value must print the digits the wire printed (fixed 2026-11-24)
+
+The queued item said "`votedX1000` truncates". It was that, and it was a family, and
+the mechanism was the opposite of what the queue implied. Every value in a dive row is
+stored as an integer count — centimetres, thousandths of a bar, millivolts — and the
+row formatter prints that integer with `fixedScaled`. So the digits in the file are
+decided **at the store step**, and every store site did its own arithmetic:
+
+```c
+s.depthCm        = (int32_t)(depthM * 100.0f);        // session_wiring, main
+s.votedX1000     = (int16_t)(votedBar * 1000.0f);
+sn.ceilingCm     = (int16_t)(ceilingM() * 100.0);     // note: a DOUBLE literal
+sn.battX1000     = (uint16_t)(vbat * 1000.0f);
+totals.sp1X1000  = (int32_t)(sp * 1000.0f + 0.5f);    // rounded... in one file, not the other
+```
+
+A cast truncates toward zero, and a decimal times 100 or 1000 can land just under the
+integer it represents. Swept on the host over the ranges the firmware stores, counting
+values that reached the file one count low:
+
+| quantity | the expression used | values one low |
+|---|---|---|
+| ppO2 / cells, 3 decimals | `x * 1000.0f` (float) | **10 of 1551** — e.g. 0.251 bar stored 250 |
+| setpoints, 2 decimals | `x * 1000.0f` (float) | 0 of 13 |
+| depth, centimetres | `x * 100.0f` (float) | **266 of 4001 (6.6%)** — 0.53 m stored 52 cm |
+| ceiling, centimetres | `x * 100.0` (**double**) | **1922 of 4001 (48%)** — 0.01 m stored 0 |
+| battery, millivolts | `x * 1000.0f` (float) | 9 of 701 — 16.05 V stored 16049 mV |
+
+Two things the queue had backwards. First, **a float multiply re-rounds** the product
+to the nearest float, which usually lands back on the integer — that is why spot checks
+looked fine and why `0.15f * 1000.0f` is exactly 150. What actually broke badly was the
+one site that used a **double literal**: the float is promoted, the product keeps the
+float's shortfall, and 48% of ceilings were one centimetre low. Second, it was not the
+same rule in both places: the dive *header*'s setpoint columns had `+ 0.5f` while the
+*rows* setpoint column did not, so one dive file could carry 550 in its header and 549
+in its rows for the same setpoint — the two-rulers shape again, one digit apart.
+
+Fixed the way the depth scale was fixed: **one helper, no arithmetic at the sites**.
+`numfmt::scaled(v, d)` stores `v` in units of 10⁻ᵈ, with the `d` the field is printed
+with, and it uses **the same rounding `numfmt::fixed()` uses** — nearest, ties to even,
+decided on the exact product via `fma`, through one shared `roundExact()`. That last
+part is the load-bearing bit: the invariant is
+
+```
+fixedScaled(buf, cap, scaled(v, d), d)  ==  fixed(buf, cap, v, d)   byte for byte
+```
+
+which is exactly the claim a diver can check — the number in his dive file is the
+number the handset was answered for the same sample. `lround()` would break it on a tie
+(0.5 → 1 while the wire prints 0), so it is forbidden by name in the suite.
+
+| injected bug | what reddens |
+|---|---|
+| a firmware site back to `(int16_t)(x * 100.0)` | the source scan, naming `src/main.cpp:593` |
+| a **new** hand-rolled field in `session_wiring.cpp` | the same scan, naming `src/comms/session_wiring.cpp:165` — this is the check that exists for the field nobody has thought of yet |
+| `EVT_SP_CHANGE` payload back to `* 100.0f` | the scan: "stores a scaled value without util/numfmt.h" |
+| `scaled()` truncating | 7 cases: the literal table, the agreement walk, the bare-cast pin, the ties case, the refusal case, and the row formatter (`Expected '20.30' Was '20.29'`) |
+| `scaled()` using `std::lround` | the agreement walk, the ties case, the refusal case (it returns `INT64_MIN` for a non-finite input), and the one-engine count |
+| `fixed()` growing its own second rule | the differential sweep against `printf`, `test_awkward_step_values`, and the surface-log count rounding |
+
+**No bench leg, and that is a measured decision, not a shortcut.** The transports of a
+dive file share one formatter, so comparing the handset export against the web export
+cannot see a scaling error — a wrong count is wrong identically on both, which is the
+same lesson as "a round-trip cannot catch a scale error". Comparing the file's centimetres
+against the `T,` line's centimetres would be the right shape, but it compares **two
+different samples** (a 30 s grid row and a 2 Hz stream), and this bench has no surface
+tare, so a cm-level match is inside its noise (±0.5 m). And of the values this bench can
+actually produce, the old code kept nearly all of them (0 of 13 setpoints, 0.6% of
+three-decimal cell readings), so a bench leg would have been green on the broken build —
+decoration. The witness is host-side, and the numbers above are why.
+
+Bench truth after all of it, on the flashed build: `hw_accept.py --dive-persist`
+**141 checks 0 failures** — the same 141 as before, because no leg was added — and
+`web_probe.py` **62**. Stack headroom was the thing to watch, since the helper adds an
+`fma()` call to the tasks that store dive rows: `u2stk=` bottomed at **3088** and `stk=`
+at **1040**, byte-identical to the run before the change (and `fixed()` has used that
+same `fma` path in the uart2 task since it was written, so the depth was already proven).
+Native gate is **269** now (+6 in `test_numfmt`, +1 in `test_logfmt`).
+
+`test_divesoak` also stopped mirroring the firmware. Its rig used to re-implement the
+same casts line for line (`(int32_t)(dv.depth * 100.0f)` and five more), so the suite
+that runs the longest dive on the host could not have noticed. The rig now calls
+`numfmt::scaled`, and the literal witness moved to the format suite:
+`test_a_row_holds_the_digits_the_wire_gave_for_the_same_sample` pins hand-typed digits
+("20.30", "0.290", "1115") straight out of a formatted `S,` row, and asserts `,20.29,`
+**never** appears in it.
 
 ### Calibration honesty: the reply is a receipt, so the verdict is its own row
 

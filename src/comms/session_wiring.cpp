@@ -30,6 +30,7 @@
 #include "config/defaults.h"
 #include "log/dive_store.h"
 #include "log/surface_store.h"
+#include "util/numfmt.h"          // scaled(): one rounding rule for stored values
 
 // The chain, the registry and the bridge belong to main.cpp; the session must
 // drive the very same objects the sensors and the HUD use.
@@ -147,17 +148,21 @@ void hookAppendSnap(void*) {
     logfmt::Snapshot s{};
     // Built from the published bridge scalars, never from the live chain:
     // the control task owns that object.
+    // Every stored number here goes through numfmt::scaled, with the same decimal
+    // count it is printed with. A bare cast truncates toward zero and the product
+    // of a decimal and 100/1000 can land just under the integer it should be, so
+    // the dive file was one count away from the wire it has to match (2026-11-24).
     s.tSec = (millis() - g_diveStartMs) / 1000;
-    s.depthCm = (int32_t)(g_bridgeTel.depthM * 100.0f);
-    s.votedX1000 = (int16_t)(g_bridgeTel.votedBar * 1000.0f);
+    s.depthCm = static_cast<int32_t>(numfmt::scaled(g_bridgeTel.depthM, 2));
+    s.votedX1000 = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.votedBar, 3));
     for (int i = 0; i < 3; i++)
-        s.cellX1000[i] = (int16_t)(g_bridgeTel.cellBar[i] * 1000.0f);
-    s.setpointX1000 = (int16_t)(g_bridgeTel.setpointBar * 1000.0f);
+        s.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.cellBar[i], 3));
+    s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.setpointBar, 3));
     s.mode = g_bridgeTel.diveActive ? (g_bridgeTel.autoMode ? 1 : 2) : 0;
     s.alarmBits = g_bridgeTel.alarmBits;
     s.cnsPct = g_bridgeTotals.cnsPeakPct;
     s.pulses = (uint16_t)g_bridgeTel.pulsesWindow;
-    s.battX1000 = (uint16_t)(g_bridgeTel.vbat * 1000.0f);
+    s.battX1000 = static_cast<uint16_t>(numfmt::scaled(g_bridgeTel.vbat, 3));
 
     xSemaphoreTake(g_logMtx, portMAX_DELAY);
     if (g_diveStore.recording()) g_diveStore.append(s);

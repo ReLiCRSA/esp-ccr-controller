@@ -697,6 +697,17 @@ dive and was rewritten afterwards.
   a client that truncates is recreating the defect. Both caps are pinned at compile
   time against the registry, and a host case walks every published key asserting that
   its maximum-length value survives the parser intact.
+* **A stored number and a printed number never disagree** (fixed 2026-11-24; they
+  could be one count apart). Dive rows store counts — centimetres, thousandths of a bar,
+  millivolts — and print them, so the rounding happens where the value is **stored**. It
+  used to happen nine different ways, and a row could carry `20.29` for a depth the same
+  build published as `T,20.30`, or an `E,` setpoint payload a hundredth away from the
+  `GET SP2` answer for the same setpoint; the ceiling column was worst (48% of centimetre
+  values stored one low, because that site multiplied by a double literal). There is one
+  rounding rule now, shared with the renderer. Client rule: the `S,`/`M,` numbers and the
+  `T,`/`D,`/`E,` numbers describe the same samples and may be compared directly — if a
+  client ever finds them a count apart, that is a firmware bug, not a rounding convention
+  to work around. Do not "fix" it by tolerating a difference.
 * **Refusal words name the rule that refused.** `ERR line too long` is the 64-character
   LINE cap (`proto::MAX_LINE`, whole line dropped, never truncated-and-run);
   `ERR value too long` is the FIELD cap inside a line. They are different rules and a

@@ -536,33 +536,36 @@ static void controlTask(void*) {
         if (st.diveActive) {
             // running totals for the dive meta (max/min/total only: cheap)
             g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
-            const int32_t dCm = (int32_t)(st.depthSmoothedM * 100.0f);
+            const int32_t dCm = static_cast<int32_t>(numfmt::scaled(st.depthSmoothedM, 2));
             if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;
-            const int32_t v = (int32_t)(st.votedBar * 1000.0f);
+            const int32_t v = static_cast<int32_t>(numfmt::scaled(st.votedBar, 3));
             if (st.haveVote) {
                 if (v < g_bridgeTotals.minVotedX1000) g_bridgeTotals.minVotedX1000 = v;
                 if (v > g_bridgeTotals.maxVotedX1000) g_bridgeTotals.maxVotedX1000 = v;
             }
             g_bridgeTotals.totalPulses = g_loop->pulseCount();
             const float cns = g_loop->cnsPct();
-            g_bridgeTotals.cnsPeakPct = cns > 254.0f ? 254 : (uint8_t)cns;
+            const long long cnsPct = numfmt::scaled(cns, 0);   // rounded: 12.9% is 13%
+            g_bridgeTotals.cnsPeakPct = cnsPct > 254 ? 254 : static_cast<uint8_t>(cnsPct);
             // The plan the dive ran on, recorded with the dive: which GF pair
             // and which setpoint ladder produced this deco schedule and these
             // doses. Read off the live config, so a dive is reviewed against the
             // settings it actually used rather than the ones on the board now.
             //
-            // Rounded, not truncated, on purpose. A decimal like 0.55 is not
-            // exact in binary (0.55f is 0.54999999403...), and float times
-            // 1000 can land just under the integer it should be, so a truncating
-            // cast can print 0.549 for a setting that reads 0.550 on `GET SP2`.
-            // These columns exist to be compared with what the handset was
-            // answered, so they must not be one count away from it. (The `S,`
-            // rows' `votedX1000` still truncates — see PLAN 16's queue.)
-            g_bridgeTotals.gfLow = (uint8_t)(g_ctrlCfg.deco.gfLow + 0.5f);
-            g_bridgeTotals.gfHigh = (uint8_t)(g_ctrlCfg.deco.gfHigh + 0.5f);
+            // Rounded, not truncated, on purpose — and now through the same helper
+            // the `S,` rows use, not a hand-rolled +0.5f here and a bare cast there.
+            // A decimal like 0.55 is not exact in binary (0.55f is 0.54999999403...),
+            // and a decimal times 1000 can land just under the integer it should be,
+            // so a truncating cast prints 0.549 for a setting that reads 0.550 on
+            // `GET SP2`. These columns exist to be compared with what the handset was
+            // answered, so they must not be one count away from it — which is exactly
+            // how the `S,` rows were wrong until 2026-11-24 (the same helper now
+            // covers both, and test_numfmt fails if they ever disagree).
+            g_bridgeTotals.gfLow = static_cast<uint8_t>(numfmt::scaled(g_ctrlCfg.deco.gfLow, 0));
+            g_bridgeTotals.gfHigh = static_cast<uint8_t>(numfmt::scaled(g_ctrlCfg.deco.gfHigh, 0));
             for (int i = 0; i < 4; i++) {
-                const int32_t sx = (int32_t)(g_ctrlCfg.sp.sp[i] * 1000.0f + 0.5f);
-                const int16_t v = sx > 32767 ? 32767 : (int16_t)sx;
+                const long long sx = numfmt::scaled(g_ctrlCfg.sp.sp[i], 3);
+                const int16_t v = sx > 32767 ? 32767 : static_cast<int16_t>(sx);
                 if (i == 0) g_bridgeTotals.sp1X1000 = v;
                 else if (i == 1) g_bridgeTotals.sp2X1000 = v;
                 else if (i == 2) g_bridgeTotals.sp3X1000 = v;
@@ -579,12 +582,15 @@ static void controlTask(void*) {
                 sn.depthCm = dCm;
                 sn.votedX1000 = (int16_t)v;
                 for (int i = 0; i < 3; i++)
-                    sn.cellX1000[i] = (int16_t)(sd.cells[i] * 1000.0f);
-                sn.setpointX1000 = (int16_t)(st.setpointBar * 1000.0f);
+                    sn.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(sd.cells[i], 3));
+                sn.setpointX1000 = static_cast<int16_t>(numfmt::scaled(st.setpointBar, 3));
                 sn.mode = st.autoMode ? 1 : 2;
                 sn.alarmBits = st.alarms.bits;
                 sn.cnsPct = g_bridgeTotals.cnsPeakPct;
-                sn.ceilingCm = (int16_t)(g_loop->deco().ceilingM() * 100.0);
+                // Was `* 100.0` — a DOUBLE literal, which promotes the float and
+                // pushes more products just below the integer: this bench's measured
+                // ceiling of 11.15 m stored 1114 cm, 11.14 m in the file.
+                sn.ceilingCm = static_cast<int16_t>(numfmt::scaled(g_loop->deco().ceilingM(), 2));
                 sn.ndlMin = st.haveVote ? (int16_t)g_loop->deco().ndlMinutes(
                     g_loop->deco().depthToBar(st.depthSmoothedM), st.votedBar) : 480;
                 sn.decoTotalMin = (int16_t)g_loop->deco().schedule(
@@ -592,7 +598,7 @@ static void controlTask(void*) {
                 const uint32_t p = g_loop->pulseCount();
                 sn.pulses = (uint16_t)(p - lastPulseBase);
                 lastPulseBase = p;
-                sn.battX1000 = (uint16_t)(sd.vbat * 1000.0f);
+                sn.battX1000 = static_cast<uint16_t>(numfmt::scaled(sd.vbat, 3));
                 comms::diveLogAppendGrid(sn);
             }
         }

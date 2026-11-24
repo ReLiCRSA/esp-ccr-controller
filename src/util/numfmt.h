@@ -42,4 +42,35 @@ char* fixed(char* buf, std::size_t cap, double v, int decimals);
 // negative value as "-5.-30" (both halves carry the sign).
 char* fixedScaled(char* buf, std::size_t cap, long long scaled, int decimals);
 
+// The one way to turn a physical value into a stored integer: `scaled(v, d)`
+// stores v in units of 10^-d, so a field written with 3 decimals is stored with
+// scaled(v, 3) and read back with fixedScaled(..., 3). Same `d` on both sides,
+// and nothing else.
+//
+// This exists because a plain cast truncates toward zero, and a decimal that is
+// not exact in binary can land just BELOW the integer it should be: 0.29f is
+// 0.28999999..., and 20.30f * 100.0f is 2029.999878, so (int32_t)(depth * 100.0f)
+// stored 2029 cm for a depth the same build printed as 20.30. Multiplying by a
+// DOUBLE literal is worse — the float is promoted and more values fall short:
+// ceiling 11.15 m times 100.0 is 1114.999962, and 0.21f, 0.29f, 0.35f, 0.45f,
+// 0.70f, 11.9f and 16.8f all lose a count that way. Measured on 2026-11-24, when
+// the dive file was found to be one least-significant-digit away from the wire it
+// is supposed to match.
+//
+// The rounding is deliberately the SAME rule fixed() uses — nearest, ties to
+// even, decided on the exact product (fma) rather than the rounded one — because
+// the invariant that matters is:
+//
+//     fixedScaled(buf, cap, scaled(v, d), d)  ==  fixed(buf, cap, v, d)
+//
+// byte for byte. A stored value must never disagree with the number the handset
+// was answered for the same sample; inventing a second tie rule here would put a
+// digit between the two. (That is why this is NOT lround(): lround rounds ties
+// away from zero and fixed() does not, so the pair would differ on a tie.)
+//
+// Returns 0 only for a non-finite value or one too large to hold. Callers keep
+// their own clamps where the field is narrower than long long (an int16_t count
+// of centimetres saturates at 327.67 m, which no dive reaches).
+long long scaled(double v, int decimals);
+
 } // namespace numfmt

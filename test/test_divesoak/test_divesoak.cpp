@@ -31,6 +31,7 @@
 #include <cstring>
 
 #include "log/divelog.h"
+#include "util/numfmt.h"       // the rig must store values the way the firmware does
 #include "sim/rig.h"
 
 using namespace sim;
@@ -598,15 +599,19 @@ void runDive(int id) {
             snapClock = tS + 10.0f;
             logfmt::Snapshot& s = snaps[nSnap++];
             s.tSec = (uint32_t)tS;
-            s.depthCm = (int32_t)(dv.depth * 100.0f);
-            s.votedX1000 = (int16_t)(rig.vote().votedPpo2 * 1000.0f);
+            // numfmt::scaled, not a cast: until 2026-11-24 the rig mirrored the
+            // firmware's truncating casts line for line, which is precisely why the
+            // soak suite could not see the defect. A rig that re-implements the code
+            // under test witnesses nothing.
+            s.depthCm = static_cast<int32_t>(numfmt::scaled(dv.depth, 2));
+            s.votedX1000 = static_cast<int16_t>(numfmt::scaled(rig.vote().votedPpo2, 3));
             for (int c = 0; c < 3; c++)
-                s.cellX1000[c] = (int16_t)(rig.cellStatus((uint8_t)c).last * 1000.0f);
-            s.setpointX1000 = (int16_t)(sp * 1000.0f);
+                s.cellX1000[c] = static_cast<int16_t>(numfmt::scaled(rig.cellStatus((uint8_t)c).last, 3));
+            s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(sp, 3));
             s.mode = rig.autoMode() ? 1 : 0;
             s.alarmBits = snapAlarm;  // anything active since the previous row
             s.cnsPct = (uint8_t)(rig.cnsPct() > 255.0 ? 255.0 : rig.cnsPct());
-            s.ceilingCm = (int16_t)(rig.deco().ceilingM() * 100.0);
+            s.ceilingCm = static_cast<int16_t>(numfmt::scaled(rig.deco().ceilingM(), 2));
             const int ndl = (int)rig.deco().ndlMinutes(rig.world().pAmbBar(),
                                                        rig.vote().votedPpo2);
             s.ndlMin = (int16_t)(ndl > 480 ? 480 : (ndl < 0 ? 0 : ndl));
@@ -683,9 +688,9 @@ void runDive(int id) {
 
     logfmt::DiveMeta meta{};
     meta.durationSec = (uint32_t)tS;
-    meta.maxDepthCm = (int32_t)(dv.depthM[0] * 100.0f);
-    meta.minVotedX1000 = (int16_t)(rig.minVotedSeen * 1000.0f);
-    meta.maxVotedX1000 = (int16_t)(rig.maxVotedSeen * 1000.0f);
+    meta.maxDepthCm = static_cast<int32_t>(numfmt::scaled(dv.depthM[0], 2));
+    meta.minVotedX1000 = static_cast<int16_t>(numfmt::scaled(rig.minVotedSeen, 3));
+    meta.maxVotedX1000 = static_cast<int16_t>(numfmt::scaled(rig.maxVotedSeen, 3));
     meta.totalPulses = (uint16_t)rig.pulseCount();
     meta.cnsPeakPct = (uint8_t)(rig.cnsPct() > 255.0 ? 255.0 : rig.cnsPct());
     meta.gfLow = 30; meta.gfHigh = 85;

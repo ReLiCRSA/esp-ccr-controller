@@ -7,6 +7,7 @@
 #include "telemetry_bridge.h"
 
 #include "control/alarms.h"
+#include "util/numfmt.h"           // scaled(): the payload digits must match the GET answer
 
 namespace bridge {
 
@@ -108,8 +109,10 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
 
     // Setpoint band changes (only report real moves, not float jitter).
     if (ps.prevSp >= 0.0f && st.setpointBar > ps.prevSp + 0.02f) {
+        // The payload is the setpoint in hundredths, and it has to be the number
+        // the handset reads back with `GET SP2` — 0.29 must arrive as 29, not 28.
         if (!ring.push({tSec, logfmt::EVT_SP_CHANGE,
-                        static_cast<uint16_t>(st.setpointBar * 100.0f)}))
+                        static_cast<uint16_t>(numfmt::scaled(st.setpointBar, 2))}))
             ring.noteDropped();
     }
     ps.prevSp = st.setpointBar;

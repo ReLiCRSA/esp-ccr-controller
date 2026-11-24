@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "log/divelog.h"
 #include "util/numfmt.h"
@@ -838,6 +839,65 @@ void test_surface_capacity_keeps_the_newest_and_never_renumbers() {
     TEST_ASSERT_EQUAL(10u, seq[kN - 1]);        // newest kept, same number it was born with
 }
 
+
+void test_a_row_holds_the_digits_the_wire_gave_for_the_same_sample() {
+    // The claim a diver can actually check: the number in his dive file is the
+    // number the handset was answered at that moment. Until 2026-11-24 the two
+    // could be one count apart — the value was stored with a truncating cast and
+    // the CSV printed that integer, while `T,` printed the float. This is the
+    // witness the soak rig could never be, because the rig used to re-implement
+    // the same casts line for line and would have followed any bug.
+    struct Src { const char* what; float v; int decimals; const char* digits; };
+    const Src kSrc[] = {
+        {"depth m",     20.30f, 2, "20.30"},   // the measured miss: 2029 cm stored
+        {"depth m",      2.53f, 2,  "2.53"},
+        {"voted bar",    0.29f, 3, "0.290"},
+        {"setpoint bar", 0.55f, 3, "0.550"},
+        {"cell bar",     0.66f, 3, "0.660"},
+        // (the ceiling row is the one the old double-literal site lost a centimetre on)
+        {"ceiling m",   11.15f, 2, "11.15"},
+        {"battery V",   11.90f, 3, "11.900"},
+    };
+    for (const Src& c : kSrc) {
+        const long long stored = numfmt::scaled(c.v, c.decimals);
+
+        char printed[32];
+        const char* got = numfmt::fixedScaled(printed, sizeof(printed), stored, c.decimals);
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "%s %.4f: stored %lld prints as '%s', want '%s'",
+                      c.what, static_cast<double>(c.v), stored, got, c.digits);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(c.digits, got, msg);   // hand-typed literal
+
+        char wire[32];
+        const char* direct = numfmt::fixed(wire, sizeof(wire), c.v, c.decimals);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(c.digits, direct,
+                                         "the handset's own rendering of the same sample "
+                                         "disagrees with the digits this case pins");
+    }
+
+    // End to end through the row formatter, not only the number helpers.
+    logfmt::Snapshot s{};
+    s.tSec = 42;
+    s.depthCm = static_cast<int32_t>(numfmt::scaled(20.30f, 2));
+    s.votedX1000 = static_cast<int16_t>(numfmt::scaled(0.29f, 3));
+    s.cellX1000[0] = static_cast<int16_t>(numfmt::scaled(0.66f, 3));
+    s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(0.55f, 3));
+    s.ceilingCm = static_cast<int16_t>(numfmt::scaled(11.15f, 2));
+    s.battX1000 = static_cast<uint16_t>(numfmt::scaled(11.90f, 3));
+    char line[256];
+    const size_t n = logfmt::snapshotCsvLine(line, sizeof(line), s);
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(40, static_cast<int>(n), "the row formatter wrote nothing");
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, ",20.30,0.290,"),
+                                 (std::string("an S, row does not carry the depth and vote the "
+                                              "handset was answered; row was: ") + line).c_str());
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, "1115"),
+                                 (std::string("ceiling_cm is not 1115 for a 11.15 m ceiling; row was: ")
+                                  + line).c_str());
+    // The defect, pinned: 20.30 m used to reach the file as 20.29.
+    TEST_ASSERT_NULL_MESSAGE(std::strstr(line, ",20.29,"),
+                             "a truncating cast is back: 20.30 m stored 2029 cm again");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_snapshot_roundtrip_and_size);
@@ -871,5 +931,6 @@ int main() {
     RUN_TEST(test_surface_counts_round_the_way_the_wire_prints_them);
     RUN_TEST(test_surface_counts_refuse_what_they_cannot_hold);
     RUN_TEST(test_surface_capacity_keeps_the_newest_and_never_renumbers);
+    RUN_TEST(test_a_row_holds_the_digits_the_wire_gave_for_the_same_sample);
     return UNITY_END();
 }

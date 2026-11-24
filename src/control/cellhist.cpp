@@ -5,6 +5,8 @@
 
 #include <cstdio>
 
+#include "util/numfmt.h"            // scaled(): one rounding rule, no hand-rolled +0.5f
+
 namespace cellhist {
 
 namespace {
@@ -93,7 +95,7 @@ size_t formatLines(const Hist& h, uint32_t nowMs, char* out, size_t cap) {
                               "HIST,%u,%u,%u,%u,%u,%u,",
                               static_cast<unsigned>(c), static_cast<unsigned>(kWindowS),
                               static_cast<unsigned>(kWindows),
-                              static_cast<unsigned>(kBinWidth * 100.0f + 0.5f),
+                              static_cast<unsigned>(numfmt::scaled(kBinWidth, 2)),
                               static_cast<unsigned>(h.horizonAgeS(nowMs)), n);
         if (q <= 0 || static_cast<size_t>(q) >= sizeof(line)) return 0;
         for (uint8_t b = 0; b < kBins; b++) {

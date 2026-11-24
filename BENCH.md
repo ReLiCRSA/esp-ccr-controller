@@ -708,18 +708,60 @@ Wiring:
       window, expected), 15/15 HB lines `fresh=111 i2cerr=0 rec=0` and
       `al=0x0010` — battery only, so `BIT_SENSOR_STALE` is clear, which is the
       proof the pressure is sane: `ai.sensorStale = !cellsFresh || !pressureValid`.
-- [ ] Squeeze test: press the port gently (or breathe through a tube into
+- [x] Squeeze test: press the port gently (or breathe through a tube into
       the metal port) — the dashboard depth/pressure must move and come
       back. The driver runs **FS_MODE=1 (260–4060 hPa ≈ 40 m sea water)**
       so the 10 m cell-proof pressurization is inside range; mode 0 would
       clip at ~2.4 m and silently flat-top.
+      **Done 2026-11-24, on the handset wire (`T,` rows, 500 ms cadence, 286
+      samples).** Baseline 0.04 m steady for 44 s; press 1 ramped to 1.55 m and
+      then 3.08 m, held ~25 s, released to 0.04 m within 1.0 s; press 2 peaked at
+      **5.57 m ≈ 560 hPa**, held 25 s, released to 0.04 m in 0.5 s. Release
+      undershoots nothing. The slow decay while held (5.57 → 5.09 m over 25 s,
+      ~1.9 hPa/s) is the finger seal, not the sensor.
+      It also proved two things nobody asked for: `sp=` in the same `T,` row went
+      **0.400 → 0.700 at 2.67 m and back to 0.400 at 0.47 m** — both hysteresis
+      edges of `SP_IN_WATER_M=2.0` ± `SP_HYST_M=0.5`, sighted by accident and
+      both correct — and `mode=STANDBY`/`al=0x0010` throughout, so depth alone
+      starts neither dosing nor alarms.
       **Still the only check that proves the sensor measures.** Identification,
       a plausible hPa and a cleared alarm bit all prove it *talks*; at the
-      surface, depth is 0.00 whether the port is open to the room or taped shut.
+      surface, depth is 0.04 m whether the port is open to the room or taped
+      shut. Do it over the handset, not by eye: `/tmp`-style observers aside,
+      the check is that `T,` depth moves AND the setpoint tier follows it.
 - [ ] Then `CAL DEPTH` (surface tare) and re-check the pre-dive list.
       **The tare belongs to sensor+package**: after any sensor swap, re-tare.
       It still answers `ERR not implemented` — now that a sensor exists, the
-      tare has a consumer and lands with one.
+      tare has a consumer and lands with one. The offset it must remove is
+      measured, not guessed: `SURFACE_PRESSURE_BAR` is a fixed 1013.0 hPa while
+      this bench sits at 1016.7 hPa, so a correct build reads **0.04 m at the
+      surface** (it was 0.04 m on the wire all through the squeeze test). Any
+      surface check needs a tolerance (±0.5 m), not "exactly zero".
+
+**Depth was overstated 1000×, and the sensor fitting is what exposed it
+(fixed 2026-11-24).** The day the LPS28DFW first went live, the handset read
+`T,37.04,…,STANDBY` on a bench sitting in an open room, and HB's `sp=` moved
+from `0.40` to `1.00`: `BAR_PER_M_SEAWATER` was `WATER_DENSITY_KGL * 9.80665 /
+100000` with the density in **kg/L**, but `ρg` is Pa/m only for **kg/m³**, so the
+constant came out 1000× too small (1.005e-4 bar/m instead of 0.1005) and every
+depth 1000× too deep — 3.7 hPa of ambient weather became 37 m, which crossed
+`SP_IN_WATER_M=2` and `SP_DEEP1_M=30` and selected the **SP3 1.00 bar** tier at
+the surface: 2.5× the intended ppO₂, plus `CELLPROOF_DEPTH` "crossed" instantly
+and the deco engine fed 37 m. The constant's own comment said the right thing
+("1 bar of sea water (1.025 kg/l) = 9.947 m"); the expression contradicted it.
+Nothing in the host suite could see it: **no test references `BAR_PER_M_SEAWATER`
+at all** — the `p → depth` line lives in `main.cpp`, outside every tested unit —
+and a test that computed expected depth *from the macro* would inherit the error
+anyway. Recorded as an open test gap, not yet closed.
+`src/deco/zhl16c.cpp` has always had the conversion right (`waterDensity * 1000.0
+* 9.80665`), which is the second reason this was invisible: the two paths
+disagreed and only one of them feeds the `T,` row.
+Why it hid for so long: no depth sensor had EVER been valid on this bench, so
+`pressureValid` was false and `depthM` was pinned to 0 in every log ever taken.
+A constant that is only wrong once its input exists.
+Verified on the wire, both directions: same squeeze, `T,0.04` and `sp=0.400` at
+the surface (predicted 0.037 m from the announce's independent 1016.7 hPa, and
+a thumb press worth ~100 hPa read 1.0 m, not 1000 m).
 
 **The announce must describe a reading, not a lock (fixed 2026-11-24).** Every
 healthy boot used to print `depth: LPS28DFW @0x5D ready, 0.0 hPa`. That was not

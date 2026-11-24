@@ -168,7 +168,18 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
 // Kept as one constant because the depth the control chain sees and the depth
 // the deco engine converts must agree; the MS5837 swap changes only the
 // driver, never this.
-#define BAR_PER_M_SEAWATER          (WATER_DENSITY_KGL * 9.80665f / 100000.0f)
+//
+// UNITS MATTER HERE, and getting them wrong is silent: rho*g is Pa/m only if
+// rho is in kg/m3, and 1 bar = 100 000 Pa, so a density given in kg/L converts
+// to bar/m as density * g / 100. Written as / 100000 with a kg/L density — as
+// this was until 2026-11-24 — the constant is 1000x too small and every depth
+// is 1000x too deep: with the depth sensor live for the first time the bench
+// reported `T,37.04` at the surface (ambient 1016.7 hPa against
+// SURFACE_PRESSURE_BAR 1013.0) and the setpoint engine walked from SP1 0.40 bar
+// to SP3 1.00 bar while the machine was sitting on a table. Depth had never
+// been valid on any bench before that day, so nothing downstream had ever seen
+// a non-zero number to disbelieve.
+#define BAR_PER_M_SEAWATER          (WATER_DENSITY_KGL * 9.80665f / 100.0f)
 
 // --- HUD pattern timing (ms) ------------------------------------------------------
 #define HB_AUTO_ON_MS               500     // 1 Hz

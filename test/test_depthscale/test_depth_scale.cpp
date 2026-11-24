@@ -180,6 +180,16 @@ void test_one_density_serves_both_paths() {
     TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-6, WATER_DENSITY_KGL, cfg.waterDensity,
                                       "the deco engine's default density no longer "
                                       "matches the build default");
+
+    // The ruler is dive-locked: one density now moves the `T,` depth, the
+    // setpoint tiers, the cellproof arm depth and the deco plan together, so a
+    // mid-dive write changes the diver's depth scale under his feet. If the flag
+    // is ever dropped, the router's refusal disappears with it — and a handset
+    // that greys the control out from the schema bitmap goes wrong in the same
+    // commit, so the flag is pinned here rather than left to prose.
+    TEST_ASSERT_TRUE_MESSAGE(reg.def(idx).flags & settings::FL_DIVE_LOCK,
+                             "WATER_DENSITY is no longer dive-locked: a mid-dive "
+                             "write would move the depth scale and the deco plan");
 }
 
 void test_no_path_writes_its_own_conversion() {

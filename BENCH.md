@@ -15,13 +15,13 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 256 cases
+pio test -e native            # host gate, currently 258 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 129 checks
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/dive-file graders, no board: 42 cases
+                                 --cal-air --predive --dive-persist    # 136 checks
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/ruler/dive-file graders, no board: 54 cases
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
 ```
 
@@ -29,6 +29,14 @@ tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 ch
 it turns C3-a's boot line into three graded checks. Without it, a boot with no
 `depth:` line at all is accepted — the absence is the honest signal for "nothing
 fitted", and it must stay that way.
+
+The run also grades **the depth ruler itself**, and that is not the same check as
+the scale being right. `WATER_DENSITY` is dive-locked (it is the one density behind
+every depth the board publishes, so a mid-dive change moves the diver's scale
+~2.5%), and the matrix refuses a mid-range write, reads the value back *during* the
+dive, restores it at the surface and reads it again. Four checks, and the mid-dive
+read is the only one of them that can see a leak — the surface restore hides it from
+every later read. See the C3-a section "The ruler is dive-locked".
 
 There is no `uploadfs` step. The web page is compiled into the app image and
 served from there; the LittleFS partition belongs to the dive logs, and writing
@@ -112,10 +120,18 @@ seq a..b, used X of Y bytes`, a `surface: N records, seq a..b` line and a
 `clock:` line) and then runs the
 **refusal matrix**
 over the wired handset: `AUTO` cold → `ERR predive required`; `SET SP2`
-mid-dive → `ERR dive locked`; `WIFI ON` mid-dive → `ERR wifi locked in
-dive`; `CAL AIR` mid-dive → `ERR cal locked in dive`; overlong line →
-`ERR line too long`; junk → `ERR unknown command`. Every one of those is a
-host-tested invariant — the bench exists to prove the wire, not the logic.
+mid-dive → `ERR dive locked`; `SET WATER_DENSITY` mid-dive → `ERR dive locked`,
+then `GET WATER_DENSITY` **still mid-dive** to ask which ruler that dive is
+actually running on, and the same write accepted after `DIVE END`; `WIFI ON`
+mid-dive → `ERR wifi locked in dive`; `CAL AIR` mid-dive → `ERR cal locked in
+dive`; overlong line → `ERR line too long`; junk → `ERR unknown command`. Every
+one of those is a host-tested invariant — the bench exists to prove the wire, not
+the logic. Two rules this matrix now follows, both learned the hard way (see C3-a
+"The ruler is dive-locked"): a refusal probe never uses a **range endpoint** (a
+boundary value can be refused by a second rule, and the entry passes for the wrong
+reason — that is exactly what hid a dive-lock regression for one run), and a
+locked write is graded by **reading the value back while the refusing state still
+holds**, never by trusting the `ERR`.
 
 The `log:` boot line is a check, not decoration. A LittleFS mount that fails is
 answered with a format, which erases every dive on the partition, and the core
@@ -852,27 +868,127 @@ exactly their own case: the tool's scale given the old `/100000` (the honest boo
 goes red), the tolerance widened to 50 m (the 1000× capture stops failing), the
 never-negative clamp removed (the altitude pair goes red), and a silent
 `return []` instead of failing when no `T,` row arrives (the vacuous-pass case).
-`--selftest` is 42 cases; the full bench gate is **129 checks, 0 failures**
-(the two new ones: `GET WATER_DENSITY` in the matrix, and "the depth on the wire
-is the announce's pressure"), `web_probe.py` 62 checks 0 failures, native 256.
+The gate at that point was **129 checks, 0 failures**; it has grown since (below).
+
+**The ruler is dive-locked, and a refusal is only half a check (2026-11-24).**
+Single-sourcing the density made `WATER_DENSITY` the one number behind the metres
+in `T,`, the setpoint tiers those metres select, the cellproof arm depth and the
+deco engine's ambient pressures. So a mid-dive `SET WATER_DENSITY=1.000` — legal,
+inside 0.990…1.100 — moves the diver's whole depth scale ~2.5% at a pressure that
+has not changed. That is a scale change under a diver's feet, and setpoints and
+alarms are already locked for less than it, so the key is `FL_DIVE_LOCK` now
+(spec §6 documents it as a refusal, and bit 0 of the `K,` line is what makes the
+page grey the input out mid-dive without knowing the key's name).
+
+The bench leg refuses to stop at the refusal's words, because `ERR dive locked`
+only reports what the router *said*. A router that prints the refusal and writes
+the registry anyway passes every reply-only check — that is the "ack with no
+consumer" defect in refusal clothing — and at the surface a wrong density is worth
+4 mm of depth, so no depth comparison can catch it either. So `hw_accept.py`
+writes a **mid-range** value while the dive is open, reads the ruler back *during*
+the dive, restores it at the surface and reads it again, with each command paired
+to its own reply (`run_protocol(..., pairs=)`). Four graded checks: the refusal's
+words; **the ruler did not move DURING the dive**; the box still says 1.025 after
+the dive; the key is writable at the surface (a key that can never be written is
+broken, not locked). `grade_density_lock` plus 10 lying-capture selftest cases.
+
+Proven on hardware, not only on the host: flashing `FL_NONE` back reddened **three**
+C2 checks — and the interesting one was
+`the ruler did not move DURING the dive: the mid-dive read says 1.025, not 1.000`.
+The post-dive read alone stayed green in that run, because the matrix's own surface
+restore overwrites the leaked value: **the mid-dive read is the only witness** to a
+dive that ran on a scale nobody agreed to. Host side, dropping the flag reddens the
+router refusal and the `test_depthscale` flag pin; and grader mutations (mid-dive
+read ignored, each of the four checks made unconditional, the two-read requirement
+relaxed, one check deleted from the grader, the leg-ran guard removed) each reddened
+exactly their own selftest case.
+
+**A refusal probed with a schema endpoint hid that defect (found on hardware
+2026-11-24, and the lesson is the useful part).** The first version of that leg
+asked for `0.990`, the *declared minimum* of the range. A build without the flag
+answered `ERR out of range` — the right shape of `ERR`, for a completely unrelated
+reason — and the matrix entry called it a dive lock. The reason was a real defect
+in its own right: `setValue` parsed with `std::strtod` (double) and compared
+against a `float` bound, and that comparison promotes the bound, moving it by up to
+one ULP. The schema's decimal bounds are not exact binary values, so
+`SET WATER_DENSITY=0.990` was refused against a published minimum of `0.990`,
+because `0.990f` is 0.99000000953674316. Measured across the whole table: **ten
+keys had an unreachable MIN** (SP1…SP4 at 0.20, `SP_HYST` 0.1, `ALLO_LOW` 0.05,
+`CAL_O2_FI` 0.85, `CAL_O2_TARGET` 0.80, `CELLPROOF_MAXSP` 0.60, `WATER_DENSITY`
+0.990) **and three an unreachable MAX** (`ALLO_CUTOFF` 1.80, `CELLPROOF_SP` 1.40,
+`CELLPROOF_MIN` 1.30) — **13 of the 30 numeric keys** advertising a range in `GET
+SCHEMA`, and in the page's own `<input min= max=>`, that their parser refused on the
+exact number it showed. Fixed by parsing and comparing in `float` (the type the schema and the
+storage both use), plus the same class of bug in the `needs integer` check. The
+regression test is a walk, not a spot check:
+`test_every_key_reaches_its_own_declared_bounds` asserts, for every one of the 30
+numeric keys, that both declared endpoints parse AND that ~1% beyond each end is
+refused — with a floor on how many keys it walked, so a loop that matched nothing
+cannot pass. Restoring `strtod` reddens it immediately (`SP1 refuses its own
+minimum 0.2: out of range`).
+
+Two rules came out of that, and they are the part worth keeping:
+* **Never probe a refusal with a schema endpoint.** A boundary value can be
+  refused by a second rule, and the check passes for the wrong reason. The
+  dive-lock probe now uses `1.000`, comfortably mid-range.
+* **A refusal is not proof that nothing changed.** Any client that needs to know
+  whether a locked write took effect must read the value back, in the same
+  session, while the state that caused the refusal still holds. That is now a
+  client rule in spec §6, not just a bench trick.
+
+One thing this batch got **wrong at first and had to take back**, which is worth
+more space than the fix: while extending
+`test_dive_locked_keys_refused_mid_dive` its trailing assertion
+(`b.run("DIVE START", r); has(r, "ERR")  // no double-start`) started failing, and
+the explanation written into the code was "stale bytes in a reused `Response` —
+`exec()` resets `len` but not what follows". **That is false.** `exec()` also writes
+`text[0] = '\0'` and every reply path terminates at `len`, so a reused buffer cannot
+hand a needle test the previous reply — an invariant already pinned since `15e08a1`
+by `test_reused_reply_buffer_never_leaks_the_previous_reply`, which exists because a
+real regression once did put an old reply's tail on the wire. The real cause was
+quieter and worse to notice: **the case's own new `DIVE END` invalidated its own
+trailing assertion.** Before the edit the dive was still open at that line, so the
+assertion was testing something real. After it, `DIVE START` correctly answers
+`OK DIVE`, and the same line was asserting a refusal that the firmware was right not
+to give. Nothing was broken in the board — but the failure is still the useful part:
+the behaviour ("a re-dive is a fresh dive") had no case of its own, it was riding at
+the end of someone else's case, and it vanished the moment that case's state changed.
+"it passed before I edited it" is not evidence a check still checks anything. The
+behaviour went into its own case, `test_re_dive_after_a_closed_dive_is_a_fresh_dive`, which also pins something no
+test had ever asserted: the refusal says **why** (`dive active` — a diver told only
+`ERR` cannot tell an open dive from a broken command), and a `DIVE START` after a
+closed dive really does open a second dive, which is what a dive log's two headers
+depend on.
+
+Gate after all of it, on the flashed build: native **258**, `hw_accept.py
+--dive-persist` **136 checks 0 failures**, `web_probe.py` **62**, `--selftest`
+**54** lying cases (9 depth, 10 scale, 10 ruler-lock, 13 dive-file, 12 surface),
+esp32 SUCCESS, float audit clean.
 
 **What the surface check cannot see, and the leg that can.** At the surface the
 depth is centimetres, so the whole legal density range moves it by 0.004 m:
-a density that stops reaching the conversion is invisible in `T,` at two
-decimals. That is pinned on the host (fresh-water anchor + the scan rule), and
-the wire demonstration is a squeeze leg with the density moved:
+a density that stops reaching the conversion is invisible in `T,` at two decimals.
+That is pinned on the host (fresh-water anchor + the scan rule). The wire
+demonstration has to respect the dive-lock, so it is a **two-configuration** squeeze
+leg, with the ruler set *before* the dive and the port held deep enough for the
+2.5% to clear two decimals (at 5 m the difference is ~0.13 m):
 
 ```
-# handset side, holding the port at a few metres (NOT at the surface):
-SET WATER_DENSITY=1.000        # fresh: the ruler changes under the diver
-expect  T, depth moves ~2.5% at constant pressure, and ceiling/NDL move with it
-SET WATER_DENSITY=1.025        # restore; check with GET WATER_DENSITY
+SET WATER_DENSITY=1.000        # fresh, at the SURFACE: dive-locked, so set it here
+DIVE START                     # then hold the port at ~5 m
+expect  T, depth ~2.5% larger than the console's hPa implies at 1.025,
+        and hw_accept's depth check still green — it grades on 1.000, because
+        it reads GET WATER_DENSITY off the link instead of assuming the default
+DIVE END
+SET WATER_DENSITY=1.025
 ```
 
-Optional, not in the C2 gate (it needs a steady squeeze held long enough to read
-a `D,` ceiling, and the density is invisible at the surface, so it cannot be
-automated off a boot line). Recorded here so the next bench day does not have to
-re-derive why the surface comparison is not enough.
+Optional, not in the C2 gate (it needs a steady squeeze held long enough to read a
+`D,` ceiling). It is also why `grade_depth_scale` takes the density off the link
+rather than using 1.025: the check must stay honest on a bench configured for a
+different ruler, instead of failing at 2.5% for the wrong reason. Recorded here so
+the next bench day does not have to re-derive why the surface comparison is not
+enough.
 
 **The announce must describe a reading, not a lock (fixed 2026-11-24).** Every
 healthy boot used to print `depth: LPS28DFW @0x5D ready, 0.0 hPa`. That was not

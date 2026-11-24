@@ -94,6 +94,11 @@ when keys are added. Useful details:
   (then `min`/`max` are lengths).
 * `flags` bit 0 → dive-locked: grey the control out while a dive is running.
   bit 1 → safety: log the change locally, the controller replies `OK SAFETY`.
+* If your handset **displays depth**, read `WATER_DENSITY` back instead of
+  assuming 1.025: it is the single density behind the metres in `T,`, the
+  setpoint tiers and the deco plan, so a dive file's depths mean whatever that
+  setting was during the dive. It is dive-locked (bit 0) precisely because
+  changing it mid-dive would move the ruler under the diver.
 
 ## The wall clock: a surface client is the time source
 

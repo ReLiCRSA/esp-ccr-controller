@@ -55,7 +55,14 @@ const Def kTable[TCOUNT] = {
     {"GF_HIGH", Type::UINT8, 85.0f, 50.0f, 100.0f, FL_SAFETY, nullptr},
     {"ASC_RATE", Type::FLOAT, 6.0f, 3.0f, 18.0f, FL_SAFETY, nullptr},
     {"ASC_RATE_SLOW", Type::FLOAT, 1.0f, 0.5f, 3.0f, FL_SAFETY, nullptr},
-    {"WATER_DENSITY", Type::FLOAT, 1.025f, 0.990f, 1.100f, FL_NONE, nullptr},
+    // The depth ruler: dive-locked since 2026-11-24, and that flag is not
+    // decoration. One density now drives the depth in the `T,` row, the setpoint
+    // tiers those metres select, the cellproof arm depth AND the deco engine's
+    // ambient pressures, so a mid-dive write used to move the diver's whole
+    // depth scale ~2.5% under his feet (0.990..1.100 is the legal range) while
+    // the physical pressure stayed put. Setpoints and alarms are locked for less
+    // than that. The refusal is graded on hardware (hw_accept matrix).
+    {"WATER_DENSITY", Type::FLOAT, 1.025f, 0.990f, 1.100f, FL_DIVE_LOCK, nullptr},
     // battery
     {"VBAT_MIN", Type::FLOAT, 10.5f, 3.0f, 30.0f, FL_SAFETY, nullptr},
     // dive lock: everything that steers the gas loop or the sensing verdicts
@@ -127,11 +134,27 @@ bool Registry::setValue(int idx, const char* text, const char** err) {
     }
 
     char* endp = nullptr;
-    const double v = std::strtod(text, &endp);
+    // Parse AND compare in float, the type the schema and the storage both use.
+    // Parsing with strtod and comparing against a `float` bound promotes the
+    // bound to double, which moves it by up to one ULP of its own — and the
+    // schema's own endpoints are not exact binary values. Measured on
+    // 2026-11-24: `SET WATER_DENSITY=0.990` answered `ERR out of range` against a
+    // declared minimum of 0.990, because 0.990f is 0.99000000953674316 and the
+    // double 0.990 is below it. Ten keys had their declared MIN unreachable
+    // (SP1..SP4 at 0.20, SP_HYST 0.1, ALLO_LOW 0.05, CAL_O2_FI 0.85, CAL_O2_TARGET
+    // 0.80, CELLPROOF_MAXSP 0.60, WATER_DENSITY 0.990) and three their MAX
+    // (ALLO_CUTOFF 1.80, CELLPROOF_SP 1.40, CELLPROOF_MIN 1.30) — 13 of the 30
+    // numeric keys. The schema promised an inclusive range and delivered an
+    // exclusive one at those edges, on the very endpoints a diver or the page
+    // would type. The bench found it by accident: a dive-lock check that used the
+    // boundary value got the right `ERR` for the wrong reason, which is also a
+    // lesson for refusal checks — never pick a value that a second refusal rule
+    // could produce.
+    const float v = std::strtof(text, &endp);
     if (endp == text || (endp && *endp != '\0' && *endp != ' ')) { *err = "not a number"; return false; }
     if (v < d.minv || v > d.maxv) { *err = "out of range"; return false; }
     if ((d.type == Type::INT16 || d.type == Type::UINT8) &&
-        v != static_cast<double>(static_cast<long>(v))) { *err = "needs integer"; return false; }
+        v != static_cast<float>(static_cast<long>(v))) { *err = "needs integer"; return false; }
     m_num[idx] = static_cast<float>(v);
     return true;
 }

@@ -144,6 +144,23 @@ OVERLONG = "X" * 120
 # every later phase (dive-persist, web_probe's CSV check) sees real dates
 # instead of epoch 0, and `TIME SET 7` keeps the refusal honest.
 _NOW_EPOCH = int(time.time())
+
+# The ruler test pair. WATER_DENSITY is dive-locked because one density now drives
+# the depth in `T,`, the setpoint tiers, the cellproof arm depth and the deco plan.
+# The refused value is deliberately MIDDLE of the range, not an endpoint: a
+# boundary value can be refused by a SECOND rule, and then the check passes for the
+# wrong reason. Caught on the bench 2026-11-24 — asked for 0.990, the declared
+# minimum, a build WITHOUT the dive-lock flag answered `ERR out of range`, because
+# the parser compared a strtod double against a float bound and 0.990f is
+# 0.99000000953674316. The entry saw an `ERR` and called it a dive lock. Both
+# halves are fixed now (the parser compares in float, and test_settings asserts
+# every schema key's own endpoints are reachable); the check still avoids boundary
+# values, because "an ERR arrived" is never the whole question.
+# A value away from the default matters for the other half too: if the lock leaks,
+# the mid-dive read shows 1.000 where the dive should be running on 1.025.
+DENSITY_REFUSED = "1.000"
+DENSITY_RESTORE = "1.025"
+
 PROTOCOL_CHECKS = [
     ("DIVE END", r"^(OK|ERR no dive)", "clean slate before the sequence"),
     ("GET T", r"^T,", "telemetry line parses", "burst"),
@@ -189,6 +206,24 @@ PROTOCOL_CHECKS = [
     # dive is minutes, so the dwell is what makes the check mean what it says.
     ("DIVE START", r"^OK DIVE", "dive opens", "dwell:2.0"),
     ("SET SP2=0.40", r"^ERR dive locked", "diver outranks the client"),
+    # The depth ruler. `WATER_DENSITY` is the single density behind the metres in
+    # the `T,` row, the setpoint tiers those metres select, the cellproof arm
+    # depth and the deco engine's ambient pressures (see grade_depth_scale below),
+    # so a mid-dive write moves the diver's whole depth scale up to ~2.5% (the
+    # legal range is 0.990..1.100) at a pressure that has not changed. Refused
+    # from 2026-11-24, like setpoints and alarms. The refused value is chosen FAR
+    # from the default on purpose: if the lock ever leaks, the 0.990 is obvious in
+    # the post-dive read-back below, and a surface-only comparison could never see
+    # it (at the surface the whole density range moves the depth by 4 mm).
+    (f"SET WATER_DENSITY={DENSITY_REFUSED}", r"^ERR dive locked",
+     "the depth ruler stays frozen under a diver"),
+    # Read the ruler back DURING the dive, immediately after the refusal. The
+    # post-dive read alone cannot catch a leak: the matrix's own surface restore
+    # rewrites the value, so by then a leaked 1.000 is gone and the box looks
+    # clean. This is the line that sees which scale the dive is running on, while
+    # it runs.
+    ("GET WATER_DENSITY", r"^WATER_DENSITY=",
+     "the ruler is readable mid-dive, to ask which value the dive is using"),
     ("WIFI ON", r"^ERR wifi locked in dive", "radio stays down in a dive"),
     ("CAL AIR", r"^ERR cal locked in dive", "calibration never under a diver"),
     ("FROBNICATE", r"^ERR unknown command", "unknown commands do nothing"),
@@ -196,6 +231,9 @@ PROTOCOL_CHECKS = [
     # dwell covers the re-arm: loopTask applies it within its poll interval and
     # softAP + captive DNS + server start are all inside that one console line.
     ("DIVE END", r"^OK DIVE", "dive closes", "dwell:4.0"),
+    (f"SET WATER_DENSITY={DENSITY_RESTORE}", r"^OK",
+     "the ruler is writable at the surface (the lock is about the dive, not the key)",
+     "dwell:1.0"),
     ("LOG LIST", r"^(OK|L,)", "log store answers"),
     # The density is not decoration: since 2026-11-24 it is the one number both
     # depth paths use — the depth in the `T,` row and the ambient pressure the
@@ -307,29 +345,40 @@ def grade_depth(lines, expect_depth):
 # the independent witness, and if it imported the firmware's formula it could
 # not catch the firmware's formula being wrong.
 SURFACE_BAR = 1.013
+SEA_DENSITY = 1.025   # the firmware default; the link's own value wins when it says
 
 
-def depth_from_bar_abs(bar_abs):
+def depth_from_bar_abs(bar_abs, density=SEA_DENSITY):
     """Depth from an absolute pressure, stated in the tool, from the physics.
 
     rho [kg/L] * g / 100 = bar per metre — the /100 is the whole lesson of
     2026-11-24: written /100000 with a kg/L density, every depth came out 1000x
     too deep and the bench dosed for 37 m in an open room.
 
-    Sea-water density (1.025) is assumed, and that is honest at the surface,
-    which is the only place this comparison can be made: the announce is a
-    SURFACE reading, so the depth being compared is centimetres, and the whole
-    legal density range (0.990..1.100) moves that by 0.004 m. A density that
-    never reaches the conversion is therefore invisible here — the arithmetic is
-    pinned on the host (test/test_depthscale), and C3-a's squeeze leg, holding a
-    few metres while the density changes, is the wire demonstration.
+    The density is a PARAMETER, taken off the link (`GET WATER_DENSITY`), not a
+    constant baked into the witness: it is the one number behind every depth this
+    controller publishes. Defaulting to sea water is honest at the surface, which
+    is where the boot announce puts this comparison — the whole legal range
+    (0.990..1.100) is worth 4 mm there — but it is wrong anywhere deeper, and that
+    is what the deeper case in `selftest_scale` pins.
 
     Never negative, mirroring the firmware's rule for what a diver reads: above
     the reference plane (altitude, weather, a sensor drifting high) the answer
     is 0 m, not a negative depth to dose against.
     """
-    bar_per_m = 1.025 * 9.80665 / 100.0
+    bar_per_m = density * 9.80665 / 100.0
     return max(0.0, (bar_abs - SURFACE_BAR) / bar_per_m)
+
+
+def stream_density(stream):
+    """The density the link itself reported, or None if it never said."""
+    for l in stream:
+        if l.startswith("WATER_DENSITY="):
+            try:
+                return float(l.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
 
 
 def grade_depth_scale(lines, stream):
@@ -359,13 +408,103 @@ def grade_depth_scale(lines, stream):
         shown = float(trow.split(",")[1])
     except (IndexError, ValueError):
         return [("the `T,` row's depth column parses", False, f"row: {trow}")]
-    want = depth_from_bar_abs(hpa / 1000.0)
+    dens = stream_density(stream)
+    used = dens if dens is not None else SEA_DENSITY
+    want = depth_from_bar_abs(hpa / 1000.0, used)
+    where = "the density the link reported" if dens is not None else "sea default"
     return [("the depth on the wire is the announce's pressure",
              abs(shown - want) <= 0.05,
-             f"`{ready.group(0)}` wants {want:.3f} m below the surface reference "
-             f"({SURFACE_BAR} bar); the wire says {shown:.2f} m [{trow}] — "
-             f"1016.7 hPa became `T,37.04` on 2026-11-24, which is a kg/L density "
-             f"divided by 100000 instead of 100")]
+             f"`{ready.group(0)}` at {used} kg/L ({where}) wants {want:.3f} m "
+             f"below the surface reference ({SURFACE_BAR} bar); the wire says "
+             f"{shown:.2f} m [{trow}] — 1016.7 hPa became `T,37.04` on 2026-11-24, "
+             f"which is a kg/L density divided by 100000 instead of 100")]
+
+
+def grade_density_lock(pairs):
+    """Did the dive-locked ruler STAY put? The refusal's words are not the point.
+
+    `SET WATER_DENSITY` is dive-locked since 2026-11-24: one density drives the
+    `T,` metres, the setpoint tiers those metres select, the cellproof arm depth
+    and the deco engine's ambient pressures, so a mid-dive write moves the diver's
+    depth scale ~2.5% under his feet at a pressure that has not changed.
+
+    Answering `ERR dive locked` is half the job. The other half is that the VALUE
+    did not move — and that half is invisible to a matrix entry, which only asks
+    whether the words arrived. This is the shape where an "ack (or refusal) with no
+    consumer" defect hides: a router that prints the refusal and writes the
+    registry anyway passes every reply-only check, on the bench and in the host
+    suite, and the dive then runs on a depth scale nobody agreed to.
+
+    So the matrix asks for a mid-range value while the dive is open and reads the
+    ruler back TWICE — once DURING the dive, immediately after the refusal, and
+    once after restoring it at the surface — pairing every command with its own
+    reply. Only the mid-dive read catches a leak: the surface restore rewrites the
+    value afterwards, so a final read alone would find a clean box over a dive that
+    ran on the wrong scale. And no depth comparison can catch it either, because at
+    the surface the whole legal density range is worth 4 mm of water.
+    """
+    asked = [p for p in pairs if p[0].startswith("SET WATER_DENSITY=")]
+    gets = [(c, r) for c, r in pairs if c == "GET WATER_DENSITY"]
+    refused_cmd = next(((c, r) for c, r in asked
+                        if c.endswith(f"={DENSITY_REFUSED}")), None)
+    surface = next(((c, r) for c, r in asked
+                    if c.endswith(f"={DENSITY_RESTORE}")), None)
+    mid = gets[0][1] if len(gets) >= 2 else None
+    read = gets[-1][1] if gets else None
+    if refused_cmd is None or mid is None or read is None:
+        return [("the ruler leg ran (a refused write, a mid-dive read and a "
+                 "post-dive read)", False,
+                 f"writes seen: {[c for c, _ in asked]}; reads: {len(gets)} "
+                 f"(want 2) — with any of them missing, 'did it land, and under "
+                 f"what scale was this dive running?' cannot be answered and the "
+                 f"leg is decoration")]
+
+    def value_of(lines):
+        # None-safe on purpose: a missing read is reported as its own failing
+        # check below, never as a traceback out of a C2 run halfway through the
+        # bench (a crash mid-run loses every check after it).
+        if lines is None:
+            return "(no read)", None
+        line = next((x for x in lines if x.startswith("WATER_DENSITY=")), "")
+        try:
+            return line, float(line.split("=", 1)[1])
+        except (ValueError, IndexError):
+            return line, None
+
+    got, shown = value_of(read)
+    mgot, mval = value_of(mid)
+    want = float(DENSITY_RESTORE)
+
+    checks = [
+        ("the mid-dive ruler write was refused",
+         any(l.startswith("ERR dive locked") for l in refused_cmd[1]),
+         f"`{refused_cmd[0]}` answered {refused_cmd[1] or ['(nothing)']}"),
+        (f"the ruler did not move DURING the dive: the mid-dive read says "
+         f"{DENSITY_RESTORE}, not {DENSITY_REFUSED}",
+         mval is not None and abs(mval - want) < 1e-6,
+         f"the read taken right after the refused write answers `{mgot}`. That is "
+         f"the scale the dive was running on — the depth in `T,`, the setpoint "
+         f"tiers, the cellproof arm depth and the deco plan all follow it — and "
+         f"the post-dive read below cannot see this, because the matrix's own "
+         f"surface restore rewrites the value afterwards"),
+        (f"the refused write never landed at all: after the dive the box still "
+         f"says {DENSITY_RESTORE}",
+         shown is not None and abs(shown - want) < 1e-6,
+         f"`GET WATER_DENSITY` answers `{got}` after the dive, where the matrix "
+         f"restored {DENSITY_RESTORE}: a refusal that prints ERR and writes the "
+         f"registry anyway is invisible to every reply-only check"),
+        ("the ruler is writable at the surface (the lock is about the dive, not "
+         "the key)",
+         surface is not None and any(l.startswith("OK") for l in surface[1]),
+         f"`SET WATER_DENSITY={DENSITY_RESTORE}` answered "
+         f"{(surface[1] if surface is not None else []) or ['(never sent)']} — a "
+         f"key that can never be written is not dive-locked, it is broken"),
+    ]
+    if mval is None:
+        checks.append(("the mid-dive read-back parses", False, f"reply: {mid}"))
+    if shown is None:
+        checks.append(("the post-dive read-back parses", False, f"reply: {read}"))
+    return checks
 
 
 def grade_boot(lines, expect_web, expect_depth=False):
@@ -699,14 +838,30 @@ def selftest_scale():
         ("a negative depth on the wire is a lie about the same sensor",
          high_boot, ["T,-0.13,0.214,0.214,0.214,0.214,0.400,STANDBY,FLAGS0x10,1.56"],
          "is the announce's pressure"),
+        # Deeper, and synthetic in one way only (this bench cannot hold 1300 hPa):
+        # the density only becomes visible once the depth is metres rather than
+        # centimetres, which is why the surface comparison alone cannot guard the
+        # density. 1300.0 hPa is 2.92 m at 1.000 and 2.86 m at 1.025 — 6 cm apart,
+        # just over the 5 cm tolerance, so a witness that ignores the link's own
+        # density is caught here and nowhere else.
+        ("deeper, on fresh water: the witness must use the density the link says",
+         [l.replace("1016.7 hPa", "1300.0 hPa") for l in DEPTH_BOOT_OK],
+         ["T,2.92,0.214,0.214,0.214,0.214,0.700,STANDBY,FLAGS0x10,1.56",
+          "WATER_DENSITY=1.000"], None),
+        ("deeper, and the two really do disagree: 2.86 m is a sea-water depth",
+         [l.replace("1016.7 hPa", "1300.0 hPa") for l in DEPTH_BOOT_OK],
+         ["T,2.86,0.214,0.214,0.214,0.214,0.700,STANDBY,FLAGS0x10,1.56",
+          "WATER_DENSITY=1.000"], "is the announce's pressure"),
     ]
     checks = []
     for name, lines, stream, want in cases:
         got = grade_depth_scale(lines, stream)
         failed = [c[0] for c in got if not c[1]]
         if want is None:
+            why = "; ".join(c[2] for c in got if c[1])
             checks.append((f"depth scale: {name}", bool(got) and not failed,
-                           f"expected graded checks, none failed: {failed}"))
+                           f"expected graded checks, none failed. What the witness "
+                           f"computed: {why}"))
         else:
             checks.append((f"depth scale: {name}", any(want in f for f in failed),
                            f"no failure matching {want!r}; failures seen: {failed}"))
@@ -721,6 +876,95 @@ def selftest_scale():
     checks.append(("depth scale: an announce with no reading cannot be reconciled",
                    grade_depth_scale(nodata, [t_ok]) == [],
                    "comparing a placeholder hPa against a depth would be inventing one"))
+    return checks
+
+
+def selftest_density_lock():
+    """The ruler-lock grader, proven on lying captures.
+
+    `honest` is the exchange the matrix performs: a dive-locked write refused with
+    the right words, the ruler read back DURING the dive, the value restored at the
+    surface, and a final read agreeing with the restore. The lies are the shapes a
+    regression takes: the ruler moved while the dive ran, the box ended on the
+    refused value, the lock missing, an `ERR` for an unrelated reason, and a leg
+    that never ran. Every value comes from the same constants the matrix writes, so
+    changing the probe cannot silently desync the fixtures.
+    """
+    refused_cmd = f"SET WATER_DENSITY={DENSITY_REFUSED}"
+    restore_cmd = f"SET WATER_DENSITY={DENSITY_RESTORE}"
+    read_ok = ("GET WATER_DENSITY", [f"WATER_DENSITY={DENSITY_RESTORE}"])
+    honest = [
+        (refused_cmd, ["ERR dive locked"]),
+        read_ok,
+        (restore_cmd, ["OK"]),
+        read_ok,
+    ]
+    cases = [
+        # name, pairs, expected failing check (None = must pass clean)
+        ("an honest dive-locked ruler: refused, read mid-dive, restored, read again",
+         honest, None),
+        (f"the ruler moved WHILE the dive ran: the mid-dive read says "
+         f"{DENSITY_REFUSED}",
+         [(refused_cmd, ["ERR dive locked"]),
+          ("GET WATER_DENSITY", [f"WATER_DENSITY={DENSITY_REFUSED}"]),
+          (restore_cmd, ["OK"]),
+          read_ok],
+         "DURING the dive"),
+        (f"unchanged mid-dive, but the box ends on {DENSITY_REFUSED}",
+         [(refused_cmd, ["ERR dive locked"]),
+          read_ok,
+          (restore_cmd, ["OK"]),
+          ("GET WATER_DENSITY", [f"WATER_DENSITY={DENSITY_REFUSED}"])],
+         "never landed at all"),
+        ("the lock is gone: the mid-dive write answers OK and lands",
+         [(refused_cmd, ["OK"]),
+          ("GET WATER_DENSITY", [f"WATER_DENSITY={DENSITY_REFUSED}"]),
+          (restore_cmd, ["OK"]),
+          read_ok],
+         "was refused"),
+        ("an ERR for some unrelated reason is not a dive lock",
+         [(refused_cmd, ["ERR out of range"]),
+          read_ok,
+          (restore_cmd, ["OK"]),
+          read_ok],
+         "was refused"),
+        ("the ruler can never be written: that is a broken key, not a locked one",
+         [(refused_cmd, ["ERR dive locked"]),
+          read_ok,
+          (restore_cmd, ["ERR dive locked"]),
+          read_ok],
+         "writable at the surface"),
+        ("only one read: the mid-dive question cannot be asked at all",
+         [(refused_cmd, ["ERR dive locked"]),
+          (restore_cmd, ["OK"]),
+          read_ok],
+         "ruler leg ran"),
+        ("no mid-dive write at all: the matrix entry went missing",
+         [read_ok, (restore_cmd, ["OK"]), read_ok],
+         "ruler leg ran"),
+        ("an unparseable mid-dive read-back",
+         [(refused_cmd, ["ERR dive locked"]),
+          ("GET WATER_DENSITY", ["WATER_DENSITY=oops"]),
+          (restore_cmd, ["OK"]),
+          read_ok],
+         "mid-dive read-back parses"),
+        ("an unparseable post-dive read-back",
+         [(refused_cmd, ["ERR dive locked"]),
+          read_ok,
+          (restore_cmd, ["OK"]),
+          ("GET WATER_DENSITY", ["WATER_DENSITY=oops"])],
+         "post-dive read-back parses"),
+    ]
+    checks = []
+    for name, pairs, want in cases:
+        got = grade_density_lock(pairs)
+        failed = [c[0] for c in got if not c[1]]
+        if want is None:
+            checks.append((f"dive lock: {name}", len(got) == 4 and not failed,
+                           f"expected four graded checks, none failed: {failed}"))
+        else:
+            checks.append((f"dive lock: {name}", any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
     return checks
 
 
@@ -1155,7 +1399,7 @@ def _await_burst(ser, pat, seen, log, send, t0):
     return False
 
 
-def run_protocol(port, baud, log, settle=1.5, stream=None):
+def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
     """Open the handset adapter and run PROTOCOL_CHECKS. No pyserial import
     at module level: the boot/replay path must work without a handset.
 
@@ -1163,6 +1407,12 @@ def run_protocol(port, baud, log, settle=1.5, stream=None):
     unsolicited T,/D,/E, rows. Those are the evidence for facts the controller
     volunteers — a refused calibration, a clamp that engaged — which no command's
     own reply can show (`OK CAL AIR` is a receipt, not a verdict).
+
+    `pairs`, if given, collects (command, [reply lines]) in the order they were
+    sent. The stream alone cannot answer "did that refused WRITE land?": the reply
+    to `GET WATER_DENSITY` is a bare `WATER_DENSITY=…`, and on the stream it lands
+    among unsolicited rows that mean something else. Pairing keeps each cause next
+    to its effect, which is what `grade_density_lock` needs.
 
     `settle`: opening the port resets the board behind it. On a plain USB-UART
     adapter that costs nothing; on a second ESP32 running handset/bridge_esp32
@@ -1240,6 +1490,8 @@ def run_protocol(port, baud, log, settle=1.5, stream=None):
                     break
                 log.append(f"[{time.time() - t0:7.2f}s] (no line at all for "
                            f"{cmd!r}: retrying once)")
+            if pairs is not None:
+                pairs.append((cmd.strip(), list(seen)))
             got = "; ".join(seen[-4:]) if seen else "(no reply in 3 s)"
             results.append((cmd if len(cmd) < 24 else cmd[:20] + "...", ok,
                             f"want {want}, got {got} — {why}"))
@@ -1902,6 +2154,7 @@ def main() -> int:
         # No board, no ports: this section is about the grader, not the machine.
         fails = 0
         for name, ok_, detail in [*selftest_depth(), *selftest_scale(),
+                                  *selftest_density_lock(),
                                   *selftest_dive_file(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
@@ -1985,8 +2238,10 @@ def main() -> int:
         print("\n--- handset protocol checks (UART2) ---")
         proto_log = []
         proto_stream = []
+        proto_pairs = []
         for name, ok, detail in run_protocol(args.handset, args.baud, proto_log,
-                                             args.handset_settle, proto_stream):
+                                             args.handset_settle, proto_stream,
+                                             proto_pairs):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
             failures += 0 if ok else 1
         (logdir / f"accept_{stamp}_handset.log").write_text("\n".join(proto_log) + "\n")
@@ -2010,6 +2265,17 @@ def main() -> int:
                 print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
                       + ("" if ok else f": {detail}"))
                 failures += 0 if ok else 1
+
+        # A refusal is only half a lock. The matrix asked for a dive-locked ruler
+        # write and got the words; these checks ask which value is actually in the
+        # box, by pairing each write with its own reply and reading the density
+        # back after the dive. Needs no depth sensor, so it is not under
+        # --expect-depth.
+        print("\n--- the dive-locked ruler: refused writes stay refused ---")
+        for name, ok, detail in grade_density_lock(proto_pairs):
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
+                  + ("" if ok else f": {detail}"))
+            failures += 0 if ok else 1
 
         # Line framing, on the wire: see run_framing for why the matrix's own
         # over-long entry was not enough. Inside the console watch on purpose —

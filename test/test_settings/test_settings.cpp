@@ -1,6 +1,9 @@
 #include <unity.h>
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "comms/settings.h"
 
@@ -119,6 +122,73 @@ void test_keys_fit_nvs() {
         TEST_ASSERT_MESSAGE(std::strlen(defs[i].key) <= 15, defs[i].key);
 }
 
+void test_every_key_reaches_its_own_declared_bounds() {
+    // The ranges in this table are a PUBLISHED contract: `GET SCHEMA` hands them
+    // to a handset, and the web page builds its <input min= max=> from them. So an
+    // endpoint that the parser refuses is a device advertising 0.99..1.10 and
+    // answering `ERR out of range` when the diver types the number it showed.
+    //
+    // This case exists because that was true on hardware on 2026-11-24. The value
+    // was parsed with strtod (double) and compared against a `float` bound, and
+    // the comparison promotes the bound to double — moving it by up to one ULP of
+    // its own. The schema's decimal bounds are not exact binary values, so ten
+    // keys had an unreachable MIN (SP1..SP4 at 0.20, SP_HYST 0.1, ALLO_LOW 0.05,
+    // CAL_O2_FI 0.85, CAL_O2_TARGET 0.80, CELLPROOF_MAXSP 0.60, WATER_DENSITY
+    // 0.990) and three an unreachable MAX (ALLO_CUTOFF 1.80, CELLPROOF_SP 1.40,
+    // CELLPROOF_MIN 1.30) — 13 of the 30 numeric keys. The type is what both the
+    // schema and the storage use,
+    // so parsing AND comparing in float is the fix — and this loop is what keeps
+    // the whole table honest, rather than the one key that happened to be under
+    // test that day.
+    Registry r;
+    r.resetToDefaults();
+    size_t n = 0;
+    const Def* table = Registry::definitions(n);
+    int checked = 0;
+    char txt[32];
+
+    for (size_t i = 0; i < n; ++i) {
+        const Def& d = table[i];
+        if (d.type == Type::STRING || d.type == Type::BOOL) continue;
+
+        std::snprintf(txt, sizeof(txt), "%.8g", static_cast<double>(d.minv));
+        const char* err = nullptr;
+        TEST_ASSERT_TRUE_MESSAGE(r.setValue(static_cast<int>(i), txt, &err),
+                                 (std::string(d.key) + " refuses its own minimum " +
+                                  txt + (err ? ": " + std::string(err) : "")).c_str());
+
+        std::snprintf(txt, sizeof(txt), "%.8g", static_cast<double>(d.maxv));
+        err = nullptr;
+        TEST_ASSERT_TRUE_MESSAGE(r.setValue(static_cast<int>(i), txt, &err),
+                                 (std::string(d.key) + " refuses its own maximum " +
+                                  txt + (err ? ": " + std::string(err) : "")).c_str());
+
+        // And the range really is a range: a little beyond each end must still be
+        // refused, or this loop would be satisfied by a parser that accepts
+        // anything. 1% is far outside float noise and inside nothing else.
+        if (d.minv > 0.0f) {
+            std::snprintf(txt, sizeof(txt), "%.8g",
+                          static_cast<double>(d.minv / 1.01f));
+            err = nullptr;
+            TEST_ASSERT_FALSE_MESSAGE(r.setValue(static_cast<int>(i), txt, &err),
+                                      (std::string(d.key) + " accepted " + txt +
+                                       ", below its minimum " +
+                                       std::to_string(d.minv)).c_str());
+        }
+        std::snprintf(txt, sizeof(txt), "%.8g",
+                      static_cast<double>(d.maxv * 1.01f));
+        err = nullptr;
+        TEST_ASSERT_FALSE_MESSAGE(r.setValue(static_cast<int>(i), txt, &err),
+                                  (std::string(d.key) + " accepted " + txt +
+                                   ", above its maximum " +
+                                   std::to_string(d.maxv)).c_str());
+        ++checked;
+    }
+    // A loop that walked nothing is decoration: the table has 30 numeric keys.
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(25, checked,
+                                             "the boundary walk covered too few keys");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_defaults_load);
@@ -127,5 +197,6 @@ int main() {
     RUN_TEST(test_value_as_string_and_list_all);
     RUN_TEST(test_reset_restores);
     RUN_TEST(test_keys_fit_nvs);
+    RUN_TEST(test_every_key_reaches_its_own_declared_bounds);
     return UNITY_END();
 }

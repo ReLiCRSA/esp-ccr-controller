@@ -163,13 +163,72 @@ void test_dive_locked_keys_refused_mid_dive() {
     // the refused write must not have landed
     TEST_ASSERT_EQUAL_STRING("diveonly", b.reg.getString(b.reg.find("AP_PASS")));
 
+    // The depth ruler. One density drives the `T,` metres, the setpoint tiers
+    // those metres select, the cellproof arm depth and the deco engine's
+    // ambient pressures, so a mid-dive write moves the diver's depth scale up to
+    // ~2.5% (0.990..1.100) at a pressure that has not changed. Refusing it is the
+    // same decision the setpoints already get — and the VALUE must not move
+    // either, which is the part a refusal that only prints ERR would fake.
+    b.run("SET WATER_DENSITY=1.000", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"),
+                             "the depth ruler was rewritten under a diver");
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, 1.025f, b.reg.getFloat(b.reg.find("WATER_DENSITY")));
+
     // schedule tuning stays writable mid-dive (normal diving, not gas control)
     b.run("SET GF_HIGH=90", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
     TEST_ASSERT_EQUAL(90, b.reg.getInt(b.reg.find("GF_HIGH")));
 
+    // Close, restore the ruler, and show the refusal was about the dive and not
+    // about the key: the identical write is accepted at the surface.
+    TEST_ASSERT_TRUE(has(b.run("DIVE END"), "OK"));
+    // The dive GATE flips at DIVE END, but the chain's dive-state work lands on
+    // the next control tick (post* contract, loop.h) — and the bench clock only
+    // moves when ticks() runs. So the gate must be off now, and it must still be
+    // off after a tick, which is what makes the surface write below a real
+    // surface write rather than one graded mid-dive.
+    b.ticks(0.21f, 0.0f, 2.0f);
+    TEST_ASSERT_FALSE_MESSAGE(b.loop.diveActive(),
+                              "the dive gate never closed on the control chain");
+    // Reusing `r` here is deliberate, not sloppiness: `exec()` resets len and
+    // actions AND writes text[0] = '\\0', and every reply path terminates at len,
+    // so a reused Response cannot hand a needle test the previous reply — that
+    // invariant is pinned by test_reused_reply_buffer_never_leaks_the_previous_reply.
+    // (An earlier draft of this case blamed a failing assertion on stale bytes in a
+    // reused buffer. It was wrong, and the real cause is worth more: the case's own
+    // DIVE END had invalidated the trailing DIVE START assertion, which was no
+    // longer testing a double start at all. A case can make its own later
+    // assertions meaningless; "it passed before I edited it" proves nothing.)
+    b.run("SET WATER_DENSITY=1.000", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "OK"),
+                             "the diver cannot switch sea to fresh at the surface");
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, 1.000f, b.reg.getFloat(b.reg.find("WATER_DENSITY")));
+}
+
+void test_re_dive_after_a_closed_dive_is_a_fresh_dive() {
+    // This behaviour used to be covered only as the last needle of the case above,
+    // inside a state that case no longer leaves in place. Stated on its own: a
+    // second DIVE START while the gate is up is refused WITH THE REASON, and once
+    // the dive has closed, starting again is a NEW dive rather than a refusal —
+    // which is what a dive log's two headers depend on.
+    Bench b;
+    CommandRouter::Response r;
+    TEST_ASSERT_TRUE(has(b.run("DIVE START"), "OK"));
+
     b.run("DIVE START", r);
-    TEST_ASSERT_TRUE(has(r, "ERR"));  // no double-start
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"), "a second DIVE START opened a dive");
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "dive active"),
+                             "the refusal did not say why: a diver told only ERR "
+                             "cannot tell an open dive from a broken command");
+
+    TEST_ASSERT_TRUE(has(b.run("DIVE END"), "OK"));
+    TEST_ASSERT_FALSE(b.loop.diveActive());     // gate flips at once (post* contract)
+    b.ticks(0.21f, 0.0f, 1.0f);                 // let the chain apply the end body
+    TEST_ASSERT_FALSE(b.loop.diveActive());
+
+    b.run("DIVE START", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "OK"), "the board would not open a second dive");
+    TEST_ASSERT_TRUE(b.loop.diveActive());
 }
 
 void test_dive_start_drops_the_radio_and_end_restores_it() {
@@ -593,6 +652,7 @@ int main() {
     RUN_TEST(test_auto_lockout_holds_over_the_router);
     RUN_TEST(test_get_set_round_trip_on_the_shared_registry);
     RUN_TEST(test_dive_locked_keys_refused_mid_dive);
+    RUN_TEST(test_re_dive_after_a_closed_dive_is_a_fresh_dive);
     RUN_TEST(test_dive_start_drops_the_radio_and_end_restores_it);
     RUN_TEST(test_diver_outranks_the_machine_cellproof_override);
     RUN_TEST(test_schema_lists_every_key_and_fits_the_buffer);

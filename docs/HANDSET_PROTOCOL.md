@@ -623,7 +623,7 @@ safety (replies `OK SAFETY`).
 | GF_HIGH | U | 85 | 50–100 | safety |
 | ASC_RATE | F | 6.0 | 3–18 | safety |
 | ASC_RATE_SLOW | F | 1.0 | 0.5–3.0 | safety |
-| WATER_DENSITY | F | 1.025 | 0.990–1.100 | — |
+| WATER_DENSITY | F | 1.025 | 0.990–1.100 | dive-lock |
 | VBAT_MIN | F | 10.5 | 3.0–30.0 | safety |
 | AP_SSID | S | `ESP-CCR` | len 1–16 | dive-lock |
 | AP_PASS | S | `diveonly` | len 8–31 | dive-lock |
@@ -640,11 +640,23 @@ disagreed — telemetry used a compile-time 1.025 while the deco engine used thi
 setting — which put a fresh-water diver's ceiling 2.5% away from the depth he was
 reading. A handset that displays depth should therefore read the value back
 (`GET WATER_DENSITY`) rather than assume 1.025, and a dive file's depths mean
-whatever the setting was during the dive. It is currently writable mid-dive
-(no `dive-lock` flag): changing it at 20 m moves the displayed depth and the plan
-together, by ~2.5% across the legal range, which is a scale change under the
-diver's feet rather than a refusal. Making it dive-locked would be a protocol-
-visible refusal and is under discussion, not decided.
+whatever the setting was during the dive.
+
+It carries the **dive-lock** flag (decided 2026-11-24): `SET WATER_DENSITY=…`
+mid-dive answers `ERR dive locked`, because a legal change (0.990…1.100) moves the
+diver's whole depth scale ~2.5% at a pressure that has not changed — displayed
+depth, tier boundaries, ceiling and NDL together. Setpoints and alarms are locked
+for less than that. The flag is bit 0 of the `K,` schema line, so a handset built
+from `GET SCHEMA` greys the control out without knowing the key's name, and the
+controller's own page disables the input while a dive is running.
+
+**A refusal is not proof that nothing changed.** A client that needs to know
+whether a locked write took effect must read the value back, in the same session,
+while the state that caused the refusal still holds: `ERR dive locked` only says
+what the router *said*. `hw_accept.py` demonstrates the shape — refused write,
+then `GET WATER_DENSITY` mid-dive, then the value restored at the surface and read
+again — because a post-dive read alone cannot see a value that leaked during the
+dive and was rewritten afterwards.
 
 ## 7. Compatibility rules (how this protocol evolves)
 
@@ -665,6 +677,20 @@ visible refusal and is under discussion, not decided.
 
 * `SET` values are truncated to 23 characters by the command parser, even
   though `AP_PASS` allows 31 — keep passphrases ≤23 for now.
+* **Numeric ranges are inclusive at both ends, and the endpoints are reachable**
+  (fixed 2026-11-24; they were not before). Until then the value was parsed as a
+  `double` and compared against a `float` bound, which promotes the bound and moves
+  it by up to one ULP — and the published decimal bounds are not exact binary
+  numbers. `SET WATER_DENSITY=0.990` answered `ERR out of range` against a declared
+  minimum of `0.990`, and **13 of the 30 numeric keys** had an unreachable endpoint:
+  SP1…SP4 (min 0.20), `SP_HYST` 0.1, `ALLO_LOW` 0.05, `CAL_O2_FI` 0.85,
+  `CAL_O2_TARGET` 0.80, `CELLPROOF_MAXSP` 0.60, `WATER_DENSITY` 0.990 (mins), and
+  `ALLO_CUTOFF` 1.80, `CELLPROOF_SP` 1.40, `CELLPROOF_MIN` 1.30 (maxes). Client
+  rule: a handset
+  or page may offer exactly the `K,` line's min and max, and a host case now walks
+  every key asserting both endpoints parse. Corollary for anyone writing a check
+  about a *refusal*: do not pick a range endpoint as your probe value, or an
+  unrelated refusal looks like the one you were testing for.
 * `LOG EXPORT n`: `n` is the slot number itself, 0..10. `LOG EXPORT 0` answers
   `ERR no such dive` (deliberate: that is what v1 did). The upper bound is the
   firmware's own `logfmt::MAX_DIVE_SLOTS`, not a number copied into the parser:

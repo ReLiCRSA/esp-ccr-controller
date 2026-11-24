@@ -90,6 +90,16 @@ MATRIX = [
     ("GET SCHEMA", "ranges the page will enforce", "identical"),
     ("GET *", "every setting", "identical"),
     ("GET FAULT", "fuse/duty picture", "identical"),
+    # Calibration honesty. `CAL O2` and `CAL DEPTH` are in the grammar but have no
+    # consumer on the board, so they must be REFUSED — and refused the same way on
+    # both transports, or a handset has a calibration the phone does not (and vice
+    # versa). `GET CALAIR` is the verdict of the one calibration that does run:
+    # code 0 (nothing asked since this power-up) is deterministic here because this
+    # probe never asks for one, so the two transports have to agree byte for byte.
+    ("CAL DEPTH", "depth tare refused: nothing consumes it", "identical"),
+    ("CAL O2", "O2 calibration refused: no sequencer on the board", "identical"),
+    ("CAL O2 CONFIRM", "no phantom two-step arm to confirm", "identical"),
+    ("GET CALAIR", "the air calibration's real verdict", "identical"),
     ("SET SP2=0.70", "surface write lands", "identical"),
     ("GET SP2", "and reads back", "identical"),
     # The over-long case now agrees on both transports byte for byte, which is
@@ -200,6 +210,27 @@ def http_probe(host, out):
     checks.append(("page shows the controller's clock state", bool(reads),
                    reads.group(0) if reads else "no GET TIME: the page cannot "
                                                 "say whether the clock landed"))
+    # A button is a promise. The page may not offer a command the controller
+    # refuses: `CAL O2`/`CAL DEPTH` are refused as unimplemented, so a button for
+    # one would be a control that does nothing on a machine that dives. (And the
+    # refusal is what the page must be able to show instead.)
+    ghost = [c for c in ('data-c="CAL DEPTH"', 'data-c="CAL O2"', 'data-c="CAL O2 CONFIRM"')
+             if c in page]
+    checks.append(("page offers no button for a command the controller refuses", not ghost,
+                   f"still offered: {ghost} — the firmware answers `ERR not implemented`"))
+    # ...and it must be able to ask for the verdict of the calibration that DOES
+    # run: `CAL AIR`'s reply is only a receipt, so the page has to read CALAIR.
+    calair = re.search(r'"GET CALAIR"', page)
+    checks.append(("page can read the air calibration's verdict", bool(calair),
+                   calair.group(0) if calair else
+                   "no GET CALAIR: the page can start the calibration and then says "
+                   "nothing about how it ended"))
+    renders = re.search(r'CALAIR\[1\]', page)
+    checks.append(("page reads the verdict code and has wording for it", bool(renders),
+                   renders.group(0) if renders else
+                   "the CALAIR status field is never read: the page would show a "
+                   "number, or nothing, where a diver needs words"))
+
     linked = sorted(set(re.findall(r'(?:href|src)="([^"]+)"', page)))
     out.append(f"  page links: {linked}")
     return checks, page, got

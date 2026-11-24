@@ -221,17 +221,54 @@ void test_diver_intent_survives_across_transports() {
     TEST_ASSERT_EQUAL(1, f.hk.wifi.back());
 }
 
-void test_the_two_step_cal_handshake_is_shared() {
+// The reason the session is one object with one lock: no transport has a private
+// path around a rule. This used to prove the CAL O2 arm was shared between the
+// phone and the handset; the command is refused outright now (its consumer,
+// cal::O2Sequencer, has never been instantiated on the board), so what has to be
+// shared is the REFUSAL — a handset must not find a working calibration where the
+// phone found none, and neither must find a different wording.
+void test_unimplemented_calibrations_refuse_alike_on_both_transports() {
     std::vector<std::string> out;
     g_out = &out;
     Fix f;
 
-    f.web("CAL O2");                       // armed from the phone...
-    TEST_ASSERT_TRUE(saw("W:OK CAL O2 ARMED"));
+    f.web("CAL O2");
+    TEST_ASSERT_TRUE(saw("W:ERR not implemented"));
     out.clear();
-    f.handset("CAL O2 CONFIRM");           // ...confirmed on the handset
-    TEST_ASSERT_TRUE_MESSAGE(!saw("H:ERR not armed"),
-                             "the handset could not confirm an arm the web made");
+    f.handset("CAL O2 CONFIRM");
+    TEST_ASSERT_TRUE(saw("H:ERR not implemented"));
+    out.clear();
+    f.handset("CAL DEPTH");
+    TEST_ASSERT_TRUE(saw("H:ERR not implemented"));
+    out.clear();
+    f.web("CAL DEPTH");
+    TEST_ASSERT_TRUE(saw("W:ERR not implemented"));
+
+    // The calibration that DOES have a consumer is accepted on both, with the
+    // same reply — the refusal above is a statement about those two commands,
+    // not a blanket "calibration unavailable".
+    out.clear();
+    f.web("CAL AIR");
+    TEST_ASSERT_TRUE(saw("W:OK CAL AIR"));
+    out.clear();
+    f.handset("CAL AIR");
+    TEST_ASSERT_TRUE(saw("H:OK CAL AIR"));
+
+    // And the verdict line is identical bytes on both transports, so a handset
+    // and a browser cannot disagree about whether the cells are calibrated.
+    out.clear();
+    f.web("GET CALAIR");
+    f.handset("GET CALAIR");
+    std::string w, h;
+    for (auto& l : out) {
+        if (l.size() > 2 && l[1] == ':') {          // "W:" / "H:" + the wire line
+            if (std::strcmp(l.substr(0, 9).c_str(), "W:CALAIR,") == 0) w = l.substr(2);
+            if (std::strcmp(l.substr(0, 9).c_str(), "H:CALAIR,") == 0) h = l.substr(2);
+        }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(!w.empty(), "the web got no CALAIR line");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE(w.c_str(), h.c_str(),
+                                     "the two transports disagree about the calibration");
 }
 
 void test_actions_run_inside_the_session_lock() {
@@ -341,7 +378,7 @@ int main() {
     RUN_TEST(test_safe_mode_is_visible_on_the_downlink);
     RUN_TEST(test_the_web_gets_identical_refusals);
     RUN_TEST(test_diver_intent_survives_across_transports);
-    RUN_TEST(test_the_two_step_cal_handshake_is_shared);
+    RUN_TEST(test_unimplemented_calibrations_refuse_alike_on_both_transports);
     RUN_TEST(test_actions_run_inside_the_session_lock);
     RUN_TEST(test_a_web_command_never_steals_the_handset_events);
     RUN_TEST(test_the_histogram_reaches_both_clients_identically);

@@ -133,6 +133,20 @@ static void onPre(const hs::PreStatus& p, void*) {
                   kSt[p.step[0]], kSt[p.step[1]], kSt[p.step[2]], kSt[p.step[3]],
                   kSt[p.step[4]], p.passed ? "PASSED" : "not passed");
 }
+static void onCalAir(const hs::CalAir& c, void*) {
+    // The air calibration's verdict, in words: `CAL AIR`'s reply is only a
+    // receipt, so a tap that prints replies alone would report a calibration as
+    // if it had happened.
+    Serial.printf("AIR %s", hs::calAirText(c.code));
+    if (c.code == hs::CalAir::OK)
+        Serial.printf("  raw %d/%d/%d  worst spread %.0f  %d samples",
+                      static_cast<int>(c.rawAvg[0]), static_cast<int>(c.rawAvg[1]),
+                      static_cast<int>(c.rawAvg[2]), static_cast<double>(c.spreadWorst),
+                      c.samples);
+    else if (c.code == hs::CalAir::WARMUP)
+        Serial.printf("  %lu s left", static_cast<unsigned long>(c.warmupLeftS));
+    Serial.printf("  (%lu s ago)\n", static_cast<unsigned long>(c.ageS));
+}
 static void onUnknown(const char* line, void*) { Serial.printf("RAW %s\n", line); }
 static void onTapUp(void* ctx) { onUp(ctx); Serial.println("link up"); }
 static void onTapDown(void* ctx) {
@@ -169,6 +183,7 @@ static hs::Handlers handlersForMode() {
         h.onErr = onErr;
         h.onEvent = onEv;
         h.onPre = onPre;
+        h.onCalAir = onCalAir;
         h.onLine = onUnknown;
     } else {
         h.onLinkUp = onUp;

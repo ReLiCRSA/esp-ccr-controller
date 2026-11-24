@@ -44,7 +44,6 @@ public:
         void (*appendSnapNow)(void* ctx) = nullptr;    // event-driven snapshot
         bool (*saveSettings)(void* ctx) = nullptr;
         void (*onCalAir)(void* ctx) = nullptr;
-        void (*onCalDepth)(void* ctx) = nullptr;
         int (*listDives)(int* slots, uint32_t* mtimes, uint32_t* seqs, int max,
                          void* ctx) = nullptr;
         int (*exportDive)(int slot, Sink sink, void* ctx) = nullptr;  // CSV lines

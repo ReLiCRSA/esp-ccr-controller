@@ -121,6 +121,11 @@ static volatile bool  g_depthValid = false;
 bridge::Telemetry g_bridgeTel{};
 bridge::EventRing g_bridgeEvents;
 bridge::DiveTotals g_bridgeTotals;
+// The last CAL AIR verdict (running / OK / refused, with the raw numbers).
+// ControlTask writes it — it owns the sampler — and the command path reads it
+// for `GET CALAIR`; the terminal verdicts also go out as `E,<t>,7,<code>`.
+// Until 2026-11-24 this fact existed only as console text.
+bridge::CalAir g_calAirStatus;
 
 // Rolling per-cell ppO2 histograms for the web histogram page (PLAN 9).
 // One writer: ControlTask, on the control thread, once per cycle -- the
@@ -131,7 +136,6 @@ cellhist::Hist g_cellHist;
 // Settings + command surface (referenced by comms/uart2_task.cpp).
 settings::Registry g_settings;
 volatile bool g_calAirRequest = false;
-volatile bool g_calDepthRequest = false;
 
 static void setSystemState(HudState s) {
     if (g_systemState == s) return;
@@ -319,14 +323,26 @@ static void controlTask(void*) {
 
         // CAL AIR: sample the raw cells at air, commit the air point.
         // Refused before warmup: an un-polarised cell's "average" is fiction.
+        // The `OK CAL AIR` the diver got from the router meant "requested", so
+        // every outcome below is published: `GET CALAIR` reads the current
+        // state, and a terminal verdict also lands on the wire as E,*,7,<code>.
+        // Same t base as the other E, rows (seconds since dive start, or since
+        // boot at the surface — see the spec's E, section).
+        const uint32_t calTSec = (now - g_bridgeTel.diveStartMs) / 1000u;
         if (g_calAirRequest) {
             g_calAirRequest = false;
             if (now < PREDIVE_WARMUP_MS) {
+                const uint32_t left = (PREDIVE_WARMUP_MS - now) / 1000u;
                 Serial.printf("cal air: REFUSED - cells still warming up (%u s left)\n",
-                              (unsigned)((PREDIVE_WARMUP_MS - now) / 1000u));
+                              (unsigned)left);
+                bridge::publishCalAirRefused(g_calAirStatus, bridge::CALAIR_WARMUP,
+                                             left, now, calTSec, g_bridgeEvents);
             } else {
                 g_airCal.start(now);
                 Serial.println("cal air: sampling (1 Hz x 12, spread-limited)");
+                cal::AirCalOutput started;   // running, no samples yet
+                started.running = true;
+                bridge::publishCalAir(g_calAirStatus, started, now, calTSec, g_bridgeEvents);
             }
         }
         if (g_airCal.running()) {
@@ -339,6 +355,7 @@ static void controlTask(void*) {
                 ai.cellsRaw[i] = static_cast<float>(g_ads.raw(i));
             ai.nowMs = now;
             const cal::AirCalOutput a = g_airCal.update(ai);
+            bridge::publishCalAir(g_calAirStatus, a, now, calTSec, g_bridgeEvents);
             if (a.done) {
                 for (int i = 0; i < 3; i++)
                     if (g_ctrlCfg.presentMask & (1u << i)) {
@@ -706,6 +723,7 @@ void setup() {
         if (g_loop != nullptr) {
             if (comms::initSession(*g_loop, g_settings, g_bridgeTel, g_bridgeEvents)) {
                 comms::session().setHist(&g_cellHist);
+                comms::session().setCalAir(&g_calAirStatus);
                 comms::session().setSafeLockout(true);
                 if (!comms::startUart2Task())
                     Serial.println("** SAFE MODE: handset offline — power-cycle to clear");
@@ -721,6 +739,7 @@ void setup() {
         Serial.println("** session NOT initialised: handset and web offline (control still runs)");
     } else {
         comms::session().setHist(&g_cellHist);   // GET HIST over either client
+        comms::session().setCalAir(&g_calAirStatus);   // GET CALAIR: ControlTask's verdict
         if (!comms::startUart2Task())
             Serial.println("** uart2 session NOT started (task create failed)");
         if (!comms::web::start())

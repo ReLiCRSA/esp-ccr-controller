@@ -108,7 +108,8 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
   </div>
 </section>
 <section id="v-check">
-  <div class="card"><div id="pre"></div><div class="hint" id="cellline"></div></div>
+  <div class="card"><div id="pre"></div><div class="hint" id="cellline"></div>
+    <div class="hint" id="calline"></div></div>
   <div class="card">
     <button class="act big" data-c="CHECK">Run pre-dive checks</button>
     <button class="act" data-c="TEST CELLS">Test cells</button>
@@ -123,12 +124,14 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
     <button class="act danger" data-c="CELLPROOF OVERRIDE">Lift clamp</button>
   </div>
   <div class="card"><fieldset><legend>Calibration</legend>
-    <div class="hint">Air is mandatory. The O&#8322; point needs a sealed loop or chamber enriched
-      to <span id="o2fi">0.99</span> &#8212; bench only. Two steps: arm, then confirm.</div>
+    <div class="hint">Air is mandatory and runs on the board: press CAL AIR, then read the
+      verdict below &#8212; it says whether the cells were sampled, refused while still
+      warming up, or failed, and with what raw numbers. The O&#8322; point (a sealed loop
+      enriched to <span id="o2fi">0.99</span>) and the depth tare are <b>not implemented in
+      this firmware</b>: asking them answers &#8220;not implemented&#8221;, so no button here
+      pretends otherwise.</div>
     <button class="act" data-c="CAL AIR">CAL AIR</button>
-    <button class="act" data-c="CAL O2">CAL O2 (arm)</button>
-    <button class="act" data-c="CAL O2 CONFIRM">CAL O2 CONFIRM</button>
-    <button class="act" data-c="CAL DEPTH">CAL DEPTH</button>
+    <button class="act" data-c="GET CALAIR">CAL AIR status</button>
   </fieldset></div>
 </section>
 <section id="v-hist">
@@ -156,7 +159,7 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
 "use strict";
 var $=function(id){return document.getElementById(id)};
 var view="status", sock=null, outq=[], busy=null, lastRx=0, bootMs=0, tries=0;
-var T=null, D=null, CELLS=null, PROOF=null, PRE=null, FAULT=null;
+var T=null, D=null, CELLS=null, PROOF=null, PRE=null, FAULT=null, CALAIR=null;
 var SCHEMA=[], VALS={}, diveActive=false;
 
 function toast(msg,kind){
@@ -271,6 +274,7 @@ function connect(){
     else if(f[0]==="CELLS") { CELLS=f; check(); }
     else if(f[0]==="PROOF") { PROOF=f; state(); }
     else if(f[0]==="PRE") { PRE=f; check(); }
+    else if(f[0]==="CALAIR") { CALAIR=f; check(); }
     else if(f[0]==="FAULT") { FAULT=f; state(); }
     else if(f[0]==="E") {
       var id=+f[2], val=+f[3];
@@ -283,6 +287,9 @@ var ALARMS=["LOW pO2","HIGH pO2","CELL DRIFT","SENSOR FAIL","BATTERY","SP CLAMP"
 function eventName(id,val){
   if(id===1) return "ALARM "+(ALARMS[val]||("bit"+val))+" RAISED";
   if(id===2) return "alarm "+(ALARMS[val]||("bit"+val))+" cleared";
+  if(id===7){var ca=["no calibration yet","sampling","calibrated","refused: cells still warming up",
+                     "aborted: a dive started","failed: cells never settled","failed: no cells fitted"];
+             return "CAL AIR: "+(ca[val]||("code "+val));}
   var n={3:"mode",4:"setpoint",5:"cell excluded",6:"cell rejoin",7:"CAL AIR",8:"CAL O2",
          9:"cell proof PASS",10:"cell proof FAIL",11:"clamp ON",12:"clamp OFF",
          13:"pre-dive PASS",14:"RESET",15:"clock unset"};
@@ -357,6 +364,25 @@ function check(){
     $("cellline").textContent="cell test "+st+"  passed "+CELLS[2]+"  failed "+CELLS[3]+
       (CELLS[4]==="1"?"  (running)":"");
   }
+  // The air calibration's own verdict, not the reply to the button: `CAL AIR`
+  // only ever says the request was accepted. The numbers are the raw ADC
+  // averages and the worst per-cell spread &#8212; what tells a dead cell from a
+  // fouled one.
+  if(CALAIR){
+    var c=+CALAIR[1];
+    var st=["no calibration since power-up","sampling &#8212; "+CALAIR[3]+" of 12 samples",
+            "calibrated","refused: cells still warming up","aborted: a dive started",
+            "failed: cells never settled inside the spread band","failed: no cells fitted"][c]
+         ||("code "+c);
+    var kind=c===2?"ok":(c===0||c===1)?"":"bad";
+    var det="";
+    if(c===2) det=" raw "+CALAIR[5]+"/"+CALAIR[6]+"/"+CALAIR[7]+"  worst spread "+CALAIR[4]+
+                  "  &#8212; "+CALAIR[2]+"s ago";
+    else if(c===3) det=" &#8212; "+CALAIR[8]+"s left before it will run";
+    else if(c!==0&&c!==1&&c!==2) det=" &#8212; "+CALAIR[2]+"s ago";
+    $("calline").innerHTML='<span class="pill'+(kind?" on "+kind:"")+'">air cal: '+st+
+                           '</span><span class="hint">'+det+'</span>';
+  } else $("calline").innerHTML='<span class="hint">air calibration: no answer from the controller yet</span>';
 }
 
 // ---- settings -------------------------------------------------------------
@@ -513,7 +539,7 @@ Array.prototype.forEach.call(document.querySelectorAll("#tabs button"),function(
       s.classList.toggle("on",s.id==="v-"+view); });
     if(view==="dives") refreshDives();
     if(view==="hist") refreshHist();
-    if(view==="check") { send("GET PRE"); send("GET CELLS"); }
+    if(view==="check") { send("GET PRE"); send("GET CELLS"); send("GET CALAIR"); }
   });
 });
 Array.prototype.forEach.call(document.querySelectorAll("button[data-c]"),function(b){
@@ -539,7 +565,7 @@ setInterval(function(){
 },1000);
 setInterval(function(){ if(sock&&sock.readyState===1) send("GET T"); },2000);
 setInterval(function(){ if(sock&&sock.readyState===1&&(view==="status"||view==="check")) send("GET D"); },2400);
-setInterval(function(){ if(sock&&sock.readyState===1&&view==="check"){ send("GET PRE"); send("GET CELLS"); send("GET PROOF"); send("GET FAULT"); } },2400);
+setInterval(function(){ if(sock&&sock.readyState===1&&view==="check"){ send("GET PRE"); send("GET CELLS"); send("GET PROOF"); send("GET FAULT"); send("GET CALAIR"); } },2400);
 setInterval(function(){ if(sock&&sock.readyState===1&&view==="hist") refreshHist(); },4000);
 connect();
 </script>

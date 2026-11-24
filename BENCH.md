@@ -15,11 +15,11 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0            # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 206 cases
+pio test -e native            # host gate, currently 233 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
-                                 --dive-persist
+                                 --cal-air --dive-persist
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle
 ```
 
@@ -306,6 +306,53 @@ controller** (its DTR/EN only touch the spare board — safer than the console
 port), and the bridge needs ~250 ms to boot after that open, so
 `hw_accept.py` settles 1.5 s and retries a command that got no line at all
 (`--handset-settle 0` for a plain adapter).
+
+### Calibration honesty: the reply is a receipt, so the verdict is its own row
+
+`hw_accept.py` asks the calibration questions on the handset link and fails if the
+machine implies work it did not do:
+
+```
+GET CALAIR        -> CALAIR,0,0,0,0,0,0,0,0     (nothing asked: code 0, not a result)
+CAL DEPTH         -> ERR not implemented        (no consumer, so refused)
+CAL O2            -> ERR not implemented
+CAL O2 CONFIRM    -> ERR not implemented        (no two-step arm to confirm)
+CAL AIR           -> OK CAL AIR                 (a receipt: nothing is claimed here)
+GET CALAIR        -> CALAIR,3,<age>,0,0,0,0,0,<left>   (refused: still warming up)
+```
+
+plus two checks over the **whole** handset stream rather than one reply: an
+unsolicited `E,<t>,7,3` row must have arrived, and no `E,<t>,7,2` (which would
+claim a calibration that was refused). The console watch adds the counterpart —
+`cal air: REFUSED` must appear there too, and `cal air: sampling` must not follow
+the refused request. Two records of one event that cannot disagree is the whole
+point of the change.
+
+The full verdict leg costs about two minutes and is opt-in:
+
+```
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 --cal-air
+```
+
+It does not guess the 120 s warm-up clock: it asks inside the gate, reads
+`warmup_left_s` back off the protocol and waits exactly that long — the honest
+refusal schedules the check. Then it samples and asserts `CALAIR,2,0,12,<spread>,
+<raw0>,<raw1>,<raw2>,0` arrives, that it ended unprompted as `E,<t>,7,2`, and that
+the console's `cal air: OK raw cell0=… worst spread … (12 samples)` carries **the
+same numbers** as the wire line. Captured on 2026-11-24:
+
+```
+E,129,7,2
+CALAIR,2,2,12,21,1514,1519,1528,0
+cal air: OK  raw cell0=1514 cell1=1519 cell2=1528  worst spread 21  (12 samples)
+```
+
+`web_probe.py` compares the refusals and `GET CALAIR` across the two transports
+byte for byte, and it fails the run if the served page still offers a button for
+`CAL O2` or `CAL DEPTH`: a control that does nothing on a machine that dives is a
+fault, so the page carries `CAL AIR` plus `CAL AIR status` and shows the verdict
+in words. It leaves the cells calibrated until the next reset, which changes what
+the pre-dive list says — expect that, do not chase it.
 
 ### When the link is silent: bisect it, do not reflash at it
 

@@ -171,30 +171,52 @@ Refusals are honest `ERR` lines — a handset should display them, not hide them
 | `DECO` | `D,` line (no OK) | ask for the deco picture now |
 | `CELLPROOF OVERRIDE` | `OK CLAMP LIFTED` / `ERR no clamp active` | lift the setpoint clamp imposed by a failed cell proof |
 
-### Calibration (all refused mid-dive with `ERR cal locked in dive`)
+### Calibration
 
 | Command | Reply |
 |---|---|
-| `CAL AIR` | `OK CAL AIR` — starts a ~12 s sampling window (1 Hz × 12, spread-limited); the outcome is printed on the controller's **USB console** only |
-| `CAL O2` | `OK CAL O2 ARMED` (first) — bare `CAL O2` again = `OK CAL O2 CANCEL` |
-| `CAL O2 CONFIRM` | `OK CAL O2` / `ERR not armed` |
-| `CAL DEPTH` | `OK CAL DEPTH` — one-shot depth offset capture |
+| `CAL AIR` | `OK CAL AIR` / `ERR cal locked in dive` — **a receipt, not a verdict**: it starts (or queues) a ~12 s sampling window (1 Hz × 12, spread-limited). Read the outcome with `GET CALAIR` or from the `E,<t>,7,<code>` event |
+| `GET CALAIR` | `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>` |
+| `CAL O2` | `ERR not implemented` |
+| `CAL O2 CONFIRM` | `ERR not implemented` |
+| `CAL DEPTH` | `ERR not implemented` |
 
-Two honest caveats a handset must not paper over (details in §8):
+**`OK CAL AIR` means the request was accepted.** The warm-up gate (cells must
+polarise for 120 s after power-on) and the sampling result live in the control
+task, so the verdict arrives on its own, two ways:
 
-* `CAL AIR` answers `OK CAL AIR` **even when it is then refused**: the reply
-  comes from the command router, the warm-up gate (< 120 s after power-on) and
-  the sampling result live in the control task and are reported on the console.
-  So `OK` means "requested", not "calibrated" — see §8.
-* `CAL O2` currently has **no consumer in the firmware**: the two-step state
-  machine (`cal::O2Sequencer`) is implemented and host-tested, but nothing
-  instantiates it on the board yet, so `ARMED`/`OK CAL O2` are protocol-true
-  and physically inert. A handset may send it; it must not present it as a
-  working calibration.
-* `CAL DEPTH` likewise has no consumer today: the command raises a request
-  flag that nothing reads, and no depth-offset trim is implemented in the
-  depth chain (depth is the smoothed sensor reading, taken as-is). Same rule:
-  the reply is honest about the *command*, not about an effect.
+* **unprompted**: `E,<t>,7,<code>` the moment it ends (see the event table in §4);
+* **on request**: `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>`
+  — the last verdict since this power-up and its age in seconds. The numbers are
+  raw ADC counts, not ppO2: `<raw0..2>` are the per-cell air averages that were
+  committed and `<spread>` the worst per-cell spread across the window; unfitted
+  channels read 0. `<warmup_left_s>` is meaningful only with code 3.
+
+| `<code>` | meaning | sent as an `E,` id 7 value |
+|---|---|---|
+| 0 | no `CAL AIR` since this power-up (all other fields 0) | never |
+| 1 | sampling; `<samples>` is progress out of 12 | never |
+| 2 | calibrated: air point committed for every fitted cell | yes |
+| 3 | refused: cells still warming up, `<warmup_left_s>` to go | yes |
+| 4 | aborted: a dive started (CAL AIR is a pre-dive act) | yes |
+| 5 | failed: cells never settled inside the spread band | yes |
+| 6 | failed: no fitted cells to sample | yes |
+
+The codes are append-only: never renumbered, new outcomes are added on the right,
+and an unrecognised code means "a verdict this client has no name for", not an
+error. A client that renders code 0 as "no calibration since power-up" is telling
+the truth; one that renders it as a green tick is not.
+
+`CAL O2` and `CAL DEPTH` are **refused, not acked**, because nothing on the board
+performs them: the O2 sequencer (`cal::O2Sequencer`) is implemented and
+host-tested but has never been instantiated in the firmware, and there is no
+depth-offset trim in the depth chain (depth is the smoothed sensor reading, taken
+as-is). Until 2026-11-24 they answered `OK CAL O2 ARMED` and `OK CAL DEPTH`,
+implying work that had not happened — on a rebreather that is a false all-clear,
+and a client has no way to tell it from the real thing. The commands stay in the
+grammar so no client has to change when the work lands; a handset must show the
+refusal. There is no two-step arm to cancel any more: `CAL O2 CONFIRM` is refused
+outright.
 
 ### Dive lifecycle
 
@@ -216,6 +238,7 @@ Two honest caveats a handset must not paper over (details in §8):
 | `GET PROOF` | `PROOF,` line |
 | `GET FAULT` | `FAULT,` line |
 | `GET HIST` | 3 × `HIST,` lines / `ERR no histogram` |
+| `GET CALAIR` | `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>` — the air calibration's verdict (§3) |
 | `GET TIME` | `TIME,<epoch>,<source>,<age_s>` — wall clock (see Wall clock below) |
 | `GET SCHEMA` | one `K,` line per settings key |
 | `GET <KEY>` | `<KEY>=<value>` for a settings key |
@@ -383,8 +406,8 @@ the split: only the marked ids are actually published by today's firmware.
 | 4 | setpoint change | setpoint × 100 (0.70 bar → 70) | yes |
 | 5 | cell excluded from vote | channel 0..2 | yes |
 | 6 | cell rejoined the vote | channel 0..2 | yes |
-| 7 | CAL AIR done | — | **no** (reserved) |
-| 8 | CAL O2 done | — | **no** (reserved) |
+| 7 | air calibration verdict | the `CALAIR,` status code (2 OK, 3 warm-up, 4 diving, 5 unsettled, 6 no cells) | yes: one row per verdict, never one per sample |
+| 8 | CAL O2 done | — | **no** (reserved — and `CAL O2` itself is refused as unimplemented, §3) |
 | 9 | cellproof PASS | unproven-high mask (bit per cell) | yes |
 | 10 | cellproof FAIL | 0 | yes |
 | 11 | setpoint clamp ON (cellproof FAIL capped the setpoints) | 0 | yes (edge: once per clamp, not once per cycle) |
@@ -393,10 +416,10 @@ the split: only the marked ids are actually published by today's firmware.
 | 14 | controller reset | — | **no** (reserved) |
 | 15 | dive started with no wall clock | 0 | dive **file** only (written into the dive at `DIVE START`; not streamed live) |
 
-Do not build a "CAL AIR done" or "pre-dive passed" *notification* on the
-remaining reserved ids — they never arrive. Learn the same facts from what is
-live now: `GET PRE` (poll, `PRE,` line), `GET PROOF` / the `T,` FLAGS clamp bit
-(5) for a clamp, and the controller's console output for calibration results.
+Do not build a "pre-dive passed" *notification* on the remaining reserved ids —
+it never arrives. Learn the same facts from what is live now: `GET PRE` (poll,
+`PRE,` line), `GET PROOF` / the `T,` FLAGS clamp bit (5) for a clamp, and
+`GET CALAIR` or `E,*,7,<code>` for the air calibration.
 
 Ids 11/12 are published as **edges**: a FAIL lasts hundreds of control cycles,
 and one row each is what the dive file needs (id 10 says the verdict, id 11 says
@@ -437,6 +460,7 @@ one line per cell (3 lines). 38 bins of 0.05 bar covering 0.00–1.90 bar
 ```
 L,<slot>,<epoch>,<seq>    dive directory entry (slot 1..10, seq 0 = unknown/pre-2026-11-24)
 TIME,<epoch>,<source>,<age_s>  wall clock answer (GET TIME); epoch 0 = no clock, source 0 unset / 1 set / 2 carried across a reset
+CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>  air calibration verdict (GET CALAIR); codes in §3, counts raw
 K,<key>,<T>,<min>,<max>,<flags>,<default>   settings schema; T ∈ F I U B S (STRING defaults are text)
 <KEY>=<value>             settings GET answer
 ```
@@ -570,15 +594,15 @@ not.
   send a line the library has not length-checked. (The library itself drops an
   oversized *downlink* line whole, which is the behaviour a handset wants from a
   corrupt stream — the firmware now behaves the same way.)
-* **`OK` means "the command was accepted", not "the effect happened".** Three
-  calibration paths are parsed, replied and armed but have no firmware
-  consumer yet: `CAL O2` (`cal::O2Sequencer` is host-tested, never
-  instantiated on the board), `CAL DEPTH` (request flag is never read; no
-  depth-offset trim exists) and the warm-up half of `CAL AIR` (`OK CAL AIR` is
-  answered even when the control task then refuses it and says so on the USB
-  console only). A handset must not draw a green "calibrated" tick from these
-  replies. A firmware-side fix (an `ERR` or an event when the effect fails) is
-  the right way to close this; until then, treat these replies as advisory.
+* **`OK` means "the command was accepted", not "the effect happened"** — and for
+  calibration the effect is now reported separately instead of being implied.
+  Fixed 2026-11-24: `CAL O2` and `CAL DEPTH` answer `ERR not implemented` (they
+  have no consumer on the board — the O2 sequencer is host-tested and never
+  instantiated, and no depth trim exists), and `CAL AIR`'s verdict — including
+  the warm-up refusal that used to appear only on the USB console — is on the
+  wire as `CALAIR,` and as an `E,<t>,7,<code>` row (§3). Rule that survives:
+  never infer an effect from `OK`. Prove it with a read-back of the state the
+  command was supposed to change (`GET CALAIR`, `GET TIME`, `GET SP2`, …).
 * Event ids 7, 8, 11, 12, 13, 14 are reserved in the log format and **not
   published** (§4 table). Do not build notifications on them.
 * `PULSE` works during a dive as well as at the surface — it is a diver

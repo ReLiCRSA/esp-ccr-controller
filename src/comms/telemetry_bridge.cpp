@@ -98,4 +98,45 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
     ps.prevSp = st.setpointBar;
 }
 
+// ---- the CAL AIR verdict ----------------------------------------------------
+// ControlTask owns the sampler; this is the seam that lets the clients know how
+// it ended. Payload first, code last (see CalAir): a command task that reads a
+// terminal code also reads the numbers that belong to it.
+void publishCalAir(CalAir& out, const cal::AirCalOutput& a, uint32_t nowMs,
+                   uint32_t tSec, EventRing& ring) {
+    uint8_t code = CALAIR_NONE;
+    if (a.done)       code = CALAIR_OK;
+    else if (a.failed) {
+        switch (a.whyCode) {
+            case cal::AirCalWhy::DIVING:    code = CALAIR_DIVING; break;
+            case cal::AirCalWhy::NOCELLS:   code = CALAIR_NOCELLS; break;
+            case cal::AirCalWhy::UNSETTLED: code = CALAIR_UNSETTLED; break;
+            default:                        code = CALAIR_UNSETTLED; break;
+        }
+    } else if (a.running) code = CALAIR_RUNNING;
+    else return;   // nothing to say: the sampler is idle
+
+    for (int i = 0; i < 3; ++i) out.rawAvg[i] = a.rawAvg[i];
+    out.spreadWorst = a.spreadWorst;
+    out.samples = a.samples;
+    out.warmupLeftS = 0;
+    out.atMs = nowMs;
+    out.code = code;   // last: see the header
+
+    if (code != CALAIR_RUNNING) {   // one row per verdict, not per sample
+        if (!ring.push({tSec, logfmt::EVT_CAL_AIR, code})) ring.noteDropped();
+    }
+}
+
+void publishCalAirRefused(CalAir& out, uint8_t code, uint32_t warmupLeftS,
+                          uint32_t nowMs, uint32_t tSec, EventRing& ring) {
+    for (int i = 0; i < 3; ++i) out.rawAvg[i] = 0.0f;
+    out.spreadWorst = 0.0f;
+    out.samples = 0;
+    out.warmupLeftS = warmupLeftS;
+    out.atMs = nowMs;
+    out.code = code;
+    if (!ring.push({tSec, logfmt::EVT_CAL_AIR, code})) ring.noteDropped();
+}
+
 } // namespace bridge

@@ -113,6 +113,26 @@ PROTOCOL_CHECKS = [
     ("SET SP2=2.5", r"^ERR", "range refusal"),
     # The clock goes up before the matrix's own dive, so THAT dive is stamped
     # with a real epoch too, and every later phase sees dated logs.
+    # Calibration honesty (PLAN 16: `OK` meant "the parser accepted it"). CAL O2
+    # armed a two-step handshake whose consumer (cal::O2Sequencer) has never been
+    # instantiated on the board, and CAL DEPTH raised a request flag nothing ever
+    # read; both used to answer OK, which on a rebreather reads as "tared" or
+    # "calibrated". They are refused now, and the air calibration's real verdict
+    # is readable instead of console-only — see the CALAIR entries below and
+    # BENCH.md "Calibration honesty".
+    ("GET CALAIR", r"^CALAIR,0,0,0,0,0,0,0,0$",
+     "nothing calibrated yet: code 0, not a result invented out of a zero"),
+    ("CAL DEPTH", r"^ERR not implemented$", "depth tare refused: nothing consumes it"),
+    ("CAL O2", r"^ERR not implemented$", "O2 calibration refused: no sequencer on the board"),
+    ("CAL O2 CONFIRM", r"^ERR not implemented$", "no phantom two-step arm to confirm"),
+    # The warm-up gate is the interesting case: the reply to `CAL AIR` is the same
+    # `OK CAL AIR` whether the cells are sampled or refused, so the verdict has to
+    # arrive on its own. Under 120 s of uptime the gate refuses, and that refusal
+    # must be visible on the protocol (and as an unsolicited E, row — graded after
+    # the matrix, see the stream checks in main()).
+    ("CAL AIR", r"^OK CAL AIR$", "accepted at the surface (the reply is only ever a receipt)", "dwell:1.5"),
+    ("GET CALAIR", r"^CALAIR,3,\d+,0,0,0,0,0,[1-9]\d*$",
+     "warm-up refusal is on the protocol with the seconds left, not only on the console"),
     (f"TIME SET {_NOW_EPOCH}", r"^OK TIME", "wall clock accepted from the bench"),
     ("TIME SET 7", r"^ERR epoch out of range", "implausible epoch refused, clock unchanged"),
     ("GET TIME", r"^TIME,\d{10},1,", "clock set since this boot, read back"),
@@ -227,7 +247,28 @@ def grade_boot(lines, expect_web):
     return checks
 
 
-def grade_watch(lines, boot_lines=None):
+def grade_stream(stream):
+    """The facts the controller volunteers, graded over everything it sent.
+
+    A command's reply only ever speaks for the command. The air calibration's
+    verdict is a fact about the machine, so it has to arrive UNPROMPTED, as an
+    `E,<t>,7,<code>` row: that is what a handset with no query in flight sees, and
+    it is the half of the story the `OK CAL AIR` receipt cannot tell."""
+    checks = []
+    ev = next((l for l in stream if re.match(r"^E,\d+,7,3$", l)), None)
+    checks.append(("the warm-up refusal was streamed unprompted as E,<t>,7,3",
+                   ev is not None,
+                   "no `E,*,7,3` row in the stream: the verdict stayed on the console"
+                   if ev is None else ev))
+    # And nothing claimed a calibration happened: id 7 with value 2 (CALAIR_OK)
+    # would be a lie on a board whose cells were refused for warm-up.
+    lie = next((l for l in stream if re.match(r"^E,\d+,7,2$", l)), None)
+    checks.append(("no CALAIR_OK row for a calibration that was refused",
+                   lie is None, lie or ""))
+    return checks
+
+
+def grade_watch(lines, boot_lines=None, cal_lines=None):
     # `boot_lines` contributes to the stack-headroom scan only: HB beats every
     # 5 s, so the boot capture is usually where the headroom numbers live. A
     # missing tripwire is a fault wherever it is missing.
@@ -266,6 +307,21 @@ def grade_watch(lines, boot_lines=None):
     checks.append(("DIVE END brought the radio back", ups >= downs and ups >= 1,
                    f"{downs} down / {ups} up; {window} — a surface with no AP is "
                    f"a fault the handset reply cannot show"))
+    # The matrix asked for a CAL AIR inside the warm-up gate, so the console must
+    # have said REFUSED. Two records of one event, and they have to agree: the
+    # protocol answered CALAIR,3 (handset side) and this is the machine's own
+    # console. A console that says "sampling" while the protocol says "refused" is
+    # the drift this whole change exists to kill.
+    window = cal_lines if cal_lines is not None else lines
+    refused = next((l for l in window if l.startswith("cal air: REFUSED")), None)
+    checks.append(("the console refused the warm-up calibration too",
+                   refused is not None,
+                   refused or "no 'cal air: REFUSED' line — the protocol's refusal has "
+                              "no counterpart in the machine's own output"))
+    started = next((l for l in window if l.startswith("cal air: sampling")), None)
+    checks.append(("a refused calibration did not also start sampling",
+                   started is None, started or ""))
+
     for marker, meaning in (("softAP failed", "AP would not come up"),
                             ("captive DNS failed to bind", "captive portal dead")):
         hit = next((l for l in lines + list(boot_lines or []) if marker in l), None)
@@ -362,9 +418,14 @@ def _await_burst(ser, pat, seen, log, send, t0):
     return False
 
 
-def run_protocol(port, baud, log, settle=1.5):
+def run_protocol(port, baud, log, settle=1.5, stream=None):
     """Open the handset adapter and run PROTOCOL_CHECKS. No pyserial import
     at module level: the boot/replay path must work without a handset.
+
+    `stream`, if given, collects EVERY line the controller sent, including the
+    unsolicited T,/D,/E, rows. Those are the evidence for facts the controller
+    volunteers — a refused calibration, a clamp that engaged — which no command's
+    own reply can show (`OK CAL AIR` is a receipt, not a verdict).
 
     `settle`: opening the port resets the board behind it. On a plain USB-UART
     adapter that costs nothing; on a second ESP32 running handset/bridge_esp32
@@ -423,6 +484,8 @@ def run_protocol(port, baud, log, settle=1.5):
                     payload = (cmd.strip() + "\r\n").encode()
                     ok = _await_burst(ser, pat, seen, log,
                                       lambda p=payload: (ser.write(p), ser.flush()), t0)
+                    if stream is not None:
+                        stream.extend(seen)
                 else:
                     deadline = time.time() + 3.0
                     while time.time() < deadline:
@@ -430,6 +493,8 @@ def run_protocol(port, baud, log, settle=1.5):
                         if not line:
                             break
                         seen.append(line)
+                        if stream is not None:
+                            stream.append(line)
                         log.append(f"[{time.time() - t0:7.2f}s] << {line}")
                         if pat.match(line):
                             ok = True
@@ -553,6 +618,129 @@ def run_framing(port, baud, log, settle=1.5):
                        f"{want} -> {back[:1] or '(no reply: the link died)'}"))
         checks.append(("the line after a dropped line still works",
                        bool(back), back[0] if back else "no reply after the dropped line"))
+    finally:
+        ser.close()
+    return checks
+
+
+def run_cal_air(console, port, baud, watch, settle=1.5, log=None):
+    """The air calibration, end to end, with its numbers on the wire.
+
+    The matrix proves the REFUSAL half (a warm-up refusal becomes a protocol row).
+    This phase proves the half that matters to a diver: the calibration actually
+    runs and its verdict — samples, raw averages, worst spread — reaches the
+    protocol, unprompted as an E, row and on request as CALAIR,, and agrees with
+    what the machine printed on its own console.
+
+    It does not guess the warm-up clock. It asks for a calibration inside the
+    gate, reads the refusal's `warmup_left_s` back off the protocol, and waits
+    exactly that long — the honest reply is what schedules the check. Takes about
+    two minutes, and leaves the cells calibrated until the next reset.
+    """
+    import serial
+
+    ser = serial.Serial(port, baud, timeout=1.0)
+    log = log if log is not None else []
+    checks = []
+    t0 = T_ORIGIN
+
+    def ask(cmd, want=None, window=2.0):
+        ser.write((cmd + "\r\n").encode())
+        ser.flush()
+        out, end = [], time.time() + window
+        while time.time() < end:
+            l = ser.readline().decode(errors="replace").strip()
+            if not l:
+                break
+            # NOT TELEM.match(l): that pattern covers T,/D,/E, and the E, rows are
+            # the evidence this phase is after — the verdict arriving unprompted.
+            if not l.startswith(("T,", "D,")):
+                log.append(f"[{time.time() - t0:7.2f}s] << {l}")
+            if want and re.match(want, l):
+                out.append(l)
+                break
+            if not l.startswith(("T,", "D,")):
+                out.append(l)
+        return out
+
+    try:
+        time.sleep(settle)
+        ser.reset_input_buffer()
+        ser.write(b"\r\n"); ser.flush()
+        end = time.time() + 0.6
+        while time.time() < end:
+            ser.readline()
+
+        # 1. Ask inside the warm-up gate and read the seconds left off the reply.
+        ask("CAL AIR", r"^OK CAL AIR$")
+        left = None
+        for l in ask("GET CALAIR", r"^CALAIR,3,"):
+            f = l.split(",")
+            if len(f) == 9:
+                left = int(f[8])
+        checks.append(("warm-up refusal says how long is left", left is not None and left > 0,
+                       f"warmup_left_s={left} — without it this phase would be guessing"))
+        if left is None:
+            return checks
+
+        log.append(f"[{time.time() - t0:7.2f}s] (waiting out the warm-up: "
+                   f"{left} s, as the controller said)")
+        time.sleep(left + 3.0)
+
+        # 2. Ask again: this time it samples. Watch until the verdict is terminal.
+        asked = time.time()
+        ask("CAL AIR", r"^OK CAL AIR$")
+        progress, verdict, events = [], [], []
+        while time.time() - asked < 45.0:
+            for l in ask("GET CALAIR", None, window=2.0):
+                if l.startswith("CALAIR,"):
+                    verdict = l
+                    if l.split(",")[1] != "1":
+                        break
+                elif l.startswith("E,"):
+                    events.append(l)
+            if verdict and verdict.split(",")[1] != "1":
+                break
+            progress.append(verdict)
+        f = verdict.split(",") if verdict else []
+        code = int(f[1]) if len(f) == 9 else None
+        checks.append(("the calibration left 'running' and reached a verdict",
+                       code in (2, 4, 5, 6), f"last answer: {verdict}"))
+        checks.append(("it sampled 12 samples, not fewer",
+                       len(f) == 9 and int(f[3]) >= 12, f"last answer: {verdict}"))
+        checks.append(("the calibration ended unprompted as E,<t>,7,2",
+                       any(re.match(r"^E,\d+,7,2$", e) for e in events),
+                       f"events seen: {events or 'none'}"))
+        ok = code == 2
+        checks.append(("the verdict is CALAIR_OK with numbers, not a bare code", ok,
+                       f"answer: {verdict}" + ("" if ok else
+                       " — the cells did not settle in the spread band on this bench "
+                       "(code 5) or aborted: a real bench condition, not a harness fault")
+                       if not ok else verdict))
+        if ok:
+            checks.append(("a committed calibration carries non-zero raw counts",
+                           all(int(x) > 0 for x in f[5:8]), f"raw: {f[5:8]}"))
+            # 3. Two records of one event. The console line is the machine's own
+            # words; CALAIR, is the client's. They must carry the same numbers, or
+            # the thing an engineer reads and the thing a diver's handset shows
+            # have come apart — the drift this change exists to prevent.
+            cons = next((l for l in watch if l.startswith("cal air: OK")), None)
+            checks.append(("the console reported the same calibration", cons is not None,
+                           cons or "no 'cal air: OK' on the console while the protocol "
+                                   "says the calibration committed"))
+            if cons:
+                nums = [int(x) for x in re.findall(r"=\s*(\d+)", cons)]
+                spread = re.search(r"worst spread\s+(\d+)", cons)
+                samples = re.search(r"\((\d+) samples\)", cons)
+                agree = (len(nums) == 3 and nums == [int(x) for x in f[5:8]]
+                         and bool(spread) and int(spread.group(1)) == int(f[4])
+                         and bool(samples) and int(samples.group(1)) == int(f[3]))
+                checks.append(("console and CALAIR, agree on the numbers", agree,
+                               f"console: {cons!r} vs wire: {verdict!r}"))
+        # The refusal's row must not still be the newest verdict: `CALAIR,3` after a
+        # successful calibration would mean the record never updated.
+        checks.append(("the newest verdict replaced the earlier refusal",
+                       code == 2, f"newest answer: {verdict}"))
     finally:
         ser.close()
     return checks
@@ -707,6 +895,12 @@ def main() -> int:
                          "control path shows up on the next tick, not on the wire).")
     ap.add_argument("--expect-web", action="store_true")
     ap.add_argument("--boot-wait", type=float, default=20.0)
+    ap.add_argument("--cal-air", action="store_true",
+                    help="run the air calibration for real and check its verdict "
+                         "reaches the protocol (CALAIR, and an unprompted E,*,7,2 "
+                         "row) and matches the console. Adds ~2 min — it has to "
+                         "wait out the 120 s cell warm-up — and leaves the cells "
+                         "calibrated until the next reset.")
     ap.add_argument("--replay", default=None)
     ap.add_argument("--dive-persist", action="store_true",
                     help="after the protocol checks, close a dive, reset the "
@@ -790,11 +984,19 @@ def main() -> int:
     if args.handset:
         print("\n--- handset protocol checks (UART2) ---")
         proto_log = []
+        proto_stream = []
         for name, ok, detail in run_protocol(args.handset, args.baud, proto_log,
-                                             args.handset_settle):
+                                             args.handset_settle, proto_stream):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
             failures += 0 if ok else 1
         (logdir / f"accept_{stamp}_handset.log").write_text("\n".join(proto_log) + "\n")
+
+        # Facts the controller volunteers: graded over the whole stream, not over
+        # one command's reply.
+        print("\n--- unsolicited rows (the verdict, not the receipt) ---")
+        for name, ok, detail in grade_stream(proto_stream):
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok else f": {detail}"))
+            failures += 0 if ok else 1
 
         # Line framing, on the wire: see run_framing for why the matrix's own
         # over-long entry was not enough. Inside the console watch on purpose —
@@ -809,18 +1011,36 @@ def main() -> int:
         (logdir / f"accept_{stamp}_framing.log").write_text(
             "\n".join(frame_log) + "\n")
 
+        # The calibration-specific console checks describe the MATRIX's traffic:
+        # --cal-air asks for a calibration on purpose two minutes later, and a
+        # "cal air: sampling" line from that must not read as the matrix's refused
+        # request having started something. So the window is marked here.
+        cal_mark = len(watch)
+
+        if args.cal_air and not args.replay:
+            # Before dive-persist: that phase resets the board, and this one has
+            # two minutes of waiting that a reset would throw away.
+            print("\n--- the air calibration's verdict (CALAIR, + E,*,7 rows) ---")
+            cal_log = []
+            for name, ok_, detail in run_cal_air(ser, args.handset, args.baud, watch,
+                                                 args.handset_settle, cal_log):
+                print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
+                failures += 0 if ok_ else 1
+            (logdir / f"accept_{stamp}_calair.log").write_text("\n".join(cal_log) + "\n")
+
         if args.watch_tail > 0:
             print(f"\n--- watching the console for {args.watch_tail:.0f} s "
                   f"after the last command ---")
             time.sleep(args.watch_tail)
         print("\n--- console watch (during the command phase) ---")
-        for name, ok, detail in grade_watch(watch, lines):
+        for name, ok, detail in grade_watch(watch, lines, watch[:cal_mark]):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok else f": {detail}"))
             failures += 0 if ok else 1
         (logdir / f"accept_{stamp}_watch.log").write_text(
             "\n".join(f"[{t:7.2f}s] {l}" for t, l in watch_stamps) + "\n")
     else:
         print("\n(handset checks skipped: pass --handset PORT)")
+    cal_mark = len(watch)
 
     if args.handset and not args.replay and args.dive_persist:
         # Last, on purpose: the reset below puts a second boot banner in the

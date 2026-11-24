@@ -27,6 +27,7 @@
 #include <cstdint>
 
 #include "comms/settings.h"
+#include "comms/telemetry_bridge.h"
 #include "comms/uart_proto.h"
 #include "comms/wallclock.h"
 #include "control/calibration.h"
@@ -61,10 +62,14 @@ public:
         ACT_DIVE_END = 1 << 2,     // close/finalise it
         ACT_WIFI = 1 << 3,         // wifiEnabled() changed: bring radio up/down
         ACT_CAL_AIR = 1 << 4,      // run the air calibration on live samples
-        ACT_CAL_O2_ARM = 1 << 5,   // arm the two-step O2 calibration
-        ACT_CAL_O2_CONFIRM = 1 << 6,
-        ACT_CAL_O2_CANCEL = 1 << 7,  // a bare CAL O2 while armed = back out
-        ACT_CAL_DEPTH = 1 << 8,    // one-shot depth offset capture
+        // Bits 5..8 (CAL O2 ARM/CONFIRM/CANCEL, CAL DEPTH) were retired
+        // 2026-11-24, not renumbered: the commands they served are refused on
+        // the wire now (`ERR not implemented`), because nothing on the board
+        // consumed them — the O2Sequencer was never instantiated and the depth
+        // request flag was raised and never read. They are recorded here so the
+        // next action bit added is 1 << 13, never a recycled number: a hook
+        // that means something different from what the sender thought is exactly
+        // the class of bug the protocol's append-only rule exists to prevent.
         ACT_LOG_LIST = 1 << 9,     // transport streams the dive directory
         ACT_LOG_EXPORT = 1 << 10,  // ...or one dive, logExportIndex()
         ACT_SAFE_ACK = 1 << 11,    // SAFE-mode ACK: the transport restarts
@@ -135,12 +140,10 @@ public:
     /// other live status keys this samples while the control thread writes
     /// it; no decision hangs on it (the A5e rule).
     void setHist(const cellhist::Hist* h) { hist_ = h; }
-    /// CAL DEPTH is a one-shot hardware capture; the sensor owner consumes it.
-    bool takeDepthCalRequest() {
-        const bool w = depthCalPending_;
-        depthCalPending_ = false;
-        return w;
-    }
+    /// The last CAL AIR verdict, published by ControlTask (it runs the
+    /// sampler). Null is allowed and answers `CALAIR,0,...` — "no calibration
+    /// since this power-up" — rather than inventing a result.
+    void setCalAir(const bridge::CalAir* c) { calAir_ = c; }
 
     /// The controller's wall clock, published by whoever owns it (the session).
     /// Null is allowed and reads as "no clock", so a transport that has not
@@ -174,6 +177,7 @@ private:
     void endDive(Response& r);
     void getSpecial(Response& r, const char* key);
     void buildCellsLine(Response& r);
+    void buildCalAirLine(Response& r);
 
     ctrl::Loop& loop_;
     settings::Registry& reg_;
@@ -182,13 +186,10 @@ private:
 
     bool wifiOn_ = true;       // diver-visible master switch (WIFI ON|OFF)
     bool wifiAutoOff_ = false; // radio dropped by DIVE START, not by the diver
-    bool depthCalPending_ = false;
     const wallclock::State* clock_ = nullptr;
     uint32_t clockEpoch_ = 0;
     const cellhist::Hist* hist_ = nullptr;
-    bool o2Armed_ = false;     // first step of the two-step CAL O2 seen here;
-                               // the O2Sequencer itself lives in the firmware
-                               // and consumes ACT_CAL_O2_* (cancel included)
+    const bridge::CalAir* calAir_ = nullptr;
     uint16_t logExportIdx_ = 0;
 };
 

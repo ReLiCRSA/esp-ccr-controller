@@ -75,6 +75,50 @@ struct Proof { int state;                    // 0 INACTIVE 1 IDLE 2 ARMED 3 RUNN
                uint8_t unprovenMask, exclusionMask; uint32_t attempts; };
 struct Fault { bool stuckOpenLatched, outputFuseTripped; float solDutyPct; };
 
+// `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>`
+// — the air calibration's real verdict, added 2026-11-24. It exists because
+// `CAL AIR`'s reply is only a receipt: `OK CAL AIR` is answered the same way
+// whether the cells are then sampled, refused for warm-up or failed, and until
+// then the outcome existed only on the controller's USB console. So do not show
+// a "calibrated" tick from the reply — read this line (or the live `E,<t>,7,<code>`
+// event, whose value is the same `Code` enumeration).
+//
+// `<code>` is append-only, like every protocol number: new outcomes are added on
+// the right, never renumbered, so a client written today must treat an
+// unrecognised code as "some verdict I have no name for", not as an error.
+struct CalAir {
+    enum Code {
+        NONE = 0,        // no CAL AIR since this power-up (fields are all zero)
+        RUNNING = 1,     // sampling; `samples` is progress out of 12
+        OK = 2,          // air point committed for every fitted cell
+        WARMUP = 3,      // refused: cells still polarising, `warmupLeftS` to go
+        DIVING = 4,      // aborted: a dive started (CAL AIR is a pre-dive act)
+        UNSETTLED = 5,   // failed: cells never stayed inside the spread band
+        NOCELLS = 6,     // failed: no fitted cells to sample
+    };
+    int code;
+    uint32_t ageS;       // seconds since that verdict, 0 while running
+    int samples;         // samples in the window
+    float spreadWorst;   // worst per-cell spread, raw ADC counts
+    float rawAvg[3];     // raw ADC counts per cell (0 for an unfitted channel)
+    uint32_t warmupLeftS;
+};
+
+// Stable English for a code, for a handset that has a display and no wording of
+// its own. Words, not numbers, are what a diver reads.
+inline const char* calAirText(int code) {
+    switch (code) {
+        case CalAir::NONE:      return "no calibration since power-up";
+        case CalAir::RUNNING:   return "sampling";
+        case CalAir::OK:        return "calibrated";
+        case CalAir::WARMUP:    return "refused: cells still warming up";
+        case CalAir::DIVING:    return "aborted: a dive started";
+        case CalAir::UNSETTLED: return "failed: cells never settled";
+        case CalAir::NOCELLS:   return "failed: no cells fitted";
+        default:                return "unknown verdict";
+    }
+}
+
 struct Setting { char key[24]; char value[40]; };      // "KEY=value" answers
 // `L,<slot>,<epoch>,<seq>`. `seq` is the fourth field, appended 2026-11-24;
 // 0 means the dive predates the field (or the controller is older), and 0 is
@@ -143,6 +187,7 @@ struct Handlers {
     void (*onLogList)(const LogEntry&, void*) = nullptr;
     void (*onDiveHeader)(const DiveHeader&, void*) = nullptr;
     void (*onClock)(const Clock&, void*) = nullptr;
+    void (*onCalAir)(const CalAir&, void*) = nullptr;
     // Everything else: CSV export rows (S,/M,), HIST, lines, WebSocket '#'
     // markers, and any line a future controller adds. Observing is optional;
     // ignoring is always safe.
@@ -265,6 +310,26 @@ inline bool parseProof(const char* line, Proof& p) {
     p.unprovenMask = static_cast<uint8_t>(pmask(f[2]));
     p.exclusionMask = static_cast<uint8_t>(pmask(f[3]));
     p.attempts = static_cast<uint32_t>(pl(f[4]));
+    return true;
+}
+
+// Append-only in both directions: a controller that sends fewer than the nine
+// fields above still parses (the code is the part a client acts on), and fields
+// a future controller appends are ignored rather than rejected.
+inline bool parseCalAir(const char* line, CalAir& c) {
+    if (!starts(line, "CALAIR,")) return false;
+    char buf[96];
+    std::strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+    char* f[9];
+    const int n = split(buf, f, 9);
+    if (n < 2) return false;
+    c.code = static_cast<int>(pl(f[1]));
+    c.ageS = n >= 3 ? static_cast<uint32_t>(pl(f[2])) : 0u;
+    c.samples = n >= 4 ? static_cast<int>(pl(f[3])) : 0;
+    c.spreadWorst = n >= 5 ? std::strtof(f[4], nullptr) : 0.0f;
+    for (int i = 0; i < 3; i++)
+        c.rawAvg[i] = n >= 6 + i ? std::strtof(f[5 + i], nullptr) : 0.0f;
+    c.warmupLeftS = n >= 9 ? static_cast<uint32_t>(pl(f[8])) : 0u;
     return true;
 }
 
@@ -432,6 +497,7 @@ public:
     bool getCells()            { return send("GET CELLS"); }
     bool getProof()            { return send("GET PROOF"); }
     bool getFault()            { return send("GET FAULT"); }
+    bool getCalAir()           { return send("GET CALAIR"); }
     bool getHist()             { return send("GET HIST"); }
     bool getSchema()           { return send("GET SCHEMA"); }
     bool set(const char* key, const char* value) {
@@ -443,8 +509,16 @@ public:
     bool ack()                 { return send("ACK"); }
     bool pulse()               { return send("PULSE"); }
     bool deco()                { return send("DECO"); }
+    // CAL AIR: the reply is a receipt, not a verdict. Read the outcome with
+    // getCalAir(), or watch the live `E,<t>,7,<code>` event.
     bool calAir()              { return send("CAL AIR"); }
-    bool calO2Arm()            { return send("CAL O2"); }        // bare CAL O2 again = cancel
+    // Refused by the controller as things stand — `ERR not implemented` — because
+    // nothing on the board performs them: the O2 sequencer has never been
+    // instantiated, and no depth-offset trim exists. The commands stay in the
+    // grammar (so no client has to change when the work lands) and the builders
+    // stay for the same reason, but a handset must NOT draw a green tick from
+    // these replies: show the refusal. There is no two-step arm to cancel.
+    bool calO2Arm()            { return send("CAL O2"); }
     bool calO2Confirm()        { return send("CAL O2 CONFIRM"); }
     bool calDepth()            { return send("CAL DEPTH"); }
     bool testCells()           { return send("TEST CELLS"); }
@@ -497,6 +571,8 @@ private:
             CellsTest c; if (parseCells(line, c)) { callS<CellsTest>(h_.onCells, c); return; }
         } else if (starts(line, "PROOF,")) {
             Proof p; if (parseProof(line, p)) { callS<Proof>(h_.onProof, p); return; }
+        } else if (starts(line, "CALAIR,")) {
+            CalAir c; if (parseCalAir(line, c)) { callS<CalAir>(h_.onCalAir, c); return; }
         } else if (starts(line, "FAULT,")) {
             Fault f; if (parseFault(line, f)) { callS<Fault>(h_.onFault, f); return; }
         } else if (starts(line, "L,")) {

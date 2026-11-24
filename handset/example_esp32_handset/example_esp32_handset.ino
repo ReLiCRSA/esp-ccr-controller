@@ -72,6 +72,8 @@ struct View {
     bool predivePassed = false;
     hs::Clock clk{};               // the controller's wall clock (TIME,)
     bool haveClock = false;        // answered at least once since boot
+    hs::CalAir cal{};              // the air calibration's verdict (CALAIR,)
+    bool haveCal = false;
 } view;
 
 // A callback writer: hs::Link calls this for every command it sends.
@@ -107,6 +109,15 @@ static void onSchema(const hs::SchemaEntry&, void* ctx) {
 }
 static void onPre(const hs::PreStatus& p, void* ctx) {
     static_cast<View*>(ctx)->predivePassed = p.passed;
+}
+static void onCalAir(const hs::CalAir& c, void* ctx) {
+    // `CAL AIR`'s own reply is only a receipt — `OK CAL AIR` is answered the same
+    // way whether the cells were then sampled, refused for warm-up or failed. This
+    // line is the verdict, and an uncalibrated cell chain is the fact a diver has
+    // to know BEFORE relying on a ppO2 reading.
+    View& v = *static_cast<View*>(ctx);
+    v.cal = c;
+    v.haveCal = true;
 }
 static void onLine(const char* line, void* ctx) {
     // Unknown / unstructured (dive CSV rows, HIST, future lines): counted.
@@ -264,6 +275,15 @@ static void draw() {
         Serial.printf("  clock +%lus", static_cast<unsigned long>(view.clk.ageS));
         if (view.clk.source == 2) Serial.printf("(carried across a reset)");
     }
+    // ... and the same argument for the cells: un-calibrated channels read
+    // nominal, and a diver who cannot see that cannot act on it.
+    if (!view.haveCal) Serial.printf("  air cal ?");
+    else if (view.cal.code == hs::CalAir::OK)
+        Serial.printf("  air cal OK %lus ago", static_cast<unsigned long>(view.cal.ageS));
+    else if (view.cal.code == hs::CalAir::RUNNING)
+        Serial.printf("  air cal: sampling (%d)", view.cal.samples);
+    else
+        Serial.printf("  ** CELLS NOT CALIBRATED: %s **", hs::calAirText(view.cal.code));
     if (!view.linkUp) Serial.printf("   *** LINK DOWN ***");
     if (view.lastErr[0]) { Serial.printf("  ERR:%s", view.lastErr); view.lastErr[0] = 0; }
     else if (view.lastNote[0]) { Serial.printf("  (%s)", view.lastNote); view.lastNote[0] = 0; }
@@ -291,6 +311,7 @@ void setup() {
     h.onPre = onPre;
     h.onLine = onLine;
     h.onClock = onClock;
+    h.onCalAir = onCalAir;
     h.onLinkDown = onLinkDown;
     h.onLinkUp = onLinkUp;
     hsLink.begin(putLine, nullptr, h);
@@ -300,6 +321,7 @@ void setup() {
     hsLink.getSchema();
     hsLink.getPre();
     hsLink.getTime();             // do we have a clock at all? (spec §3)
+    hsLink.getCalAir();           // and are the cells calibrated? (spec §3)
     Serial.println("ESP-CCR handset up");
     Serial.println("clock unset? type the unix epoch and Enter, e.g. 1795517641");
 }
@@ -351,6 +373,17 @@ void loop() {
     if (view.linkUp && now - lastClockMs > (view.clk.epoch ? 60000u : 10000u)) {
         lastClockMs = now;
         hsLink.getTime();
+    }
+
+    // ... and the calibration: ask again until it is actually done. A handset that
+    // starts CAL AIR must then watch for the verdict rather than assume it, and
+    // the live `E,*,7,<code>` event is what tells it, unprompted, that the
+    // calibration ended while nobody was asking.
+    static uint32_t lastCalMs = 0;
+    if (view.linkUp && view.cal.code != hs::CalAir::OK &&
+        now - lastCalMs > 15000u) {
+        lastCalMs = now;
+        hsLink.getCalAir();
     }
 
     alarmPattern(now);

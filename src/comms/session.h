@@ -72,6 +72,11 @@ public:
     /// after begin(); a session without one answers GET HIST with ERR.
     void setHist(const cellhist::Hist* h) { if (router_) router_->setHist(h); }
 
+    /// The last CAL AIR verdict, published by ControlTask (see bridge::CalAir):
+    /// `GET CALAIR` answers from it over either transport. Null answers code 0,
+    /// "no calibration since this power-up".
+    void setCalAir(const bridge::CalAir* c) { if (router_) router_->setCalAir(c); }
+
     /// Wall clock source for `GET TIME` (see comms/wallclock.h). Optional: with
     /// no clock wired up the answer is epoch 0, meaning "there is no clock",
     /// rather than a date invented out of a zero.

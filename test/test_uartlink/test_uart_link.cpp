@@ -35,7 +35,7 @@ bool hasLineStarting(const char* prefix) {
 }
 
 struct Hooks {
-    int wifi = 0, calAir = 0, calDepth = 0, settings = 0, snaps = 0;
+    int wifi = 0, calAir = 0, settings = 0, snaps = 0;
     bool wifiLast = false, saveFails = false, openFails = false;
     int closes = 0, opens = 0;
     bool open(uint32_t) { opens++; return !openFails; }
@@ -80,7 +80,6 @@ struct Fixture {
         h.appendSnapNow = [](void*) { if (g_fix) g_fix->hooks.snaps++; };
         h.saveSettings = [](void*) { return g_fix && !g_fix->hooks.saveFails; };
         h.onCalAir = [](void*) { if (g_fix) g_fix->hooks.calAir++; };
-        h.onCalDepth = [](void*) { if (g_fix) g_fix->hooks.calDepth++; };
         h.onSettings = [](void*) { if (g_fix) g_fix->hooks.settings++; };
         h.listDives = [](int* slots, uint32_t* mt, uint32_t* seq, int max, void*) {
             if (!g_fix) return 0;
@@ -134,8 +133,14 @@ void test_command_replies_and_hooks_fire() {
     out.clear();
     f.send("CAL AIR");
     TEST_ASSERT_EQUAL(1, f.hooks.calAir);
+
+    // CAL DEPTH asks for a depth offset capture nothing performs, so it is
+    // refused and, crucially, no hook fires: a client must not be able to set
+    // in motion a calibration that has no consumer.
+    out.clear();
     f.send("CAL DEPTH");
-    TEST_ASSERT_EQUAL(1, f.hooks.calDepth);
+    TEST_ASSERT_TRUE(hasLineStarting("ERR not implemented"));
+    TEST_ASSERT_EQUAL(1, f.hooks.calAir);   // unchanged: no hook fired for it
 
     out.clear();
     f.send("auto");
@@ -373,6 +378,87 @@ void test_cellproof_clamp_edges_publish_once() {
     TEST_ASSERT_EQUAL_MESSAGE(0, onAfter, "lifting the clamp must not invent a second CLAMP_ON");
 }
 
+// The CAL AIR verdict used to exist only as text on the USB console, while the
+// wire said `OK CAL AIR` whatever happened next. This is the publication that
+// changed that, pinned at the level the diver's client sees: one `E,` row per
+// verdict (not one per 100 ms control cycle), the bridge::CalAirCode vocabulary
+// as the row's value, and the raw numbers readable afterwards.
+void test_cal_air_verdicts_reach_the_wire_once_each() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+    bridge::CalAir cal;
+
+    // Refused before the sampler even started (the warm-up gate): the client
+    // that was told `OK CAL AIR` must be able to learn it was refused.
+    bridge::publishCalAirRefused(cal, bridge::CALAIR_WARMUP, 117, 3000, 3, f.events);
+    TEST_ASSERT_EQUAL_UINT8(bridge::CALAIR_WARMUP, cal.code);
+    TEST_ASSERT_EQUAL_UINT32(117u, static_cast<uint32_t>(cal.warmupLeftS));
+    bridge::Event e;
+    TEST_ASSERT_TRUE(f.events.pop(e));
+    TEST_ASSERT_EQUAL_UINT16(logfmt::EVT_CAL_AIR, e.id);
+    TEST_ASSERT_EQUAL_UINT16(bridge::CALAIR_WARMUP, e.value);
+    TEST_ASSERT_EQUAL_UINT32(3u, e.tSec);
+    TEST_ASSERT_FALSE_MESSAGE(f.events.pop(e),
+                              "a refusal must be one row, not one per control cycle");
+
+    // Sampling: a state, so no row — 12 samples would otherwise bury the dive in
+    // rows for one fact. `GET CALAIR` reports the progress instead.
+    cal::AirCalOutput run;
+    run.running = true;
+    run.samples = 4;
+    bridge::publishCalAir(cal, run, 9000, 9, f.events);
+    TEST_ASSERT_EQUAL_UINT8(bridge::CALAIR_RUNNING, cal.code);
+    TEST_ASSERT_EQUAL_UINT8(4, cal.samples);
+    TEST_ASSERT_FALSE_MESSAGE(f.events.pop(e), "CAL AIR progress must not emit events");
+
+    // Committed, with the numbers an installer needs (raw counts, worst spread).
+    cal::AirCalOutput ok;
+    ok.done = true;
+    ok.samples = 12;
+    ok.spreadWorst = 23.0f;
+    for (int i = 0; i < 3; i++) ok.rawAvg[i] = 1500.0f + i;
+    bridge::publishCalAir(cal, ok, 21000, 21, f.events);
+    TEST_ASSERT_EQUAL_UINT8(bridge::CALAIR_OK, cal.code);
+    TEST_ASSERT_EQUAL_UINT8(12, cal.samples);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1501.0f, static_cast<float>(cal.rawAvg[1]));
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 23.0f, static_cast<float>(cal.spreadWorst));
+    TEST_ASSERT_EQUAL_UINT32(0u, static_cast<uint32_t>(cal.warmupLeftS));
+    TEST_ASSERT_TRUE(f.events.pop(e));
+    TEST_ASSERT_EQUAL_UINT16(bridge::CALAIR_OK, e.value);
+    TEST_ASSERT_EQUAL_UINT32(21u, e.tSec);
+
+    // Each failure reason is its own code: "it failed" is not a diagnosis, and
+    // the diver does something different for each of them.
+    struct Case { cal::AirCalWhy why; uint16_t want; };
+    const Case cases[] = {
+        {cal::AirCalWhy::DIVING, bridge::CALAIR_DIVING},
+        {cal::AirCalWhy::UNSETTLED, bridge::CALAIR_UNSETTLED},
+        {cal::AirCalWhy::NOCELLS, bridge::CALAIR_NOCELLS},
+        {cal::AirCalWhy::NONE, bridge::CALAIR_UNSETTLED},  // unmapped: never code 0
+    };
+    bridge::EventRing ring;
+    for (const Case& c : cases) {
+        cal::AirCalOutput fl;
+        fl.failed = true;
+        fl.whyCode = c.why;
+        bridge::publishCalAir(cal, fl, 30000, 30, ring);
+        TEST_ASSERT_TRUE(ring.pop(e));
+        TEST_ASSERT_EQUAL_UINT16(logfmt::EVT_CAL_AIR, e.id);
+        TEST_ASSERT_EQUAL_UINT16_MESSAGE(c.want, e.value,
+                                         "failure reason reached the wire as the wrong code");
+    }
+    TEST_ASSERT_FALSE(ring.pop(e));
+
+    // And through the session's own handset downlink: the ring is not the end of
+    // the road, the handset's E, line is.
+    out.clear();
+    bridge::publishCalAirRefused(cal, bridge::CALAIR_WARMUP, 90, 40000, 40, f.events);
+    f.pump(41000);
+    TEST_ASSERT_TRUE_MESSAGE(hasLineStarting("E,40,7,3"),
+                             "the refusal did not reach the handset downlink");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_command_replies_and_hooks_fire);
@@ -383,6 +469,7 @@ int main() {
     RUN_TEST(test_log_list_and_export_stream_over_the_session);
     RUN_TEST(test_publish_state_is_not_static_between_dives);
     RUN_TEST(test_cellproof_clamp_edges_publish_once);
+    RUN_TEST(test_cal_air_verdicts_reach_the_wire_once_each);
     RUN_TEST(test_an_export_hands_the_callers_sink_context_back);
     return UNITY_END();
 }

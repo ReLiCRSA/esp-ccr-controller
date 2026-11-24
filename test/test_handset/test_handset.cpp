@@ -19,7 +19,7 @@ Link link;
 struct Captured {
     int telemetry = 0, deco = 0, events = 0, ok = 0, err = 0;
     int settings = 0, schema = 0, pre = 0, cells = 0, proof = 0, fault = 0;
-    int logList = 0, diveHeader = 0, clock = 0, raw = 0, linkDown = 0, linkUp = 0;
+    int logList = 0, diveHeader = 0, clock = 0, calAir = 0, raw = 0, linkDown = 0, linkUp = 0;
     Telemetry t{};
     Deco d{};
     Event e{};
@@ -32,6 +32,7 @@ struct Captured {
     LogEntry le{};
     DiveHeader dh{};
     Clock ck{};
+    CalAir ca{};
     char okNote[64] = {0}, errReason[64] = {0}, rawLine[1200] = {0};
 };
 Captured cap;
@@ -51,6 +52,7 @@ void hFault(const Fault& f, void*) { cap.fa = f; cap.fault++; }
 void hLog(const LogEntry& l, void*) { cap.le = l; cap.logList++; }
 void hDive(const DiveHeader& h, void*) { cap.dh = h; cap.diveHeader++; }
 void hClock(const Clock& c, void*) { cap.ck = c; cap.clock++; }
+void hCalAir(const CalAir& c, void*) { cap.ca = c; cap.calAir++; }
 void hRaw(const char* l, void*) { std::strncpy(cap.rawLine, l, 1199); cap.raw++; }
 void hDown(void*) { cap.linkDown++; }
 void hUp(void*) { cap.linkUp++; }
@@ -66,7 +68,8 @@ void reset() {
     h.onTelemetry = hTel; h.onDeco = hDeco; h.onEvent = hEv;
     h.onOk = hOk; h.onErr = hErr; h.onSetting = hSet; h.onSchema = hSc;
     h.onPre = hPre; h.onCells = hCells; h.onProof = hProof; h.onFault = hFault;
-    h.onLogList = hLog; h.onDiveHeader = hDive; h.onClock = hClock; h.onLine = hRaw;
+    h.onLogList = hLog; h.onDiveHeader = hDive; h.onClock = hClock;
+    h.onCalAir = hCalAir; h.onLine = hRaw;
     h.onLinkDown = hDown; h.onLinkUp = hUp;
     link.begin(writer, nullptr, h);
     sent[0] = 0;
@@ -253,12 +256,81 @@ void test_dive_header_dated_and_legacy() {
     TEST_ASSERT_EQUAL_STRING("", cap.dh.iso);
 }
 
+// `CALAIR,` — the air calibration's verdict. Every literal below was captured on
+// the bench link 2026-11-24, in the order the board actually sent them: the empty
+// answer, the warm-up refusal, progress, and a committed calibration with its raw
+// counts. They matter because `CAL AIR`'s own reply is only a receipt: `OK CAL AIR`
+// looks identical whether the cells were sampled, refused or failed, so a handset
+// that shows "calibrated" from that reply is lying, and this record is the only
+// thing that lets it tell.
+void test_parse_calair_verdicts() {
+    link.feedText("CALAIR,0,0,0,0,0,0,0,0\n");     // nothing asked since power-up
+    TEST_ASSERT_EQUAL_INT(1, cap.calAir);
+    TEST_ASSERT_EQUAL_INT(CalAir::NONE, cap.ca.code);
+    TEST_ASSERT_EQUAL_STRING("no calibration since power-up", calAirText(cap.ca.code));
+
+    // 1 s after a surface `CAL AIR` inside the warm-up gate: refused, 97 s to go.
+    link.feedText("CALAIR,3,1,0,0,0,0,0,97\n");
+    TEST_ASSERT_EQUAL_INT(CalAir::WARMUP, cap.ca.code);
+    TEST_ASSERT_EQUAL_UINT32(1u, cap.ca.ageS);
+    TEST_ASSERT_EQUAL_UINT32(97u, cap.ca.warmupLeftS);
+    TEST_ASSERT_EQUAL_STRING("refused: cells still warming up", calAirText(cap.ca.code));
+
+    // Progress, while it samples. `samples` is the progress bar.
+    link.feedText("CALAIR,1,0,3,0,0,0,0,0\n");
+    TEST_ASSERT_EQUAL_INT(CalAir::RUNNING, cap.ca.code);
+    TEST_ASSERT_EQUAL_INT(3, cap.ca.samples);
+
+    // Committed, 2 s ago: 12 samples, worst spread 21 counts, raw averages. Those
+    // numbers are how an installer tells a dead cell from a fouled one.
+    link.feedText("CALAIR,2,2,12,21,1514,1519,1528,0\n");
+    TEST_ASSERT_EQUAL_INT(CalAir::OK, cap.ca.code);
+    TEST_ASSERT_EQUAL_INT(12, cap.ca.samples);
+    TEST_ASSERT_EQUAL_UINT32(2u, cap.ca.ageS);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 21.0f, cap.ca.spreadWorst);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1514.0f, cap.ca.rawAvg[0]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1519.0f, cap.ca.rawAvg[1]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1528.0f, cap.ca.rawAvg[2]);
+    TEST_ASSERT_EQUAL_STRING("calibrated", calAirText(cap.ca.code));
+
+    // The same verdict, arriving unprompted: the `E,` row's value is the SAME
+    // enumeration, so a client never translates between two numberings.
+    reset();
+    link.feedText("E,18,7,3\n");
+    TEST_ASSERT_EQUAL_INT(1, cap.events);
+    TEST_ASSERT_EQUAL_UINT16(7, cap.e.id);
+    TEST_ASSERT_EQUAL_UINT16(CalAir::WARMUP, cap.e.value);
+    reset();
+    link.feedText("E,129,7,2\n");
+    TEST_ASSERT_EQUAL_UINT16(CalAir::OK, cap.e.value);
+
+    // Append-only both ways: fewer fields still parses (the code is what a client
+    // acts on), and an unknown future code is "a verdict with no name", never a
+    // parse failure that would throw the record away.
+    reset();
+    link.feedText("CALAIR,2\n");
+    TEST_ASSERT_EQUAL_INT(1, cap.calAir);
+    TEST_ASSERT_EQUAL_INT(CalAir::OK, cap.ca.code);
+    TEST_ASSERT_EQUAL_UINT32(0u, cap.ca.ageS);
+    reset();
+    link.feedText("CALAIR,9,5,12,3,100,100,100,0\n");
+    TEST_ASSERT_EQUAL_INT(9, cap.ca.code);
+    TEST_ASSERT_EQUAL_STRING("unknown verdict", calAirText(cap.ca.code));
+
+    // `CALAIR,` must not fall through to the KEY=value fallback (it has no '='),
+    // which is how `TIME,` was being counted as an unknown line until 2026-11-24.
+    TEST_ASSERT_EQUAL_MESSAGE(0, cap.raw, "the CALAIR line was treated as unknown");
+}
+
 // The uplink half of the clock: exact command strings, and the epoch window
 // enforced before the wire — the same window `wallclock::sane()` applies to the
 // bytes if they arrive.
 void test_clock_commands_exact_strings() {
     TEST_ASSERT_TRUE(link.getTime());
     TEST_ASSERT_EQUAL_STRING("GET TIME", sent);
+
+    TEST_ASSERT_TRUE(link.getCalAir());
+    TEST_ASSERT_EQUAL_STRING("GET CALAIR", sent);
 
     TEST_ASSERT_TRUE(link.timeSet(1795517641u));
     TEST_ASSERT_EQUAL_STRING("TIME SET 1795517641", sent);
@@ -320,6 +392,37 @@ void test_line_assembly_crlf_and_overflow() {
     TEST_ASSERT_EQUAL_INT(1, cap.ok);
 }
 
+// Two of the three calibration commands are refused by the controller because
+// nothing on the board performs them. The builders stay (the grammar is unchanged,
+// so a client keeps compiling when the work lands) and the refusal string is part
+// of the contract, so it is pinned here: a handset that never sees `OK` for these
+// cannot accidentally draw a green tick from one.
+void test_unimplemented_calibrations_refuse_with_one_string() {
+    TEST_ASSERT_TRUE(link.calDepth());
+    TEST_ASSERT_EQUAL_STRING("CAL DEPTH", sent);
+    link.feedText("ERR not implemented\n");
+    TEST_ASSERT_EQUAL_STRING("not implemented", cap.errReason);
+
+    reset();
+    TEST_ASSERT_TRUE(link.calO2Arm());
+    TEST_ASSERT_EQUAL_STRING("CAL O2", sent);
+    link.feedText("ERR not implemented\n");
+    TEST_ASSERT_EQUAL_STRING("not implemented", cap.errReason);
+
+    reset();
+    TEST_ASSERT_TRUE(link.calO2Confirm());
+    TEST_ASSERT_EQUAL_STRING("CAL O2 CONFIRM", sent);
+    link.feedText("ERR not implemented\n");
+    TEST_ASSERT_EQUAL_STRING("not implemented", cap.errReason);
+
+    // Asked twice, it is refused twice: there is no arm for a handset to manage,
+    // so no client-side "armed" state can be right.
+    reset();
+    link.feedText("ERR not implemented\n");
+    link.feedText("ERR not implemented\n");
+    TEST_ASSERT_EQUAL(2, cap.err);
+}
+
 void test_command_builders_exact_strings() {
     TEST_ASSERT_TRUE(link.getT());      TEST_ASSERT_EQUAL_STRING("GET T", sent);
     TEST_ASSERT_TRUE(link.getAll());    TEST_ASSERT_EQUAL_STRING("GET *", sent);
@@ -376,6 +479,8 @@ int main() {
     RUN_TEST(test_log_list_sequence_and_legacy_shape);
     RUN_TEST(test_dive_header_dated_and_legacy);
     RUN_TEST(test_clock_commands_exact_strings);
+    RUN_TEST(test_parse_calair_verdicts);
+    RUN_TEST(test_unimplemented_calibrations_refuse_with_one_string);
     RUN_TEST(test_event_lines);
     RUN_TEST(test_unknown_lines_counted_not_fatal);
     RUN_TEST(test_line_assembly_crlf_and_overflow);

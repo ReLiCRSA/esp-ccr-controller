@@ -40,7 +40,6 @@ extern bridge::DiveTotals g_bridgeTotals;
 // that drops the qualifier lets the compiler treat a flag as loop-invariant, and
 // the linker cannot see the disagreement.
 extern volatile bool g_calAirRequest;
-extern volatile bool g_calDepthRequest;
 
 namespace comms {
 
@@ -158,7 +157,6 @@ void hookSettings(void*) {
 }
 
 void hookCalAir(void*) { g_calAirRequest = true; }
-void hookCalDepth(void*) { g_calDepthRequest = true; }
 
 // ---- log reads (handset LOG LIST / LOG EXPORT) ----------------------------
 
@@ -198,7 +196,6 @@ UartLink::Hardware makeHardware() {
     hw.saveSettings = hookSave;
     hw.onSettings = hookSettings;
     hw.onCalAir = hookCalAir;
-    hw.onCalDepth = hookCalDepth;
     hw.onSafeAck = hookSafeAck;
     hw.listDives = hookListDives;
     hw.exportDive = hookExport;

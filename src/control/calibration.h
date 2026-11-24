@@ -90,6 +90,19 @@ struct AirCalInput {
     uint32_t nowMs = 0;
 };
 
+// Why the sampler gave up, as a NUMBER. `why` (English) is for the console a
+// engineer reads; a number is for the wire a client has to branch on. Until
+// 2026-11-24 the string was all there was, so the controller's real CAL AIR
+// verdict could not be published at all without a client matching English
+// sentences — and the console is the only place the verdict ever appeared.
+// Append-only: never renumber, new reasons go on the right.
+enum class AirCalWhy : uint8_t {
+    NONE = 0,
+    DIVING = 1,       // a dive started; CAL AIR is a pre-dive act
+    UNSETTLED = 2,    // never stayed inside the spread band before the timeout
+    NOCELLS = 3,      // present mask empty: nothing to average
+};
+
 struct AirCalOutput {
     bool running = false;
     bool done = false;            // set in the one call that completes
@@ -97,7 +110,8 @@ struct AirCalOutput {
     float rawAvg[3] = {0, 0, 0};  // valid when done
     float spreadWorst = 0.0f;     // worst per-cell spread, raw counts
     uint8_t samples = 0;          // progress
-    const char* why = nullptr;    // failure reason (English, log-bound)
+    const char* why = nullptr;    // failure reason (English, console-bound)
+    AirCalWhy whyCode = AirCalWhy::NONE;   // the same fact, wire-bound
 };
 
 class AirCal {

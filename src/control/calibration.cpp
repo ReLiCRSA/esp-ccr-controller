@@ -70,6 +70,7 @@ AirCalOutput AirCal::update(const AirCalInput& in) {
         o.running = false;
         o.failed = true;
         o.why = "diving: CAL AIR is a pre-dive act";
+        o.whyCode = AirCalWhy::DIVING;
         return o;
     }
     if (in.nowMs >= deadlineMs_) {
@@ -77,6 +78,7 @@ AirCalOutput AirCal::update(const AirCalInput& in) {
         o.running = false;
         o.failed = true;
         o.why = "timeout: cells never settled in the spread band";
+        o.whyCode = AirCalWhy::UNSETTLED;
         return o;
     }
     if (in.injecting) {
@@ -116,6 +118,7 @@ AirCalOutput AirCal::update(const AirCalInput& in) {
         o.running = false;
         o.failed = true;
         o.why = "no cells present";
+        o.whyCode = AirCalWhy::NOCELLS;
         return o;
     }
     if (unstable) {  // give the cell a chance to settle; count restarts

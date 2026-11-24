@@ -229,6 +229,35 @@ void CommandRouter::buildCellsLine(Response& r) {
     replyText(r, buf, static_cast<size_t>(n));
 }
 
+// `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>`
+// The air calibration's real verdict, on the same wire the request arrived on.
+// Raw ADC counts (not ppO2) and the worst per-cell spread: those are the numbers
+// an installer needs to tell a dead cell from a fouled one, and until now they
+// existed only on the USB console. `<code>` is bridge::CalAirCode, the same
+// vocabulary as the `E,` id 7 event value. No calibration since this power-up
+// answers code 0 with zeros — a stated nothing, not an error a client has to
+// special-case and not a result it could mistake for one.
+void CommandRouter::buildCalAirLine(Response& r) {
+    char buf[128], r0[16], r1[16], r2[16], ws[16];
+    const uint8_t code = calAir_ ? static_cast<uint8_t>(calAir_->code) : bridge::CALAIR_NONE;
+    const uint32_t at = calAir_ ? static_cast<uint32_t>(calAir_->atMs) : 0u;
+    const uint32_t age = (calAir_ && code) ? (nowMs_ - at) / 1000u : 0u;
+    const int n = std::snprintf(buf, sizeof(buf), "CALAIR,%u,%u,%u,%s,%s,%s,%s,%u\n",
+                                static_cast<unsigned>(code),
+                                static_cast<unsigned>(age),
+                                static_cast<unsigned>(calAir_ ? calAir_->samples : 0u),
+                                numfmt::fixed(ws, sizeof(ws),
+                                              calAir_ ? calAir_->spreadWorst : 0.0f, 0),
+                                numfmt::fixed(r0, sizeof(r0),
+                                              calAir_ ? calAir_->rawAvg[0] : 0.0f, 0),
+                                numfmt::fixed(r1, sizeof(r1),
+                                              calAir_ ? calAir_->rawAvg[1] : 0.0f, 0),
+                                numfmt::fixed(r2, sizeof(r2),
+                                              calAir_ ? calAir_->rawAvg[2] : 0.0f, 0),
+                                static_cast<unsigned>(calAir_ ? calAir_->warmupLeftS : 0u));
+    replyText(r, buf, static_cast<size_t>(n));
+}
+
 void CommandRouter::getSpecial(Response& r, const char* key) {
     if (std::strcmp(key, "T") == 0) {
         proto::Telemetry t;
@@ -275,6 +304,10 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         replyText(r, buf, static_cast<size_t>(n));
         return;
     }
+    // The air calibration's verdict, and progress while it samples (12 s: a
+    // diver who started it needs to know whether it is running, refused or
+    // done — the `OK CAL AIR` reply only ever meant "requested").
+    if (std::strcmp(key, "CALAIR") == 0) { buildCalAirLine(r); return; }
     if (std::strcmp(key, "PRE") == 0) {
         char buf[64];
         int p = std::snprintf(buf, sizeof(buf), "PRE,");
@@ -412,29 +445,32 @@ void CommandRouter::exec(const char* line, Response& r) {
             break;
 
         case Kind::CAL:
+            // Refuse what does not exist. Until 2026-11-24 these answered `OK`:
+            // `CAL O2` ran a two-step arm/confirm state machine whose consumer
+            // (cal::O2Sequencer) is host-tested but never instantiated on the
+            // board, and `CAL DEPTH` raised a request flag that nothing read and
+            // no depth trim implements. A reply that implies work the machine
+            // never did is not a placeholder for a future feature — on a
+            // rebreather it is a false all-clear, and the diver has no way to
+            // tell it from the real thing. The grammar still parses (so the day
+            // the consumer lands no client has to change), and the action bits
+            // are retired in cmd_router.h rather than recycled.
+            if (cmd.cal == CalAction::DEPTH || cmd.cal == CalAction::O2 ||
+                cmd.cal == CalAction::O2_CONFIRM) {
+                replyErr(r, "not implemented");
+                break;
+            }
             if (loop_.diveActive() && cmd.cal != CalAction::NONE) {
                 replyErr(r, "cal locked in dive");
                 break;
             }
             switch (cmd.cal) {
+                // `OK CAL AIR` means the request was accepted, NOT that the
+                // cells were calibrated: the warm-up gate and the 12 s window
+                // run in ControlTask. That is honest now because the outcome
+                // reaches the wire too — `E,<t>,7,<code>` as it happens, and
+                // `GET CALAIR` to read it afterwards (bridge::CalAirCode).
                 case CalAction::AIR:    r.actions |= ACT_CAL_AIR;      replyOk(r, "CAL AIR"); break;
-                case CalAction::O2:
-                    // Bare CAL O2 twice = back out. The O2Sequencer itself
-                    // (and the enrichment it drives) live in the firmware;
-                    // it must see the cancel too, hence the action bit.
-                    if (o2Armed_) { o2Armed_ = false; r.actions |= ACT_CAL_O2_CANCEL;
-                                    replyOk(r, "CAL O2 CANCEL"); }
-                    else { o2Armed_ = true; r.actions |= ACT_CAL_O2_ARM;
-                           replyOk(r, "CAL O2 ARMED"); }
-                    break;
-                case CalAction::O2_CONFIRM:
-                    if (!o2Armed_) { replyErr(r, "not armed"); break; }
-                    o2Armed_ = false;
-                    r.actions |= ACT_CAL_O2_CONFIRM;
-                    replyOk(r, "CAL O2");
-                    break;
-                case CalAction::DEPTH:  depthCalPending_ = true;
-                                        r.actions |= ACT_CAL_DEPTH;    replyOk(r, "CAL DEPTH"); break;
                 default: replyErr(r, "bad cal"); break;
             }
             break;

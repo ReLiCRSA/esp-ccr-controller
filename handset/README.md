@@ -131,6 +131,41 @@ undated dive is honest — the log records an `E,,15` row and exports
 to know which day it was. A dive that is already running keeps the stamp it was
 opened with, so a late `TIME SET` fixes the *next* dive, never the current one.
 
+### Calibration: the reply is a receipt, the verdict is a separate fact
+
+`CAL AIR`'s `OK CAL AIR` says the request was accepted. Nothing more. The cells
+must polarise for 120 s after power-on before an air point means anything, the
+window is 12 samples at 1 Hz, and any of those can fail — so the verdict arrives
+on its own:
+
+```cpp
+h.onCalAir = [](const hs::CalAir& c, void*) {
+    // code: 0 none since power-up, 1 sampling, 2 calibrated,
+    //       3 refused (warming up), 4 aborted (diving), 5 unsettled, 6 no cells
+    Serial.printf("air cal: %s", hs::calAirText(c.code));
+    if (c.code == hs::CalAir::OK)
+        Serial.printf("  raw %d/%d/%d  worst spread %.0f  %d samples, %lus ago",
+                      (int)c.rawAvg[0], (int)c.rawAvg[1], (int)c.rawAvg[2],
+                      c.spreadWorst, c.samples, (unsigned long)c.ageS);
+    else if (c.code == hs::CalAir::WARMUP)
+        Serial.printf("  %lu s left", (unsigned long)c.warmupLeftS);
+    Serial.println();
+};
+
+hsLink.calAir();        // receipt only — never show "calibrated" from onOk()
+hsLink.getCalAir();     // and the live `E,*,7,<code>` event tells you unprompted
+```
+
+Those raw ADC counts are the useful part: they tell an installer whether a cell
+is dead (no counts), fouled (counts but huge spread) or fine. `hs::CalAir::OK` is
+the only code that means the ppO2 readings on the display can be trusted.
+
+`CAL O2` and `CAL DEPTH` are refused by the controller (`ERR not implemented`)
+because nothing on the board performs them yet; the builders exist so your code
+keeps compiling when it does. A button for either must show the refusal — a
+"calibrated" tick from `onOk` would be a lie about the machine.
+
+
 ### Reading the dive log from a handset
 
 `logList()` answers one `L,<slot>,<epoch>,<seq>` row per stored dive,

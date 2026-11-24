@@ -497,29 +497,95 @@ void test_log_and_pulse_and_calibration_commands_delegations() {
     b.run("PULSE", r);
     TEST_ASSERT_TRUE(has(r, "OK"));
 
-    // two-step CAL O2 handshake, enforced in one place for every client
-    b.run("CAL O2 CONFIRM", r);
-    TEST_ASSERT_TRUE(has(r, "ERR"));  // confirm without arm: refused
-    b.run("CAL O2", r);
-    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_ARM);
-    b.run("CAL O2 CONFIRM", r);
-    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_CONFIRM);
-    b.run("CAL O2", r);
-    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_ARM);
-    b.run("CAL O2", r);  // bare CAL O2 while armed = back out
-    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_O2_CANCEL);
-
+    // CAL AIR is the one calibration with a consumer on the board, so it is
+    // accepted (and its verdict reaches the wire: see test_uartlink).
     b.run("CAL AIR", r);
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_AIR);
-    b.run("CAL DEPTH", r);
-    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_DEPTH);
-    TEST_ASSERT_TRUE(b.router.takeDepthCalRequest());
-    TEST_ASSERT_FALSE(b.router.takeDepthCalRequest());  // one-shot
 
     // calibration never runs under a diver
     b.run("DIVE START");
     b.run("CAL AIR", r);
     TEST_ASSERT_TRUE(has(r, "ERR"));
+}
+
+// Refusals are a safety surface. CAL O2 armed a two-step handshake whose
+// consumer (cal::O2Sequencer) was never instantiated on the board, and CAL
+// DEPTH raised a request flag nothing reads; both answered OK, which on a
+// rebreather reads as "calibrated". They are refused now, and refused the same
+// way for every client, because that is what the shared session is for.
+void test_unimplemented_calibrations_are_refused_not_acked() {
+    Bench b;
+    CommandRouter::Response r;
+
+    // The verbs are case-sensitive on the wire (see uart_proto); extra spaces
+    // must not smuggle a different answer. Explicit array, not a braced
+    // initializer_list: this suite compiles for the target too.
+    static const char* const kRefused[] = {
+        "CAL DEPTH", "CAL O2", "CAL O2 CONFIRM", "CAL  DEPTH", "CAL O2   CONFIRM"};
+    for (const char* const cmd : kRefused) {
+        b.run(cmd, r);
+        TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR not implemented"), cmd);
+        // and nothing at all was asked of the machine: no action bit, so no
+        // transport hook, so no flag that a future consumer might read
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(CommandRouter::ACT_NONE, r.actions, cmd);
+    }
+
+    // The refusal outranks the mid-dive gate: "cal locked in dive" would imply
+    // it works out of the water, which is the same lie in a different order.
+    b.run("DIVE START");
+    b.run("CAL DEPTH", r);
+    TEST_ASSERT_TRUE(has(r, "ERR not implemented"));
+    b.run("CAL O2", r);
+    TEST_ASSERT_TRUE(has(r, "ERR not implemented"));
+
+    // The grammar is unchanged, so the day a consumer lands no client has to
+    // change: an unknown target is still a syntax error, not this refusal.
+    b.run("CAL BALDERDASH", r);
+    TEST_ASSERT_TRUE(has(r, "ERR unknown CAL target"));
+
+    // CAL AIR is unaffected by any of this (it does have a consumer).
+    b.run("DIVE END");
+    b.run("CAL AIR", r);
+    TEST_ASSERT_TRUE(has(r, "OK CAL AIR"));
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CAL_AIR);
+}
+
+// GET CALAIR is how any client learns what the air calibration actually did:
+// `OK CAL AIR` only ever meant "requested", and until 2026-11-24 the verdict
+// (numbers, or the reason it refused) existed only on the USB console.
+void test_get_calair_reports_the_verdict_not_the_request() {
+    Bench b;
+    bridge::CalAir cal;
+    b.router.setCalAir(&cal);
+
+    // Nothing asked yet: a stated nothing, not an error and not a result.
+    TEST_ASSERT_TRUE(std::strstr(b.run("GET CALAIR").text, "CALAIR,0,0,0,0,0,0,0,0"));
+
+    // Refused for warm-up: the seconds left are the useful part.
+    cal.code = bridge::CALAIR_WARMUP;
+    cal.atMs = 1000; cal.warmupLeftS = 117; cal.samples = 0;
+    b.now = 60000;   // 60 s later: the age is part of the answer
+    TEST_ASSERT_TRUE(std::strstr(b.run("GET CALAIR").text, "CALAIR,3,59,0,0,0,0,0,117"));
+
+    // Committed: the raw averages and the worst spread, the numbers the console
+    // used to be the only place to read them.
+    cal.code = bridge::CALAIR_OK; cal.atMs = b.now; cal.warmupLeftS = 0;
+    cal.samples = 12; cal.spreadWorst = 23.0f;
+    cal.rawAvg[0] = 1502.0f; cal.rawAvg[1] = 1488.0f; cal.rawAvg[2] = 0.0f;
+    TEST_ASSERT_TRUE(std::strstr(b.run("GET CALAIR").text, "CALAIR,2,0,12,23,1502,1488,0,0"));
+    TEST_ASSERT_TRUE(std::strstr(b.run("GET CALAIR").text, "\n"));   // one line, terminated
+
+    // In progress, so a client can tell "still sampling" from "refused".
+    cal.code = bridge::CALAIR_RUNNING; cal.atMs = b.now; cal.samples = 7;
+    TEST_ASSERT_TRUE(std::strstr(b.run("GET CALAIR").text, "CALAIR,1,0,7,23,1502,1488,0,0"));
+
+    // A session with nothing wired up says so rather than inventing a result.
+    b.router.setCalAir(nullptr);
+    TEST_ASSERT_TRUE(std::strstr(b.run("GET CALAIR").text, "CALAIR,0,0,0,0,0,0,0,0"));
+
+    // A display key, not a setting: GET CALAIR must never be answered out of
+    // the registry, and CALAIR must not have become one.
+    TEST_ASSERT_EQUAL(-1, b.reg.find("CALAIR"));
 }
 
 int main() {
@@ -537,6 +603,8 @@ int main() {
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);
     RUN_TEST(test_set_actually_moves_the_live_chain);
     RUN_TEST(test_log_and_pulse_and_calibration_commands_delegations);
+    RUN_TEST(test_unimplemented_calibrations_are_refused_not_acked);
+    RUN_TEST(test_get_calair_reports_the_verdict_not_the_request);
     RUN_TEST(test_time_set_is_range_checked_and_delegated);
     return UNITY_END();
 }

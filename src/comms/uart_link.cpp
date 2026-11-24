@@ -46,8 +46,6 @@ void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
         if (hw_.onWifi) hw_.onWifi(router_.wifiEnabled(), hw_.ctx);
     if (actions & CommandRouter::ACT_CAL_AIR)
         if (hw_.onCalAir) hw_.onCalAir(hw_.ctx);
-    if (actions & CommandRouter::ACT_CAL_DEPTH)
-        if (hw_.onCalDepth) hw_.onCalDepth(hw_.ctx);
     if (actions & CommandRouter::ACT_DIVE_START) {
         // The log is opened by whoever holds the file. If it fails, say so
         // out loud on the same socket the dive just started on: an unlogged

@@ -42,6 +42,13 @@ public:
         void (*closeDive)(const logfmt::DiveMeta&, void* ctx) = nullptr;
         bridge::DiveTotals* totals = nullptr;  // in-force totals for closeDive
         void (*appendSnapNow)(void* ctx) = nullptr;    // event-driven snapshot
+        // The event row itself, into the dive file. It exists because the
+        // snapshot alongside an event shows the STATE at that moment, while the
+        // event row is the machine's VERDICT: a dive file full of samples whose
+        // alarm word went 0x0010 -> 0x0030 still does not say that the cell
+        // proof failed, that the clamp engaged, or that the diver lifted it.
+        void (*appendEventNow)(uint16_t id, uint16_t value, uint32_t tSec,
+                               void* ctx) = nullptr;
         bool (*saveSettings)(void* ctx) = nullptr;
         void (*onCalAir)(void* ctx) = nullptr;
         int (*listDives)(int* slots, uint32_t* mtimes, uint32_t* seqs, int max,

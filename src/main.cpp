@@ -541,6 +541,28 @@ static void controlTask(void*) {
             g_bridgeTotals.totalPulses = g_loop->pulseCount();
             const float cns = g_loop->cnsPct();
             g_bridgeTotals.cnsPeakPct = cns > 254.0f ? 254 : (uint8_t)cns;
+            // The plan the dive ran on, recorded with the dive: which GF pair
+            // and which setpoint ladder produced this deco schedule and these
+            // doses. Read off the live config, so a dive is reviewed against the
+            // settings it actually used rather than the ones on the board now.
+            //
+            // Rounded, not truncated, on purpose. A decimal like 0.55 is not
+            // exact in binary (0.55f is 0.54999999403...), and float times
+            // 1000 can land just under the integer it should be, so a truncating
+            // cast can print 0.549 for a setting that reads 0.550 on `GET SP2`.
+            // These columns exist to be compared with what the handset was
+            // answered, so they must not be one count away from it. (The `S,`
+            // rows' `votedX1000` still truncates — see PLAN 16's queue.)
+            g_bridgeTotals.gfLow = (uint8_t)(g_ctrlCfg.deco.gfLow + 0.5f);
+            g_bridgeTotals.gfHigh = (uint8_t)(g_ctrlCfg.deco.gfHigh + 0.5f);
+            for (int i = 0; i < 4; i++) {
+                const int32_t sx = (int32_t)(g_ctrlCfg.sp.sp[i] * 1000.0f + 0.5f);
+                const int16_t v = sx > 32767 ? 32767 : (int16_t)sx;
+                if (i == 0) g_bridgeTotals.sp1X1000 = v;
+                else if (i == 1) g_bridgeTotals.sp2X1000 = v;
+                else if (i == 2) g_bridgeTotals.sp3X1000 = v;
+                else g_bridgeTotals.sp4X1000 = v;
+            }
 
             // 30 s snapshot grid (PLAN 10). Event-driven snapshots are taken
             // by the command task alongside each E, line; ControlTask only

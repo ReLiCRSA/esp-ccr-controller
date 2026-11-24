@@ -15,13 +15,13 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 247 cases
+pio test -e native            # host gate, currently 249 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 118 checks
-tools/.../python tools/hw_accept.py --selftest   # the log + depth graders, no board
+                                 --cal-air --predive --dive-persist    # 127 checks
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/dive-file graders, no board: 34 cases
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
 ```
 
@@ -54,6 +54,20 @@ not (PLAN 16: with every dive stamped epoch 0 the eviction order is undecided).
 matches the handset export" had been asserted by hand since it was written and
 was false the whole time (two writers, two shapes). Both now come out of one
 formatter, and the comparison is the tripwire.
+
+`--dive-persist` also **watches the link while its dive runs** and then grades
+the dive it just closed against what the handset saw live: every `E,` row that
+streamed past must be in the file, in the order it happened, and the `M,` summary
+must agree with the rows beside it (its snapshot and event counts equal the
+`S,`/`E,` rows actually exported, and its `gf_low`/`gf_high`/`sp1..4` equal what
+`GET GF_LOW`…`GET SP4` answer on the same link). The watch starts the moment
+`DIVE START` goes out — a capture that begins after a pause misses the dive's own
+opening rows and leaves the comparison against nothing, which is a check that can
+never fail. It is deliberately one-way: rows streamed *outside* the dive window
+have no file row, correctly. `hw_accept.py --selftest` grades those graders with
+real captures — an honest dive exported off the fixed build, and the clamp dive
+of 2026-11-24 recorded before the fix, whose file held 13 samples, no verdict
+rows and an `M,` line claiming 0 of each.
 
 **Fresh-filesystem leg** (run it after anything that wipes the log partition, and
 now and then just to prove the recovery path): erase the partition the dive files
@@ -799,17 +813,20 @@ announce is late now, by design, because it waits for a sample. Sensor-task
 headroom moved 2702 → 2700 bytes with the announce's 160 B line buffer in place.
 
 
-**Cell-proof clamp events (`E,` ids 10/11/12) — depth-leg check, host-proven
-2026-11-24, never yet seen on the wire.** The proof arms on the descent
-crossing `CELLPROOF_DEPTH`, so with no depth sensor it never runs and these
-three rows can never appear: `test_uartlink`'s `test_cellproof_clamp_edges_publish_once`
-drives the real engine instead. With the LPS28DFW now fitted this is reachable
-on the bench — force the failure cheaply and watch the wire (handset side, and
-the dive file):
+**Cell-proof clamp events (`E,` ids 10/11/12) — seen on the wire 2026-11-24,
+and the dive-file gap they exposed (fixed the same day).** The proof arms on the
+descent crossing `CELLPROOF_DEPTH`, so with no depth sensor it never runs and
+these three rows can never appear: `test_uartlink`'s `test_cellproof_clamp_edges_publish_once`
+drives the real engine instead. With the LPS28DFW fitted this is reachable on
+the bench — force the failure cheaply and watch the wire (handset side, and the
+dive file):
 
 ```
 SET CELLPROOF_DEPTH=3        # arm depth, minimum the schema allows
 SET CELLPROOF_TMO=20         # fail fast: 20 s instead of 60
+SET SP2=1.00                 # the tier the fake depth selects, pushed ABOVE the
+                             # clamp ceiling (CELLPROOF_MAXSP=0.90): a cap the
+                             # loop would never reach is a cap nobody can see
 TIME SET <epoch> ; DIVE START
 # press the port / breathe through a tube until depth passes 3 m, then hold it:
 #   the bench cells sit near 0.21 bar, so the vote never reaches CELLPROOF_MIN
@@ -821,10 +838,72 @@ expect  E,<t>,12,1           # value 1 = the diver lifted it (never the machine)
 DIVE END ; LOG EXPORT <slot>
 ```
 
-The export must carry the same three rows inside the dive, in that order, and
-the cap must be visible in the `S,` rows' `setpoint` column from the FAIL row on
-(≤ `CELLPROOF_MAXSP`). One row per edge is the property being checked: a FAIL
-lasts hundreds of 100 ms cycles, so a per-cycle publisher buries the dive.
+**Done on the bench 2026-11-24** (dive slot 8 / seq 58, 66 s, thumb to 7.42 m,
+the whole leg over UART2 through the handset bridge):
+
+```
+E,0,1,4   E,0,6,0  E,0,6,1  E,0,6,2      dive opens: battery alarm, three rejoins
+E,34,4,110                               proof demands SP 1.10 at the crossing
+E,54,1,5                                 alarm raised: bit 5 = BIT_SP_CLAMP
+E,54,10,0                                verdict: the proof failed
+E,54,11,0                                consequence: setpoints capped, once
+CELLPROOF OVERRIDE -> OK CLAMP LIFTED
+E,66,12,1                                clamp OFF, value 1 = the diver lifted it
+GET PROOF -> PROOF,4,000,000,1
+```
+
+HB `sp=0.90 al=0x0030` inside the clamp, `sp=1.00 al=0x0010` after the override;
+one row per edge, all nine rows in one dive. The same arc is in the `S,` rows'
+`sp`/alarm columns: `0.400 → 1.100 → 0.900 → 1.000` with `0x0010 → 0x0030 →
+0x0010`, so the cap (0.90, then back above it by the diver's own order) is
+readable from the file, not only from the live line. `SP2` was restored to 0.550
+at the end of the leg (`OK SAFETY`).
+
+**What it exposed: the dive file kept the clamp's effects and none of its
+verdicts.** That dive exported **0 `E,` rows** — checked from both transports,
+`LOG EXPORT 8` and `GET /dive/8.csv`, both `grep -c "^E,"` → 0. So a dive
+downloaded afterwards answered "the setpoint got capped" and never "the cell
+proof failed, the clamp engaged, the diver overrode it": the alarm word moves
+between two samples and the reader has to infer the rest. Cause is precise:
+`DiveStore::append(const logfmt::Event&)` existed and worked, but nothing called
+it for protocol events — `UartLink::drainEvents` appended an event-driven
+**snapshot** per event and threw the event row away. The only event row any dive
+ever held was `EVT_CLOCK_UNSET` at open, and this dive had a clock set. The same
+dive's `M,` line read `M,66,743,0.212,0.215,0,0,0,0,0,0,0.000,0.000,0.000,0.000`
+beside 13 `S,` rows: `DiveTotals::toMeta()` filled 6 of the 14 fields, so
+`snapshots 0`, `events 0`, `gf 0/0` (the plan is 30/85) and a `0.000` setpoint
+ladder (the dive ran 0.40/1.00/1.00/1.30). The format has carried those columns
+since v2 with nothing behind them; a summary line that contradicts its own dive
+cannot be reviewed later.
+
+**Fixed 2026-11-24, as one publication rather than two writers.** `drainEvents`
+now emits the **event row first, then the snapshot that shows the state it was
+decided in** (`Hardware::appendEventNow` → `session_wiring` → `DiveStore::append`),
+so the wire and the file cannot drift: same pop, same `t_s`, same numbers. The
+`M,` count columns come from `DiveStore` — the object that wrote the rows —
+patched in at close, never from a chain-side counter. `gf_low`/`gf_high`/`sp1..4`
+ride in `bridge::DiveTotals`, filled by ControlTask from the live config, so a
+dive is reviewed against the plan it used rather than the one on the board now.
+The host test that pinned this caught a third bug on the way: `toMeta()` guarded
+the min-ppO₂ sentinel but not the max (`maxVotedX1000 < -32768` can never be
+true, and the field *starts* at −32768), so a dive where no vote ever arrived
+wrote `max_ppo2 = -32.768` bar into its own summary — an impossible ppO₂ printed
+with the same three decimals as a real one. Our dive had votes, so nobody saw it.
+Bench side the property is now a C2 leg, not a one-off script: `--dive-persist`
+watches a dive's `E,` rows live and requires them, in order, in the file, and
+requires the summary to agree with the rows beside it — **127 checks, 0
+failures**. `--selftest` grows to 34 lying cases including the pre-fix dive above;
+five grader mutations each reddened exactly its own case (join removed, order
+ignored, counts trusted, an unverifiable setting counted as agreement, the
+sentinel tolerated), and removing the "the capture was not empty" guard reddens
+the case that exists to catch a vacuous join.
+
+**One honesty note that stands, and is not a defect:** after `CELLPROOF
+OVERRIDE`, `GET PROOF` answers state `4` = PASS, because `Engine::override()`
+moves `FAIL → PASS` — the diver outranks the machine. A handset reading that line
+cannot tell "cells proven" from "diver overrode a failure"; the distinction lives
+in the `E,<t>,12,1` row and the id-10 row that preceded it, which the dive file
+now keeps.
 
 ## C3-b — MS5837-30BA swap (before ANY wet test)
 

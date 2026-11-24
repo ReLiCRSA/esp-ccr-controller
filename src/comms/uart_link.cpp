@@ -127,8 +127,14 @@ void UartLink::drainEvents(Sink sink, void* ctx) {
         const size_t n = proto::formatEvent(e.tSec, e.id, e.value, buf, sizeof(buf));
         emit(sink, ctx, buf, n);
         if (n) linesOut_++;
-        // Every protocol event is also a moment of interest for the dive
-        // log (PLAN 10): grab an event-driven snapshot alongside it.
+        // The same publication feeds both records, so the wire and the dive
+        // file cannot drift: the EVENT row first (what the machine decided),
+        // then the event-driven SNAPSHOT (what the machine looked like when it
+        // decided it, PLAN 10). Before 2026-11-24 only the snapshot was
+        // written: a dive downloaded after the fact showed the alarm word move
+        // and the setpoint get capped, but never the FAIL, the clamp or the
+        // diver's override - the effects survived, the verdicts did not.
+        if (n && hw_.appendEventNow) hw_.appendEventNow(e.id, e.value, e.tSec, hw_.ctx);
         if (hw_.appendSnapNow) hw_.appendSnapNow(hw_.ctx);
         sent++;
     }

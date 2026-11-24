@@ -15,9 +15,26 @@ logfmt::DiveMeta DiveTotals::toMeta() const {
     m.durationSec = durationSec;
     m.maxDepthCm = maxDepthCm;
     m.minVotedX1000 = minVotedX1000 == 32767 ? 0 : static_cast<int16_t>(minVotedX1000);
-    m.maxVotedX1000 = maxVotedX1000 < -32768 ? 0 : static_cast<int16_t>(maxVotedX1000);
+    // Symmetric with the min side. The previous guard (`< -32768`) could never
+    // be true, so the "never voted" sentinel was published verbatim: a dive
+    // started with no cells reading, or with them all rejected, wrote
+    // `max_ppo2 = -32.768` into its own summary — an impossible ppO2, printed
+    // with the same three decimals as every real one.
+    m.maxVotedX1000 = maxVotedX1000 <= -32768 ? 0 : static_cast<int16_t>(maxVotedX1000);
     m.totalPulses = totalPulses > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(totalPulses);
     m.cnsPeakPct = cnsPeakPct;
+    // The plan in force, not a guess at one: these are the values the control
+    // chain was running when the dive ended. Left at zero by a chain that has
+    // nothing to say, which the CSV then shows as zero rather than as a number
+    // someone made up.
+    m.gfLow = gfLow;
+    m.gfHigh = gfHigh;
+    m.sp1X1000 = sp1X1000;
+    m.sp2X1000 = sp2X1000;
+    m.sp3X1000 = sp3X1000;
+    m.sp4X1000 = sp4X1000;
+    // `eventCount`/`snapshotCount` are deliberately NOT taken from here: the
+    // store counts the rows it actually wrote, at close (see hookCloseDive).
     return m;
 }
 

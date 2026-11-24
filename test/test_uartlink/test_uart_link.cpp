@@ -38,8 +38,14 @@ struct Hooks {
     int wifi = 0, calAir = 0, settings = 0, snaps = 0;
     bool wifiLast = false, saveFails = false, openFails = false;
     int closes = 0, opens = 0;
+    // What the dive file was handed, in call order: "E<t>,<id>,<value>" for an
+    // event row and "S" for a snapshot. The order matters — the verdict row has
+    // to be in the file alongside the state it caused, not somewhere else.
+    std::vector<std::string> appends;
+    logfmt::DiveMeta lastMeta{};
+    bool hasMeta = false;
     bool open(uint32_t) { opens++; return !openFails; }
-    void close(const logfmt::DiveMeta&) { closes++; }
+    void close(const logfmt::DiveMeta& m) { closes++; lastMeta = m; hasMeta = true; }
 };
 
 } // namespace
@@ -77,7 +83,17 @@ struct Fixture {
         h.onWifi = [](bool on, void*) { if (g_fix) { g_fix->hooks.wifi++; g_fix->hooks.wifiLast = on; } };
         h.openDive = [](uint32_t, void*) { return g_fix && g_fix->hooks.open(0); };
         h.closeDive = [](const logfmt::DiveMeta& m, void*) { if (g_fix) g_fix->hooks.close(m); };
-        h.appendSnapNow = [](void*) { if (g_fix) g_fix->hooks.snaps++; };
+        h.appendSnapNow = [](void*) {
+            if (!g_fix) return;
+            g_fix->hooks.snaps++;
+            g_fix->hooks.appends.push_back("S");
+        };
+        h.appendEventNow = [](uint16_t id, uint16_t value, uint32_t tSec, void*) {
+            if (!g_fix) return;
+            g_fix->hooks.appends.push_back("E," + std::to_string(tSec) + "," +
+                                           std::to_string(id) + "," +
+                                           std::to_string(value));
+        };
         h.saveSettings = [](void*) { return g_fix && !g_fix->hooks.saveFails; };
         h.onCalAir = [](void*) { if (g_fix) g_fix->hooks.calAir++; };
         h.onSettings = [](void*) { if (g_fix) g_fix->hooks.settings++; };
@@ -199,6 +215,96 @@ void test_events_reach_the_wire_and_snapshot_the_log() {
     size_t eCount = 0;
     for (auto& l : out) if (l[0] == 'E') eCount++;
     TEST_ASSERT_EQUAL(2u, eCount);
+}
+
+void test_event_rows_are_written_into_the_dive_file_beside_their_snapshot() {
+    // The wire has always carried these rows; the dive file never did. A dive
+    // downloaded afterwards showed the alarm word change and the setpoint get
+    // capped — the EFFECTS — without the verdict that caused them (cellproof
+    // FAIL, clamp ON, the diver's override). Same publication, both records,
+    // same numbers: this is what stops the file and the wire drifting apart.
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+
+    TEST_ASSERT_TRUE(f.events.push({54, logfmt::EVT_CELLPROOF_FAIL, 0}));
+    TEST_ASSERT_TRUE(f.events.push({54, logfmt::EVT_CLAMP_ON, 0}));
+    TEST_ASSERT_TRUE(f.events.push({66, logfmt::EVT_CLAMP_OFF, 1}));
+
+    f.pump(1000);
+
+    // In the file, as three rows, with the dive-relative time the wire used...
+    TEST_ASSERT_EQUAL(6u, f.hooks.appends.size());
+    const std::vector<std::string> want{
+        "E,54,10,0", "S", "E,54,11,0", "S", "E,66,12,1", "S"};
+    TEST_ASSERT_EQUAL_MESSAGE(want.size(), f.hooks.appends.size(),
+                              "wrong number of rows handed to the dive store");
+    for (size_t i = 0; i < want.size(); i++) {
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(want[i].c_str(), f.hooks.appends[i].c_str(),
+                                         "dive-file row out of order or wrong value");
+    }
+    // ...the verdict row BEFORE the state snapshot that goes with it, and the
+    // same bytes the handset saw live.
+    for (size_t i = 0; i + 1 < f.hooks.appends.size(); i += 2)
+        TEST_ASSERT_EQUAL_STRING("S", f.hooks.appends[i + 1].c_str());
+    TEST_ASSERT_TRUE(hasLineStarting("E,54,10,0"));
+    TEST_ASSERT_TRUE(hasLineStarting("E,54,11,0"));
+    TEST_ASSERT_TRUE(hasLineStarting("E,66,12,1"));
+}
+
+void test_dive_summary_states_the_plan_the_dive_ran_on() {
+    // `M,` has had gf_low/gf_high/sp1..sp4 and snapshots/events columns since v2,
+    // and toMeta() filled 6 of the 14 fields — so every dive on the board ended
+    // with "gf 0/0, sp 0.000 0.000 0.000 0.000, snapshots 0, events 0" while the
+    // file beside it held the GF pair, the ladder and a dozen samples. A dive
+    // whose own summary contradicts it cannot be reviewed later.
+    bridge::DiveTotals t;
+    t.durationSec = 66;
+    t.maxDepthCm = 743;
+    t.minVotedX1000 = 212;
+    t.maxVotedX1000 = 215;
+    t.totalPulses = 7;
+    t.cnsPeakPct = 3;
+    t.gfLow = 30;
+    t.gfHigh = 85;
+    t.sp1X1000 = 400;
+    t.sp2X1000 = 1000;
+    t.sp3X1000 = 1000;
+    t.sp4X1000 = 1300;
+
+    const logfmt::DiveMeta m = t.toMeta();
+    TEST_ASSERT_EQUAL_UINT32(66u, m.durationSec);
+    TEST_ASSERT_EQUAL_INT(743, m.maxDepthCm);
+    TEST_ASSERT_EQUAL_INT16(212, m.minVotedX1000);
+    TEST_ASSERT_EQUAL_INT16(215, m.maxVotedX1000);
+    TEST_ASSERT_EQUAL_UINT16(7u, m.totalPulses);
+    TEST_ASSERT_EQUAL_UINT8(3u, m.cnsPeakPct);
+    TEST_ASSERT_EQUAL_UINT8(30u, m.gfLow);
+    TEST_ASSERT_EQUAL_UINT8(85u, m.gfHigh);
+    TEST_ASSERT_EQUAL_INT16(400, m.sp1X1000);
+    TEST_ASSERT_EQUAL_INT16(1000, m.sp2X1000);
+    TEST_ASSERT_EQUAL_INT16(1000, m.sp3X1000);
+    TEST_ASSERT_EQUAL_INT16(1300, m.sp4X1000);
+
+    // A dive that never voted: the sentinels must not be published as numbers.
+    bridge::DiveTotals quiet;
+    const logfmt::DiveMeta q = quiet.toMeta();
+    TEST_ASSERT_EQUAL_INT16(0, q.minVotedX1000);
+    // The max side is the one that used to leak: `maxVotedX1000` STARTS at
+    // -32768, and the old guard (`< -32768`) can never be true, so a dive with
+    // no cells reading wrote -32.768 bar as its own maximum ppO2 — an impossible
+    // value in the same three decimals as every real one.
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(0, q.maxVotedX1000,
+                                    "the never-voted sentinel was published as a ppO2");
+    TEST_ASSERT_EQUAL_UINT8(0u, q.gfLow);      // and an unset plan stays 0, never
+    TEST_ASSERT_EQUAL_INT16(0, q.sp1X1000);    // a value someone made up
+
+    // The count columns are NOT taken from the chain: the store counts the rows
+    // it wrote (hookCloseDive patches them), so toMeta leaving them zero is the
+    // contract, not a gap — asserted here so a "helpful" fill here cannot
+    // silently double-count.
+    TEST_ASSERT_EQUAL_UINT16(0u, m.eventCount);
+    TEST_ASSERT_EQUAL_UINT16(0u, m.snapshotCount);
 }
 
 void test_publish_events_from_a_real_chain_cycle() {
@@ -464,6 +570,8 @@ int main() {
     RUN_TEST(test_command_replies_and_hooks_fire);
     RUN_TEST(test_periodic_lines_keep_their_cadence);
     RUN_TEST(test_events_reach_the_wire_and_snapshot_the_log);
+    RUN_TEST(test_event_rows_are_written_into_the_dive_file_beside_their_snapshot);
+    RUN_TEST(test_dive_summary_states_the_plan_the_dive_ran_on);
     RUN_TEST(test_publish_events_from_a_real_chain_cycle);
     RUN_TEST(test_dive_lifecycle_opens_and_closes_the_log_and_announces_failure);
     RUN_TEST(test_log_list_and_export_stream_over_the_session);

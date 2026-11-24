@@ -142,6 +142,7 @@ bool DiveStore::startDive(uint32_t startEpoch) {
     pathFor(slot, p, sizeof(p));
     file_ = LittleFS.open(p, "w");
     if (!file_) return false;
+    snaps_ = evs_ = 0;    // the counts belong to THIS dive, not to the mount
 
     // Fixed 16 B header: magic, version, dive sequence, start epoch, slot, CRC
     // of the rest. Records follow, interleaved by time, each type-tagged; the
@@ -169,7 +170,8 @@ void DiveStore::append(const logfmt::Snapshot& s) {
         file_.close();
         return;
     }
-    file_.flush();
+    if (snaps_ < 0xFFFFu) snaps_++;   // counted on the write that WORKED: the
+    file_.flush();                    // `M,` row must not claim a lost record
 }
 
 void DiveStore::append(const logfmt::Event& e) {
@@ -178,6 +180,7 @@ void DiveStore::append(const logfmt::Event& e) {
     buf[0] = logfmt::REC_EVENT;
     logfmt::packEvent(e, buf + 1);
     if (file_.write(buf, sizeof(buf)) != sizeof(buf)) { file_.close(); return; }
+    if (evs_ < 0xFFFFu) evs_++;
     file_.flush();
 }
 

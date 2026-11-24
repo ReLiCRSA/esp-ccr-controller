@@ -504,6 +504,27 @@ The renderer is the firmware's own (`logfmt::isoUtc`, closed-form civil date)
 — not newlib's `gmtime`/`strftime`, whose time and float tables do not belong
 on the task that answers clients.
 
+**What the `M,` totals row says when there is nothing to total.** Pinned
+2026-11-24, because every one of these was previously a lie on real flash:
+
+* `snapshots` and `events` count the `S,` and `E,` rows **in the same export**,
+  so a client can use them as a truncation check. A dive's event rows are the
+  same bytes the controller pushed live during that dive (`E,<t_s>,<id>,<value>`,
+  §2), including the verdicts a dive cannot otherwise be reviewed without:
+  cellproof PASS/FAIL (9/10), clamp ON/OFF (11/12, value 1 on the OFF row meaning
+  the diver lifted it), alarms (1/2), mode (3), setpoint (4). Before that date
+  the firmware wrote **no** event rows into the dive file and both counts said 0
+  beside a dozen samples — the effects of a decision survived, the decision did
+  not.
+* `min_ppo2`/`max_ppo2` are `0.000` when no vote ever arrived — not a sentinel.
+  The max side used to publish its internal `-32768` verbatim, so a dive with no
+  cells reading answered `max_ppo2 = -32.768`: an impossible ppO₂, printed with
+  the same three decimals as a real one.
+* `gf_low`/`gf_high` and `sp1`…`sp4` are the plan **the dive ran on** — the
+  settings in force during it, not the ones on the board afterwards. `0` means
+  the firmware had nothing to say: the settings schema will not let a legal
+  configuration reach it (`GF_LOW` ≥ 10, `GF_HIGH` ≥ 50, setpoints ≥ 0.20).
+
 Two corrections worth knowing, both of which were documentation errors rather
 than wire errors:
 
@@ -521,8 +542,15 @@ a handset *can* offer a dump-to-host feature.
 **`E,` rows are ambiguous inside an export, on purpose and by shape.** An
 exported event row is `E,<t_s>,<id>,<value>` — byte-identical to the live event
 the controller pushes unprompted (§2). A client that needs the exported event
-list reads the file (`/dive/<n>.csv`), not the UART stream. `tools/web_probe.py`
-counts exported `E,` rows but does not compare them for this reason.
+list reads the file (`/dive/<n>.csv`), not the UART stream: on the stream there
+is no marker that tells an exported row from a live one arriving beside it, and
+that is a limit of the *reader's* position, not the controller disagreeing with
+itself. The two sets are the same rows by construction — the file row and the
+stream line come out of one publication — which is what `hw_accept.py
+--dive-persist` now asserts: every `E,` row streamed while a dive was open is in
+that dive's file, in order. `tools/web_probe.py` still counts exported `E,` rows
+without putting them in its row-for-row cross-transport comparison, for the
+reader-side reason above.
 
 ### 5.1 The surface log rows (`GET /surface.csv`) — web/HTTP only
 

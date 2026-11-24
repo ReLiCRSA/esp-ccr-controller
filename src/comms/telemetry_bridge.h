@@ -151,6 +151,13 @@ struct DiveTotals {
     int32_t maxVotedX1000 = -32768;
     uint32_t totalPulses = 0;
     uint8_t cnsPeakPct = 0;
+    // The plan the dive actually ran on. A dive file whose `M,` row says
+    // gf 0/0 and sp 0.000/0.000/0.000/0.000 cannot be reviewed later: a
+    // different GF pair or a different setpoint ladder explains a deco
+    // schedule, and the columns have been in the format since v2 while nothing
+    // ever filled them.
+    uint8_t gfLow = 0, gfHigh = 0;
+    int16_t sp1X1000 = 0, sp2X1000 = 0, sp3X1000 = 0, sp4X1000 = 0;
     logfmt::DiveMeta toMeta() const;
 };
 

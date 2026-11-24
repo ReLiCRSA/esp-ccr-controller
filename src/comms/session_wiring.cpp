@@ -107,7 +107,27 @@ bool hookOpenDive(uint32_t epoch, void*) {
 void hookCloseDive(const logfmt::DiveMeta& meta, void*) {
     if (!g_logMtx) return;
     xSemaphoreTake(g_logMtx, portMAX_DELAY);
-    g_diveStore.endDive(meta);
+    // The two count columns are filled from the store, not from the chain: the
+    // store wrote the rows, so it is the only thing that can say how many there
+    // are. `M,` claims them, and until 2026-11-24 it claimed 0/0 for a dive that
+    // had thirteen samples in it and none of its verdict rows.
+    logfmt::DiveMeta m = meta;
+    m.snapshotCount = g_diveStore.snapshotCount();
+    m.eventCount = g_diveStore.eventCount();
+    g_diveStore.endDive(m);
+    xSemaphoreGive(g_logMtx);
+}
+
+/// The verdict row for a protocol event, into the dive file. Same publication as
+/// the `E,` line on the wire (UartLink::drainEvents), so a dive downloaded later
+/// answers "what did the machine decide, and when" with the same bytes the
+/// handset saw live — a FAIL, a clamp, an override — instead of leaving a reader
+/// to infer them from an alarm word that changed between two samples.
+void hookAppendEvent(uint16_t id, uint16_t value, uint32_t tSec, void*) {
+    if (!g_logMtx) return;
+    const logfmt::Event ev{tSec, static_cast<logfmt::EventId>(id), value};
+    xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    if (g_diveStore.recording()) g_diveStore.append(ev);
     xSemaphoreGive(g_logMtx);
 }
 
@@ -198,6 +218,7 @@ UartLink::Hardware makeHardware() {
     hw.setClock = hookSetClock;
     hw.closeDive = hookCloseDive;
     hw.appendSnapNow = hookAppendSnap;
+    hw.appendEventNow = hookAppendEvent;
     hw.saveSettings = hookSave;
     hw.onSettings = hookSettings;
     hw.onCalAir = hookCalAir;

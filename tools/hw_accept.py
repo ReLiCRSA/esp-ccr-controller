@@ -35,6 +35,7 @@ import threading
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -543,6 +544,243 @@ def selftest_depth():
     failed = [c[0] for c in grade_depth(honest_nodata, True) if not c[1]]
     checks.append(("depth: identified-but-deaf, with the alarm raised, is honest",
                    not failed, f"unexpected failures: {failed}"))
+    return checks
+
+
+# Dive exports for the dive-file grader's own selftest. Every row below is a
+# literal captured off the handset link, not typed from the grammar:
+#   DIVE_HONEST      slot 10 / seq 60, exported 2026-11-24 off the build that
+#                    writes event rows — note the interleaving, the verdict row
+#                    then the snapshot that shows the state it was decided in;
+#   DIVE_PRE_FIX     slot 8 / seq 58, the clamp dive recorded BEFORE the fix:
+#                    the wire streamed ids 10/11/12 (see WIRE_PRE_FIX) and the
+#                    file holds none of them, while `M,` also claims 0 snapshots
+#                    beside the 13 samples a few lines above it.
+DIVE_HONEST = [
+    "DIVE,10,1795540808,3,3,2026-11-24T17:20:08Z",
+    "E,0,1,4",
+    "S,0,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "E,0,6,0",
+    "S,0,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "E,0,6,1",
+    "S,0,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "E,0,6,2",
+    "S,0,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "M,13,4,0.213,0.214,0,0,4,4,30,85,0.400,0.550,1.000,1.300",
+]
+DIVE_HONEST_WIRE = ["E,0,1,4", "E,0,6,0", "E,0,6,1", "E,0,6,2"]
+
+DIVE_PRE_FIX = [
+    "DIVE,8,1795538524,3,3,2026-11-24T16:42:04Z",
+] + [
+    "S,0,0.03,0.213,0.212,0.213,0.215,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "S,0,0.03,0.213,0.212,0.213,0.215,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "S,0,0.03,0.213,0.212,0.213,0.215,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "S,0,0.03,0.213,0.212,0.213,0.215,0.400,0x0010,0,0,0,0,0,1562,2,0,0,0",
+    "S,30,0.03,0.213,0.213,0.213,0.215,0.400,0x0010,0,0,480,0,0,1622,2,0,0,0",
+    "S,34,3.32,0.213,0.213,0.213,0.215,1.100,0x0010,0,0,0,0,0,1623,2,0,0,0",
+    "S,54,6.52,0.213,0.212,0.213,0.215,1.100,0x0030,0,0,0,0,0,1628,2,0,0,0",
+    "S,54,6.52,0.213,0.212,0.213,0.215,1.100,0x0030,0,0,0,0,0,1628,2,0,0,0",
+    "S,54,6.52,0.213,0.212,0.213,0.215,1.100,0x0030,0,0,0,0,0,1628,2,0,0,0",
+    "S,60,6.44,0.213,0.213,0.213,0.215,0.900,0x0030,0,0,480,6,0,1594,2,0,0,0",
+    "S,66,6.30,0.213,0.213,0.213,0.215,1.000,0x0010,0,0,0,0,0,1624,2,0,0,0",
+    "S,66,6.30,0.213,0.213,0.213,0.215,1.000,0x0010,0,0,0,0,0,1624,2,0,0,0",
+    "S,66,6.30,0.213,0.213,0.213,0.215,1.000,0x0010,0,0,0,0,0,1624,2,0,0,0",
+    "M,66,743,0.212,0.215,0,0,0,0,0,0,0.000,0.000,0.000,0.000",
+]
+# Same dive, as the handset saw it live (clamp_leg.log, 2026-11-24): the proof
+# FAIL, the clamp, and the diver's override were all on the wire.
+WIRE_PRE_FIX = ["E,0,1,4", "E,0,6,0", "E,0,6,1", "E,0,6,2", "E,34,4,110",
+                "E,54,1,5", "E,54,10,0", "E,54,11,0", "E,66,12,1"]
+
+# What the same link answered for the plan in force (GET GF_LOW/GF_HIGH/SP1..4).
+DIVE_WANT = {"GF_LOW": "GF_LOW=30", "GF_HIGH": "GF_HIGH=85",
+             "SP1": "SP1=0.400", "SP2": "SP2=0.550", "SP3": "SP3=1.000",
+             "SP4": "SP4=1.300"}
+
+
+def grade_dive_file(drows, want, wire=()):
+    """Grade one exported dive against itself, and against the settings it claims.
+
+    Four claims, each a different lie:
+
+      * the dive FILE holds the verdict rows the wire streamed (ids 10/11/12 for
+        a failed cell proof, 1/2 for alarms, 3 for mode, 4 for setpoint): until
+        2026-11-24 the wire carried them and the file did not, so a dive
+        downloaded afterwards showed a setpoint getting capped without ever
+        saying why — the effects survived, the verdicts did not;
+      * those rows arrive in the order they happened, so a reader can put the
+        override after the failure rather than guess;
+      * the `M,` summary agrees with the rows beside it. It printed
+        `snapshots 0, events 0, gf 0/0, sp 0.000 x4` next to a dozen samples:
+        a summary line contradicting its own dive;
+      * no impossible ppO2. A dive that never voted published the -32768
+        sentinel as `-32.768` bar, in the same three decimals as a real reading.
+
+    `want` is what the same link answered for GET GF_LOW / GF_HIGH / SP1..SP4,
+    `wire` the `E,` rows seen live while the dive was open. A claim nobody could
+    check (an empty `want`, a missing M, column) is a FAIL, never a pass.
+
+    The join is deliberately ONE-WAY: every row the handset streamed while the
+    dive was open must be in the file, but a row streamed outside that window
+    (an alarm edge a second before `DIVE START`, the last ones drained after
+    `DIVE END`) legitimately has no file row. Asserting equality in both
+    directions would fail a dive that worked as designed.
+    """
+    samp = [l for l in drows if l.startswith("S,")]
+    ev = [l for l in drows if l.startswith("E,")]
+    meta = next((l for l in drows if l.startswith("M,")), "")
+    mf = meta.split(",")
+
+    def val(key):
+        s = want.get(key, "")
+        try:
+            return float(s.split("=", 1)[1])
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    def same(key, col):
+        v, shown = val(key), None
+        try:
+            shown = float(mf[col])
+        except (ValueError, IndexError, TypeError):
+            return False
+        return v is not None and abs(v - shown) < 1e-6
+
+    def num(col):
+        try:
+            return float(mf[col])
+        except (ValueError, IndexError, TypeError):
+            return None
+
+    # Multiset, not set: two identical rows (a rejoin for two different cells
+    # reads alike in value but not in id, and a duplicate edge is a duplicate
+    # bug) must both be in the file.
+    missing = sorted((Counter(wire) - Counter(ev)).elements())
+    it = iter(ev)
+    in_order = all(any(w == x for x in it) for w in wire)
+
+    checks = [
+        ("dive file: the link saw the dive's verdict rows live, so the join "
+         "below is not vacuous", bool(wire),
+         "no E, row was captured while the dive was open. Every dive opens with "
+         "per-cell vote-rejoin rows (id 6), so an empty capture means the "
+         "watching loop read nothing — and a join against nothing can never "
+         "fail, which is the kind of check that has burned this bench before"),
+        ("dive file: every verdict the wire streamed is in the file", not missing,
+         f"missing {missing or 'none'}: the file holds {len(ev)} E, rows, the wire "
+         f"streamed {len(wire)} — a dive downloaded afterwards must answer 'what "
+         f"did the machine decide, and when' with the bytes the handset saw live"),
+        ("dive file: the verdict rows are in the order they happened", in_order,
+         f"file {ev} vs wire {list(wire)}: the override must sit after the "
+         f"failure it lifted, not just somewhere in the dive"),
+        ("dive file: it holds verdict rows at all", bool(ev),
+         f"{len(samp)} S, rows and {len(ev)} E, rows. Every dive opens with "
+         f"per-cell vote-rejoin rows (id 6), so an empty event set means the "
+         f"publication or the file join is broken, not that nothing happened"),
+        ("dive file: M, snapshot count matches the S, rows",
+         len(mf) > 7 and mf[7].isdigit() and int(mf[7]) == len(samp),
+         f"M, says {mf[7] if len(mf) > 7 else '?'} snapshots, the file holds "
+         f"{len(samp)} S, rows"),
+        ("dive file: M, event count matches the E, rows",
+         len(mf) > 8 and mf[8].isdigit() and int(mf[8]) == len(ev),
+         f"M, says {mf[8] if len(mf) > 8 else '?'} events, the file holds "
+         f"{len(ev)} E, rows"),
+        ("dive file: M, states the GF pair the dive ran on",
+         same("GF_LOW", 9) and same("GF_HIGH", 10),
+         f"M, gf {mf[9:11] if len(mf) > 10 else '?'} vs the link's "
+         f"{want.get('GF_LOW', '?')} / {want.get('GF_HIGH', '?')}"),
+        ("dive file: M, states the setpoint ladder the dive ran on",
+         all(same(k, 11 + i) for i, k in enumerate(("SP1", "SP2", "SP3", "SP4"))),
+         f"M, sp {mf[11:15] if len(mf) > 14 else '?'} vs the link's "
+         + " ".join(want.get(k, "?").split("=")[-1] for k in ("SP1", "SP2", "SP3", "SP4"))),
+        ("dive file: no impossible ppO2 in the summary",
+         num(3) is not None and num(4) is not None and num(3) >= 0.0 and num(4) >= 0.0,
+         f"M, min_ppo2 {mf[3] if len(mf) > 3 else '?'} max_ppo2 "
+         f"{mf[4] if len(mf) > 4 else '?'}: a dive that never voted used to "
+         f"publish the -32768 sentinel as -32.768 bar"),
+    ]
+    return checks
+
+
+def selftest_dive_file():
+    """Proves the dive-file graders can fail, no board needed.
+
+    The first case is the honest dive as it now exports off the fixed build; the
+    second is the same bench, one day earlier, and it must fail on the missing
+    verdict rows. Both are real captures. The rest are one-change corruptions of
+    the honest dive, each the shape of a bug the fix could plausibly regress
+    into — the counts lying again, the plan columns zeroed again, the never-voted
+    sentinel printed as a ppO2.
+    """
+    def row(idx, new):
+        out = list(DIVE_HONEST)
+        out[idx] = new
+        return out
+
+    def drop(prefix):
+        return [l for l in DIVE_HONEST if not l.startswith(prefix)]
+
+    honest_m = DIVE_HONEST[-1].split(",")
+
+    def meta(**over):
+        f = list(honest_m)
+        # M,<dur>,<cm>,<min>,<max>,<pulses>,<cns>,<snaps>,<evs>,<gfl>,<gfh>,<sp1..4>
+        col = {"snaps": 7, "evs": 8, "gfl": 9, "gfh": 10, "sp1": 11, "sp2": 12,
+               "sp3": 13, "sp4": 14, "min": 3, "max": 4}
+        for k, v in over.items():
+            f[col[k]] = v
+        return ",".join(f)
+
+    cases = [
+        # name, export rows, settings the link reported, wire E, rows, expected
+        # failing check (None = must pass clean)
+        ("an honest dive: verdict rows, samples and a summary that agrees",
+         DIVE_HONEST, DIVE_WANT, DIVE_HONEST_WIRE, None),
+        ("the same dive as it shipped before 2026-11-24: the wire streamed the "
+         "proof FAIL, the clamp and the override; the file holds none of them",
+         DIVE_PRE_FIX, DIVE_WANT, WIRE_PRE_FIX, "streamed is in the file"),
+        ("the clamp rows are there but out of order (override before failure)",
+         drop("E,") + ["E,66,12,1", "E,54,10,0", "E,54,11,0"], DIVE_WANT,
+         ["E,54,10,0", "E,54,11,0", "E,66,12,1"], "order they happened"),
+        ("M, claims 0 snapshots beside 13 samples (the counts never patched)",
+         DIVE_PRE_FIX, DIVE_WANT, [], "snapshot count matches"),
+        ("M, claims 0 events while the file now holds 4",
+         row(len(DIVE_HONEST) - 1, meta(evs="0")), DIVE_WANT, DIVE_HONEST_WIRE,
+         "event count matches"),
+        ("M, claims 9 snapshots the file does not hold",
+         row(len(DIVE_HONEST) - 1, meta(snaps="9")), DIVE_WANT, DIVE_HONEST_WIRE,
+         "snapshot count matches"),
+        ("M, states GF 0/0 while the link says 30/85",
+         row(len(DIVE_HONEST) - 1, meta(gfl="0", gfh="0")), DIVE_WANT,
+         DIVE_HONEST_WIRE, "GF pair"),
+        ("M, states a 0.000 ladder while the dive ran 0.40/0.55/1.00/1.30",
+         row(len(DIVE_HONEST) - 1,
+             meta(sp1="0.000", sp2="0.000", sp3="0.000", sp4="0.000")),
+         DIVE_WANT, DIVE_HONEST_WIRE, "setpoint ladder"),
+        ("a dive that never voted publishes the sentinel as -32.768 bar",
+         row(len(DIVE_HONEST) - 1, meta(min="0.000", max="-32.768")), DIVE_WANT,
+         DIVE_HONEST_WIRE, "impossible ppO2"),
+        ("no M, row at all: every claim in it is unchecked",
+         drop("M,"), DIVE_WANT, DIVE_HONEST_WIRE, "snapshot count matches"),
+        ("the settings query came back empty: a claim nobody can check is a fail",
+         DIVE_HONEST, {}, DIVE_HONEST_WIRE, "GF pair"),
+        ("the watching loop captured nothing: a join against nothing can never "
+         "fail, so it must not be allowed to pass quietly",
+         DIVE_HONEST, DIVE_WANT, [], "not vacuous"),
+        ("a truncated export: 3 of 4 samples arrive, the summary says 4",
+         drop("S,")[:3] + [l for l in DIVE_HONEST if not l.startswith("S,")],
+         DIVE_WANT, DIVE_HONEST_WIRE, "snapshot count matches"),
+    ]
+    checks = []
+    for name, rows, wn, wire, want in cases:
+        failed = [c[0] for c in grade_dive_file(rows, wn, wire) if not c[1]]
+        if want is None:
+            checks.append((f"dive file: {name}", not failed,
+                           f"unexpected failures: {failed}"))
+        else:
+            checks.append((f"dive file: {name}", any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
     return checks
 
 
@@ -1321,14 +1559,62 @@ def run_dive_persist(console, port, baud, watch, settle=1.5, boot_n=None):
                     out.append((int(parts[1]), ep, sq))
         return out
 
+    def ask(line, window=3.0, stop_at=None):
+        """One command, fixed collection window. The controller streams T,/D,/E,
+        rows every 500 ms, so there is no 'the link went quiet' end to a read:
+        the window is the window. `stop_at` ends the read on a line that is the
+        data's own terminator — for a dive export that is the `M,` trailer,
+        which matters because live `E,` rows pushed AFTER the trailer are
+        byte-identical to exported ones and would otherwise be counted as file
+        rows (see spec §5: the ambiguity is the reader's position, not the
+        controller disagreeing with itself)."""
+        ser.reset_input_buffer()
+        ser.write((line + "\r\n").encode())
+        ser.flush()
+        out, end = [], time.time() + window
+        while time.time() < end:
+            l = ser.readline().decode(errors="replace").strip()
+            if not l:
+                continue
+            out.append(l)
+            if stop_at and stop_at(l):
+                break
+        return out
+
     before = slots()
     ser.write(b"DIVE START\r\n")
     ser.flush()
-    time.sleep(7.0)                    # one 30 s grid row will not land; event
-    ser.write(b"DIVE END\r\n")        # rows and the header already make a dive
+    # Watching the link while the dive runs, rather than sleeping through it:
+    # the `E,` rows the handset sees live are the reference the dive FILE has to
+    # match. Both records come out of the same pop in UartLink::drainEvents, so
+    # a row the handset saw and the file does not hold is a verdict the diver
+    # cannot read back after the dive — which is exactly how this used to work.
+    # Reading starts the instant the command goes out, not after a pause: the
+    # dive's own opening rows (the per-cell vote rejoins, id 6) are published on
+    # the next control cycle, and a capture that misses them leaves the join
+    # below comparing the file against nothing.
+    wire_events = []
+    end = time.time() + 7.5            # one 30 s grid row will not land; event
+    while time.time() < end:           # rows and the header already make a dive
+        l = ser.readline().decode(errors="replace").strip()
+        if l.startswith("E,"):
+            wire_events.append(l)
+    ser.write(b"DIVE END\r\n")
     ser.flush()
     time.sleep(3.0)
     mid = slots()
+    print(f"    dive watch: {len(wire_events)} E, rows streamed live — "
+          f"{wire_events[:6]}")
+
+    # The dive just closed, read back out of flash and graded against itself
+    # (see grade_dive_file: the file's verdict rows, and the `M,` summary
+    # agreeing with the rows beside it rather than contradicting them).
+    newest = max(mid, key=lambda r: r[2], default=None)
+    drows = ask(f"LOG EXPORT {newest[0]}", 7.0,
+                stop_at=lambda l: l.startswith("M,")) if newest else []
+    want = {k: next((l for l in ask(f"GET {k}") if l.startswith(f"{k}=")), "")
+            for k in ("GF_LOW", "GF_HIGH", "SP1", "SP2", "SP3", "SP4")}
+    checks.extend(grade_dive_file(drows, want, wire_events))
 
     mark = len(watch)   # everything the console watcher sees after here is the new boot
     # Run-mode reset through EN. DTR stays low on purpose: pulsing it drives IO0
@@ -1471,21 +1757,27 @@ def main() -> int:
                          "plausible reading (BENCH.md C3-a). Without this flag a "
                          "sensor-less boot is accepted as-is.")
     ap.add_argument("--selftest", action="store_true",
-                    help="grade known-lying surface logs and known-lying depth "
-                         "announces (no board needed) to prove the graders can "
+                    help="grade known-lying surface logs, known-lying depth "
+                         "announces and known-lying dive exports (no board "
+                         "needed) to prove the graders can "
                          "fail. Run it after touching the graders or the formats.")
     ap.add_argument("--replay", default=None)
     ap.add_argument("--dive-persist", action="store_true",
-                    help="after the protocol checks, close a dive, reset the "
-                         "controller through the console's EN line and ask "
-                         "`LOG LIST` again: dive history must outlive the reset. "
-                         "Adds ~35 s and a deliberate reboot, so it is opt-in.")
+                    help="after the protocol checks, close a dive, read that dive "
+                         "back out of flash and grade it against what the link "
+                         "streamed while it ran, then reset the controller through "
+                         "the console's EN line and ask `LOG LIST` again: dive "
+                         "history must outlive the reset, and the file must hold "
+                         "the verdict rows and a summary that agrees with its own "
+                         "rows. Adds ~35 s and a deliberate reboot, so it is "
+                         "opt-in.")
     args = ap.parse_args()
 
     if args.selftest:
         # No board, no ports: this section is about the grader, not the machine.
         fails = 0
-        for name, ok_, detail in [*selftest_depth(), *selftest()]:
+        for name, ok_, detail in [*selftest_depth(), *selftest_dive_file(),
+                                  *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1
         print(f"\n{fails} failure(s)")

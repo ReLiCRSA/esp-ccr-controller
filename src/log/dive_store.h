@@ -49,6 +49,14 @@ public:
     /// Write the final meta (totals) and close. Safe to call if not recording.
     void endDive(const logfmt::DiveMeta& meta);
 
+    /// Records written into the dive that is being closed, counted HERE because
+    /// this object is the one that writes them. The `M,` summary line claims
+    /// these numbers, and a claim copied from some other counter is a claim
+    /// that can drift away from the rows in the file: the dive that had 13
+    /// `S,` rows used to print `snapshots 0`.
+    uint16_t snapshotCount() const { return snaps_; }
+    uint16_t eventCount() const { return evs_; }
+
     /// The dive-sequence range currently on the partition (false when no dive
     /// carries one, which is the state of a board whose dives predate 2026-11-24).
     /// The boot banner prints it because that is the only place the bench can see
@@ -90,4 +98,5 @@ private:
     File file_;
     bool mounted_ = false;
     bool formatted_ = false;
+    uint16_t snaps_ = 0, evs_ = 0;   // records in the dive being recorded
 };

@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "comms/cmd_router.h"
 #include "comms/settings_apply.h"
@@ -647,10 +648,47 @@ void test_get_calair_reports_the_verdict_not_the_request() {
     TEST_ASSERT_EQUAL(-1, b.reg.find("CALAIR"));
 }
 
+
+void test_a_published_max_length_value_lands_whole() {
+    // `GET SCHEMA` publishes AP_PASS as 8..31 characters, and the page puts those
+    // numbers in the input it renders. Until 2026-11-24 the command parser carried
+    // 23 characters, so a diver typing the length the device advertised got `OK`
+    // and a DIFFERENT passphrase — the ack-with-no-consumer shape again, one layer
+    // further down. Reading the value back is the only witness, so this asserts
+    // both the ack and the stored string, and asserts the reply line too because a
+    // truncated GET answer would hide the same bug from every client.
+    Bench b;
+    CommandRouter::Response r;
+    const char* pass = "correct horse battery staple XY";      // exactly 31
+    TEST_ASSERT_EQUAL_INT_MESSAGE(31, static_cast<int>(std::strlen(pass)),
+                                  "fixture length IS the published maximum");
+
+    b.run((std::string("SET AP_PASS=") + pass).c_str(), r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "OK"), "a 31-character passphrase was refused");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE(pass, b.reg.getString(b.reg.find("AP_PASS")),
+                                     "the ack was OK and the stored string is not "
+                                     "what the client sent");
+
+    b.run("GET AP_PASS", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, (std::string("AP_PASS=") + pass).c_str()),
+                             "the read-back is shorter than what was written");
+
+    // And the registry, not the transport, is what draws the line: 32 characters is
+    // one past what a string key can hold, and that must be an honest refusal with
+    // the registry's own words — never a shortened write that answers OK.
+    b.run((std::string("SET AP_PASS=") + std::string(32, 'z')).c_str(), r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR"), "32 characters were accepted");
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "value too long"),
+                             "the refusal did not use the registry's own phrase");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE(pass, b.reg.getString(b.reg.find("AP_PASS")),
+                                     "the refused write moved the value anyway");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_auto_lockout_holds_over_the_router);
     RUN_TEST(test_get_set_round_trip_on_the_shared_registry);
+    RUN_TEST(test_a_published_max_length_value_lands_whole);
     RUN_TEST(test_dive_locked_keys_refused_mid_dive);
     RUN_TEST(test_re_dive_after_a_closed_dive_is_a_fresh_dive);
     RUN_TEST(test_dive_start_drops_the_radio_and_end_restores_it);

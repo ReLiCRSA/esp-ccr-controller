@@ -19,6 +19,19 @@ using proto::CalAction;
 using proto::Command;
 using proto::Kind;
 
+// The parser has to be able to CARRY what the registry can accept. If either of
+// these fires, the two caps have drifted and the board is back to answering `OK`
+// for a write it silently shortened: `AP_PASS` published 8..31 characters through
+// a 23-character parser field until 2026-11-24, so a diver typing the length the
+// device advertised stored a different passphrase than he set (and the endpoint
+// fix the same day made those lengths legal rather than refused). The schema a
+// handset reads with `GET SCHEMA` is a contract; these asserts are what keep the
+// transport from quietly breaking it.
+static_assert(sizeof(Command::value) >= settings::MAX_VAL_STR,
+              "SET value buffer is shorter than the settings registry's own limit");
+static_assert(sizeof(Command::key) >= settings::MAX_KEY,
+              "command key buffer is shorter than the settings registry's own limit");
+
 // ---- reply helpers ----------------------------------------------------------
 
 void CommandRouter::replyOk(Response& r, const char* note) {

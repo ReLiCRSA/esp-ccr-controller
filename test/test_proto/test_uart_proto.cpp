@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 
+#include "comms/settings.h"
 #include "comms/uart_proto.h"
 
 using namespace proto;
@@ -286,6 +287,126 @@ void test_line_reader_rate_limit_gates_the_text() {
     TEST_ASSERT_EQUAL_INT(2, w.errs);
 }
 
+// ---- the value/key caps: a parser that truncates can turn a refusal into an
+// ---- accept, which is what happened on hardware (2026-11-24, PLAN 16):
+// ---- AP_PASS publishes 8..31 characters while Command::value was 24 bytes, so a
+// ---- 24..31 character passphrase answered `OK` and stored something shorter.
+void test_a_full_length_passphrase_survives_the_parser() {
+    // 31 is the published maximum in `GET SCHEMA`, and the number the page puts in
+    // <input maxlength=>. Hand-typed, not computed from any constant: if the
+    // schema's maximum ever moves, this case says so rather than following it.
+    const char* pass = "correct horse battery staple X";      // 30 chars
+    TEST_ASSERT_EQUAL_INT_MESSAGE(30, static_cast<int>(std::strlen(pass)),
+                                  "fixture length: the point of the case is a "
+                                  "specific length");
+    auto c = parsed("SET AP_PASS=correct horse battery staple X");
+    TEST_ASSERT_EQUAL_STRING("AP_PASS", c.key);
+    TEST_ASSERT_EQUAL_STRING(pass, c.value);
+    TEST_ASSERT_EQUAL_INT(30, static_cast<int>(std::strlen(c.value)));
+
+    // 31, the actual declared maximum — and the value has a space in it, because
+    // spaces are legal in a passphrase and the parser takes the REST OF THE LINE.
+    c = parsed("SET AP_PASS=correct horse battery staple XY");
+    TEST_ASSERT_EQUAL_INT(31, static_cast<int>(std::strlen(c.value)));
+    TEST_ASSERT_EQUAL_STRING("correct horse battery staple XY", c.value);
+
+    // Not just the schema's maximum: anything the REGISTRY could accept has to
+    // arrive whole. 39 is longer than any string key allows, so the registry
+    // refuses it — and that refusal, with the client's own words, is what must
+    // reach the client instead of a truncated write.
+    const std::string long39 = std::string("SET AP_PASS=") + std::string(39, 'p');
+    c = parsed(long39.c_str());
+    TEST_ASSERT_EQUAL_INT(39, static_cast<int>(std::strlen(c.value)));
+}
+
+void test_over_long_values_are_refused_not_truncated() {
+    // The doctrine already established for LINES (an over-long line is dropped
+    // whole, never truncated-and-run) applied to the FIELDS inside a line: this
+    // used to copy 39 characters and answer OK. 40 is one past what the parser
+    // can carry, and the refusal uses the registry's own phrase so a client
+    // matches one vocabulary at either layer.
+    const char* err = nullptr;
+    Command c;
+    const std::string line = std::string("SET AP_PASS=") + std::string(40, 'q');
+    TEST_ASSERT_FALSE_MESSAGE(parseCommand(line.c_str(), c, &err),
+                              "a 40-character value was accepted: the parser is "  
+                              "truncating it again");
+    TEST_ASSERT_EQUAL_STRING("value too long", err);
+
+    // Same for the key: a truncated key could address something the client did not
+    // name, which is worse than an unknown key.
+    err = nullptr;
+    const std::string kline = std::string("SET ") + std::string(24, 'K') + "=1";
+    TEST_ASSERT_FALSE_MESSAGE(parseCommand(kline.c_str(), c, &err),
+                              "a 24-character key was accepted");
+    TEST_ASSERT_EQUAL_STRING("key too long", err);
+    TEST_ASSERT_EQUAL_UINT8(Kind::SET, c.kind);   // refused, and nothing was read
+    TEST_ASSERT_EQUAL_STRING("", c.key);
+
+    // The GET path has to say the same thing, and this is the only witness that it
+    // does — proven by removing the guard, which changed NOTHING observable: today's
+    // longest published key is well under 24 characters, so a truncated GET key never
+    // matches anything and the answer is `unknown key` either way. Which is exactly
+    // why the words matter: "I have no such setting" and "your key is too long to be
+    // one" are different diagnoses, and a client that is told the first will go looking
+    // for a typo instead of its own length bug. It also stops a future long key from
+    // turning truncation into addressing.
+    err = nullptr;
+    const std::string gline = std::string("GET ") + std::string(24, 'K');
+    TEST_ASSERT_FALSE_MESSAGE(parseCommand(gline.c_str(), c, &err),
+                              "a 24-character GET key was accepted");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("key too long", err,
+                                     "a too-long key was reported as an unknown key");
+    TEST_ASSERT_EQUAL_STRING("", c.key);
+}
+
+void test_every_published_key_and_max_length_value_reaches_the_parser() {
+    // The contract test, table-driven, so it cannot be satisfied by the one key
+    // that happened to be under review. For every key the schema publishes:
+    //   * the key itself must survive `GET <key>` and `SET <key>=x` intact, so a
+    //     command can never address a DIFFERENT setting than the client named;
+    //   * a value of exactly the key's published maximum length (strings: `maxv`
+    //     characters) must survive the parse whole, so the registry — not the
+    //     transport — is what decides whether a write is acceptable.
+    // This is the check that would have failed for years on `AP_PASS`.
+    size_t n = 0;
+    const settings::Def* table = settings::Registry::definitions(n);
+    int checked = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const settings::Def& d = table[i];
+        std::string line = std::string("GET ") + d.key;
+        Command c;
+        const char* err = nullptr;
+        TEST_ASSERT_TRUE_MESSAGE(parseCommand(line.c_str(), c, &err),
+                                 (std::string("GET ") + d.key + " was refused").c_str());
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(d.key, c.key,
+                                         (std::string("key truncated by the parser: ") +
+                                          d.key).c_str());
+
+        // longest legal value for this key
+        std::string val;
+        if (d.type == settings::Type::STRING) {
+            val = std::string(static_cast<size_t>(d.maxv), 'x');
+        } else {
+            val = "1";
+        }
+        line = std::string("SET ") + d.key + "=" + val;
+        if (line.size() > MAX_LINE) continue;   // the LINE cap is a different rule
+        err = nullptr;
+        TEST_ASSERT_TRUE_MESSAGE(parseCommand(line.c_str(), c, &err),
+                                 (std::string(d.key) + " with its maximum-length value "
+                                  "was refused by the parser").c_str());
+        TEST_ASSERT_EQUAL_STRING(d.key, c.key);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(val.c_str(), c.value,
+                                         (std::string(d.key) + ": the parser shortened a "
+                                          "value the schema publishes as legal").c_str());
+        ++checked;
+    }
+    // A walk that checked nothing is decoration.
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(25, checked,
+                                             "the schema walk covered too few keys");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_simple_verbs);
@@ -301,5 +422,8 @@ int main() {
     RUN_TEST(test_line_reader_overflow_drops_the_whole_line);
     RUN_TEST(test_line_reader_overflow_cannot_execute_a_write);
     RUN_TEST(test_line_reader_rate_limit_gates_the_text);
+    RUN_TEST(test_a_full_length_passphrase_survives_the_parser);
+    RUN_TEST(test_over_long_values_are_refused_not_truncated);
+    RUN_TEST(test_every_published_key_and_max_length_value_reaches_the_parser);
     return UNITY_END();
 }

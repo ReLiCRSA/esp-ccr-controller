@@ -24,6 +24,22 @@
 namespace proto {
 
 constexpr size_t MAX_LINE = 64;      // longer uplink lines are rejected
+// SET value text. This is NOT a free choice: it must be at least as long as the
+// longest value the SETTINGS registry can accept, or the parser silently hands
+// the registry a shorter string than the client sent and the write lands
+// truncated while still answering `OK`. It was exactly that until 2026-11-24:
+// this field was 24 bytes (23 chars) while `AP_PASS` publishes a range of 8..31,
+// so a 24..31 character passphrase was legal, answered `OK`, and stored short —
+// the diver then could not join the access point he had just configured. The
+// string bounds are integer length checks, so unlike the numeric endpoints (see
+// settings.cpp, same day) this was never masked by anything: it was live the
+// whole time. The
+// client library's own field is 40 bytes (`Setting::value`), so a handset was
+// never the limiting factor. Pinned by a static_assert in cmd_router.cpp and by a
+// schema walk in test_proto, because either side drifting reopens the lie.
+// Budget check: the longest legal line is `SET AP_PASS=` + 31 = 43 chars, inside
+// MAX_LINE, so this cannot make an acceptable line overflow the reader.
+constexpr size_t MAX_VALUE = 40;
 constexpr int MAX_STOPS = 8;
 
 enum class Kind : uint8_t {
@@ -36,8 +52,10 @@ enum class CalAction : uint8_t { NONE, AIR, O2, O2_CONFIRM, DEPTH };
 
 struct Command {
     Kind kind = Kind::UNKNOWN;
-    char key[24] = {0};       // GET/SET key, WIFI arg ("ON"/"OFF"), LOG arg
-    char value[24] = {0};     // SET raw value text (registry validates)
+    char key[24] = {0};       // GET/SET key, WIFI arg ("ON"/"OFF"), LOG arg.
+                              // 24 matches the client library's SchemaEntry::key,
+                              // and every published key is <= settings::MAX_KEY.
+    char value[MAX_VALUE] = {0};   // SET raw value text (registry validates)
     CalAction cal = CalAction::NONE;
     bool logExport = false;   // LOG EXPORT vs LOG LIST
     uint16_t logIndex = 0;

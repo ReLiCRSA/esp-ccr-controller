@@ -95,6 +95,17 @@ void test_value_as_string_and_list_all() {
     // tight buffer fails cleanly
     char tiny[8];
     TEST_ASSERT_EQUAL(0, r.listAll(tiny, sizeof(tiny)));
+
+    // ...and valueAsString must REFUSE rather than answer half a value. The router
+    // turns `false` into `ERR value too long`; a success here with a truncated
+    // string would show a handset or the page a setting value that is not the one
+    // stored — the same silent-shortening as the 23-character parser field
+    // (2026-11-24), one layer further down. Mutation-proved: dropping the
+    // overflow test from valueAsString reddens this and nothing else.
+    char small[6];
+    TEST_ASSERT_FALSE_MESSAGE(r.valueAsString(r.find("AP_PASS"), small, sizeof(small)),
+                              "a 5-byte buffer reported an 8-character passphrase "
+                              "as rendered");
 }
 
 void test_reset_restores() {

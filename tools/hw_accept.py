@@ -161,6 +161,13 @@ _NOW_EPOCH = int(time.time())
 DENSITY_REFUSED = "1.000"
 DENSITY_RESTORE = "1.025"
 
+# A string value past what the command parser can carry (its field is 40 bytes; 39
+# characters is the longest thing that survives). 40 forces a refusal. The line
+# itself is 52 characters, comfortably inside the 64-character LINE cap, so what
+# refuses here is the FIELD cap — which is the whole point of the leg, and why
+# grade_value_caps rejects `ERR line too long` as a wrong-rule answer.
+VALUE_TOO_LONG = "z" * 40
+
 PROTOCOL_CHECKS = [
     ("DIVE END", r"^(OK|ERR no dive)", "clean slate before the sequence"),
     ("GET T", r"^T,", "telemetry line parses", "burst"),
@@ -173,6 +180,16 @@ PROTOCOL_CHECKS = [
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
     ("SET SP2=2.5", r"^ERR", "range refusal"),
+    # Value caps on the wire (2026-11-24, see grade_value_caps): the parser's value
+    # field used to be 23 characters while `AP_PASS` publishes 8..31, so a longer
+    # passphrase answered OK and was stored short. Both writes here are REFUSED, so
+    # the access point is never re-armed and no later phase waits on a station
+    # rejoining — the leg costs three lines and no radio churn.
+    ("GET AP_PASS", r"^AP_PASS=", "string read-back (the cap leg reads it twice)"),
+    (f"SET AP_PASS={VALUE_TOO_LONG}", r"^ERR value too long",
+     "a value the parser cannot carry is refused, never stored shortened"),
+    ("GET AP_PASS", r"^AP_PASS=",
+     "read again, so 'did the refusal keep the value?' is answerable"),
     # The clock goes up before the matrix's own dive, so THAT dive is stamped
     # with a real epoch too, and every later phase sees dated logs.
     # Calibration honesty (PLAN 16: `OK` meant "the parser accepted it"). CAL O2
@@ -504,6 +521,128 @@ def grade_density_lock(pairs):
         checks.append(("the mid-dive read-back parses", False, f"reply: {mid}"))
     if shown is None:
         checks.append(("the post-dive read-back parses", False, f"reply: {read}"))
+    return checks
+
+
+def grade_value_caps(pairs):
+    """A value the parser cannot carry must be REFUSED, never quietly shortened.
+
+    The command parser's value field was 23 characters while `AP_PASS` publishes
+    8..31, so until 2026-11-24 a passphrase of 24..31 characters answered `OK` and
+    stored something shorter than the client sent — the same "ack with no consumer"
+    shape as the settings-applier defects, one layer further down, and invisible to
+    the client that typed it. The host suite pins the parser and the schema against
+    each other (`test_every_published_key_and_max_length_value_reaches_the_parser`,
+    and a `static_assert` tying the buffer to `settings::MAX_VAL_STR`); this leg is
+    the wire's copy of the same question, and it is deliberately built out of
+    REFUSED writes: the passphrase never changes, so the access point is not
+    re-armed and no later phase of the run depends on a station rejoining.
+
+    Two reads around the write, paired with their own replies, because the refusal's
+    words are only half the claim: the other half is that the value is exactly what
+    it was.
+    """
+    reads = [(c, r) for c, r in pairs if c == "GET AP_PASS"]
+    over = next(((c, r) for c, r in pairs
+                 if c.startswith("SET AP_PASS=") and len(c) > len("SET AP_PASS=") + 31),
+                None)
+    # None-safety is deliberate: a missing read or write must come back as its own
+    # failing check, never as a traceback that aborts the run and hides every check
+    # after it (learned on this bench, where a crash mid-C2 loses the whole leg).
+    if over is None or len(reads) < 2:
+        return [("the value-cap leg ran (two passphrase reads around a refused write)",
+                 False,
+                 f"reads: {len(reads)} (want 2); over-long write: "
+                 f"{'yes' if over is not None else 'no'} — with either missing, "
+                 f"'did the refusal keep the value?' cannot be answered")]
+
+    def value_of(lines):
+        line = next((x for x in lines if x.startswith("AP_PASS=")), "")
+        return line.split("=", 1)[1] if "=" in line else None
+
+    before = value_of(reads[0][1] or []) if reads else None
+    after = value_of(reads[-1][1] or []) if reads else None
+    wrote = over[0] if over is not None else "(no over-long write was sent)"
+    replied = (over[1] if over is not None else None) or []
+    return [
+        ("an over-long value is refused with the registry's own words",
+         any(l.startswith("ERR value too long") for l in replied),
+         f"`{wrote}` answered {replied or ['(nothing)']} — "
+         f"note the distinction being graded: `ERR line too long` would be the LINE "
+         f"cap (64 chars) answering, not the FIELD cap, and a check that accepts "
+         f"either is testing the wrong rule"),
+        ("the refused write left the passphrase exactly as it was",
+         before is not None and after is not None and before == after,
+         f"read before: {before!r}, read after: {after!r}. A parser that copies what "
+         f"fits and answers OK changes the access point's key under a client that "
+         f"typed a longer one — the client then cannot join, and the log says the "
+         f"write succeeded"),
+    ]
+
+
+def selftest_value_caps():
+    """The value-cap grader, proven on lying captures.
+
+    `honest` is what the matrix performs: two passphrase readings around a write the
+    parser refuses because it cannot carry the value. The lies are the shapes a
+    regression takes: the value moved (the truncation defect itself), a refusal from
+    a DIFFERENT rule (the line cap is not the field cap — the same
+    "right ERR, wrong reason" trap that hid a dive-lock defect the same day), and a
+    leg that never ran.
+    """
+    long_write = f"SET AP_PASS={'z' * 40}"
+    honest = [
+        ("GET AP_PASS", ["AP_PASS=diveonly"]),
+        (long_write, ["ERR value too long"]),
+        ("GET AP_PASS", ["T,0.04,0.214,0.214,0.214,0.214,0.400,STANDBY,FLAGS0x10,1.56",
+                         "AP_PASS=diveonly"]),
+    ]
+    cases = [
+        ("an honest leg: refused, and the key did not move", honest, None),
+        ("the truncation defect: refused in words, stored anyway",
+         [("GET AP_PASS", ["AP_PASS=diveonly"]),
+          (long_write, ["ERR value too long"]),
+          ("GET AP_PASS", ["AP_PASS=" + "z" * 23])],
+         "left the passphrase"),
+        ("silently accepted and shortened: no refusal at all",
+         [("GET AP_PASS", ["AP_PASS=diveonly"]),
+          (long_write, ["OK"]),
+          ("GET AP_PASS", ["AP_PASS=" + "z" * 23])],
+         "registry's own words"),
+        ("the LINE cap refusing is not the FIELD cap refusing",
+         [("GET AP_PASS", ["AP_PASS=diveonly"]),
+          (long_write, ["ERR line too long"]),
+          ("GET AP_PASS", ["AP_PASS=diveonly"])],
+         "registry's own words"),
+        ("only one read: 'did it move?' is unanswerable",
+         [(long_write, ["ERR value too long"]),
+          ("GET AP_PASS", ["AP_PASS=diveonly"])],
+         "value-cap leg ran"),
+        ("no over-long write: the matrix entry went missing",
+         [("GET AP_PASS", ["AP_PASS=diveonly"]),
+          ("GET AP_PASS", ["AP_PASS=diveonly"])],
+         "value-cap leg ran"),
+        ("a read that answered no value at all (ERR instead of a passphrase)",
+         [("GET AP_PASS", ["ERR unknown key"]),
+          (long_write, ["ERR value too long"]),
+          ("GET AP_PASS", ["AP_PASS=diveonly"])],
+         "left the passphrase"),
+        ("neither read answered a value: comparing two nothings proves nothing",
+         [("GET AP_PASS", ["ERR unknown key"]),
+          (long_write, ["ERR value too long"]),
+          ("GET AP_PASS", ["ERR unknown key"])],
+         "left the passphrase"),
+    ]
+    checks = []
+    for name, pairs, want in cases:
+        got = grade_value_caps(pairs)
+        failed = [c[0] for c in got if not c[1]]
+        if want is None:
+            checks.append((f"value caps: {name}", len(got) == 2 and not failed,
+                           f"expected two graded checks, none failed: {failed}"))
+        else:
+            checks.append((f"value caps: {name}", any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
     return checks
 
 
@@ -2155,6 +2294,7 @@ def main() -> int:
         fails = 0
         for name, ok_, detail in [*selftest_depth(), *selftest_scale(),
                                   *selftest_density_lock(),
+                                  *selftest_value_caps(),
                                   *selftest_dive_file(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
@@ -2273,6 +2413,12 @@ def main() -> int:
         # --expect-depth.
         print("\n--- the dive-locked ruler: refused writes stay refused ---")
         for name, ok, detail in grade_density_lock(proto_pairs):
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
+                  + ("" if ok else f": {detail}"))
+            failures += 0 if ok else 1
+
+        print("\n--- value caps: an unwritable value is refused, not shortened ---")
+        for name, ok, detail in grade_value_caps(proto_pairs):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
                   + ("" if ok else f": {detail}"))
             failures += 0 if ok else 1

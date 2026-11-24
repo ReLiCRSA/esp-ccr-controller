@@ -15,13 +15,13 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 258 cases
+pio test -e native            # host gate, currently 262 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 136 checks
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/ruler/dive-file graders, no board: 54 cases
+                                 --cal-air --predive --dive-persist    # 141 checks
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/ruler/value-cap/dive-file graders, no board: 62 cases
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
 ```
 
@@ -124,7 +124,9 @@ mid-dive → `ERR dive locked`; `SET WATER_DENSITY` mid-dive → `ERR dive locke
 then `GET WATER_DENSITY` **still mid-dive** to ask which ruler that dive is
 actually running on, and the same write accepted after `DIVE END`; `WIFI ON`
 mid-dive → `ERR wifi locked in dive`; `CAL AIR` mid-dive → `ERR cal locked in
-dive`; overlong line → `ERR line too long`; junk → `ERR unknown command`. Every
+dive`; overlong line → `ERR line too long`; junk → `ERR unknown command`;
+`GET AP_PASS` / an over-long value → `ERR value too long` / the same passphrase read
+back unchanged. Every
 one of those is a host-tested invariant — the bench exists to prove the wire, not
 the logic. Two rules this matrix now follows, both learned the hard way (see C3-a
 "The ruler is dive-locked"): a refusal probe never uses a **range endpoint** (a
@@ -357,6 +359,84 @@ controller** (its DTR/EN only touch the spare board — safer than the console
 port), and the bridge needs ~250 ms to boot after that open, so
 `hw_accept.py` settles 1.5 s and retries a command that got no line at all
 (`--handset-settle 0` for a plain adapter).
+
+### The parser must not shorten what the schema promises (fixed 2026-11-24)
+
+The queued item was small and known: `SET` values were cut to 23 characters by the
+command parser while `AP_PASS` publishes 8..31. It was live the whole time, not a
+later consequence of the endpoint fix above — that was written into this section first
+and then disproved. A string key's `min`/`max` are **lengths**, checked as integers
+(`strlen` against 8 and 31), so the float-ULP bug never touched them: a 24..31
+character passphrase was legal before that fix and after it. The mutation is the
+witness: restoring the pre-fix `strtod` reddens **only**
+`test_every_key_reaches_its_own_declared_bounds`, while
+`test_a_published_max_length_value_lands_whole` and the parser cases stay green —
+independent rules, and two checks that never interfere. So a diver could type the
+length the device advertised, get `OK`, and then be unable to join his own access
+point, because the stored value was the first 23 characters. The page is the proof it
+was reachable: it builds its inputs from `GET SCHEMA` and sets `maxLength` from the
+`K,` line, so the page let him type exactly 31. The only clue on the wire is a
+`GET AP_PASS` that comes back shorter than what was typed.
+
+Fixed as a rule rather than a bigger number:
+
+* the parser's value field is 40 bytes and a **static_assert** ties it to
+  `settings::MAX_VAL_STR`, so the transport can never again be narrower than what the
+  registry accepts (the client library's own field has been 40 bytes all along — the
+  controller was the limiting factor, not the handset);
+* a value that does not fit is **refused**, `ERR value too long` — the registry's own
+  phrase, so a client learns one vocabulary at either layer. Same decision already
+  taken for over-long *lines* (dropped whole, never truncated-and-run) now applied to
+  the fields inside a line. A truncated **key** is refused too (`ERR key too long`):
+  an address that resolves to something else is worse than an unknown key.
+
+Host gates, mutation-proved:
+
+| injected bug | what reddens |
+|---|---|
+| copy the value into 23 bytes anyway | `Expected 'correct horse battery staple X' Was 'correct horse battery s'` (test_proto), the schema walk naming `AP_PASS`, and the router case `the ack was OK and the stored string is not what the client sent` |
+| guards removed (accept-and-truncate) | `test_over_long_values_are_refused_not_truncated` |
+| value field back to 24 bytes | **compile failure**: `static assertion failed: SET value buffer is shorter than the settings registry's own limit` |
+| the `GET` reply buffer shrunk | the read-back assertion in `test_a_published_max_length_value_lands_whole` |
+| `valueAsString` stops reporting overflow | `test_value_as_string_and_list_all` (a 5-byte buffer reported an 8-character passphrase as rendered) — that hole existed until it was probed: nothing else in the suite had ever asked |
+| the SET-path key guard removed | `a 24-character key was accepted` |
+| the **GET**-path key guard removed | nothing at all — until a case was written for it, this guard was a check that could never be the only witness. Removing it is invisible today because every published key is short, so a truncated GET key matches nothing and the answer is `unknown key` either way. What is observable, and now asserted, is **which rule answers**: `key too long`, not `unknown key`. "There is no such setting" and "that key is too long to be one" are different diagnoses, and a client told the first goes looking for a typo instead of its own length bug |
+
+The wire leg is deliberately built out of refused writes only: `GET AP_PASS`,
+`SET AP_PASS=` + 40 characters → `ERR value too long`, `GET AP_PASS` again, each
+paired with its own reply, and `grade_value_caps` requires the two reads to answer the
+**same** passphrase (2 checks, 8 lying-capture selftest cases). So the access point is
+never re-armed and no later phase of the run waits on a station rejoining. Writing a
+legal 24..31 character passphrase on the bench would reconfigure the access point out
+from under the run: `AP_PASS` takes effect at the next radio restart, and the matrix
+restarts the radio twice (DIVE START / DIVE END), so a mid-run write means the AP comes
+back on a key the operator's phone does not hold unless the restore step runs — and a
+crash in between skips it. A real cost, bought for no information the host does not
+already have: the shortening lived in `proto::parseCommand`, which the handset and web
+transports share and which is host-covered on both, so by this section's own rule ("the
+bench exists to prove the wire, not the logic") that half stays on the host. What the
+wire is separately trusted for — a 52-character command line reaching the parser at all
+— is already covered by the framing leg and the 64-character line cap.
+What the wire leg does prove is the distinction the grader insists on: `ERR line too
+long` (the 64-character LINE cap) is **not** an acceptable answer here, because it
+would mean a different rule refused the command and the field cap was never reached.
+
+Captured on the bench 2026-11-24, on the flashed build with these changes in it:
+
+```
+--- value caps: an unwritable value is refused, not shortened ---
+  [PASS] an over-long value is refused with the registry's own words
+  [PASS] the refused write left the passphrase exactly as it was
+```
+
+Gate after it: native **262** (test_proto +3 cases, test_router +1, plus a new
+assertion inside `test_settings`' existing `valueAsString` case), `hw_accept.py
+--dive-persist` **141 checks 0 failures**, `web_probe.py` **62**, `--selftest` **62**
+lying cases (9 depth, 10 scale, 10 ruler-lock, 8 value-cap, 13 dive-file, 12 surface),
+esp32 SUCCESS, float audit clean. Stack headroom was the thing to watch, because
+`Command` is a value on the uart2 task's stack: `u2stk=` bottomed at **3088** in this
+run and **3088** in the run before it, and `stk=` at 1040 in both, so the 16 extra bytes
+are invisible against a 512-byte floor — measured, not assumed.
 
 ### Calibration honesty: the reply is a receipt, so the verdict is its own row
 
@@ -960,10 +1040,10 @@ test had ever asserted: the refusal says **why** (`dive active` — a diver told
 closed dive really does open a second dive, which is what a dive log's two headers
 depend on.
 
-Gate after all of it, on the flashed build: native **258**, `hw_accept.py
---dive-persist` **136 checks 0 failures**, `web_probe.py` **62**, `--selftest`
-**54** lying cases (9 depth, 10 scale, 10 ruler-lock, 13 dive-file, 12 surface),
-esp32 SUCCESS, float audit clean.
+Gate at that point, on the flashed build: native **258**, `hw_accept.py
+--dive-persist` **136 checks 0 failures**, `web_probe.py` **62**, `--selftest` **54**
+lying cases (9 depth, 10 scale, 10 ruler-lock, 13 dive-file, 12 surface), esp32
+SUCCESS, float audit clean. The numbers as of now are in the C2 block at the top.
 
 **What the surface check cannot see, and the leg that can.** At the surface the
 depth is centimetres, so the whole legal density range moves it by 0.004 m:

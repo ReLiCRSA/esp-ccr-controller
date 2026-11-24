@@ -250,8 +250,14 @@ outright.
 important for `AP_SSID`/`AP_PASS`). Reply `OK`, or `OK SAFETY` when the key is
 safety-relevant (the client should event-log these), or:
 `ERR dive locked` (key is frozen while a dive runs), `ERR bad value`,
-`ERR unknown key`, and registry validation reasons (`wants ON/OFF`,
-`value too long`, `value too short`).
+`ERR unknown key`, `ERR key too long`, and registry validation reasons
+(`wants ON/OFF`, `value too long`, `value too short`).
+
+A value is **never quietly shortened**: the parser carries up to 39 characters and
+answers `ERR value too long` beyond that, so what the registry validates is exactly
+what the client sent (§8 for the defect this replaced — a 23-character parser field
+behind an 8..31-character published range). Whatever refused, the key's value did not
+move; a client that needs certainty reads the key back.
 
 The authoritative key list with types, ranges and flags is **self-describing at
 runtime via `GET SCHEMA`** — build the handset settings UI from that, not from
@@ -668,15 +674,35 @@ dive and was rewritten afterwards.
 2. **Unknown uplink** always answers `ERR unknown command` — never silent.
 3. **Unknown downlink** lines must be ignored by clients (defensive: forward
    compatibility).
-4. Refusal strings are stable words (`dive locked`, `predive required`, …) —
-   match the leading words, not full-sentence equality, when reacting.
+4. Refusal strings are stable words (`dive locked`, `predive required`,
+   `wifi locked in dive`, `cal locked in dive`, `out of range`, `needs integer`,
+   `not a number`, `value too long`, `key too long`, `unknown key`, `line too
+   long`, …) — match the leading words, not full-sentence equality, when reacting.
+   Words are per RULE, not per failure: reacting to `out of range` as if it were
+   `dive locked` means waiting for a surface when the value was simply invalid.
 5. The controller console heartbeat (`HB st=...`) is a debug line on the USB
    serial console, **not** part of this protocol — do not parse it from UART2.
 
 ## 8. Known current limits (truthful as of this revision)
 
-* `SET` values are truncated to 23 characters by the command parser, even
-  though `AP_PASS` allows 31 — keep passphrases ≤23 for now.
+* **A `SET` value is never truncated** (fixed 2026-11-24; it was, and silently). The
+  command parser carried 23 characters of value while `AP_PASS` published 8..31, so a
+  passphrase of 24..31 characters answered `OK` and stored something SHORTER than the
+  client sent: the access point then ran on a key the diver never typed, and the only
+  clue was a `GET AP_PASS` read-back that came back short. Now a value of up to **39
+  characters** is carried whole (the parser's field) and anything longer is refused —
+  `ERR value too long`, the same phrase the registry uses when a value exceeds a key's
+  own declared length, so a client matches one vocabulary at either layer. Client
+  rule: send what the `K,` line publishes, and never shorten a value locally to fit —
+  a client that truncates is recreating the defect. Both caps are pinned at compile
+  time against the registry, and a host case walks every published key asserting that
+  its maximum-length value survives the parser intact.
+* **Refusal words name the rule that refused.** `ERR line too long` is the 64-character
+  LINE cap (`proto::MAX_LINE`, whole line dropped, never truncated-and-run);
+  `ERR value too long` is the FIELD cap inside a line. They are different rules and a
+  check that accepts either is testing the wrong one. The same lesson in the other
+  direction applies to range endpoints: `ERR out of range` is the registry refusing a
+  value, not a lock refusing a key.
 * **Numeric ranges are inclusive at both ends, and the endpoints are reachable**
   (fixed 2026-11-24; they were not before). Until then the value was parsed as a
   `double` and compared against a `float` bound, which promotes the bound and moves
@@ -685,12 +711,11 @@ dive and was rewritten afterwards.
   minimum of `0.990`, and **13 of the 30 numeric keys** had an unreachable endpoint:
   SP1…SP4 (min 0.20), `SP_HYST` 0.1, `ALLO_LOW` 0.05, `CAL_O2_FI` 0.85,
   `CAL_O2_TARGET` 0.80, `CELLPROOF_MAXSP` 0.60, `WATER_DENSITY` 0.990 (mins), and
-  `ALLO_CUTOFF` 1.80, `CELLPROOF_SP` 1.40, `CELLPROOF_MIN` 1.30 (maxes). Client
-  rule: a handset
-  or page may offer exactly the `K,` line's min and max, and a host case now walks
-  every key asserting both endpoints parse. Corollary for anyone writing a check
-  about a *refusal*: do not pick a range endpoint as your probe value, or an
-  unrelated refusal looks like the one you were testing for.
+  `ALLO_CUTOFF` 1.80, `CELLPROOF_SP` 1.40, `CELLPROOF_MIN` 1.30 (maxes). Client rule:
+  a handset or page may offer exactly the `K,` line's min and max, and a host case
+  walks every key asserting both endpoints parse. Corollary for anyone writing a check
+  about a *refusal*: do not pick a range endpoint as your probe value, or an unrelated
+  refusal looks like the one you were testing for.
 * `LOG EXPORT n`: `n` is the slot number itself, 0..10. `LOG EXPORT 0` answers
   `ERR no such dive` (deliberate: that is what v1 did). The upper bound is the
   firmware's own `logfmt::MAX_DIVE_SLOTS`, not a number copied into the parser:

@@ -68,8 +68,13 @@ bool parseCommand(const char* line, Command& out, const char** err) {
 
     if (std::strcmp(verb, "GET") == 0) {
         out.kind = Kind::GET;
-        if (*rest) copyField(out.key, sizeof(out.key), const_cast<char*>(tok(const_cast<char*>(rest), &rest)));
-        else copyField(out.key, sizeof(out.key), "*");
+        if (*rest) {
+            const char* k = tok(const_cast<char*>(rest), &rest);
+            if (std::strlen(k) >= sizeof(out.key)) { *err = "key too long"; return false; }
+            copyField(out.key, sizeof(out.key), k);
+        } else {
+            copyField(out.key, sizeof(out.key), "*");
+        }
         return true;
     }
     if (std::strcmp(verb, "SET") == 0) {
@@ -84,10 +89,20 @@ bool parseCommand(const char* line, Command& out, const char** err) {
         *eq = '\0';
         size_t klen = std::strlen(kv);
         while (klen && (kv[klen - 1] == ' ' || kv[klen - 1] == '\t')) kv[--klen] = '\0';
+        // Never truncate, on either side of the '='. A parser that shortens the
+        // text before the registry sees it can turn a refusal into an accept:
+        // `AP_PASS` published 8..31 while this field was 24 bytes, so typing the
+        // length the device advertised answered `OK` and stored a different
+        // passphrase (2026-11-24, PLAN 16). Refusing is also the same verdict the
+        // line reader takes for an over-long LINE — dropped whole, never
+        // truncated-and-run — and `value too long` is the registry's own phrase,
+        // so a client matches one vocabulary across both layers.
+        if (klen >= sizeof(out.key)) { *err = "key too long"; return false; }
         copyField(out.key, sizeof(out.key), kv);
         const char* val = eq + 1;
         while (*val == ' ' || *val == '\t') ++val;
         if (!*val) { *err = "SET empty value"; return false; }
+        if (std::strlen(val) >= sizeof(out.value)) { *err = "value too long"; return false; }
         copyField(out.value, sizeof(out.value), val);
         if (!validKey(out.key)) { *err = "bad key"; return false; }
         return true;

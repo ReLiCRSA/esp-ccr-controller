@@ -94,6 +94,14 @@ when keys are added. Useful details:
   (then `min`/`max` are lengths).
 * `flags` bit 0 → dive-locked: grey the control out while a dive is running.
   bit 1 → safety: log the change locally, the controller replies `OK SAFETY`.
+* Send the `K,` line's own limits, and **never truncate a value on the client side
+  to make it fit**. The controller carries a value up to 39 characters and answers
+  `ERR value too long` past that; the registry answers the same words when a value
+  exceeds a key's declared length (`AP_PASS` is 8..31 characters). Until
+  2026-11-24 the controller's own parser carried 23, so a longer passphrase was
+  stored short and answered `OK` — a client that shortened it first would be
+  recreating that defect, and a diver would be locked out of his own access point.
+  When you need to know whether a refused write took effect, read the key back.
 * If your handset **displays depth**, read `WATER_DENSITY` back instead of
   assuming 1.025: it is the single density behind the metres in `T,`, the
   setpoint tiers and the deco plan, so a dive file's depths mean whatever that

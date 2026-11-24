@@ -27,6 +27,12 @@
 //
 // NDL/ceiling honesty: Deco::ndlMin == -1 means "unknown, no valid vote" —
 // display it as "---", never as 0 and never as unlimited.
+//
+// WALL CLOCK: the controller has no RTC chip and its access point has no
+// uplink, so a client at the surface is its time source — `timeSet(epoch)`,
+// `getTime()`, `onClock`. A handset that keeps time itself should set the
+// controller's clock at every link-up, and should show `Clock::epoch == 0` to
+// the diver as "dives will be undated". See spec §3 and Clock below.
 // ============================================================================
 #pragma once
 
@@ -70,8 +76,46 @@ struct Proof { int state;                    // 0 INACTIVE 1 IDLE 2 ARMED 3 RUNN
 struct Fault { bool stuckOpenLatched, outputFuseTripped; float solDutyPct; };
 
 struct Setting { char key[24]; char value[40]; };      // "KEY=value" answers
-struct LogEntry { int slot; uint32_t epoch; };
-struct DiveHeader { int slot; uint32_t startEpoch; int version; };
+// `L,<slot>,<epoch>,<seq>`. `seq` is the fourth field, appended 2026-11-24;
+// 0 means the dive predates the field (or the controller is older), and 0 is
+// also what the firmware's own FIFO treats as "unknown, evict first". It exists
+// because on a board with no clock every dive carries epoch 0, and a handset
+// then has ten dives and no way to say which is the newest. The controller
+// lists newest-written first — sort by seq yourself if you read a different
+// order from an older controller.
+struct LogEntry { int slot; uint32_t epoch; uint32_t seq; };
+
+// `DIVE,<slot>,<epoch>,<dive_ver>,<row_ver>,<iso>` — the first line of a
+// `LOG EXPORT` dive. `rowFormat` and `iso` are the appends: 0 and "" mean the
+// controller did not send them (older firmware). `iso` is `clock-unset` for a
+// dive that has no date, never 1970-01-01: an undated dive must look undated.
+struct DiveHeader { int slot; uint32_t startEpoch; int version;
+                    int rowFormat; char iso[24]; };
+
+// `TIME,<epoch>,<source>,<age_s>` — the controller's wall clock. There is no
+// RTC chip and the access point has no uplink, so a client at the surface IS
+// the time source (spec §3 "Wall clock"): if your handset can keep time, it
+// should set the controller's, because a dive logged without it carries no
+// date. epoch 0 = there is no clock, which is an answer, not a 1970 date.
+struct Clock {
+    uint32_t epoch;
+    uint8_t source;    // 0 never set since power-up, 1 set by a command,
+                       // 2 carried across a reset the FIRMWARE performed on
+                       // itself (panic/watchdog/SAFE ACK). It does NOT survive
+                       // the EN pin or a battery pull — measured on the bench
+                       // 2026-11-24: EN is a CHIP_PU power-down on this board.
+    uint32_t ageS;     // seconds since the clock was last set
+};
+
+// Accepted `TIME SET` window, mirroring `src/comms/wallclock.h`. A
+// plausible-looking wrong epoch is worse than no epoch — it puts a dive in 1970
+// or 2200 and every reader of the log believes it — so the controller refuses
+// anything outside it, and so does `Link::timeSet()` below, before the bytes
+// reach the wire. Keep these two definitions in step; the conformance suite
+// feeds the firmware's own `ERR epoch out of range` and pins both bounds.
+constexpr uint32_t kMinEpoch = 946684800u;    // 2000-01-01T00:00:00Z
+constexpr uint32_t kMaxEpoch = 4102444800u;   // 2100-01-01T00:00:00Z
+inline bool saneEpoch(uint32_t e) { return e >= kMinEpoch && e <= kMaxEpoch; }
 
 struct SchemaEntry {
     char key[24];
@@ -98,6 +142,7 @@ struct Handlers {
     void (*onFault)(const Fault&, void*) = nullptr;
     void (*onLogList)(const LogEntry&, void*) = nullptr;
     void (*onDiveHeader)(const DiveHeader&, void*) = nullptr;
+    void (*onClock)(const Clock&, void*) = nullptr;
     // Everything else: CSV export rows (S,/M,), HIST, lines, WebSocket '#'
     // markers, and any line a future controller adds. Observing is optional;
     // ignoring is always safe.
@@ -239,22 +284,47 @@ inline bool parseLogList(const char* line, LogEntry& e) {
     if (!starts(line, "L,")) return false;
     char buf[48];
     std::strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
-    char* f[3];
-    if (split(buf, f, 3) < 3) return false;
+    char* f[4];
+    const int n = split(buf, f, 4);
+    if (n < 3) return false;
     e.slot = static_cast<int>(pl(f[1]));
     e.epoch = static_cast<uint32_t>(pl(f[2]));
+    // A controller that predates the field still parses; seq 0 = unknown order.
+    e.seq = n >= 4 ? static_cast<uint32_t>(pl(f[3])) : 0u;
     return true;
 }
 
 inline bool parseDiveHeader(const char* line, DiveHeader& h) {
     if (!starts(line, "DIVE,")) return false;
+    // The v3 row is 45 bytes at worst ("DIVE,10,4294967295,3,3,9999-12-31T23:59:59Z"),
+    // so 64 here is the firmware's own bound, not a guess.
     char buf[64];
     std::strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
-    char* f[4];
-    if (split(buf, f, 4) < 4) return false;
+    char* f[6];
+    const int n = split(buf, f, 6);
+    if (n < 4) return false;
     h.slot = static_cast<int>(pl(f[1]));
     h.startEpoch = static_cast<uint32_t>(pl(f[2]));
     h.version = static_cast<int>(pl(f[3]));
+    h.rowFormat = n >= 5 ? static_cast<int>(pl(f[4])) : 0;
+    h.iso[0] = '\0';
+    if (n >= 6) {
+        std::strncpy(h.iso, f[5], sizeof(h.iso) - 1);
+        h.iso[sizeof(h.iso) - 1] = '\0';
+    }
+    return true;
+}
+
+inline bool parseClock(const char* line, Clock& c) {
+    if (!starts(line, "TIME,")) return false;
+    char buf[48];
+    std::strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+    char* f[4];
+    const int n = split(buf, f, 4);
+    if (n < 3) return false;              // TIME,<epoch>,<source>[,<age_s>]
+    c.epoch = static_cast<uint32_t>(pl(f[1]));
+    c.source = static_cast<uint8_t>(pl(f[2]));
+    c.ageS = n >= 4 ? static_cast<uint32_t>(pl(f[3])) : 0u;
     return true;
 }
 
@@ -385,6 +455,21 @@ public:
     bool logExport(int slot)   { char b[24]; std::snprintf(b, sizeof b, "LOG EXPORT %d", slot); return send(b); }
     bool wifiOn()              { return send("WIFI ON"); }
     bool wifiOff()             { return send("WIFI OFF"); }
+    bool getTime()             { return send("GET TIME"); }
+    // `TIME SET <epoch>`: the controller has no RTC, so this client IS the time
+    // source (spec §3). Out-of-window epochs are refused HERE, with no bytes on
+    // the wire: a handset whose own timekeeping has gone to soup should hear it
+    // from its own code, not as an `ERR epoch out of range` it has to be
+    // listening for. The controller refuses them too — this is a second gate,
+    // not a replacement for the first. A handset with a real RTC should set the
+    // clock at every link-up: an undated dive is honest but useless to a diver
+    // who wants to know which day it was.
+    bool timeSet(uint32_t epoch) {
+        if (!saneEpoch(epoch)) return false;
+        char b[32];
+        std::snprintf(b, sizeof b, "TIME SET %lu", static_cast<unsigned long>(epoch));
+        return send(b);
+    }
 
 private:
     void call(void (*fn)(const char*, void*), const char* a) { if (fn) fn(a, h_.ctx); }
@@ -418,6 +503,10 @@ private:
             LogEntry l; if (parseLogList(line, l)) { callS<LogEntry>(h_.onLogList, l); return; }
         } else if (starts(line, "DIVE,")) {
             DiveHeader h; if (parseDiveHeader(line, h)) { callS<DiveHeader>(h_.onDiveHeader, h); return; }
+        } else if (starts(line, "TIME,")) {
+            // Before the KEY=value fallback: a `TIME,` answer has no '=', so it
+            // would otherwise be counted as an unknown line.
+            Clock c; if (parseClock(line, c)) { callS<Clock>(h_.onClock, c); return; }
         } else if (starts(line, "K,")) {
             SchemaEntry s; if (parseSchema(line, s)) { callS<SchemaEntry>(h_.onSchema, s); return; }
         }

@@ -22,6 +22,12 @@
 //     duplicating the latch logic here would drift from the controller.
 //   * Alarms on link silence (>3 s with no line at all) — this is the failure
 //     a wired handset is most likely to suffer in water.
+//   * Shows the controller's wall clock, and can set it. The controller has no
+//     RTC chip and its AP has no uplink, so a surface client IS the time
+//     source. This example board has no RTC of its own, so the operator types
+//     the epoch on the handset's console; a handset that does have a clock
+//     (DS3231, GNSS, a phone) should call hsLink.timeSet() at every link-up,
+//     and everything else here stays as it is.
 //   * Two-press confirmation on DIVE START / DIVE END: those two commands
 //     start and stop the recording, so one brush of a button must not.
 //   * No dynamic memory, no RTOS tricks, one loop().
@@ -64,6 +70,8 @@ struct View {
     uint32_t events = 0, schemaKeys = 0, unknown = 0;
     uint8_t alarmSeen = 0;         // flags that were set on the last T,
     bool predivePassed = false;
+    hs::Clock clk{};               // the controller's wall clock (TIME,)
+    bool haveClock = false;        // answered at least once since boot
 } view;
 
 // A callback writer: hs::Link calls this for every command it sends.
@@ -108,6 +116,49 @@ static void onLine(const char* line, void* ctx) {
 }
 static void onLinkDown(void* ctx) { static_cast<View*>(ctx)->linkUp = false; }
 static void onLinkUp(void* ctx) { static_cast<View*>(ctx)->linkUp = true; }
+static void onClock(const hs::Clock& c, void* ctx) {
+    // epoch 0 is an ANSWER, not a date: it means "nothing has set the clock
+    // since this power-up", and every dive from now on carries no date. Say so
+    // on screen rather than letting the diver read 01/01/1970 later.
+    View& v = *static_cast<View*>(ctx);
+    v.clk = c;
+    v.haveClock = true;
+}
+
+// ---- the clock, from the handset's own console ------------------------------
+// No RTC on this board, so the operator supplies the epoch: type the unix time
+// on the handset's USB serial and press Enter. Non-blocking, digits only.
+//
+// A handset that DOES keep time should do this by itself (at every link-up,
+// and again if `GET TIME` reports epoch 0): an undated dive is honest but
+// useless to a diver who wants to know which day it was.
+static char epochIn[16];
+static size_t epochLen = 0;
+
+static void pollConsole() {
+    while (Serial.available()) {
+        const int c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (!epochLen) continue;
+            epochIn[epochLen] = '\0';
+            const unsigned long e = strtoul(epochIn, nullptr, 10);
+            // timeSet() refuses, without sending, anything outside the window
+            // the controller itself enforces — so a typo here cannot date the
+            // dive log with a wrong number.
+            if (hsLink.timeSet(static_cast<uint32_t>(e)))
+                Serial.printf("clock: sending TIME SET %lu\n", e);
+            else
+                Serial.printf("clock: %lu rejected (want 2000-01-01..2100-01-01)\n", e);
+            epochLen = 0;
+            continue;
+        }
+        if (c >= '0' && c <= '9') {
+            if (epochLen + 1 < sizeof(epochIn)) epochIn[epochLen++] = static_cast<char>(c);
+        } else if (c == 8 || c == 127) {          // backspace
+            if (epochLen) --epochLen;
+        }
+    }
+}
 
 // ---- buttons: non-blocking, debounced, edge-detected ------------------------
 // The debounce is a member, not a top-level function, and that is not style:
@@ -205,6 +256,14 @@ static void draw() {
         if (t.flags & (1 << 5)) Serial.printf(" CLAMP");
         if (t.flags & (1 << 6)) Serial.printf(" PROOF-FAIL");
     }
+    // The clock is a dive-log property, so it lives on the main line: a diver
+    // who cannot see "no clock" cannot act on it before the next dive.
+    if (!view.haveClock) Serial.printf("  clock ?");
+    else if (view.clk.epoch == 0) Serial.printf("  ** NO CLOCK: dives undated **");
+    else {
+        Serial.printf("  clock +%lus", static_cast<unsigned long>(view.clk.ageS));
+        if (view.clk.source == 2) Serial.printf("(carried across a reset)");
+    }
     if (!view.linkUp) Serial.printf("   *** LINK DOWN ***");
     if (view.lastErr[0]) { Serial.printf("  ERR:%s", view.lastErr); view.lastErr[0] = 0; }
     else if (view.lastNote[0]) { Serial.printf("  (%s)", view.lastNote); view.lastNote[0] = 0; }
@@ -231,6 +290,7 @@ void setup() {
     h.onSchema = onSchema;
     h.onPre = onPre;
     h.onLine = onLine;
+    h.onClock = onClock;
     h.onLinkDown = onLinkDown;
     h.onLinkUp = onLinkUp;
     hsLink.begin(putLine, nullptr, h);
@@ -239,7 +299,9 @@ void setup() {
     // table (spec §6): a handset that does this keeps working when keys change.
     hsLink.getSchema();
     hsLink.getPre();
+    hsLink.getTime();             // do we have a clock at all? (spec §3)
     Serial.println("ESP-CCR handset up");
+    Serial.println("clock unset? type the unix epoch and Enter, e.g. 1795517641");
 }
 
 void loop() {
@@ -281,6 +343,15 @@ void loop() {
     // periodic housekeeping: keep the pre-dive picture fresh until it passes
     static uint32_t lastPreMs = 0;
     if (!view.predivePassed && now - lastPreMs > 5000) { lastPreMs = now; hsLink.getPre(); }
+
+    // ... and keep the clock picture fresh: ask often while there is no clock,
+    // slowly once there is one. (A battery pull or an EN cycle clears it.)
+    pollConsole();
+    static uint32_t lastClockMs = 0;
+    if (view.linkUp && now - lastClockMs > (view.clk.epoch ? 60000u : 10000u)) {
+        lastClockMs = now;
+        hsLink.getTime();
+    }
 
     alarmPattern(now);
     runBuzzer(now);

@@ -544,7 +544,7 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done `1b8c807`, page tabs working since `70049fa` |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done `73e004d` (tag `m4-deco-validated`) |
-| M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done `acfada8` — **183/183 native**, both esp32 builds clean. The protocol contract is now verified against real firmware on real wires: the C2 matrix runs over the bench bridge on 16/17 (48 checks), and `web_probe.py` proves the same lines over `/ws`. Never yet flashed: the example handset board itself. |
+| M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done `acfada8` — **183/183 native**, both esp32 builds clean. The protocol contract is now verified against real firmware on real wires: the C2 matrix runs over the bench bridge on 16/17 (48 checks), and `web_probe.py` proves the same lines over `/ws`. Never yet flashed: the example handset board itself. **Caught up 2026-11-24** with the clock batch (`7f98a2c`), which had reached the spec and the firmware but not the package: `timeSet`/`getTime`/`onClock` + `Clock`, `LogEntry::seq` (the fourth `L,` field; a legacy three-field line still parses, `seq 0` = unknown order), `DiveHeader::rowFormat`/`iso` (`clock-unset` passes through verbatim), `timeSet`'s epoch window enforced client-side too — mirroring `wallclock::sane`, refusing **without sending** — a README section on being the time source, and the example firmware now carries the clock state on its main line (`** NO CLOCK: dives undated **`) and can set it from its own console. 14 conformance cases, fed literals **captured off the bench link** (`TIME,1795518150,1,509`, `L,7,1795517641,27`, `L,6,0,26` — an undated dive, `DIVE,10,1795516836,3,3,2026-11-24T10:40:36Z`) rather than literals typed from the spec's grammar; four library mutations (drop the `TIME,` dispatch, drop `L,`'s fourth field, drop the dated `DIVE,` fields, drop the epoch gate) turned five cases red, each with the matching reason. The bench bridge runs this same library as a live observer: reflashed with it, the C2 short gate stayed green (53 checks, 0 failures) |
 | M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `-DBRIDGE_TAP=1` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image | done `233ad2c`, **and the bench link is live**: the bridge is flashed and the C2 refusal matrix has been run over it many times (48 checks, 0 failures), with the client library on the bridge side watching the same stream. Two facts the wiring taught, both now in 16 and `BENCH.md`: opening the bridge's serial port resets it and its boot banner lands in the controller's line buffer, where un-terminated bytes are glued onto the next command, so `hw_accept.py` and `web_probe.py` send a newline first and discard what it draws; and both CP2102s report the same `/dev/serial/by-id`, so an upload must name `--upload-port`. `tools/port_id.py` (`--loopback` jumper test, boot-time UART2 self-test in the tap build) stays as the bisect path if the link ever goes silent again |
 
 ## 16. Design watch-outs (recorded decisions)
@@ -1368,3 +1368,32 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
     power-up.** `hw_accept.py` does it in the refusal matrix, and
     `--dive-persist` asserts the whole chain — dive stamped with a real
     epoch, boot after the reset says `clock: ... (carried across a reset...)`.
+- **The contract document and the client package drift apart, and the drift is
+  invisible to every suite (found by reading, 2026-11-24).** The dive-log batch
+  added `TIME SET`, `GET TIME`, the `TIME,` answer, the fourth `L,` field and
+  the dated `DIVE,` row. The spec described all of them, the firmware emitted
+  all of them, the bench gates asserted all of them — and `handset/handset_link.h`
+  knew none of them: no way to set the clock, no way to see dive order, no way
+  to read a dive's date. Nothing failed. That package exists so a handset can
+  be built **by someone else from the contract**, so the gap was not
+  cosmetic: a third-party handset built the week's "correct" way could date
+  nothing and order nothing, and `test_handset` would have certified it,
+  because the suite pins the library against wire literals — from the last time
+  someone updated it. Two rules come out of this, both now in force:
+  * **A protocol-visible addition lands in ONE commit across the whole
+    package** — spec, client library, example firmware, README and the
+    conformance suite. The firmware and the spec agreeing is not the invariant;
+    the firmware and every published client of it agreeing is.
+  * **The suite's literals are captured off the wire, not typed from the
+    spec.** A literal copied from the grammar proves the parser matches the
+    grammar; a literal copied from the board proves it matches the controller.
+    The 2026-11-24 refresh used `TIME,1795518150,1,509`, `L,7,1795517641,27`,
+    `L,6,0,26` (a real undated dive) and
+    `DIVE,10,1795516836,3,3,2026-11-24T10:40:36Z`, all read from the bench
+    link first. It also retired two stale literals the suite had been passing
+    on (`L,3,1764123456`, `DIVE,3,1764123456,1`): both are kept **as legacy
+    cases** — a v1 client must still parse a pre-append controller — which is
+    the difference between an out-of-date test and a compatibility test.
+  The same drift is what §16's "`OK` is about the command, not the effect"
+  entry is about, seen from the other side: a contract is only worth the
+  weakest published client of it.

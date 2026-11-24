@@ -19,7 +19,7 @@ Link link;
 struct Captured {
     int telemetry = 0, deco = 0, events = 0, ok = 0, err = 0;
     int settings = 0, schema = 0, pre = 0, cells = 0, proof = 0, fault = 0;
-    int logList = 0, diveHeader = 0, raw = 0, linkDown = 0, linkUp = 0;
+    int logList = 0, diveHeader = 0, clock = 0, raw = 0, linkDown = 0, linkUp = 0;
     Telemetry t{};
     Deco d{};
     Event e{};
@@ -31,6 +31,7 @@ struct Captured {
     Fault fa{};
     LogEntry le{};
     DiveHeader dh{};
+    Clock ck{};
     char okNote[64] = {0}, errReason[64] = {0}, rawLine[1200] = {0};
 };
 Captured cap;
@@ -49,6 +50,7 @@ void hProof(const Proof& p, void*) { cap.pr = p; cap.proof++; }
 void hFault(const Fault& f, void*) { cap.fa = f; cap.fault++; }
 void hLog(const LogEntry& l, void*) { cap.le = l; cap.logList++; }
 void hDive(const DiveHeader& h, void*) { cap.dh = h; cap.diveHeader++; }
+void hClock(const Clock& c, void*) { cap.ck = c; cap.clock++; }
 void hRaw(const char* l, void*) { std::strncpy(cap.rawLine, l, 1199); cap.raw++; }
 void hDown(void*) { cap.linkDown++; }
 void hUp(void*) { cap.linkUp++; }
@@ -64,7 +66,7 @@ void reset() {
     h.onTelemetry = hTel; h.onDeco = hDeco; h.onEvent = hEv;
     h.onOk = hOk; h.onErr = hErr; h.onSetting = hSet; h.onSchema = hSc;
     h.onPre = hPre; h.onCells = hCells; h.onProof = hProof; h.onFault = hFault;
-    h.onLogList = hLog; h.onDiveHeader = hDive; h.onLine = hRaw;
+    h.onLogList = hLog; h.onDiveHeader = hDive; h.onClock = hClock; h.onLine = hRaw;
     h.onLinkDown = hDown; h.onLinkUp = hUp;
     link.begin(writer, nullptr, h);
     sent[0] = 0;
@@ -153,15 +155,130 @@ void test_parse_schema_log_dive() {
     TEST_ASSERT_EQUAL_CHAR('S', cap.sc.type);
     TEST_ASSERT_EQUAL_STRING("diveonly", cap.sc.defStr);
 
-    link.feedText("L,3,1764123456\n");
-    TEST_ASSERT_EQUAL_INT(3, cap.le.slot);
+    // current firmware literals (captured off the bench link, 2026-11-24)
+    link.feedText("L,7,1795517641,27\n");
+    TEST_ASSERT_EQUAL_INT(7, cap.le.slot);
+    TEST_ASSERT_EQUAL_UINT32(27u, cap.le.seq);
 
-    link.feedText("DIVE,3,1764123456,1\n");
-    TEST_ASSERT_EQUAL_INT(3, cap.dh.slot);
+    link.feedText("DIVE,7,1795517641,3,3,2026-11-24T11:47:21Z\n");
+    TEST_ASSERT_EQUAL_INT(7, cap.dh.slot);
+    TEST_ASSERT_EQUAL_INT(3, cap.dh.version);
+    TEST_ASSERT_EQUAL_INT(3, cap.dh.rowFormat);
+    TEST_ASSERT_EQUAL_STRING("2026-11-24T11:47:21Z", cap.dh.iso);
 
     // dive CSV rows and HIST lines land in onLine (documented, not structured)
     link.feedText("S,120,18.35,0.712,0.708,0.715,0.711,0.700,0x0010,3,6.00,17,24,4,12.41\n");
     TEST_ASSERT_EQUAL_INT(1, cap.raw);
+}
+
+// The clock is protocol-visible and the client package had not been carrying it
+// (2026-11-24): TIME SET / GET TIME / TIME,. Literals below are what the board
+// actually answered on the bench link, not what the spec's grammar suggests.
+void test_parse_clock_line() {
+    link.feedText("TIME,1795518150,1,509\n");        // set by a command, 509 s ago
+    TEST_ASSERT_EQUAL_INT(1, cap.clock);
+    TEST_ASSERT_EQUAL_UINT32(1795518150u, cap.ck.epoch);
+    TEST_ASSERT_EQUAL_UINT8(1, cap.ck.source);
+    TEST_ASSERT_EQUAL_UINT32(509u, cap.ck.ageS);
+
+    // The honest "no clock" answer: epoch 0, NOT a 1970 date. A handset that
+    // renders this as 01/01/1970 is lying to the diver about their own log.
+    reset();
+    link.feedText("TIME,0,0,0\n");
+    TEST_ASSERT_EQUAL_INT(1, cap.clock);
+    TEST_ASSERT_EQUAL_UINT32(0u, cap.ck.epoch);
+    TEST_ASSERT_EQUAL_UINT8(0, cap.ck.source);
+
+    // carried across a reset the firmware performed on itself
+    reset();
+    link.feedText("TIME,1795517641,2,86400\n");
+    TEST_ASSERT_EQUAL_UINT8(2, cap.ck.source);
+    TEST_ASSERT_EQUAL_UINT32(86400u, cap.ck.ageS);
+
+    // `TIME SET` answers `OK TIME`: the note matters, "TIME" is how the handset
+    // knows the clock write is the OK it was waiting for.
+    reset();
+    link.feedText("OK TIME\n");
+    TEST_ASSERT_EQUAL_INT(1, cap.ok);
+    TEST_ASSERT_EQUAL_STRING("TIME", cap.okNote);
+
+    // and the refusal, which a handset must be able to show
+    reset();
+    link.feedText("ERR epoch out of range\n");
+    TEST_ASSERT_EQUAL_STRING("epoch out of range", cap.errReason);
+}
+
+// `L,` gained a fourth field because ten dives that all carry epoch 0 cannot be
+// ordered; the library must read it AND keep parsing an older controller's
+// three-field line (append-only, spec §7).
+void test_log_list_sequence_and_legacy_shape() {
+    link.feedText("L,7,1795517641,27\n");            // dated, newest first
+    TEST_ASSERT_EQUAL_INT(7, cap.le.slot);
+    TEST_ASSERT_EQUAL_UINT32(1795517641u, cap.le.epoch);
+    TEST_ASSERT_EQUAL_UINT32(27u, cap.le.seq);
+
+    link.feedText("L,6,0,26\n");                     // undated dive, still ordered
+    TEST_ASSERT_EQUAL_UINT32(0u, cap.le.epoch);
+    TEST_ASSERT_EQUAL_UINT32(26u, cap.le.seq);
+
+    reset();
+    link.feedText("L,3,1764123456\n");               // pre-sequence controller
+    TEST_ASSERT_EQUAL_INT(1, cap.logList);
+    TEST_ASSERT_EQUAL_INT(3, cap.le.slot);
+    TEST_ASSERT_EQUAL_UINT32(1764123456u, cap.le.epoch);
+    TEST_ASSERT_EQUAL_UINT32(0u, cap.le.seq);        // 0 = unknown, like the firmware
+}
+
+// The exported dive's identity row: version, row format and the ISO date the
+// v3 row appends. `clock-unset` must survive verbatim — it is the difference
+// between "no date" and "31 December 1969".
+void test_dive_header_dated_and_legacy() {
+    link.feedText("DIVE,10,1795516836,3,3,2026-11-24T10:40:36Z\n");
+    TEST_ASSERT_EQUAL_INT(10, cap.dh.slot);
+    TEST_ASSERT_EQUAL_UINT32(1795516836u, cap.dh.startEpoch);
+    TEST_ASSERT_EQUAL_INT(3, cap.dh.version);
+    TEST_ASSERT_EQUAL_INT(3, cap.dh.rowFormat);
+    TEST_ASSERT_EQUAL_STRING("2026-11-24T10:40:36Z", cap.dh.iso);
+
+    reset();
+    link.feedText("DIVE,6,0,3,3,clock-unset\n");
+    TEST_ASSERT_EQUAL_UINT32(0u, cap.dh.startEpoch);
+    TEST_ASSERT_EQUAL_STRING("clock-unset", cap.dh.iso);
+
+    reset();
+    link.feedText("DIVE,3,1764123456,1\n");          // older row: no date field
+    TEST_ASSERT_EQUAL_INT(1, cap.diveHeader);
+    TEST_ASSERT_EQUAL_INT(1, cap.dh.version);
+    TEST_ASSERT_EQUAL_INT(0, cap.dh.rowFormat);      // unknown, not "0"
+    TEST_ASSERT_EQUAL_STRING("", cap.dh.iso);
+}
+
+// The uplink half of the clock: exact command strings, and the epoch window
+// enforced before the wire — the same window `wallclock::sane()` applies to the
+// bytes if they arrive.
+void test_clock_commands_exact_strings() {
+    TEST_ASSERT_TRUE(link.getTime());
+    TEST_ASSERT_EQUAL_STRING("GET TIME", sent);
+
+    TEST_ASSERT_TRUE(link.timeSet(1795517641u));
+    TEST_ASSERT_EQUAL_STRING("TIME SET 1795517641", sent);
+
+    // both bounds are accepted, just outside them are not
+    sent[0] = 0;
+    TEST_ASSERT_TRUE(link.timeSet(kMinEpoch));
+    TEST_ASSERT_EQUAL_STRING("TIME SET 946684800", sent);
+    sent[0] = 0;
+    TEST_ASSERT_TRUE(link.timeSet(kMaxEpoch));
+    TEST_ASSERT_EQUAL_STRING("TIME SET 4102444800", sent);
+
+    // refused client-side: nothing on the wire. A handset whose own clock has
+    // gone to soup must not be able to date the dive log with it.
+    const uint32_t bad[] = {0u, 7u, kMinEpoch - 1u, kMaxEpoch + 1u, 0xFFFFFFFFu};
+    for (uint32_t e : bad) {
+        sent[0] = 0;
+        TEST_ASSERT_FALSE_MESSAGE(link.timeSet(e), "implausible epoch must not send");
+        TEST_ASSERT_EQUAL_STRING_MESSAGE("", sent, "bytes reached the wire");
+    }
 }
 
 void test_event_lines() {
@@ -255,6 +372,10 @@ int main() {
     RUN_TEST(test_parse_status_lines);
     RUN_TEST(test_parse_replies_and_settings);
     RUN_TEST(test_parse_schema_log_dive);
+    RUN_TEST(test_parse_clock_line);
+    RUN_TEST(test_log_list_sequence_and_legacy_shape);
+    RUN_TEST(test_dive_header_dated_and_legacy);
+    RUN_TEST(test_clock_commands_exact_strings);
     RUN_TEST(test_event_lines);
     RUN_TEST(test_unknown_lines_counted_not_fatal);
     RUN_TEST(test_line_assembly_crlf_and_overflow);

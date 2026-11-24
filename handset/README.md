@@ -64,6 +64,10 @@ Rules that matter for a diver-safety device:
 * **`tick(nowMs)` every loop iteration.** The controller sends `T,` at 2 Hz;
   more than 3 s of silence is `onLinkDown`. A handset that stays quiet when
   its cable fails is worse than no handset.
+* **You are the controller's clock.** It has no RTC chip and its access point
+  has no uplink, so wall time is something a surface client hands it — see
+  "The wall clock" below. A dive logged while the clock is unset is still
+  logged, and says so (`Clock::epoch == 0`, `clock-unset` in the export).
 * **`Deco::ndlMin == -1` means unknown** (no valid cell vote yet) — render
   `---`. `480` means effectively unlimited. Never print `-1` or `0` for it.
 * **`Telemetry::flags` bit 0 (low ppO2) and bit 3 (major fault) demand an
@@ -90,6 +94,54 @@ when keys are added. Useful details:
   (then `min`/`max` are lengths).
 * `flags` bit 0 → dive-locked: grey the control out while a dive is running.
   bit 1 → safety: log the change locally, the controller replies `OK SAFETY`.
+
+## The wall clock: a surface client is the time source
+
+The controller has **no RTC chip**, and its access point has no internet
+uplink, so there is nothing for it to take time from. `TIME SET <epoch>` hands
+it one, and `GET TIME` reads it back (`TIME,<epoch>,<source>,<age_s>` →
+`onClock`). If your handset can keep time — an RTC chip, a phone, a GNSS
+module — it *should* set the controller's clock at every link-up:
+
+```cpp
+h.onClock = [](const hs::Clock& c, void*) {
+    if (c.epoch == 0) { /* show it: dives from this power-up will be undated */ }
+    // c.source: 0 never set, 1 set by a command, 2 carried across a reset the
+    // controller performed on itself. It does NOT survive the EN pin or a
+    // battery pull — on this board EN is a power-down (measured 2026-11-24).
+};
+
+if (myRtc.hasTime()) hsLink.timeSet(myRtc.unixTime());
+hsLink.getTime();                 // and show the answer to the diver
+```
+
+What the library does for you, and what it refuses to do:
+
+* `timeSet(epoch)` returns **false without sending** if the epoch is outside
+  2000-01-01 .. 2100-01-01 — the same window the controller enforces. A
+  handset whose own timekeeping has failed should find out from its own code,
+  not from an `ERR epoch out of range` it has to be listening for. The
+  controller still refuses too; this is a second gate, not a replacement.
+* `Clock::epoch == 0` is an answer, not a date. Render it as "no clock", never
+  as 01/01/1970.
+
+Set it at the surface, after **every** power-up (and after an EN cycle): an
+undated dive is honest — the log records an `E,,15` row and exports
+`clock-unset` where the date would be — but it is useless to a diver who wants
+to know which day it was. A dive that is already running keeps the stamp it was
+opened with, so a late `TIME SET` fixes the *next* dive, never the current one.
+
+### Reading the dive log from a handset
+
+`logList()` answers one `L,<slot>,<epoch>,<seq>` row per stored dive,
+**newest-written first**. `seq` is the field that makes that order verifiable
+when the clock is missing: ten dives that all carry `epoch == 0` still have ten
+different sequences. `seq == 0` means "this dive predates the field", and such
+dives list last. `logExport(slot)` then streams the dive, whose first row is
+`DIVE,<slot>,<epoch>,<dive_ver>,<row_ver>,<iso>` → `DiveHeader::iso` is the
+date (`2026-11-24T10:40:36Z`) or the literal `clock-unset`. Rows are append-only
+(older controllers give you four fields and `iso == ""`; never assume a field
+is there because the current firmware sends it).
 
 ## Verifying your handset against real firmware
 

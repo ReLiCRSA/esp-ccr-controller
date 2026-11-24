@@ -587,3 +587,10 @@ dependency) and `handset/example_esp32_handset/` (complete wiring + main
 loop). Self-certification: the controller-side suites pin every format above,
 and `tools/hw_accept.py` (host, Python) drives the same commands the handset
 sends — run it with a handset wired to see the protocol from the other side.
+
+The library carries the whole v1 surface, including the wall clock
+(`timeSet`/`getTime`/`onClock`, §3), the dive-list sequence field
+(`LogEntry::seq`, §4) and the dated export header (`DiveHeader::iso`, §5). If
+your handset keeps time, it is the controller's time source: set the clock at
+every link-up and show `epoch == 0` to the diver as "dives will be undated".
+`handset/README.md` has the working snippets.

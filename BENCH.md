@@ -18,11 +18,17 @@ fuser /dev/ttyUSB0            # must be empty; a reader here corrupts the run
 pio test -e native            # host gate, currently 206 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
-pio run -e esp32 -t uploadfs  # ONLY if data/ changed: it erases the dive logs
 tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
                                  --dive-persist
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle
 ```
+
+There is no `uploadfs` step. The web page is compiled into the app image and
+served from there; the LittleFS partition belongs to the dive logs, and writing
+it (`pio run -e esp32 -t uploadfs`) erases dive history. `data/index.html` is the
+bench's reference copy — `web_probe.py` fails unless the bytes on the wire equal
+it — not an install target. If the partition ever has to be written by hand it
+needs `--upload-port` (two identical CP2102s) and it is a destructive step.
 
 `hw_accept.py --dive-persist` closes one dive, resets the controller through the
 console's EN line and asks `LOG LIST` again: the slots must be the same ones, and
@@ -31,7 +37,10 @@ it by name — it adds ~35 s and a deliberate reboot, so it is not part of the
 short run. Reading the dive log before the first `DIVE START` of a boot used to be
 blind (the filesystem was only mounted by `DIVE START`), and the FIFO reused slot 1
 for every dive, so the board kept exactly one dive; both are in 16 and both were
-found by asking this question on the bench.
+found by asking this question on the bench. Once the FIFO holds its full ten, the
+new dive *replaces* one, so the check expects ten slots and not eleven — and it
+deliberately does not claim the replaced dive was the right one, because it was
+not (PLAN 16: with every dive stamped epoch 0 the eviction order is undecided).
 
 `web_probe.py` also compares `LOG EXPORT <n>` on the handset with
 `GET /dive/<n>.csv` over HTTP, row for row — the C2 claim that "the download
@@ -39,11 +48,34 @@ matches the handset export" had been asserted by hand since it was written and
 was false the whole time (two writers, two shapes). Both now come out of one
 formatter, and the comparison is the tripwire.
 
-`uploadfs` needs `--upload-port` on this bench (two identical CP2102s, identical
-`/dev/serial/by-id`) and it writes the whole filesystem partition, which is where
-the dive logs live — so it deletes dive history. It is only needed when the web
-page changes; with no `data/` install the firmware serves the identical built-in
-page out of app flash.
+**Fresh-filesystem leg** (run it after anything that wipes the log partition, and
+now and then just to prove the recovery path): erase the partition the dive files
+live on, then boot.
+
+```
+~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32 --port /dev/ttyUSB0 \
+    --baud 921600 erase_region 0x290000 0x160000          # LittleFS, 1 441 792 B
+```
+
+Expect, in the boot banner: `esp_littlefs: mount failed, (-84)` and
+`Corrupted dir pair at {0x0, 0x1}`, then the store's own verdict —
+
+```
+log: LittleFS mounted, 0 dives, used 8192 of 1441792 bytes  ** mounted after FORMAT: dive history erased
+```
+
+and **nothing else has to be done**: no install, no reflash. The store tries
+`LittleFS.begin(false)` first and only formats if that fails, and the
+`** mounted after FORMAT` suffix is what stops a wiped history from being
+silent. `hw_accept.py --dive-persist` asserts the suffix is *absent* after an
+ordinary reset, so a format at the wrong time fails the gate.
+
+While the log is being probed, the console also shows ten lines like
+`E (658) vfs_api: open(): /littlefs/dive10.bin does not exist, no permits for
+creation`. That is core noise, not a fault: `list()` probes the FIFO slots and the
+Arduino VFS logs a missing one at error level; asking with `LittleFS.exists()`
+first does not silence it (measured 2026-11-24 — the lines arrived anyway). The
+verdict is the `log:` line, not those.
 
 `tools/float_audit.py` is in the gate because the same bug came back once: a
 `%f`/`%g` conversion pulls in newlib's float conversion, which wants kilobytes
@@ -420,10 +452,22 @@ up a defect that no amount of flashing or code reading would have shown:
   assertion that compares the three artifacts (`web_page.h` → `sync_webdata.py`
   → `data/` → what the router picks) end to end.
 
-So: `uploadfs` matters only when the page changes, and when it runs it must say
-`littlefs.bin` in the build log. If a served page ever again disagrees with
-`data/index.html` after a correct install, reopen the LittleFS-preference
-question then; there is no evidence for it today.
+So: the page never needs installing — the built-in copy in app flash is the one
+that answers (`serveIndex` in `src/comms/web_server.cpp`, decided 2026-11-24), and
+`web_probe.py`'s byte-exact check against `data/index.html` is what proves the
+page in the repo, the page in the image and the page on the phone are the same
+bytes. The LittleFS copy of the page is now dead weight: it is never read. The
+board being flashed still holds the older 25 445-byte copy from the mismatched
+installs while serving the current 25 642-byte one — that difference is the
+preference bug, and it is the reason the preference is gone.
+
+One check that had to be repaired on the way: `/` was graded as "contains `<html`
+within the first 200 bytes". A comment at the top of the page pushed the tag to
+byte 213 and the check went red on a page that was fine — it was asserting the
+page's first two hundred bytes, not that the response is a document. It now
+requires a doctype and an `<html` tag inside 4 KiB, and was tried against an
+empty body, a plain-text error, a stripped doctype, a missing `<html`, and HTTP
+500, failing all five.
 
 ## C3-a — depth sensor: LPS28DFW on its own bus (decided 2026-11-23)
 

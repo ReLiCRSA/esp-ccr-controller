@@ -62,32 +62,48 @@ int DiveStore::nextSlot() const {
     // on the bench 2026-11-24: a boot reporting `1 dive`, a DIVE START/END cycle,
     // and the boot after it reporting `1 dive` again.
     //
-    // Ten stat()s cost microseconds and cannot be misread, so the FIFO no longer
-    // depends on how a directory iterator spells a name. Eviction still needs the
-    // start epoch, so an occupied slot is opened and its header read anyway: that
-    // is where "the oldest dive" comes from when the FIFO is full.
-    int freeSlot = 0, oldest = 0;
+    // The first free slot ends the search: finding one tells us everything DIVE
+    // START needs, so the usual case is a handful of probes and no header reads.
+    // Only a full FIFO has to open all ten, because eviction is by start epoch.
+    for (int s = 1; s <= DiveStore::kMaxDives; s++) {
+        char p[24];
+        pathFor(s, p, sizeof(p));
+        if (!LittleFS.exists(p)) return s;
+    }
+
+    int oldest = 0;
     uint32_t oldestTime = 0xFFFFFFFFu;
     for (int s = 1; s <= DiveStore::kMaxDives; s++) {
         char p[24];
         pathFor(s, p, sizeof(p));
-        if (!LittleFS.exists(p)) {
-            if (freeSlot == 0) freeSlot = s;
-            continue;
-        }
+        // Epoch 0 for anything unreadable — file that will not open, short read,
+        // failed header CRC. A dive the reader cannot get at is the one to throw
+        // away first, and it has to sort before every readable dive rather than
+        // tie with them, which is what the 0 does.
+        //
+        // What this CANNOT do, measured on the bench 2026-11-24: with no RTC every
+        // real epoch is 0 as well, so all ten keys tie, and a strict `<` keeps the
+        // first slot scanned. Every dive after the tenth then overwrites slot 1:
+        // ten 4 s dives, then 8 s, 40 s, 8 s left the board holding `8, 2, 3, 4, 5,
+        // 7, 7, 9, 10, 10` seconds — the 40 s dive was gone before the next boot.
+        // So the log keeps the nine oldest dives and the very newest, and eats each
+        // recent one. The strict `<` is not the bug; the bug is that there is no
+        // ordering identity to compare. Epoch ordering needs an epoch, and this
+        // board has no clock (no RTC, no NTP over an AP with no uplink). The fix is
+        // a monotonic dive sequence number, not a different comparison — open item,
+        // PLAN 16.
+        uint32_t epoch = 0u;
         File f = LittleFS.open(p, "r");
-        if (!f) continue;   // present but unreadable: not a slot to reuse
-        uint8_t head[HEADER_SIZE];
-        uint32_t epoch = 0xFFFFFFFFu;
-        if (f.read(head, sizeof(head)) == (int)sizeof(head)) {
+        if (f) {
+            uint8_t head[HEADER_SIZE];
             uint8_t slotChk = 0;
-            if (logfmt::unpackHeader(head, epoch, slotChk)) { /* ok */ }
-            else epoch = 0xFFFFFFFFu;   // unreadable header: evict it first
+            if (f.read(head, sizeof(head)) != (int)sizeof(head) ||
+                !logfmt::unpackHeader(head, epoch, slotChk))
+                epoch = 0u;
+            f.close();
         }
-        f.close();
         if (epoch < oldestTime) { oldestTime = epoch; oldest = s; }
     }
-    if (freeSlot) return freeSlot;
     return oldest ? oldest : 1;  // full: evict the oldest dive
 }
 
@@ -153,12 +169,13 @@ int DiveStore::list(int* slotOut, uint32_t* mtimeOut, int max) const {
     for (int s = kMaxDives; s >= 1 && n < max; s--) {  // newest-written first
         char p[24];
         pathFor(s, p, sizeof(p));
-        // stat before opening: an open of a missing file is an error the Arduino
-        // VFS prints at E level, so probing ten FIFO slots by open used to put
-        // nine "dive9.bin does not exist" lines in every boot log. On a bench
-        // where the console is the instrument, that much noise hides the one
-        // line that matters.
-        if (!LittleFS.exists(p)) continue;
+        // A missing FIFO slot is an ordinary state, but the Arduino VFS reports
+        // it as an error: `open(): /littlefs/dive9.bin does not exist, no permits
+        // for creation`, one line per empty slot. Asking with `exists()` first
+        // does not silence it — measured 2026-11-24 on a freshly erased partition,
+        // ten lines arrived anyway — so there is no cleverer probe here, just core
+        // noise. What to read at boot is the store's own verdict, `log: LittleFS
+        // mounted, N dives, used X of Y bytes` (BENCH.md), not these.
         File f = LittleFS.open(p, "r");
         if (!f) continue;
         uint8_t head[HEADER_SIZE];

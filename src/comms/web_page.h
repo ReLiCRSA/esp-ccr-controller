@@ -1,15 +1,19 @@
 // ============================================================================
-// web_page.h — the built-in status/settings UI (PLAN.md 9), served when
-// LittleFS has no /index.html.
+// web_page.h — the status/settings UI (PLAN.md 9), and the ONLY copy the
+// controller serves. It lives in app flash next to the code it talks to.
 //
 // Plain HTML/CSS/vanilla JS, one file, no framework and no CDN: the access
 // point has no internet, ever, and a page that cannot be fetched is a page
-// that cannot be read on the day it matters. Serving this built-in copy also
-// means the worst LittleFS outcome (not mounted, half-written, wiped) costs
-// the UI nothing — the phone still gets a screen.
+// that cannot be read on the day it matters. Keeping it in the firmware image
+// also means the worst LittleFS outcome (not mounted, half-written, wiped, or
+// holding a copy of the previous generation) costs the UI nothing — the phone
+// still gets the screen this build was tested with.
 //
-// The same file is extracted to data/index.html for LittleFS installs
-// (tools/sync_webdata.py), so there is exactly one source of truth.
+// The same text is extracted to data/index.html (tools/sync_webdata.py) as the
+// reference copy: `tools/web_probe.py` fetches / over the AP and requires the
+// bytes to match, which is what keeps the two in step. It is not an install
+// target — installing it means `uploadfs`, which rewrites the partition the dive
+// logs share and erases dive history.
 //
 // Protocol: every command line is answered with reply lines and then a
 // '#<n>' control line (n = number of reply lines), so the page knows when an
@@ -21,6 +25,9 @@
 
 // clang-format off
 static const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html>
+<!-- Served out of app flash, byte for byte. The filesystem copy of this page is
+     never used: updating it would mean uploadfs, and uploadfs erases the dive
+     logs on the same partition. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">

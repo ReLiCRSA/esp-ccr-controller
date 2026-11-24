@@ -60,8 +60,21 @@ ROM_RE = re.compile(r"^ets |^load:0x|^entry 0x|^rst:0x|^configsip:|SPI_FAST_FLAS
 
 
 def open_quiet(port: str):
-    """pyserial port with DTR/RTS inactive BEFORE open(): no reset pulse, no
-    download-mode latch. This is the only safe way to look at these boards."""
+    """pyserial port with DTR/RTS held low across the open.
+
+    What that buys: no download-mode latch. DTR driving IO0 is what holds the ROM
+    in the bootloader, which looks like a dead board, so keeping DTR low matters.
+
+    What it does not buy, measured on the bench 2026-11-24: it does not avoid the
+    reset. Opening either CP2102 pulses EN whatever pyserial does with the modem
+    lines — open the console and a fresh boot banner arrives inside a second,
+    every time. So a "quiet look" at the console is really "restart the controller,
+    then read its boot log". Useful, but only if it is treated that way: never
+    conclude from an open that the board rebooted by itself, and never compare
+    state across one without counting the reset in between. The docstring here
+    used to promise no reset pulse, and measurements were made on that promise:
+    dive-log state read across a port open is a state read across a reboot.
+    """
     import serial  # the pipx platformio venv has it
 
     s = serial.Serial()
@@ -114,7 +127,8 @@ def cmd_listen(args) -> int:
     if not ports:
         print("no serial ports at all — is the USB cable a DATA cable?")
         return 1
-    print(f"listening {args.listen:.0f}s per port (DTR/RTS held inactive: no resets)\n")
+    print(f"listening {args.listen:.0f}s per port (DTR/RTS held low: no "
+          f"download-mode latch, but the open still resets the board)\n")
     flashed_ok = True
     for p in ports:
         try:

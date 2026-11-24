@@ -56,6 +56,10 @@ WEB_AP_LINE = re.compile(r'^web: AP "([A-Za-z0-9_-]+)" on 192\.168\.4\.1')
 # firmware's warning: it is empty on a clean mount and says so when the mount
 # failed and the partition had to be formatted (which erases dive history).
 LOG_LINE = re.compile(r"^log: LittleFS mounted, (\d+) dives?, used (\d+) of (\d+) bytes(.*)$")
+# The firmware's own FIFO depth (logfmt::MAX_DIVE_SLOTS, src/log/divelog.h). A
+# full FIFO evicts a dive instead of growing, so "one more dive than before" is
+# only the right expectation while a slot is free.
+MAX_DIVE_SLOTS = 10
 MUST_NONE = [
     (re.compile(r"SAFE MODE"), "SAFE boot"),
     (re.compile(r"FATAL"), "FATAL line"),
@@ -485,9 +489,19 @@ def run_dive_persist(console, port, baud, watch, settle=1.5):
     new_boot = watch[mark:]
     ll = next((l for l in new_boot if LOG_LINE.search(l)), None)
 
+    # A closed dive must appear in the list. The count only has to grow while a
+    # slot is free: the FIFO holds ten dives and a full one evicts, so once it is
+    # full the set stays at ten and the new dive replaces an old one. Asserting
+    # "+1" in the full case would fail a run that worked as designed — and the
+    # eviction order itself is an open question (PLAN 16), not something this
+    # check is allowed to quietly bless.
+    want = min(len(before) + 1, MAX_DIVE_SLOTS)
     checks.append(("dive closed this run is in LOG LIST",
-                   len(mid) == len(before) + 1,
-                   f"before {before or '[]'}, after DIVE END {mid or '[]'}"))
+                   len(mid) == want,
+                   f"before {before or '[]'} ({len(before)}), after DIVE END "
+                   f"{mid or '[]'} ({len(mid)}), expected {want}"
+                   + (", FIFO full so one dive is evicted"
+                      if len(before) >= MAX_DIVE_SLOTS else "")))
     checks.append(("dive history survives a reset",
                    bool(mid) and set(after) == set(mid),
                    f"{len(mid)} slots before the reset, {len(after)} after: "

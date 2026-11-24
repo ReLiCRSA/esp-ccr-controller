@@ -982,20 +982,32 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   it is a claim about the writer and not about the history.
 
 - **Mounting the log at boot made an installed copy of the web page the one the
-  browser gets (decision open, 2026-11-24).** `serveIndex` prefers
-  `LittleFS:/index.html` when `pageInFlash` says it is there, and until now
+  browser gets (decided, 2026-11-24).** `serveIndex` used to prefer
+  `LittleFS:/index.html` whenever `pageInFlash` said it was there, and until then
   LittleFS was mounted only after the first `DIVE START` of a boot, so on a fresh
   surface the preference never resolved and the built-in PROGMEM copy answered.
-  It is mounted at boot now, so the filesystem copy wins — which is fine today
-  (the installed copy is byte-identical, and `web_probe.py`'s byte-exact check is
-  what proves it) and a
-  trap tomorrow: a firmware change to the page with no matching `uploadfs` serves
-  the previous generation, and `uploadfs` is the one operation that erases dive
-  history, because page and dive files share the partition. The clean fix is to
-  make the built-in copy authoritative (the page ships in the firmware image, so
-  it cannot be a generation behind and cannot be half-written), which would also
-  retire the `uploadfs` step from the C2 gate entirely. Not done here because it
-  changes what a diver sees and belongs with the page work, not with the CSV fix.
+  Once the store mounted at boot, the filesystem copy won — and that copy is a
+  generation behind whatever firmware was flashed last, because refreshing it
+  takes `uploadfs`, which rewrites the partition the dive files live on. The two
+  artefacts were demonstrably different on the bench board: it served 25 642 bytes
+  while `LittleFS:/index.html` still held the 25 445-byte copy from before.
+  **Decision, taken and implemented 2026-11-24: the built-in copy is the only one
+  the controller serves.** `serveIndex` answers from `kIndexHtml` in app flash,
+  unconditionally; the route that preferred the filesystem copy is gone, and
+  `pageInFlash` is now `assetInstalled`, used only for optional assets
+  (`/style.css`, `/app.js` answer 404 on a normal board, and `web_probe.py`
+  asserts that). Nothing was installed or erased to make that change, and a board
+  may still be holding an old installed copy that nothing reads. Consequences: the
+  page cannot be a generation behind, cannot be half-written, `data/index.html` is
+  a reference copy rather than an install target, and `uploadfs` leaves the C2 gate
+  (BENCH.md). Verified on the flashed board: served 25 642 bytes including the new
+  marker comment near the top of the page, byte-identical to `data/index.html`,
+  with the older copy still sitting in the filesystem.
+  Repairing that check was part of the work: `/` was graded as "contains `<html`
+  within the first 200 bytes", and the comment pushed the tag to byte 213, so a
+  good page failed. It now requires a doctype and an `<html` inside 4 KiB, and was
+  injected with an empty body, a plain-text error, a stripped doctype, a missing
+  `<html` and HTTP 500 — it fails all five.
 
 - **Removing float printf did not stop the crash, and the backtrace said why
   (bench, 2026-11-23, C2).** `GET T` panicked `uart2` a second time, on a build
@@ -1217,3 +1229,47 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   WebSocket to `--host`, only ever *scans* to confirm the AP is broadcasting, and
   carries three verdicts — a check it cannot observe is "not evaluated", not a
   failure charged to the firmware.
+
+- **A full dive FIFO has no way to tell which dive is oldest (open defect, found
+  on the bench 2026-11-24, C2).** `nextSlot()` evicts the dive with the smallest
+  start epoch, and every dive on this board carries epoch 0 — no RTC, and no NTP
+  through an access point with no uplink — so all ten keys tie and the comparison
+  decides by accident. The bench sequence: fill ten slots with 4 s dives, then
+  write 8 s, 40 s, 8 s. The board came back holding durations
+  `8, 2, 3, 4, 5, 7, 7, 9, 10, 10` seconds — **the 40 s dive was gone before the
+  next boot**, and the same thing happened in an earlier fill: twelve dives of
+  2, 4, ... 24 s left slots 2..10 holding dives 2..10 and slot 1 holding dive 12,
+  with dive 11 simply gone. So the log keeps the *nine oldest* dives plus the very
+  newest, and silently discards recent ones. It is not the comparison operator:
+  `<` and `<=` both pick a fixed slot when every key is equal, so no tie-break can
+  fix it. What is missing is an ordering identity. Epoch ordering needs an epoch,
+  and there is no clock.
+  The fix is a monotonic dive sequence number, written at `DIVE START` and
+  compared instead of the epoch (the 16-byte dive header has four unused bytes:
+  `out[5..7]` and `out[13]`, enough for a counter, at the cost of a `DIVE_VERSION`
+  bump and codec tests; the alternative is a counter in NVS). Not done here: it
+  changes the on-flash dive format and the host codec tests that pin it, which is
+  a decision, not a last-step fix in a C2 run. `hw_accept.py --dive-persist` now
+  tolerates an evicted dive once the FIFO holds ten (counting +1 there would fail
+  a run that worked), and deliberately does not bless *which* dive was evicted.
+- **The harness promised something the bench contradicted: opening a port does not
+  reset the board (2026-11-24).** BENCH.md's first rule says the open *is* a reset
+  pulse, and `tools/port_id.py`'s `open_quiet()` docstring said the opposite —
+  "no reset pulse" — with DTR/RTS held low offered as the reason. Both sentences
+  were in the repo at the same time, and measurements were being made against the
+  wrong one: a quiet console open was used as a look that did not disturb the
+  board, and the boot banner that followed was read as firmware behaviour.
+  Measured: nine seconds of quiet listening on `/dev/ttyUSB0` after the board had
+  been running produced `rst:0x1 (POWERON_RESET)` and a fresh banner. Holding DTR
+  low buys one thing — no IO0 download-mode latch, which does look like a dead
+  board — and not the other. So a quiet console read means "restart the controller
+  and read its boot log": never conclude that a board rebooted by itself from
+  traffic that starts with a banner, and never compare state across a port open
+  without counting the reset in between (a dive-log slot list read that way is a
+  list read across a reboot). The docstring says so now.
+- **Two readers on one port do not both fail loudly.** The second reader gets
+  `SerialException: device reports readiness to read but returned no data
+  (device disconnected or multiple access on port?)`, and during this session that
+  exception came from a probe of mine that was still holding `/dev/ttyUSB1` while
+  a new one opened it — the first reader alive, not the firmware misbehaving.
+  `fuser /dev/ttyUSB0 /dev/ttyUSB1` before any run; rc=1 means free.

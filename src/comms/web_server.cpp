@@ -215,25 +215,35 @@ void onWsEvent(AsyncWebSocket* /*server*/, AsyncWebSocketClient* client, AwsEven
 
 // ---- static pages ---------------------------------------------------------
 
-bool pageInFlash(const char* path) {
+bool assetInstalled(const char* path) {
     // Never mount from a network callback: LittleFS is owned by the dive log.
-    // If it is not mounted yet the answer is simply "use the built-in page".
+    // If it is not mounted the answer is simply "not installed".
     return LittleFS.exists(path);
 }
 
 void serveIndex(AsyncWebServerRequest* req) {
+    // The page always comes out of app flash, never out of LittleFS. That used
+    // to be the fallback and the filesystem copy won whenever one was installed —
+    // and once the dive log mounts at boot, it always is. Two ways that loses: an
+    // installed copy is a generation behind the firmware that serves it (the page
+    // a diver reads is not the page this build was tested with), and the only way
+    // to refresh it is `pio run -t uploadfs`, which rewrites the partition that the
+    // dive files live on — erasing dive history to update a stylesheet. The
+    // built-in copy ships in the firmware image, so it cannot be stale, cannot be
+    // half-written, and costs the diver nothing when the filesystem is broken.
+    //
     // Phone browsers cache aggressively; a stale cached page after a firmware
     // fix is an "I fixed it but nothing changed" bug report every time.
-    AsyncWebServerResponse* rsp =
-        pageInFlash("/index.html")
-            ? req->beginResponse(LittleFS, "/index.html", "text/html")
-            : req->beginResponse_P(200, "text/html", kIndexHtml);  // built-in page
+    AsyncWebServerResponse* rsp = req->beginResponse_P(200, "text/html", kIndexHtml);
     rsp->addHeader("Cache-Control", "no-store");
     req->send(rsp);
 }
 
 void serveAsset(AsyncWebServerRequest* req, const char* path, const char* type) {
-    if (pageInFlash(path)) req->send(LittleFS, path, type);
+    // Optional escape hatch for a file someone installs deliberately (the
+    // built-in page references nothing, so nothing here is required: /style.css
+    // and /app.js answer 404 on a normal board, and `web_probe.py` asserts that).
+    if (assetInstalled(path)) req->send(LittleFS, path, type);
     else req->send(404, "text/plain", "not installed");
 }
 

@@ -141,7 +141,13 @@ def http_probe(host, out):
             continue
         got[path] = body
         if path == "/":
-            ok = code == 200 and b"<html" in body[:200].lower()
+            # What this is really asserting: a real HTML document, not an error
+            # page, not an empty body. The window used to be 200 bytes, which a
+            # harmless comment at the top of the page broke — so it asserted the
+            # page's first two hundred bytes, not that the page is a page.
+            head = body[:4096].lower()
+            ok = code == 200 and body.lstrip().lower().startswith(b"<!doctype html") \
+                and b"<html" in head
             detail = f"{code}, {len(body)} bytes, html"
         elif path == "/app.js":
             ok = code == 404
@@ -686,7 +692,10 @@ def main() -> int:
     print(f"--- HTTP {args.host}")
     checks, page, got = http_probe(args.host, out)
     print("\n".join(out))
-    print(f"  page size {len(page)} bytes, "
+    # Bytes, not characters: the page is UTF-8 and carries multi-byte characters
+    # (ppO₂, →), so `len(page)` on the decoded text reads 25 642 as 25 640 and the
+    # line below contradicts the byte-identity check two lines later.
+    print(f"  page size {len(got['/'])} bytes, "
           f"{page.count(chr(10))} lines")
     for name, ok, detail in checks:
         print(f"  [{mark(ok)}] {name}: {detail}")

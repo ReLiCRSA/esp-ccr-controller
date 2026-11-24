@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Extract the built-in web page into data/ for LittleFS installs.
+"""Extract the built-in web page into data/ as the bench's reference copy.
 
-One source of truth: src/comms/web_page.h holds the page the firmware falls
-back on, and this writes that same text to data/index.html (and style.css /
-app.js if the page ever splits). Upload with:
+One source of truth: src/comms/web_page.h holds the only copy the firmware
+serves, and this writes that same text to data/index.html. `tools/web_probe.py`
+then fetches / over the AP and fails unless the bytes match, so the page in the
+repo, the page in app flash and the page a diver reads cannot drift apart.
 
-    pio run -e esp32 -t uploadfs
-
-Run it after editing web_page.h and commit both, or the installed copy and the
-built-in copy drift — and the drift only shows up on the one board that has a
-filesystem.
+Do NOT install this onto the board. `pio run -e esp32 -t uploadfs` rewrites the
+whole LittleFS partition, and the dive logs live on that partition: the way to
+update a page is to build the firmware, which takes twenty seconds and keeps the
+dive history. The route that would serve an installed copy was removed on
+2026-11-24 for exactly that reason (PLAN 16), and a board may still be holding
+an old installed copy that nothing reads.
 """
 from __future__ import annotations
 

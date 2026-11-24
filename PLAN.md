@@ -50,7 +50,7 @@ espRebController/
 │   ├── comms/
 │   │   ├── settings.cpp      # ONE key/value registry → NVS (handset+web shared)
 │   │   ├── uart_proto.cpp    # handset protocol
-│   │   └── web/              # ESPAsyncWebServer + WebSocket + LittleFS pages
+│   │   └── web_server.cpp    # ESPAsyncWebServer + WebSocket; the page text is web_page.h
 │   ├── log/divelog.cpp       # dive records, events, CSV export
 │   └── hud.cpp               # 3-LED pattern engine
 ├── sim/                      # PC build of the real logic + world model
@@ -1340,12 +1340,21 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   now asserts **the served bytes equal `data/index.html`**, the only end-to-end
   check over `web_page.h` → `sync_webdata.py` → `data/` → the router's
   LittleFS-or-flash choice.
-- **`web/` is a superseded page generation whose assets match nothing in the
-  router** — housekeeping, not a defect. `/style.css` is registered and the repo has
-  never had that file; `/app.css` and the four sub-pages (`checklist`, `dives`,
-  `histogram`, `settings`) have no routes at all. The live page is the single
-  file in `src/comms/web_page.h`, extracted to `data/index.html`. Either delete
-  `web/` or route it; today it is only a trap for the next reader.
+- **`web/` is gone (2026-11-25).** A superseded page generation, 635 lines, whose
+  assets matched nothing in the router — `/app.css` and the four sub-pages
+  (`checklist`, `dives`, `histogram`, `settings`) had no routes at all — and whose
+  README stated something false and dangerous: that the pages were "served from LittleFS
+  on the device". They are not: the served page is `src/comms/web_page.h`, compiled into
+  the app image, and that partition holds the **dive logs**, so writing it erases dive
+  history. The firmware was already honest about this — `/style.css` and `/app.js` answer
+  404 unless someone deliberately installs a file, and `web_probe.py` asserts exactly
+  those 404s — the lie lived only in prose, which is the kind of thing that sends the
+  next reader to fix a UI the board never serves. That drift has already bitten the bench
+  once (C2-f: the page the board served was not the page in the repo). What keeps a
+  second UI from creeping back is not the deletion but the byte-exact check:
+  `web_probe.py` requires the served bytes to equal `data/index.html`, which
+  `tools/sync_webdata.py` generates from `web_page.h`. One page, one source, checked on
+  the wire.
   (Recorded and closed 2026-11-23: the worry that a LittleFS install could
   shadow a firmware fix was **an artifact of the mismatched installs on this
   bench**, not evidence about the design — owner decision, do not carry it until it
@@ -1918,9 +1927,7 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   the small known lies: a depth-source field
   (`ds=`) so a reader of `HB` or a dive header can tell which sensor produced a
   depth; WiFi idle auto-off (an open M5 criterion); a `PULSE` button on the page
-  (the command exists, the page has AUTO/MANUAL/ACK); and the fate of the tracked
-  `web/` directory now that
-  `src/comms/web_page.h` is authoritative and `data/index.html` is generated.
+  (the command exists, the page has AUTO/MANUAL/ACK).
   Added by the dive-file batch: the page's dive view **ignores `E,` rows** — it
   renders the chart from `S,` and one hint line from `M,`, so the verdicts are in
   the file and in the download but a surface reader on the AP never sees that the

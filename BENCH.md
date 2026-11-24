@@ -830,10 +830,13 @@ up a defect that no amount of flashing or code reading would have shown:
   artifact of testing, not a design defect**: owner decision 2026-11-23, drop the
   "LittleFS could shadow a firmware fix" worry unless it shows up again. The
   `web_probe.py` byte-exact check stays, because that is what noticed it. Real
-  housekeeping that came out of the same look: `web/` is a superseded page
-  generation whose assets match nothing in the router (`/style.css` is
-  registered and the repo never had that file; `/app.css` and the four
-  sub-pages have no routes).
+  housekeeping that came out of the same look, closed 2026-11-25: the tracked `web/`
+  directory (a superseded page generation whose assets match nothing in the router,
+  and whose README claimed the pages were served from LittleFS — the partition that
+  holds dive logs) is **deleted**. `/style.css` and `/app.js` stay registered in the
+  live router and answer 404 unless a file is deliberately installed, and
+  `web_probe.py` asserts those 404s; the byte-exact page check is what stops a second
+  UI from creeping back.
 * **Page and dive logs share one partition.** `uploadfs` writes that partition's
   whole image, so it deletes dive history. Observed, not just inferred: a
   338-byte dive sat in slot 1 before the first real install; after it,

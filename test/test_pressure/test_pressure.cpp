@@ -7,10 +7,12 @@
 #include <utility>
 #include <vector>
 
+#include "sensors/depth_announce.h"
 #include "sensors/depth_manager.h"
 #include "sensors/lps28.h"
 #include "sensors/ms5837.h"
 
+using press::Announcer;
 using press::Lps28;
 using press::Ms5837;
 using press::DepthArbiter;
@@ -472,6 +474,115 @@ void test_arbiter_never_switches_midrun() {
     TEST_ASSERT_EQUAL_STRING("MS5837-30BA @0x76", arb.sourceName());
 }
 
+// ---------------------------------------------------------------------------
+// The boot announce. Its whole job is to not print a number it has not
+// measured: the drivers report READY at IDENTIFICATION and the first pressure
+// conversion comes later, so an announce wired to the lock printed
+// `ready, 0.0 hPa` in the line the bench reads as evidence (BENCH.md C3-a).
+// These cases pin the ordering, the exact bytes, and the fact that a source
+// which identifies but never reads says so instead of leaving silence.
+// ---------------------------------------------------------------------------
+
+void test_announce_prints_nothing_until_a_source_locks() {
+    Announcer a;
+    char line[160];
+    // An absent sensor: nothing ever locks, so the boot stays silent. That is
+    // the contract a sensor-less bench run depends on - the honest signal for
+    // "no sensor fitted" is the absence of this line, and it must stay that way.
+    for (uint32_t t = 1000; t < 10000; t += 100)
+        TEST_ASSERT_TRUE(a.update(t, false, false, 0.0f) == Announcer::Action::NONE);
+    TEST_ASSERT_EQUAL(0, a.line(Announcer::Action::NONE, "LPS28DFW @0x5D",
+                                line, sizeof(line)));
+}
+
+void test_announce_waits_for_a_reading_not_for_a_lock() {
+    Announcer a;
+    char line[160];
+
+    // Locked at 1.6 s (the arbiter's way), no conversion yet: NO line, because
+    // the only pressure available would be the driver's initial zero.
+    TEST_ASSERT_TRUE(a.update(1600, true, false, 0.0f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(1700, true, false, 0.0f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(2000, true, false, 0.0f) == Announcer::Action::NONE);
+
+    // First sane sample wins: the announce is about this reading, whenever it
+    // arrives, and it prints once.
+    TEST_ASSERT_TRUE(a.update(2100, true, true, 1.0132f) == Announcer::Action::READY);
+    // The returned length is what gets written to the console, so it is asserted
+    // equal to the bytes too: a short return silently drops the tail of the line.
+    const char* ready = "depth: LPS28DFW @0x5D ready, 1013.2 hPa\n";
+    TEST_ASSERT_EQUAL(std::strlen(ready),
+                      a.line(Announcer::Action::READY, "LPS28DFW @0x5D", line,
+                             sizeof(line)));
+    TEST_ASSERT_EQUAL_STRING(ready, line);
+
+    TEST_ASSERT_TRUE(a.update(2200, true, true, 1.0133f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(9000, true, true, 1.0130f) == Announcer::Action::NONE);
+}
+
+void test_announce_says_so_when_a_locked_source_never_reads() {
+    Announcer a;
+    char line[160];
+
+    TEST_ASSERT_TRUE(a.update(1600, true, false, 0.0f) == Announcer::Action::NONE);
+    // The grace is measured from the lock, not from boot.
+    TEST_ASSERT_TRUE(a.update(1600 + Announcer::NO_DATA_GRACE_MS - 1, true, false,
+                              0.0f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(1600 + Announcer::NO_DATA_GRACE_MS, true, false,
+                              0.0f) == Announcer::Action::NO_DATA);
+    const char* warn =
+        "depth: ** LPS28DFW @0x5D identified, no sane pressure within 3 s "
+        "(reads 0.0 hPa) - depth will not be used\n";
+    TEST_ASSERT_EQUAL(std::strlen(warn),
+                      a.line(Announcer::Action::NO_DATA, "LPS28DFW @0x5D", line,
+                             sizeof(line)));
+    TEST_ASSERT_EQUAL_STRING(warn, line);
+    // Once per boot.
+    TEST_ASSERT_TRUE(a.update(6000, true, false, 0.0f) == Announcer::Action::NONE);
+
+    // A reading that turns up late still gets the truth on the record, because
+    // the last thing the boot says about depth is what the machine will use.
+    TEST_ASSERT_TRUE(a.update(7000, true, true, 1.0121f) == Announcer::Action::READY);
+    a.line(Announcer::Action::READY, "LPS28DFW @0x5D", line, sizeof(line));
+    TEST_ASSERT_EQUAL_STRING("depth: LPS28DFW @0x5D ready, 1012.1 hPa\n", line);
+}
+
+void test_announce_shows_the_reading_that_was_refused() {
+    // A chip answering with a plausible-but-wrong conversion is the case the
+    // line exists to catch, and the number in it is the evidence: printing
+    // `0.0` for a chip streaming garbage would send the bench looking in the
+    // wrong place.
+    Announcer a;
+    char line[160];
+    TEST_ASSERT_TRUE(a.update(1000, true, false, 0.0f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(1100, true, false, 0.031f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(1200, true, false, 0.031f) == Announcer::Action::NONE);
+    TEST_ASSERT_TRUE(a.update(1000 + Announcer::NO_DATA_GRACE_MS, true, false,
+                              0.031f) == Announcer::Action::NO_DATA);
+    a.line(Announcer::Action::NO_DATA, "MS5837-30BA @0x76", line, sizeof(line));
+    TEST_ASSERT_EQUAL_STRING(
+        "depth: ** MS5837-30BA @0x76 identified, no sane pressure within 3 s "
+        "(reads 31.0 hPa) - depth will not be used\n", line);
+}
+
+void test_announce_refuses_a_truncated_line() {
+    Announcer a;
+    char line[160];
+    TEST_ASSERT_TRUE(a.update(2000, true, true, 1.0132f) == Announcer::Action::READY);
+    // One byte short of the full line: refuse, do not emit half a claim.
+    const char* full = "depth: LPS28DFW @0x5D ready, 1013.2 hPa\n";
+    TEST_ASSERT_EQUAL(0, a.line(Announcer::Action::READY, "LPS28DFW @0x5D", line,
+                                std::strlen(full)));
+    TEST_ASSERT_EQUAL_STRING("", line);
+    TEST_ASSERT(a.line(Announcer::Action::READY, "LPS28DFW @0x5D", line,
+                       sizeof(line)) > 0);
+
+    char tiny[8];
+    TEST_ASSERT_EQUAL(0, a.line(Announcer::Action::NO_DATA, "LPS28DFW @0x5D",
+                                tiny, sizeof(tiny)));
+    TEST_ASSERT_EQUAL_STRING("", tiny);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_ms5837_boot_and_datasheet_vector);
@@ -486,5 +597,10 @@ int main() {
     RUN_TEST(test_arbiter_refuses_unidentified_sources);
     RUN_TEST(test_arbiter_hotplug_then_boot_lock);
     RUN_TEST(test_arbiter_never_switches_midrun);
+    RUN_TEST(test_announce_prints_nothing_until_a_source_locks);
+    RUN_TEST(test_announce_waits_for_a_reading_not_for_a_lock);
+    RUN_TEST(test_announce_says_so_when_a_locked_source_never_reads);
+    RUN_TEST(test_announce_shows_the_reading_that_was_refused);
+    RUN_TEST(test_announce_refuses_a_truncated_line);
     return UNITY_END();
 }

@@ -28,6 +28,7 @@
 #include "control/loop.h"
 #include "sensors/ads1115_bus.h"
 #include "sensors/battery.h"
+#include "sensors/depth_announce.h"
 #include "sensors/depth_manager.h"
 #include "sensors/lps28.h"
 #include "sensors/ms5837.h"
@@ -172,6 +173,7 @@ static void sensorTask(void*) {
         // arbiter holds the boot-locked source and drives its state machine.
         g_depth.begin(now);      // arbitrates until locked; then re-inits on fault
         g_depth.start(now);      // no-ops unless the cycle is idle
+        bool depthSane = false;
         if (g_depth.poll(now)) {
             const float p = g_depth.pressureBar();
             if (p > 0.2f) {      // a sane absolute pressure before deriving depth
@@ -179,22 +181,32 @@ static void sensorTask(void*) {
                                ? (p - SURFACE_PRESSURE_BAR) / BAR_PER_M_SEAWATER
                                : 0.0f;
                 g_depthValid = true;
+                depthSane = true;
             }
         }
         // locked() first: there is no source to go stale before boot-lock.
         if (g_depth.locked() && now - g_depth.lastGoodMs() > PRESSURE_STALE_MS)
             g_depthValid = false;
-        // Say it once when the depth sensor comes up: WHICH sensor, address,
-        // sanity. A missing line at boot means the bench check (BENCH.md
-        // C3-a) fails — and which sensor dove must be in the record.
-        static bool depthAnnounced = false;
-        if (!depthAnnounced && g_depth.healthy()) {
-            depthAnnounced = true;
-            char hp[16];
-            Serial.printf("depth: %s ready, %s hPa\n",
-                          g_depth.source()->identity(),
-                          numfmt::fixed(hp, sizeof(hp),
-                                        g_depth.pressureBar() * 1000.0, 1));
+        // Say it once, and say it about a READING rather than about a lock. The
+        // drivers report READY the instant the chip is IDENTIFIED (WHO_AM_I,
+        // PROM CRC) — the first conversion comes later, paced by the driver's
+        // own sample window — so an announce wired to the lock printed
+        // `ready, 0.0 hPa`, and that line is the bench's evidence for which
+        // sensor, at which address, reading what (BENCH.md C3-a). `depthSane`
+        // is the same `p > 0.2f` gate the control path uses, so there is one
+        // rule about what counts as a reading. And a source that identifies but
+        // never produces one now says so: "no sensor fitted" and "identified,
+        // no data" are different facts, and silence reads like the first one.
+        static press::Announcer depthAnnouncer;
+        const press::Announcer::Action depthAct = depthAnnouncer.update(
+            now, g_depth.locked(), depthSane,
+            g_depth.locked() ? g_depth.pressureBar() : 0.0f);
+        if (depthAct != press::Announcer::Action::NONE) {
+            char dline[160];
+            const size_t dn = depthAnnouncer.line(depthAct, g_depth.sourceName(),
+                                                  dline, sizeof(dline));
+            if (dn) Serial.write(dline, dn);
+            else Serial.println("depth: ** announce line would not fit");
         }
 #endif
 

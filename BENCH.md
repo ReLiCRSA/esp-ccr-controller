@@ -15,14 +15,20 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 242 cases
+pio test -e native            # host gate, currently 247 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
-tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 115 checks
-tools/.../python tools/hw_accept.py --selftest   # the surface-log graders, no board
+tools/.../python tools/hw_accept.py --expect-web --expect-depth \
+                                 --handset /dev/ttyUSB1 \
+                                 --cal-air --predive --dive-persist    # 118 checks
+tools/.../python tools/hw_accept.py --selftest   # the log + depth graders, no board
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
 ```
+
+`--expect-depth` is how the operator says *this bench has a depth sensor fitted*:
+it turns C3-a's boot line into three graded checks. Without it, a boot with no
+`depth:` line at all is accepted — the absence is the honest signal for "nothing
+fitted", and it must stay that way.
 
 There is no `uploadfs` step. The web page is compiled into the app image and
 served from there; the LittleFS partition belongs to the dive logs, and writing
@@ -414,15 +420,20 @@ The seq is read back off the file (max + 1) rather than kept in RAM, so the
 console's number *is* the CSV row's number, and the join is on the number rather
 than on "some record was written this run".
 
-**`--selftest` grades lying logs, no board needed.** Twelve cases of a
-surface export that is wrong in exactly one known way — header claims 3 records
+**`--selftest` grades lying logs, no board needed.** Twenty-one cases: twelve of
+a surface export that is wrong in exactly one known way — header claims 3 records
 and 2 arrive, no identity row at all, a seq range describing a different file,
 this run wrote nothing, `raw0` disagreeing with the wire, a warm-up refusal
 recorded as OK, a failure filed under the pass id, an appended id with no name,
 a record with no clock rendered as a date, the console never reporting the write,
-and the console reporting a *different* record number. Run it after touching the
-graders or the record format; a case that stops failing means that check is
-decoration.
+and the console reporting a *different* record number — and nine lying boots for
+the depth announce: an honest boot with and without `--expect-depth`, the
+placeholder `ready, 0.0 hPa` (the real defect), an unidentified chip holding the
+depth slot, a `no sane pressure` line the alarm word contradicts, a `ready` line
+the alarm word contradicts, a claimed sensor that never announced, a sensor-less
+boot that is honest, and the identified-but-deaf boot that is honest *because* it
+raised the alarm. Run it after touching the graders or the record format; a case
+that stops failing means that check is decoration.
 
 Two harness bugs it caught on the day, both of which read as firmware faults:
 
@@ -673,34 +684,86 @@ wedge the bus feeding ppO2, and each bus bit-bang-recovers its own pins
 
 Wiring:
 
-- [ ] VIN → **3V3** (the breakout regulates; do not feed 5 V into a 3V3 bus),
+- [x] VIN → **3V3** (the breakout regulates; do not feed 5 V into a 3V3 bus),
       GND to the ADS1115 GND point, **SDA→19, SCL→18**. STEMMA QT cable fits.
-- [ ] Pull-ups are per-bus now: the 4.7 k pair on 21/22 does **not** serve
+      (Fitted and proven 2026-11-24. It was first wired wrong: the symptom was
+      `requestFrom(): Error 263` — `ESP_ERR_TIMEOUT`, a transaction that starts
+      and never finishes — rather than the clean `Error -1` of an absent chip,
+      and the depth retries were long enough to make cell channels go stale
+      between them. Wrong wiring, not a finding; corrected and re-measured.)
+- [x] Pull-ups are per-bus now: the 4.7 k pair on 21/22 does **not** serve
       18/19. The breakout's on-board 10 k works at 100 kHz on the bench;
       add a 4.7 k pair on 18/19 for the wet harness.
-- [ ] Boot must show `depth: LPS28DFW @0x5C ready, <n> hPa` once (or the
+- [x] Boot must show `depth: LPS28DFW @0x5C ready, <n> hPa` once (or the
       MS5837 line if it is fitted — it wins on ties), and then silence: no
       periodic `requestFrom()` error lines, HB `stale=` drops out of the
       alarm word, `al` should fall toward `0x0010` (battery only). The
       sensor that booted is the sensor that dove — the line is part of the
       build record.
+      **This bench answers at `@0x5D`, not `0x5C`** — the XSA pad is high. The
+      driver probes `0x5C` then `0x5D` and prints which one answered, so the
+      line names the real address; check the pad if that was not deliberate.
+      Measured 2026-11-24: `depth: LPS28DFW @0x5D ready, 1016.7 hPa`, one
+      `requestFrom` error in 75 s (the MS5837 probe inside the preferred
+      window, expected), 15/15 HB lines `fresh=111 i2cerr=0 rec=0` and
+      `al=0x0010` — battery only, so `BIT_SENSOR_STALE` is clear, which is the
+      proof the pressure is sane: `ai.sensorStale = !cellsFresh || !pressureValid`.
 - [ ] Squeeze test: press the port gently (or breathe through a tube into
       the metal port) — the dashboard depth/pressure must move and come
       back. The driver runs **FS_MODE=1 (260–4060 hPa ≈ 40 m sea water)**
       so the 10 m cell-proof pressurization is inside range; mode 0 would
       clip at ~2.4 m and silently flat-top.
+      **Still the only check that proves the sensor measures.** Identification,
+      a plausible hPa and a cleared alarm bit all prove it *talks*; at the
+      surface, depth is 0.00 whether the port is open to the room or taped shut.
 - [ ] Then `CAL DEPTH` (surface tare) and re-check the pre-dive list.
       **The tare belongs to sensor+package**: after any sensor swap, re-tare.
+      It still answers `ERR not implemented` — now that a sensor exists, the
+      tare has a consumer and lands with one.
 
-Until the sensor is fitted the controller behaves correctly with no depth —
-`HB … al=0x0090` includes `BIT_SENSOR_STALE` — it just refuses to pretend.
+**The announce must describe a reading, not a lock (fixed 2026-11-24).** Every
+healthy boot used to print `depth: LPS28DFW @0x5D ready, 0.0 hPa`. That was not
+a bad sensor: `begin()` reports READY the instant the chip is *identified*
+(WHO_AM_I `0xB4`), while the first conversion comes later, paced by the driver's
+own sample window — so the one line the bench reads as evidence always carried a
+placeholder. A number that is always zero is worse than no number: it reads like
+a measurement. The announce now fires on the first sample the **control path**
+would use — the same `p > 0.2f` gate in `main.cpp`, passed across as `saneSample`
+so the two rules cannot drift — and a source that identifies but never produces
+one says so out loud instead of leaving silence:
+
+```
+depth: LPS28DFW @0x5D ready, 1016.7 hPa
+depth: ** LPS28DFW @0x5D identified, no sane pressure within 3 s (reads 0.0 hPa) - depth will not be used
+```
+
+The second form is a different fact from "no sensor fitted", which stays silent;
+3 s is the grace, measured from the lock rather than from boot. `hw_accept.py
+--expect-depth` grades all of it — identity+address pair the gates would actually
+accept, an hPa inside 250..1200 (loose on purpose: weather and altitude — the
+check is about *placeholder vs reading*, not calibration), and the line agreeing
+with HB's `al` word in both directions: a `ready` line with `BIT_SENSOR_STALE`
+set, or a `no sane pressure` line with the chain believing the sensor, is a
+console disagreeing with the machine. Host side: `test_pressure`'s five announce
+cases pin the ordering, the exact bytes, and the refusal to emit a truncated
+line. Proven by replay — the pre-fix capture fails "the depth announce carries a
+reading, not a placeholder", the post-fix capture is clean; five grader mutations
+each redden `--selftest`. On the bench itself the whole gate is **118 checks, 0
+failures** (`--expect-web --expect-depth --handset /dev/ttyUSB1 --cal-air
+--predive --dive-persist`), and the *once per boot* property shows up for free:
+`--dive-persist`'s deliberate reset produces a second, equally honest
+`depth: LPS28DFW @0x5D ready, 1016.7 hPa` about 2.5 s into the new boot — the
+announce is late now, by design, because it waits for a sample. Sensor-task
+headroom moved 2702 → 2700 bytes with the announce's 160 B line buffer in place.
+
 
 **Cell-proof clamp events (`E,` ids 10/11/12) — depth-leg check, host-proven
 2026-11-24, never yet seen on the wire.** The proof arms on the descent
 crossing `CELLPROOF_DEPTH`, so with no depth sensor it never runs and these
 three rows can never appear: `test_uartlink`'s `test_cellproof_clamp_edges_publish_once`
-drives the real engine instead. With the LPS28DFW fitted, force the failure
-cheaply on the bench and watch the wire (handset side, and the dive file):
+drives the real engine instead. With the LPS28DFW now fitted this is reachable
+on the bench — force the failure cheaply and watch the wire (handset side, and
+the dive file):
 
 ```
 SET CELLPROOF_DEPTH=3        # arm depth, minimum the schema allows

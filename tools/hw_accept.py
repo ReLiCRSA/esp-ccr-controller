@@ -80,6 +80,32 @@ SURFACE_RECORD = re.compile(r"^surface: record (?P<seq>\d+) id (?P<id>\d+)"
                             r"(?: value (?P<value>\d+))?(?: .*)?$")
 SURFACE_FAIL = re.compile(r"^surface: record NOT written")
 
+# The depth announce, both forms, captured off the bench link on 2026-11-24:
+#   depth: LPS28DFW @0x5D ready, 1016.7 hPa
+#   depth: ** LPS28DFW @0x5D identified, no sane pressure within 3 s (reads 0.0
+#            hPa) - depth will not be used
+# There is deliberately NO line when no depth sensor is fitted: the absence is
+# the signal for "nothing fitted", so these checks grade whatever the board has
+# unless --expect-depth says a sensor must be there.
+DEPTH_READY = re.compile(
+    r"^depth: (?P<who>[A-Za-z0-9._ -]+?) @(?P<addr>0x[0-9A-Fa-f]{2}) ready, "
+    r"(?P<hp>-?[\d.]+) hPa")
+DEPTH_NODATA = re.compile(
+    r"^depth: \*\* (?P<who>[A-Za-z0-9._ -]+?) @(?P<addr>0x[0-9A-Fa-f]{2}) "
+    r"identified, no sane pressure within (?P<grace>\d+) s \(reads (?P<hp>[^)]*)\)")
+# Which identity+address pairs the firmware's identity gates accept (WHO_AM_I
+# 0xB4 for the LPS28DFW at 0x5C/0x5D, PROM CRC for the MS5837 at 0x76/0x77). A
+# depth line naming anything else means an unidentified chip won the depth slot.
+DEPTH_IDENTS = {"LPS28DFW": {"0x5C", "0x5D"}, "MS5837-30BA": {"0x76", "0x77"}}
+# Absolute pressure a surface sensor must be able to read. Loose on purpose -
+# weather and altitude - because this check is not about calibration: it exists
+# because the announce used to print a PLACEHOLDER. Before 2026-11-24 the line
+# fired the instant the chip was identified, before the first conversion, and
+# printed `ready, 0.0 hPa` on every boot, healthy sensor or not.
+DEPTH_HPA_MIN, DEPTH_HPA_MAX = 250.0, 1200.0
+AL_RE = re.compile(r"\bal=(0x[0-9A-Fa-f]+)\b")
+BIT_SENSOR_STALE = 0x80          # alarms::BIT_SENSOR_STALE, bit 7 of HB's al=
+
 # `clock: 2026-11-24T09:12:03Z (set 41 s ago)`, or `unset: ...`, or a value
 # `carried across a reset, not verified since`. The boot must always state it:
 # a dive log whose dates nobody can account for is the defect this replaced.
@@ -209,7 +235,66 @@ CRASH_MARKERS = [
 HB_STACK_RE = re.compile(r"stk=(\d+)(?: u2stk=(\d+))?")
 
 
-def grade_boot(lines, expect_web):
+def grade_depth(lines, expect_depth):
+    """The depth announce, graded against the rest of the boot.
+
+    Three things, each a different lie:
+      * the line names an identity+address pair the firmware's identity gates
+        would actually accept (a near-relative chip getting a depth slot);
+      * a `ready` line carries a pressure that is a READING, not a placeholder -
+        this is the check that would have caught the announce printing 0.0 hPa
+        from before the first conversion, which every healthy boot printed;
+      * if the sensor identifies but never reads, the alarm word says so: a
+        `no sane pressure` line with `al` clean would mean the console shouts
+        about a dead sensor while the control chain believes it is fine.
+    """
+    checks = []
+    ready = next((DEPTH_READY.search(l) for l in lines if DEPTH_READY.search(l)), None)
+    nodata = next((DEPTH_NODATA.search(l) for l in lines
+                   if DEPTH_NODATA.search(l)), None)
+    als = [int(m.group(1), 16) for l in lines if (m := AL_RE.search(l))]
+    stale = any(a & BIT_SENSOR_STALE for a in als)
+
+    if not (ready or nodata):
+        # No line at all: correct for a bench with no depth sensor fitted, wrong
+        # for one that claims to have it. --expect-depth is how the operator says
+        # which bench this is; C3-a runs with it.
+        checks.append(("depth source announced at boot", not expect_depth,
+                       "no `depth:` line: no depth sensor claimed depth"
+                       + ("" if not expect_depth else
+                          " — but --expect-depth was asked for, so a fitted, "
+                          "identified sensor must announce itself")))
+        return checks
+
+    m = ready or nodata
+    who, addr = m.group("who").strip(), m.group("addr")
+    checks.append(("depth source is one the identity gates accept",
+                   addr in DEPTH_IDENTS.get(who, set()),
+                   f"{who} @{addr}, accepted {DEPTH_IDENTS}"))
+    if ready:
+        try:
+            hp = float(ready.group("hp"))
+        except ValueError:
+            hp = float("nan")
+        checks.append(("the depth announce carries a reading, not a placeholder",
+                       DEPTH_HPA_MIN <= hp <= DEPTH_HPA_MAX,
+                       f"{ready.group(0)} — want {DEPTH_HPA_MIN}..{DEPTH_HPA_MAX} hPa "
+                       f"at the surface; 0.0 here is the announce printing before "
+                       f"the first conversion"))
+        checks.append(("HB does not report the depth sensor stale",
+                       not als or not stale,
+                       " ".join(f"al=0x{a:04X}" for a in als) or "no HB al= to compare"))
+    else:
+        checks.append(("a sensor that identifies but never reads raises the alarm",
+                       bool(als) and stale,
+                       (f"{nodata.group(0)} but HB says "
+                        f"{' '.join(f'al=0x{a:04X}' for a in als) or 'no al= field'}: "
+                        f"the console says no data while the chain believes there is")
+                       if als else f"{nodata.group(0)} with no HB al= to compare"))
+    return checks
+
+
+def grade_boot(lines, expect_web, expect_depth=False):
     """Return list of (check_name, passed, detail)."""
     checks = []
     # soak_logger's raw captures prefix lines with [HH:MM:SS]; the console
@@ -268,6 +353,7 @@ def grade_boot(lines, expect_web):
         # from a diver who had simply not dived.
         note = LOG_LINE.search(ll).group("note").strip()
         checks.append(("dive log mount did not format (history intact)", not note, ll))
+    checks.extend(grade_depth(lines, expect_depth))
     cl = next((l for l in lines if CLOCK_LINE.search(l)), None)
     checks.append(("wall clock stated at boot", cl is not None,
                    cl or "no `clock:` line: the boot does not say whether dives "
@@ -399,6 +485,67 @@ CAL_WANT = [("value", SURF_COL["value"], 2), ("samples", SURF_COL["samples"], 12
             ("raw1", SURF_COL["raw1"], 1519), ("raw2", SURF_COL["raw2"], 1528)]
 
 
+# Boot fragments for the depth-announce grader's own selftest, built from the
+# two real captures of 2026-11-24 (the broken announce, then the fixed one).
+DEPTH_BOOT_OK = [
+    "=== ESP-CCR controller M1 boot ===",
+    "depth: LPS28DFW @0x5D ready, 1016.7 hPa",
+    "HB st=0 c0=1515 c1=1518 c2=1524 fresh=111 smp=30 i2cerr=0 rec=0 vbat=1.56 "
+    "stale=0 batlow=1 al=0x0010",
+]
+DEPTH_HB_STALE = ("HB st=0 c0=1515 c1=1518 c2=1524 fresh=111 smp=30 i2cerr=0 rec=0 "
+                  "vbat=1.56 stale=1 batlow=1 al=0x0090")
+
+
+def selftest_depth():
+    """Proves the depth-announce graders can fail, no board needed.
+
+    Same rule as the surface-log cases below: every case is a boot that lies in
+    exactly one known way, and a case that does NOT fail means the check is
+    decoration. The first case here is the real defect this whole pass exists
+    for — the announce fired the instant the chip was identified, so every
+    healthy boot printed `ready, 0.0 hPa` and the line the bench reads as
+    evidence could never carry a measurement.
+    """
+    nodata = ("depth: ** LPS28DFW @0x5D identified, no sane pressure within 3 s "
+              "(reads 0.0 hPa) - depth will not be used")
+    cases = [
+        # name, boot lines, --expect-depth, expected failing check (None = clean)
+        ("an honest boot with the sensor fitted", DEPTH_BOOT_OK, True, None),
+        ("the same honest boot, sensor not declared", DEPTH_BOOT_OK, False, None),
+        ("placeholder pressure — the announce printed before the first "
+         "conversion",
+         [l.replace("1016.7 hPa", "0.0 hPa") for l in DEPTH_BOOT_OK], True,
+         "carries a reading, not a placeholder"),
+        ("a chip the identity gates would refuse owns the depth slot",
+         [l.replace("LPS28DFW @0x5D", "LPS22HB @0x5C") for l in DEPTH_BOOT_OK],
+         True, "identity gates accept"),
+        ("the announce says no data but the control chain believes the sensor",
+         [nodata, DEPTH_BOOT_OK[2]], True, "raises the alarm"),
+        ("the announce says ready while the control chain calls the sensor stale",
+         [DEPTH_BOOT_OK[0], DEPTH_BOOT_OK[1], DEPTH_HB_STALE], True,
+         "does not report the depth sensor stale"),
+        ("a sensor is claimed to be fitted and nothing announced",
+         DEPTH_BOOT_OK[:1], True, "depth source announced at boot"),
+        ("nothing fitted, nothing announced: honest", DEPTH_BOOT_OK[:1], False,
+         None),
+    ]
+    checks = []
+    for name, lines, expect, want in cases:
+        failed = [c[0] for c in grade_depth(lines, expect) if not c[1]]
+        if want is None:
+            checks.append((f"depth: {name}", not failed, f"unexpected failures: {failed}"))
+        else:
+            checks.append((f"depth: {name}", any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
+    # The no-data form WITH the alarm it implies is the other honest shape.
+    honest_nodata = [DEPTH_BOOT_OK[0], nodata, DEPTH_HB_STALE]
+    failed = [c[0] for c in grade_depth(honest_nodata, True) if not c[1]]
+    checks.append(("depth: identified-but-deaf, with the alarm raised, is honest",
+                   not failed, f"unexpected failures: {failed}"))
+    return checks
+
+
 def selftest():
     """Proves the surface-log graders can fail.
 
@@ -406,7 +553,8 @@ def selftest():
     does NOT fail means the check is decoration — which is the lesson already
     learned on this bench, when a check was hunting an `E,` row its own line
     filter was throwing away and could never have passed. Run it after touching
-    the graders or the export format (`hw_accept.py --selftest`).
+    the graders or the export format (`hw_accept.py --selftest`). The depth
+    announce's own lying boots are in `selftest_depth()`, run alongside.
     """
     # (what the log claims, the bytes, the expected verdict: (failing check name,
     #  or None for "must pass clean"))
@@ -1317,10 +1465,15 @@ def main() -> int:
                          "Pulses the solenoid on the bench.")
     ap.add_argument("--web-host", default="http://192.168.4.1",
                     help="base URL for /surface.csv, used by --cal-air and --predive")
+    ap.add_argument("--expect-depth", action="store_true",
+                    help="a depth sensor is fitted on this bench: its boot announce "
+                         "is then required, and graded for identity, address and a "
+                         "plausible reading (BENCH.md C3-a). Without this flag a "
+                         "sensor-less boot is accepted as-is.")
     ap.add_argument("--selftest", action="store_true",
-                    help="grade known-lying surface logs (no board needed) to prove "
-                         "the export graders can fail. Run it after touching the "
-                         "graders or the record format.")
+                    help="grade known-lying surface logs and known-lying depth "
+                         "announces (no board needed) to prove the graders can "
+                         "fail. Run it after touching the graders or the formats.")
     ap.add_argument("--replay", default=None)
     ap.add_argument("--dive-persist", action="store_true",
                     help="after the protocol checks, close a dive, reset the "
@@ -1332,7 +1485,7 @@ def main() -> int:
     if args.selftest:
         # No board, no ports: this section is about the grader, not the machine.
         fails = 0
-        for name, ok_, detail in selftest():
+        for name, ok_, detail in [*selftest_depth(), *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1
         print(f"\n{fails} failure(s)")
@@ -1406,7 +1559,7 @@ def main() -> int:
 
     failures = 0
     print("\n--- boot checks ---")
-    for name, ok, detail in grade_boot(lines, args.expect_web):
+    for name, ok, detail in grade_boot(lines, args.expect_web, args.expect_depth):
         print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok else f": {detail}"))
         failures += 0 if ok else 1
 

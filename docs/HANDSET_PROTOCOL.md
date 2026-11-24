@@ -387,16 +387,21 @@ the split: only the marked ids are actually published by today's firmware.
 | 8 | CAL O2 done | — | **no** (reserved) |
 | 9 | cellproof PASS | unproven-high mask (bit per cell) | yes |
 | 10 | cellproof FAIL | 0 | yes |
-| 11 | clamp ON | 0 | **no** (reserved) |
-| 12 | clamp OFF | 0 | **no** (reserved) |
+| 11 | setpoint clamp ON (cellproof FAIL capped the setpoints) | 0 | yes (edge: once per clamp, not once per cycle) |
+| 12 | setpoint clamp OFF | 1 = lifted by the diver's `CELLPROOF OVERRIDE` | yes |
 | 13 | pre-dive PASS | 0 | **no** (reserved) |
 | 14 | controller reset | — | **no** (reserved) |
 | 15 | dive started with no wall clock | 0 | dive **file** only (written into the dive at `DIVE START`; not streamed live) |
 
-Do not build a "CAL AIR done" or "pre-dive passed" *notification* on those
-reserved ids — they never arrive. Learn the same facts from what is live now:
-`GET PRE` (poll, `PRE,` line), the `T,` FLAGS clamp bit (5) for a clamp, and
-the controller's console output for calibration results.
+Do not build a "CAL AIR done" or "pre-dive passed" *notification* on the
+remaining reserved ids — they never arrive. Learn the same facts from what is
+live now: `GET PRE` (poll, `PRE,` line), `GET PROOF` / the `T,` FLAGS clamp bit
+(5) for a clamp, and the controller's console output for calibration results.
+
+Ids 11/12 are published as **edges**: a FAIL lasts hundreds of control cycles,
+and one row each is what the dive file needs (id 10 says the verdict, id 11 says
+the consequence the diver can act on, id 12 says who lifted it — value 1, the
+diver, because a FAIL never re-arms itself).
 
 ### Status answer lines
 

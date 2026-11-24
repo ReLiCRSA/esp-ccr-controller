@@ -817,7 +817,18 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   intent, not a behaviour; and `CAL AIR` answers `OK CAL AIR` *before* the
   control task applies the 120 s warm-up gate, so a too-early call says OK and
   reports the refusal only on the USB console. Event ids 7/8/11/12/13/14 are
-  the same shape: defined in the log format, never published. A handset built
+  the same shape: defined in the log format, never published. **Partly closed
+  2026-11-24: ids 11/12 (clamp ON / clamp OFF) are published now** — as edges,
+  one row each (`CLAMP_OFF` value 1 = the diver lifted it, because a FAIL never
+  re-arms itself), pinned by `test_uartlink` driving the real cell-proof engine
+  to a FAIL and then lifting it with the handset's own path, and each half of the
+  pair proven to bite by deleting it. Their hardware sighting is queued in
+  `BENCH.md` C3-a, because the proof arms on a depth crossing and this bench has
+  no depth sensor: host-proven, never yet seen on the wire. **7/8/13/14 remain
+  reserved, and the reason is structural, not laziness** — an event row lives
+  inside a dive file, and every one of those facts is made at the surface
+  (calibration, pre-dive) or at the moment a dive file was left unclosed by a
+  reset. Giving them a home is a decision, not a patch. A handset built
   by someone else would have drawn a "calibrated" tick from all of this, so
   the spec states it plainly (§3 caveats, §4 id table, §8) and the library
   refuses to invent the missing feedback. Fix on our side: give `CAL O2` and

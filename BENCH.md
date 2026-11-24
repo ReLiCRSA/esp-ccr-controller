@@ -546,6 +546,32 @@ Wiring:
 Until the sensor is fitted the controller behaves correctly with no depth —
 `HB … al=0x0090` includes `BIT_SENSOR_STALE` — it just refuses to pretend.
 
+**Cell-proof clamp events (`E,` ids 10/11/12) — depth-leg check, host-proven
+2026-11-24, never yet seen on the wire.** The proof arms on the descent
+crossing `CELLPROOF_DEPTH`, so with no depth sensor it never runs and these
+three rows can never appear: `test_uartlink`'s `test_cellproof_clamp_edges_publish_once`
+drives the real engine instead. With the LPS28DFW fitted, force the failure
+cheaply on the bench and watch the wire (handset side, and the dive file):
+
+```
+SET CELLPROOF_DEPTH=3        # arm depth, minimum the schema allows
+SET CELLPROOF_TMO=20         # fail fast: 20 s instead of 60
+TIME SET <epoch> ; DIVE START
+# press the port / breathe through a tube until depth passes 3 m, then hold it:
+#   the bench cells sit near 0.21 bar, so the vote never reaches CELLPROOF_MIN
+expect  E,<t>,10,0           # verdict: the proof failed
+        E,<t>,11,0           # consequence: setpoints capped — once, not per cycle
+        T, ... CLAMP         # FLAGS bit 5, the same fact held live
+CELLPROOF OVERRIDE           # the diver lifts it
+expect  E,<t>,12,1           # value 1 = the diver lifted it (never the machine)
+DIVE END ; LOG EXPORT <slot>
+```
+
+The export must carry the same three rows inside the dive, in that order, and
+the cap must be visible in the `S,` rows' `setpoint` column from the FAIL row on
+(≤ `CELLPROOF_MAXSP`). One row per edge is the property being checked: a FAIL
+lasts hundreds of 100 ms cycles, so a per-cycle publisher buries the dive.
+
 ## C3-b — MS5837-30BA swap (before ANY wet test)
 
 - [ ] Potting inspection: gel-filled port free of voids, epoxy not lifted

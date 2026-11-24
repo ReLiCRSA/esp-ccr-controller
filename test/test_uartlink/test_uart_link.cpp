@@ -8,6 +8,7 @@
 #include <unity.h>
 
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -305,6 +306,73 @@ void test_publish_state_is_not_static_between_dives() {
     TEST_ASSERT_EQUAL(2, raised);              // one per chain, not one total
 }
 
+// ids 11/12 (clamp ON / OFF) were defined in the log format and never published:
+// the diver-visible fact "your setpoints are capped until you say otherwise"
+// existed only as a FLAGS bit and a `PROOF,` field, so a dive file could not say
+// whether a clamp was applied or who lifted it. Driven through the real engine,
+// because what matters here is the EDGE: FAIL is a state that lasts hundreds of
+// cycles, and a per-cycle publisher would bury the dive in rows.
+void test_cellproof_clamp_edges_publish_once() {
+    bridge::EventRing ring;
+    bridge::PublisherState ps;
+    Loop loop{Config{}};
+
+    SensorData sd{};
+    for (int c = 0; c < 3; c++) sd.cells[c] = 0.45f;   // fitted, flat, never reaches 1.00
+    sd.vbat = 12.4f;
+    sd.depthM = 3.0f;                                  // shallow: the proof arms...
+
+    uint32_t now = 0;
+    loop.postStartDive(now);
+    auto cycle = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            now += Loop::kTickMs;
+            const State st = loop.cycle(sd, now);
+            bridge::publishEvents(st, now / 1000, ring, ps);
+        }
+    };
+    cycle(20);
+    sd.depthM = 12.0f;                                 // ...and runs on the crossing
+    cycle(700);                                        // 70 s: proof times out -> FAIL
+
+    // The clamp is up, and the chain agrees with the publisher about that.
+    TEST_ASSERT_TRUE_MESSAGE(loop.clampActive(), "the cellproof FAIL did not clamp");
+    cycle(100);                                        // 10 s more in FAIL: no repeats
+
+    std::vector<int> ids;
+    bridge::Event e;
+    int offValue = -1;
+    while (ring.pop(e)) {
+        ids.push_back(e.id);
+        if (e.id == logfmt::EVT_CLAMP_OFF) offValue = e.value;
+    }
+    const int fail = static_cast<int>(std::count(ids.begin(), ids.end(), logfmt::EVT_CELLPROOF_FAIL));
+    const int on = static_cast<int>(std::count(ids.begin(), ids.end(), logfmt::EVT_CLAMP_ON));
+    TEST_ASSERT_EQUAL_MESSAGE(1, fail, "cellproof FAIL must publish exactly once");
+    TEST_ASSERT_EQUAL_MESSAGE(1, on, "CLAMP_ON must publish exactly once per clamp");
+    TEST_ASSERT_EQUAL(0, std::count(ids.begin(), ids.end(), logfmt::EVT_CLAMP_OFF));
+    // Verdict first, then the consequence the diver acts on — the order a person
+    // reading the dive file afterwards should see.
+    const auto itFail = std::find(ids.begin(), ids.end(), logfmt::EVT_CELLPROOF_FAIL);
+    const auto itOn = std::find(ids.begin(), ids.end(), logfmt::EVT_CLAMP_ON);
+    TEST_ASSERT_TRUE(itFail != ids.end() && itOn != ids.end() && itOn > itFail);
+
+    // The diver lifts it: `CELLPROOF OVERRIDE` queues the lift for the control
+    // tick, exactly as the handset asks for it.
+    loop.postCpOverride();
+    cycle(5);
+    TEST_ASSERT_FALSE(loop.clampActive());
+
+    int off = 0, onAfter = 0;
+    while (ring.pop(e)) {
+        if (e.id == logfmt::EVT_CLAMP_OFF) { off++; offValue = e.value; }
+        if (e.id == logfmt::EVT_CLAMP_ON) onAfter++;
+    }
+    TEST_ASSERT_EQUAL_MESSAGE(1, off, "CLAMP_OFF must publish when the diver lifts the clamp");
+    TEST_ASSERT_EQUAL(1, offValue);                     // value 1 = lifted by OVERRIDE
+    TEST_ASSERT_EQUAL_MESSAGE(0, onAfter, "lifting the clamp must not invent a second CLAMP_ON");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_command_replies_and_hooks_fire);
@@ -314,6 +382,7 @@ int main() {
     RUN_TEST(test_dive_lifecycle_opens_and_closes_the_log_and_announces_failure);
     RUN_TEST(test_log_list_and_export_stream_over_the_session);
     RUN_TEST(test_publish_state_is_not_static_between_dives);
+    RUN_TEST(test_cellproof_clamp_edges_publish_once);
     RUN_TEST(test_an_export_hands_the_callers_sink_context_back);
     return UNITY_END();
 }

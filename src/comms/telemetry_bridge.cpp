@@ -53,6 +53,25 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
         } else if (cp == static_cast<int16_t>(cellproof::State::FAIL)) {
             if (!ring.push({tSec, logfmt::EVT_CELLPROOF_FAIL, 0})) ring.noteDropped();
         }
+        // The clamp is a separate fact from the verdict, and it is the one the
+        // diver can act on: ids 11/12 exist because "the proof failed" and "your
+        // setpoints are now capped until you override" are different news. The
+        // FAIL edge says both, and it says them once: staying in FAIL for 200
+        // cycles must not produce 200 rows.
+        if (cp == static_cast<int16_t>(cellproof::State::FAIL) &&
+            ps.prevCp != static_cast<int16_t>(cellproof::State::FAIL)) {
+            if (!ring.push({tSec, logfmt::EVT_CLAMP_ON, 0})) ring.noteDropped();
+        }
+        // FAIL → PASS happens exactly one way: `CELLPROOF OVERRIDE`, because a
+        // FAIL never re-arms itself (the clamp is the safe state, lifting it is
+        // the diver's call). So value 1 = lifted by the diver, and a dive CSV
+        // can later tell "the clamp came off because the engine relented" (it
+        // cannot) from "the diver took it off" — a distinction that matters when
+        // someone reads the file afterwards.
+        if (ps.prevCp == static_cast<int16_t>(cellproof::State::FAIL) &&
+            cp == static_cast<int16_t>(cellproof::State::PASS)) {
+            if (!ring.push({tSec, logfmt::EVT_CLAMP_OFF, 1})) ring.noteDropped();
+        }
         ps.prevCp = cp;
     }
 

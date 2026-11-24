@@ -74,6 +74,30 @@ void test_compound_commands() {
     TEST_ASSERT_EQUAL_UINT8(Kind::TESTCELLS, c.kind);
 }
 
+// TIME SET is the only command that carries a number, and the grammar takes the
+// digits without judging them: what counts as a believable dive date is the
+// router's decision, not the parser's.
+void test_time_set_grammar() {
+    auto c = parsed("TIME SET 1795509660\r\n");
+    TEST_ASSERT_EQUAL_UINT8(Kind::TIME_SET, c.kind);
+    TEST_ASSERT_EQUAL_UINT32(1795509660u, c.epoch);
+
+    c = parsed("TIME SET 7");            // nonsense value, valid grammar
+    TEST_ASSERT_EQUAL_UINT8(Kind::TIME_SET, c.kind);
+    TEST_ASSERT_EQUAL_UINT32(7u, c.epoch);
+
+    parsed("TIME", false);
+    parsed("TIME SET", false);
+    parsed("TIME SET twelve", false);
+    parsed("TIME SET 1 2", false);
+    parsed("TIME NOW", false);
+
+    // The read side needs no new verb: `GET TIME` is an ordinary GET key.
+    c = parsed("GET TIME");
+    TEST_ASSERT_EQUAL_UINT8(Kind::GET, c.kind);
+    TEST_ASSERT_EQUAL_STRING("TIME", c.key);
+}
+
 void test_rejections_are_errs_not_crashes() {
     parsed("", false);
     parsed("SET", false);
@@ -140,6 +164,7 @@ int main() {
     RUN_TEST(test_get_and_set);
     RUN_TEST(test_two_step_cal_confirm);
     RUN_TEST(test_compound_commands);
+    RUN_TEST(test_time_set_grammar);
     RUN_TEST(test_rejections_are_errs_not_crashes);
     RUN_TEST(test_format_telemetry_shape);
     RUN_TEST(test_format_deco_stops_and_overflow);

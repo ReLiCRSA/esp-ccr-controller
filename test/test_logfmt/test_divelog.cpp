@@ -126,7 +126,7 @@ void capture(const logfmt::RawRecord& r, void* v) {
 size_t buildImage(uint8_t* img, const logfmt::Snapshot* ss, int nS,
                   const logfmt::Event* es, int nE, bool withMeta) {
     size_t p = 0;
-    logfmt::packHeader(1700000000u, 3, img + p);
+    logfmt::packHeader(1700000000u, 3, 1, img + p);
     p += logfmt::HEADER_SIZE;
     int si = 0, ei = 0;
     // interleave on purpose: chronological is how the store writes
@@ -162,14 +162,139 @@ logfmt::Snapshot mkSnap(uint32_t t) {
 
 void test_header_roundtrip_and_version_gate() {
     uint8_t head[logfmt::HEADER_SIZE];
-    logfmt::packHeader(1700000000u, 7, head);
-    uint32_t epoch = 0;
+    logfmt::packHeader(1700000000u, 7, 4242u, head);
+    uint32_t epoch = 0, seq = 0;
     uint8_t slot = 0;
-    TEST_ASSERT_TRUE(logfmt::unpackHeader(head, epoch, slot));
+    TEST_ASSERT_TRUE(logfmt::unpackHeader(head, epoch, slot, seq));
     TEST_ASSERT_EQUAL_UINT32(1700000000u, epoch);
     TEST_ASSERT_EQUAL_UINT8(7, slot);
+    TEST_ASSERT_EQUAL_UINT32(4242u, seq);
     head[9] ^= 0xFF;   // one flipped byte in the header
-    TEST_ASSERT_FALSE(logfmt::unpackHeader(head, epoch, slot));
+    TEST_ASSERT_FALSE(logfmt::unpackHeader(head, epoch, slot, seq));
+}
+
+// The header grew its sequence field out of bytes that used to be zero padding,
+// so a file written before that change must still read — and must read as
+// "age unknown", not as a dive that is sequenced. The board being flashed on
+// 2026-11-24 had ten such dives on it; making them unreadable would have been a
+// worse bug than the one being fixed.
+void test_header_reads_a_pre_sequence_file_as_unknown() {
+    uint8_t head[logfmt::HEADER_SIZE];
+    logfmt::packHeader(1700000000u, 4, 0, head);   // what the old writer left in 5..7
+    TEST_ASSERT_EQUAL_UINT8(0, head[5]);
+    TEST_ASSERT_EQUAL_UINT8(0, head[6]);
+    TEST_ASSERT_EQUAL_UINT8(0, head[7]);
+    uint32_t epoch = 0, seq = 99;
+    uint8_t slot = 0;
+    TEST_ASSERT_TRUE(logfmt::unpackHeader(head, epoch, slot, seq));
+    TEST_ASSERT_EQUAL_UINT32(logfmt::SEQ_UNKNOWN, seq);
+    TEST_ASSERT_EQUAL_UINT32(1700000000u, epoch);
+    TEST_ASSERT_EQUAL_UINT8(4, slot);
+    // The sequence is inside the CRC: tampering with it is a corrupt header,
+    // not a dive that suddenly looks older or newer than it is.
+    head[5] ^= 0x01;
+    TEST_ASSERT_FALSE(logfmt::unpackHeader(head, epoch, slot, seq));
+}
+
+// A sequence counter that came back round would make the newest dive look like
+// the oldest and get it evicted first — the exact failure mode the field
+// exists to prevent, so the saturation is asserted rather than assumed.
+void test_sequence_saturates_and_never_wraps() {
+    uint8_t head[logfmt::HEADER_SIZE];
+    logfmt::packHeader(1u, 1, logfmt::SEQ_MAX + 7u, head);
+    uint32_t epoch = 0, seq = 0;
+    uint8_t slot = 0;
+    TEST_ASSERT_TRUE(logfmt::unpackHeader(head, epoch, slot, seq));
+    TEST_ASSERT_EQUAL_UINT32(logfmt::SEQ_MAX, seq);
+
+    const uint32_t empty[1] = {0};
+    TEST_ASSERT_EQUAL_UINT32(1u, logfmt::nextSeq(empty, 0));      // empty log
+    const uint32_t legacy[3] = {0, 0, 0};
+    TEST_ASSERT_EQUAL_UINT32(1u, logfmt::nextSeq(legacy, 3));     // pre-change dives
+    const uint32_t full[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    TEST_ASSERT_EQUAL_UINT32(11u, logfmt::nextSeq(full, 10));
+    const uint32_t afterEvict[10] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    TEST_ASSERT_EQUAL_UINT32(12u, logfmt::nextSeq(afterEvict, 10));
+    const uint32_t maxed[2] = {logfmt::SEQ_MAX, 0};
+    TEST_ASSERT_EQUAL_UINT32(logfmt::SEQ_MAX, logfmt::nextSeq(maxed, 2));
+}
+
+// This is the bench defect written as a unit test. Ten dives filled the FIFO,
+// then three more were written, and every one of them landed in slot 1 because
+// all ten epoch keys were equal (no RTC: every dive is epoch 0). The 40-second
+// dive was gone before the next boot, and the log kept the nine OLDEST dives
+// plus the very newest. Epoch ordering needs an epoch; this ordering runs with
+// no clock at all.
+void test_eviction_rotates_when_there_is_no_clock() {
+    const uint32_t noEpoch[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t seq[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    uint32_t written = 11;
+    // Twelve more dives: the evicted slot must advance every time, and the set
+    // of surviving sequences must be the twelve most recent, not the nine
+    // oldest plus the newest.
+    int evicted[12];
+    for (int i = 0; i < 12; i++) {
+        const int s = logfmt::pickEvictSlot(seq, noEpoch, 10);
+        TEST_ASSERT_TRUE(s >= 0);
+        evicted[i] = s;
+        seq[s] = written++;
+    }
+    for (int i = 0; i < 12; i++)
+        TEST_ASSERT_EQUAL_MESSAGE(i % 10, evicted[i],
+                                  "eviction must rotate through the slots, not "
+                                  "hammer one of them");
+    uint32_t lo = seq[0], hi = seq[0];
+    for (int i = 1; i < 10; i++) { if (seq[i] < lo) lo = seq[i]; if (seq[i] > hi) hi = seq[i]; }
+    // Twenty-two dives written; the ten that survive must be 13..22, the last
+    // ten. The firmware of 2026-11-24 kept 2..10 plus 22 and lost 11..21.
+    TEST_ASSERT_EQUAL_UINT32(13u, lo);
+    TEST_ASSERT_EQUAL_UINT32(22u, hi);
+    bool distinct[24] = {false};
+    for (int i = 0; i < 10; i++) {
+        TEST_ASSERT_FALSE_MESSAGE(distinct[seq[i]], "two dives sharing a sequence");
+        distinct[seq[i]] = true;
+    }
+}
+
+void test_unknown_age_is_evicted_before_any_sequenced_dive() {
+    // A board upgrading into this format has unsequenced dives on it. Those are
+    // the ones to shed first: they predate everything the new firmware wrote.
+    const uint32_t seq[3] = {0, 5, 7};
+    const uint32_t epoch[3] = {999999u, 0u, 0u};   // a legacy dive with a real epoch
+    TEST_ASSERT_EQUAL(0, logfmt::pickEvictSlot(seq, epoch, 3));
+    const uint32_t seq2[3] = {0, 0, 0};            // all legacy: epoch decides
+    const uint32_t epoch2[3] = {500u, 100u, 300u};
+    TEST_ASSERT_EQUAL(1, logfmt::pickEvictSlot(seq2, epoch2, 3));
+    const uint32_t seq3[3] = {4, 4, 4};            // identical keys: lower slot wins
+    const uint32_t epoch3[3] = {7u, 7u, 7u};       // deterministically, not by luck
+    TEST_ASSERT_EQUAL(0, logfmt::pickEvictSlot(seq3, epoch3, 3));
+    TEST_ASSERT_EQUAL(-1, logfmt::pickEvictSlot(seq3, epoch3, 0));
+    // Equal sequences are impossible in a running log, but if two files somehow
+    // say the same thing, the real clock is the tie-break.
+    const uint32_t seq4[2] = {6, 6};
+    const uint32_t epoch4[2] = {1800000000u, 1700000000u};
+    TEST_ASSERT_EQUAL(1, logfmt::pickEvictSlot(seq4, epoch4, 2));
+}
+
+// Rendered by this project, printed on the diver's CSV, and never by newlib:
+// `strftime`/`gmtime` would pull the time tables and float conversion into the
+// task that answers clients, which is the stack that has run out before.
+void test_utc_rendering_is_exact_and_says_when_there_is_no_clock() {
+    char s[32];
+    const struct { uint32_t epoch; const char* want; } cases[] = {
+        {1234567u, "1970-01-15T06:56:07Z"},
+        {1700000000u, "2023-11-14T22:13:20Z"},
+        {1795509660u, "2026-11-24T08:41:00Z"},   // the day this was written
+        {951782400u, "2000-02-29T00:00:00Z"},    // 2000 IS a leap year
+        {4107542400u, "2100-03-01T00:00:00Z"},   // 2100 is not: there is no Feb 29
+        {0u, logfmt::kNoClock},                  // no clock: not 1970-01-01
+    };
+    for (const auto& c : cases) {
+        const size_t n = logfmt::isoUtc(s, sizeof(s), c.epoch);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(c.want, s, "utc render");
+        TEST_ASSERT_EQUAL_MESSAGE((int)std::strlen(c.want), (int)n, "utc length");
+    }
+    TEST_ASSERT_EQUAL(0, logfmt::isoUtc(s, 20, 1700000000u));   // 20 stops before the Z
 }
 
 void test_scan_walks_interleaved_records_in_order() {
@@ -307,9 +432,19 @@ static int countFields(const char* line) {
 static void test_dive_identity_line() {
     char l[48];
     const size_t n = diveCsvLine(l, sizeof(l), 7, 1234567);
-    const char* want = "DIVE,7,1234567,3,2\n";   // slot, epoch, codec, row format
+    // v3 appends one column on the right; the first five fields are exactly the
+    // v1/v2 bytes, which is what "append-only" has to mean in practice.
+    const char* want = "DIVE,7,1234567,3,3,1970-01-15T06:56:07Z\n";
     TEST_ASSERT_EQUAL_STRING(want, l);
     TEST_ASSERT_EQUAL((int)std::strlen(want), (int)n);
+    TEST_ASSERT_EQUAL_STRING_LEN("DIVE,7,1234567,3,3,", l, 19);
+    int fields = 1;
+    for (const char* c = l; *c; ++c) if (*c == ',') ++fields;
+    TEST_ASSERT_EQUAL(6, fields);   // the five v1/v2 fields, plus the date
+    // A dive recorded with no clock says so in the date field.
+    char l2[48];
+    diveCsvLine(l2, sizeof(l2), 7, 0);
+    TEST_ASSERT_EQUAL_STRING("DIVE,7,0,3,3,clock-unset\n", l2);
 }
 
 static void test_snapshot_row_is_the_documented_shape() {
@@ -398,7 +533,7 @@ static void test_both_export_paths_are_the_same_bytes() {
         {REC_SNAPSHOT, sb1}, {REC_EVENT, eb}, {REC_SNAPSHOT, sb2}};
     const DiveMeta m = sampleMeta();
     uint8_t img[512];
-    const size_t len = packImage(img, sizeof(img), 4242, 3, recs, 3, &m);
+    const size_t len = packImage(img, sizeof(img), 4242, 3, 1, recs, 3, &m);
     TEST_ASSERT_TRUE(len > 0);
 
     Collector streamed{};
@@ -414,8 +549,9 @@ static void test_both_export_paths_are_the_same_bytes() {
     TEST_ASSERT_EQUAL((int)streamed.used, (int)n);
 
     // Identity line first, exactly once, carrying the slot the writer stamped.
-    TEST_ASSERT_EQUAL_STRING_LEN("DIVE,3,4242,3,2\n", buffered, 16);
-    TEST_ASSERT_NULL(std::strstr(buffered + 16, "DIVE,"));
+    const char* kHead = "DIVE,3,4242,3,3,1970-01-01T01:10:42Z\n";
+    TEST_ASSERT_EQUAL_STRING_LEN(kHead, buffered, (int)std::strlen(kHead));
+    TEST_ASSERT_NULL(std::strstr(buffered + std::strlen(kHead), "DIVE,"));
 
     // Rows in file order (the E row belongs between the two S rows), trailer last.
     const char* a = std::strstr(buffered, "\nS,30,");
@@ -441,10 +577,10 @@ static void test_pack_image_refuses_a_short_buffer() {
     const ImageRecord recs[] = {{REC_SNAPSHOT, sb}};
     const DiveMeta m = sampleMeta();
     uint8_t img[HEADER_SIZE + 1 + SNAPSHOT_SIZE];   // trailer will not fit
-    TEST_ASSERT_EQUAL(0, packImage(img, sizeof(img), 1, 1, recs, 1, &m));
+    TEST_ASSERT_EQUAL(0, packImage(img, sizeof(img), 1, 1, 1, recs, 1, &m));
     // ... and fits exactly when the trailer has room.
     uint8_t enough[HEADER_SIZE + 1 + SNAPSHOT_SIZE + 1 + 64];
-    TEST_ASSERT_TRUE(packImage(enough, sizeof(enough), 1, 1, recs, 1, &m) > 0);
+    TEST_ASSERT_TRUE(packImage(enough, sizeof(enough), 1, 1, 1, recs, 1, &m) > 0);
 }
 
 int main() {
@@ -455,6 +591,11 @@ int main() {
     RUN_TEST(test_high_alarm_bits_survive_the_record);
     RUN_TEST(test_snapshot_version_gate);
     RUN_TEST(test_header_roundtrip_and_version_gate);
+    RUN_TEST(test_header_reads_a_pre_sequence_file_as_unknown);
+    RUN_TEST(test_sequence_saturates_and_never_wraps);
+    RUN_TEST(test_eviction_rotates_when_there_is_no_clock);
+    RUN_TEST(test_unknown_age_is_evicted_before_any_sequenced_dive);
+    RUN_TEST(test_utc_rendering_is_exact_and_says_when_there_is_no_clock);
     RUN_TEST(test_scan_walks_interleaved_records_in_order);
     RUN_TEST(test_scan_stops_at_the_first_corrupt_record);
     RUN_TEST(test_scan_rejects_unknown_tags_and_foreign_headers);

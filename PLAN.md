@@ -539,8 +539,8 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
 | A5c | handset session on UART2 | done `0e681e1` |
 | A5d | web AP + `/ws` bridge + built-in page + dive CSV | done `6c11ac6` — web-fix build `a8cd6bf`, dead page tabs fixed `70049fa` |
 | A5e | close the control-vs-command race: defer chain mutations (`setConfig`, `startDive`/`endDive`, pre-dive, pulse requests) into ControlTask's cycle boundary, so the handset/web task never mutates the chain mid-`cycle()` on the other core; host test | done `0d446fc` |
-| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **PASSes on the flashed build: 48 checks 0 failures** (harness `342d2b3`, first green `1257bec` on `1b8c807`, green at `b1d8d2e` (tag `m4-radio-cycled`) and again at `0256df6`, which added the `log:` boot check and `--dive-persist`): boot console (fresh-boot banner, HB contract, no SAFE/FATAL, `settings: 32 keys from NVS`, `web: AP "..."`), the refusal matrix over the spare-ESP32 handset bridge (`AUTO` cold, `SET SP2` mid-dive, `WIFI ON` mid-dive, `CAL AIR` mid-dive, overlong, junk), `GET T`/`GET D` proven to be real replies by cadence anchoring, a console watcher that fails the run on any panic, SAFE latch or lost stack headroom, and `stk=`/`u2stk=` headroom at or above 512 bytes. The link paid for itself immediately: the first `GET T` over it panicked the controller (uart2 stack overflow — 16), fixed structurally (`util/numfmt.cpp`, no by-value reply buffers, `stk=`/`u2stk=` in HB) together with the SAFE-mode `ACK` the boot log had been promising but never implemented, now verified on hardware (`ACK` — `OK SAFE RESTART` — clean boot). **Closed since that run:** the `LOG EXPORT` vs `/dive/<n>.csv` row-shape mismatch (16) — one row formatter now, columns append-only, and `web_probe.py` compares the two transports on the wire. Asking the question that check should have asked (what would a broken build do differently?) then turned up two worse dive-log defects behind it, both fixed in `0256df6` and both bench-checked (16). **Still open for C2:** the depth and `CAL O2` legs, which need the LPS28DFW on 19/18 and the bench jar; and no battery-margin or pre-dive conclusion is trustworthy yet, because the pack is unplugged (`vbat` about 1.56 V, `batlow=1`) and `[CELLS UNCALIBRATED: run CAL AIR]` stands. The BMP085 that used to block the depth leg never ACKed on the shared bus and has been replaced on the bench by the LPS28DFW (`1e1e15a`, auto-detect `de97ab9`) |
-| C2w | the surface web stack, verified over a joined station instead of "join a phone and look": `tools/web_probe.py` → page served byte-identical to `data/index.html`, captive DNS answers any name, WebSocket handshake verified against RFC 6455, every `#<n>` marker count matches its answer, each command sent over `/ws` and UART2 **back to back** and compared, and `--dive-cycle` proving `DIVE START` takes the radio out from under an associated client and the surface comes back after `DIVE END` on the other transport | done `1d8f284` (tag `m4-web-verified`), extended `0256df6` — 38 checks, 0 failures; the 38th compares `LOG EXPORT n` with `GET /dive/<n>.csv` row for row; it found `board_build.filesystem` defaulting to SPIFFS while the firmware mounts LittleFS, so the page in `data/` had never actually been installed (16) |
+| C2 | bench acceptance: `tools/hw_accept.py` (boot checks + refusal matrix over a wired handset; `--replay` validated against the soak log) + `BENCH.md` sequence, then flash the current build | **PASSes on the flashed build: 48 checks 0 failures** (harness `342d2b3`, first green `1257bec` on `1b8c807`, green at `b1d8d2e` (tag `m4-radio-cycled`) and again at `0256df6`, which added the `log:` boot check and `--dive-persist`): boot console (fresh-boot banner, HB contract, no SAFE/FATAL, `settings: 32 keys from NVS`, `web: AP "..."`), the refusal matrix over the spare-ESP32 handset bridge (`AUTO` cold, `SET SP2` mid-dive, `WIFI ON` mid-dive, `CAL AIR` mid-dive, overlong, junk), `GET T`/`GET D` proven to be real replies by cadence anchoring, a console watcher that fails the run on any panic, SAFE latch or lost stack headroom, and `stk=`/`u2stk=` headroom at or above 512 bytes. The link paid for itself immediately: the first `GET T` over it panicked the controller (uart2 stack overflow — 16), fixed structurally (`util/numfmt.cpp`, no by-value reply buffers, `stk=`/`u2stk=` in HB) together with the SAFE-mode `ACK` the boot log had been promising but never implemented, now verified on hardware (`ACK` — `OK SAFE RESTART` — clean boot). **Closed since that run:** the `LOG EXPORT` vs `/dive/<n>.csv` row-shape mismatch (16) — one row formatter now, columns append-only, and `web_probe.py` compares the two transports on the wire. Asking the question that check should have asked (what would a broken build do differently?) then turned up two worse dive-log defects behind it, both fixed in `0256df6` and both bench-checked (16). The FIFO identity defect behind them is closed too (16): a 24-bit dive sequence in the header's spare bytes, `seq a..b` in the boot line, the `L,` fourth field with newest-written-first listing, `TIME SET`/`GET TIME` as the surface-set wall clock, and ISO-8601 dive dates appended to the CSV (v3). The matrix now carries the clock accept and the range refusal, and `--dive-persist` asserts WHICH dive survived — newest sequence present after the reset, a real epoch stamped on the closed dive, the boot stating the clock honestly after a power-down. The bench re-run of the original defect (ten 2 s dives, then 8 s, 40 s, 8 s) now leaves the ten most recent dives on the board, 40 s dive included, where the old firmware kept the nine oldest and ate the rest. 57 checks 0 failures at the time of writing. **Still open for C2:** the depth and `CAL O2` legs, which need the LPS28DFW on 19/18 and the bench jar; and no battery-margin or pre-dive conclusion is trustworthy yet, because the pack is unplugged (`vbat` about 1.56 V, `batlow=1`) and `[CELLS UNCALIBRATED: run CAL AIR]` stands. The BMP085 that used to block the depth leg never ACKed on the shared bus and has been replaced on the bench by the LPS28DFW (`1e1e15a`, auto-detect `de97ab9`) |
+| C2w | the surface web stack, verified over a joined station instead of "join a phone and look": `tools/web_probe.py` → page served byte-identical to `data/index.html`, captive DNS answers any name, WebSocket handshake verified against RFC 6455, every `#<n>` marker count matches its answer, each command sent over `/ws` and UART2 **back to back** and compared, and `--dive-cycle` proving `DIVE START` takes the radio out from under an associated client and the surface comes back after `DIVE END` on the other transport | done `1d8f284` (tag `m4-web-verified`), extended `0256df6` — 38 checks, 0 failures; the 38th compares `LOG EXPORT n` with `GET /dive/<n>.csv` row for row; it found `board_build.filesystem` defaulting to SPIFFS while the firmware mounts LittleFS, so the page in `data/` had never actually been installed (16); extended again by the dive-log clock work — 41 checks now, the page itself must post `TIME SET` on socket open and show `GET TIME` (the page IS the surface clock source), and the exported dive's identity row must be the v3 shape with an ISO-8601 start |
 | C3 | MS5837 swap + potting checklist, pre-dive on real cells — checklists in `BENCH.md` | pending — hardware |
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done `1b8c807`, page tabs working since `70049fa` |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done `73e004d` (tag `m4-deco-validated`) |
@@ -1244,14 +1244,26 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   `<` and `<=` both pick a fixed slot when every key is equal, so no tie-break can
   fix it. What is missing is an ordering identity. Epoch ordering needs an epoch,
   and there is no clock.
-  The fix is a monotonic dive sequence number, written at `DIVE START` and
-  compared instead of the epoch (the 16-byte dive header has four unused bytes:
-  `out[5..7]` and `out[13]`, enough for a counter, at the cost of a `DIVE_VERSION`
-  bump and codec tests; the alternative is a counter in NVS). Not done here: it
-  changes the on-flash dive format and the host codec tests that pin it, which is
-  a decision, not a last-step fix in a C2 run. `hw_accept.py --dive-persist` now
-  tolerates an evicted dive once the FIFO holds ten (counting +1 there would fail
-  a run that worked), and deliberately does not bless *which* dive was evicted.
+  **Closed on the bench, 2026-11-24.** The header gained a monotonic dive
+  sequence in `out[5..7]` — 24-bit, saturating — and `DIVE_VERSION` did NOT
+  move: the layout, size and CRC coverage of the header are unchanged, so
+  every pre-change file still reads, as sequence 0 = "age unknown", and
+  unknown-age dives are evicted before any sequenced one. The ordering
+  decision is pure host-tested code (`logfmt::nextSeq` = max-on-partition + 1,
+  `logfmt::pickEvictSlot`: smallest sequence first, real epoch as tie-break,
+  then lower slot, so the choice is stated rather than emergent from a scan).
+  A counter in NVS was rejected: the dive files are the durable history, and
+  a second copy of the order somewhere else is one more thing that can
+  disagree with them. The order is now visible where it was invisible — the
+  boot banner says `log: LittleFS mounted, N dives, seq a..b`, and the `L,`
+  lines carry a fourth field — so `hw_accept.py --dive-persist` asserts WHICH
+  dive survived (the newest sequence must still be present after the reset),
+  not just how many. The bench re-run with distinguishable durations: after
+  twelve more dives the surviving set is exactly the last twelve, and the
+  eviction index rotates through the slots instead of hammering slot 1. The
+  injected bug ("ignore the sequence, order by epoch as before") makes the
+  host test fail with `Expected 1 Was 0`, which is the bench defect in one
+  line. Epochs also mean something now — see the wall-clock entry below.
 - **The harness promised something the bench contradicted: opening a port does not
   reset the board (2026-11-24).** BENCH.md's first rule says the open *is* a reset
   pulse, and `tools/port_id.py`'s `open_quiet()` docstring said the opposite —
@@ -1273,3 +1285,56 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   exception came from a probe of mine that was still holding `/dev/ttyUSB1` while
   a new one opened it — the first reader alive, not the firmware misbehaving.
   `fuser /dev/ttyUSB0 /dev/ttyUSB1` before any run; rc=1 means free.
+
+- **Wall clock: a client at the surface IS the time source (decision,
+  2026-11-24).** The dive epoch had been a hard-coded `0` in `uart_link.cpp`
+  since the log existed: no RTC chip, no NTP through an access point with no
+  uplink, and nothing anywhere said so. Since the FIFO defect above was
+  partly a clock problem in disguise, the clock got designed rather than
+  patched. Decisions, all deliberate:
+  * `TIME SET <epoch>` and `GET TIME` on the handset protocol (a command,
+    never a settings key — settings live in NVS, and resurrecting a saved
+    epoch after a battery pull would date every dive with a number from a
+    previous life in silence). The built-in page posts its phone's clock on
+    every WebSocket open, so the normal surface flow sets it without anyone
+    typing.
+  * Accepted window 2000-01-01..2100-01-01; a refusal changes nothing and
+    says `ERR epoch out of range` on the socket it arrived on. A
+    plausible-looking wrong epoch is worse than no epoch, because every
+    reader of the log believes it. `0xDEADBEEF` passes the range check —
+    that is why the RTC carry needs the magic too.
+  * The clock state is pure arithmetic (`epoch = epochSet + (nowMs -
+    setAtMs)/1000`, `src/comms/wallclock.{h,cpp}`), with the monotonic
+    millisecond clock handed in by the caller — same shape as
+    `CommandRouter::setNowMs`, host-testable including the ~49.7-day ms wrap.
+    It is mirrored into `RTC_NOINIT_ATTR` every control cycle (magic +
+    epoch), so a carried clock stays CURRENT rather than freezing at the
+    instant it was set. What the carry survives, measured on the bench
+    2026-11-24 (the design assumption was wrong in one corner and the bench
+    caught it): firmware-initiated resets (panic, watchdog, SAFE `ACK`) keep
+    RTC no-init memory; the **EN pin does not** — pulling EN on this board
+    is a CHIP_PU power-down, the next boot reports `rst:0x1 (POWERON_RESET)`,
+    and the clock is honestly `unset` afterwards, exactly like a battery
+    pull. A power-down also leaves plausible-looking garbage in that region,
+    which is what the magic+range rejection is for: `GET TIME` and the boot
+    banner then say unset, never a date from a previous life.
+  * A dive started with the clock unset is **recorded anyway**, and says so
+    in three places: an `E,,15` (EVT_CLOCK_UNSET) row inside the dive file,
+    `clock-unset` in the CSV date column, and `clock: unset...` at boot.
+    Refusing to log a dive over a calendar would cost the diver the dive data
+    — the opposite of what the machine is for.
+  * The dive CSV identity row went v2→v3 by **appending** field 6, ISO-8601
+    UTC (`DIVE,<slot>,<epoch>,3,3,2026-11-24T08:41:00Z`). It is rendered
+    from the stored epoch, never stored, so there is one truth on the flash
+    and pre-v3 dives export correct dates too. The renderer is the project's
+    own (`logfmt::isoUtc`, Hinnant's civil-from-days): `gmtime`/`strftime`
+    would pull newlib's time and float tables into the task that answers
+    clients, the stack that has run out before.
+  * `LOG LIST` now lists by sequence, newest-written first. Slot-number
+    ordering became a lie the moment eviction started rotating — a full FIFO
+    with the newest dive in slot 4 lists slot 4 first. Unsequenced (legacy)
+    dives list last, slot-descending, exactly as before.
+  * The bench rule this creates: **set the clock at the surface after every
+    power-up.** `hw_accept.py` does it in the refusal matrix, and
+    `--dive-persist` asserts the whole chain — dive stamped with a real
+    epoch, boot after the reset says `clock: ... (carried across a reset...)`.

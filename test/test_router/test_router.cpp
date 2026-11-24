@@ -431,6 +431,58 @@ void test_set_actually_moves_the_live_chain() {
                              "SET ALLO_LOW never reached the live alarm engine");
 }
 
+// The clock is a command, not a settings key: a settings key would put the
+// epoch in NVS, and a board that woke after a battery pull would then date every
+// dive with a number from a previous life and never mention it. The router
+// range-checks and hands the write to the transport, which owns the time.
+void test_time_set_is_range_checked_and_delegated() {
+    Bench b;
+    wallclock::State clk;
+    b.router.setClock(&clk);
+    CommandRouter::Response r;
+
+    // No clock: the answer is 0, not a 1970 date the caller might believe.
+    b.run("GET TIME", r);
+    TEST_ASSERT_TRUE(has(r, "TIME,0,0,0"));
+
+    b.run("TIME SET 1795509660", r);              // 2026-11-24T08:41:00Z
+    TEST_ASSERT_TRUE(has(r, "OK TIME"));
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_CLOCK_SET);
+    TEST_ASSERT_EQUAL_UINT32(1795509660u, b.router.clockEpochPending());
+
+    // A plausible-looking wrong epoch is worse than no epoch: it puts the dive
+    // in 1970 or 2200 and every reader of the log believes it.
+    b.run("TIME SET 7", r);
+    TEST_ASSERT_TRUE(has(r, "ERR epoch out of range"));
+    TEST_ASSERT_FALSE(r.actions & CommandRouter::ACT_CLOCK_SET);
+    b.run("TIME SET 99999999999999", r);          // saturates: still refused
+    TEST_ASSERT_TRUE(has(r, "ERR epoch out of range"));
+
+    // What the transport does with the action, then what the client sees.
+    wallclock::set(clk, b.router.clockEpochPending(), b.now);
+    b.now += 5000;
+    b.run("GET TIME", r);
+    TEST_ASSERT_TRUE(has(r, "TIME,1795509665,1,5"));
+
+    // Mid-dive is allowed on purpose: the dive header was written at DIVE START,
+    // so this cannot rewrite the dive that is running, and a surface PC that has
+    // only now noticed the clock is unset should be able to fix it before the
+    // NEXT dive rather than be refused.
+    b.run("DIVE START");
+    b.run("TIME SET 1795509800", r);
+    TEST_ASSERT_TRUE(has(r, "OK TIME"));
+    b.run("DIVE END");
+
+    // SAFE mode: the chain is not running, so no client may author anything —
+    // including the clock the dive log would be stamped with.
+    b.router.setSafeLockout(true);
+    b.run("TIME SET 1795509900", r);
+    TEST_ASSERT_TRUE(has(r, "ERR safe mode"));
+    TEST_ASSERT_FALSE(r.actions & CommandRouter::ACT_CLOCK_SET);
+    b.run("GET TIME", r);
+    TEST_ASSERT_TRUE(has(r, "ERR safe mode"));
+}
+
 void test_log_and_pulse_and_calibration_commands_delegations() {
     Bench b;
     CommandRouter::Response r;
@@ -485,5 +537,6 @@ int main() {
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);
     RUN_TEST(test_set_actually_moves_the_live_chain);
     RUN_TEST(test_log_and_pulse_and_calibration_commands_delegations);
+    RUN_TEST(test_time_set_is_range_checked_and_delegated);
     return UNITY_END();
 }

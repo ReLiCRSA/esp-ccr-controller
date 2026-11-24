@@ -15,12 +15,14 @@
 //     bounded, non-blocking action (flag set, record appended, radio moved).
 // ============================================================================
 #include <Arduino.h>
+#include <esp_sleep.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
 #include "comms/nvs_store.h"
 #include "comms/session.h"
 #include "comms/settings_apply.h"
+#include "comms/wallclock.h"
 #include "comms/web_server.h"
 #include "config/defaults.h"
 #include "log/dive_store.h"
@@ -37,6 +39,24 @@ extern bool g_calAirRequest;
 extern bool g_calDepthRequest;
 
 namespace comms {
+
+// ---- wall clock: the state, and the memory that carries it across a reset --
+wallclock::State g_clock;
+
+/// RTC no-init memory: kept across the resets the firmware performs on itself
+/// (panic, watchdog, SAFE-mode ACK), and gone after an EN cycle or a battery
+/// pull — measured 2026-11-24: the bench's EN pulse boots as `rst:0x1
+/// (POWERON_RESET)` and the carry is lost, exactly like pulling the pack. What
+/// survives and what does not is stated at boot either way. After a power-down
+/// that region holds whatever the silicon left there, which can be a number
+/// that looks exactly like a plausible epoch — that is why the magic travels
+/// with the value: a garbage word believed as a clock would date every dive in
+/// the log wrong, silently, and nothing downstream would ever question it.
+RTC_NOINIT_ATTR struct ClockCarry {
+    uint32_t magic;
+    uint32_t epoch;
+} g_clockCarry;
+
 
 namespace {
 
@@ -59,6 +79,19 @@ bool hookOpenDive(uint32_t epoch, void*) {
     xSemaphoreTake(g_logMtx, portMAX_DELAY);
     g_diveStartMs = millis();
     const bool ok = g_diveStore.begin() && g_diveStore.startDive(epoch);
+    if (ok && epoch == 0u) {
+        // The dive is recorded either way — refusing to log a dive because
+        // nobody set a clock would cost the diver the dive data, which is the
+        // opposite of what a dive computer is for. What must not be possible is
+        // reading the log later and not knowing it has no date, so the dive says
+        // so itself: an event row inside the file, and `clock-unset` in the CSV
+        // export where a date would otherwise be printed.
+        logfmt::Event ev{};
+        ev.tSec = 0;
+        ev.id = logfmt::EVT_CLOCK_UNSET;
+        ev.value = 0;
+        g_diveStore.append(ev);
+    }
     xSemaphoreGive(g_logMtx);
     return ok;
 }
@@ -68,6 +101,15 @@ void hookCloseDive(const logfmt::DiveMeta& meta, void*) {
     xSemaphoreTake(g_logMtx, portMAX_DELAY);
     g_diveStore.endDive(meta);
     xSemaphoreGive(g_logMtx);
+}
+
+uint32_t hookWallEpoch(void*) { return wallclock::epoch(g_clock, millis()); }
+
+bool hookSetClock(uint32_t epoch, void*) {
+    if (!wallclock::set(g_clock, epoch, millis())) return false;
+    g_clockCarry.epoch = epoch;
+    g_clockCarry.magic = wallclock::CARRY_MAGIC;
+    return true;
 }
 
 /// Event-driven snapshot (PLAN 10): the moment an alarm/mode/cellproof edge
@@ -116,8 +158,8 @@ void hookCalDepth(void*) { g_calDepthRequest = true; }
 
 // ---- log reads (handset LOG LIST / LOG EXPORT) ----------------------------
 
-int hookListDives(int* slots, uint32_t* mt, int max, void*) {
-    return g_diveStore.list(slots, mt, max);
+int hookListDives(int* slots, uint32_t* mt, uint32_t* seq, int max, void*) {
+    return g_diveStore.list(slots, mt, seq, max);
 }
 
 int hookExport(int slot, UartLink::Sink sink, void* ctx) {
@@ -145,6 +187,8 @@ UartLink::Hardware makeHardware() {
     hw.totals = &g_bridgeTotals;
     hw.onWifi = hookWifi;
     hw.openDive = hookOpenDive;
+    hw.wallEpoch = hookWallEpoch;
+    hw.setClock = hookSetClock;
     hw.closeDive = hookCloseDive;
     hw.appendSnapNow = hookAppendSnap;
     hw.saveSettings = hookSave;
@@ -174,16 +218,69 @@ void exportUnderLock(void* vctx) {
 struct ListCtx {
     int* slots;
     uint32_t* mtimes;
+    uint32_t* seqs;
     int max;
     int n;
 };
 
 void listUnderLock(void* vctx) {
     ListCtx& o = *static_cast<ListCtx*>(vctx);
-    o.n = g_diveStore.list(o.slots, o.mtimes, o.max);
+    o.n = g_diveStore.list(o.slots, o.mtimes, o.seqs, o.max);
+}
+
+struct SeqRangeCtx {
+    uint32_t lo;
+    uint32_t hi;
+    bool any;
+};
+
+void seqRangeUnderLock(void* vctx) {
+    SeqRangeCtx& o = *static_cast<SeqRangeCtx*>(vctx);
+    o.any = g_diveStore.seqRange(o.lo, o.hi);
 }
 
 } // namespace
+
+// ---- wall clock: what the boot code and the control cycle call -------------
+// These are outside the anonymous namespace on purpose: `namespace comms` alone
+// is not enough to be reachable from main.cpp, and the first version of this put
+// them in the anonymous block, where the link step caught it.
+
+void clockBootRestore() {
+    const uint32_t e = wallclock::carryPick(g_clockCarry.magic, g_clockCarry.epoch);
+    if (e == 0u) return;              // nothing trustworthy: boot with no clock
+    g_clock.epochSet = e;
+    g_clock.setAtMs = millis();
+    g_clock.source = wallclock::CARRIED;
+}
+
+void clockTick() {
+    if (g_clock.epochSet == 0u) return;
+    const uint32_t now = wallclock::epoch(g_clock, millis());
+    if (now == 0u) return;
+    // A RAM write, not flash: the RTC no-init region is live memory that the
+    // reset leaves alone. Mirroring every control cycle is what makes a carried
+    // clock correct — without it the value freezes at the instant it was
+    // set, and a reset eight hours later resumes eight hours in the past.
+    g_clockCarry.epoch = now;
+    g_clockCarry.magic = wallclock::CARRY_MAGIC;
+}
+
+void clockBootText(char* out, size_t cap) {
+    const uint32_t e = wallclock::epoch(g_clock, millis());
+    if (e == 0u) {
+        snprintf(out, cap, "unset: nothing has set the clock since power-up, "
+                           "dives will carry no date");
+        return;
+    }
+    char iso[24];
+    logfmt::isoUtc(iso, sizeof(iso), e);
+    if (g_clock.source == wallclock::CARRIED)
+        snprintf(out, cap, "%s (carried across a reset, not verified since)", iso);
+    else
+        snprintf(out, cap, "%s (set %lu s ago)", iso,
+                 (unsigned long)wallclock::ageS(g_clock, millis()));
+}
 
 bool initSession(ctrl::Loop& loop, settings::Registry& reg, bridge::Telemetry& tel,
                  bridge::EventRing& events) {
@@ -195,7 +292,9 @@ bool initSession(ctrl::Loop& loop, settings::Registry& reg, bridge::Telemetry& t
     Session::Lock lock;
     lock.acquire = lockAcquire;
     lock.release = lockRelease;
-    return session().begin(loop, reg, tel, events, makeHardware(), lock);
+    if (!session().begin(loop, reg, tel, events, makeHardware(), lock)) return false;
+    session().setClock(&g_clock);   // `GET TIME` answers from the one clock
+    return true;
 }
 
 bool diveLogRecording() {
@@ -226,7 +325,7 @@ int diveLogBoot(char* note, size_t cap) {
     int n = -1;
     if (mounted) {
         static int slots[DiveStore::kMaxDives];
-        n = g_diveStore.list(slots, nullptr, DiveStore::kMaxDives);
+        n = g_diveStore.list(slots, nullptr, nullptr, DiveStore::kMaxDives);
     }
     const bool formatted = g_diveStore.lastBeginFormatted();
     if (g_logMtx) xSemaphoreGive(g_logMtx);
@@ -241,10 +340,18 @@ long unsigned diveLogUsedBytes() { return (long unsigned)g_diveStore.usedBytes()
 long unsigned diveLogTotalBytes() { return (long unsigned)g_diveStore.totalBytes(); }
 bool diveLogMountFormatted() { return g_diveStore.lastBeginFormatted(); }
 
-int diveLogList(int* slots, uint32_t* mtimes, int max) {
-    ListCtx o{slots, mtimes, max, 0};
+int diveLogList(int* slots, uint32_t* mtimes, uint32_t* seqs, int max) {
+    ListCtx o{slots, mtimes, seqs, max, 0};
     session().withLock(listUnderLock, &o);
     return o.n;
+}
+
+bool diveLogSeqRange(uint32_t& lo, uint32_t& hi) {
+    SeqRangeCtx o{0, 0, false};
+    session().withLock(seqRangeUnderLock, &o);
+    lo = o.lo;
+    hi = o.hi;
+    return o.any;
 }
 
 } // namespace comms

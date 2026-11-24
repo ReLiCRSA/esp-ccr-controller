@@ -720,7 +720,7 @@ void runDive(int id) {
     }
     static uint8_t img[32 * 1024];
     const size_t len =
-        logfmt::packImage(img, sizeof(img), 0, 1, recs, (size_t)nRec, &meta);
+        logfmt::packImage(img, sizeof(img), 0, 1, (uint32_t)id, recs, (size_t)nRec, &meta);
     if (len == 0) FAIL("dive %d: could not pack the dive image (%d records)", id, nRec);
 
     static char csv[160 * 1024];

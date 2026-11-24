@@ -72,6 +72,11 @@ public:
     /// after begin(); a session without one answers GET HIST with ERR.
     void setHist(const cellhist::Hist* h) { if (router_) router_->setHist(h); }
 
+    /// Wall clock source for `GET TIME` (see comms/wallclock.h). Optional: with
+    /// no clock wired up the answer is epoch 0, meaning "there is no clock",
+    /// rather than a date invented out of a zero.
+    void setClock(const wallclock::State* c) { if (router_) router_->setClock(c); }
+
     /// SAFE mode: refuse every command but ACK (see CommandRouter::setSafeLockout).
     void setSafeLockout(bool on) { if (router_) router_->setSafeLockout(on); }
 
@@ -127,7 +132,14 @@ void diveLogAppendGrid(const logfmt::Snapshot& s);
 /// lock): an export must not race DIVE START opening the next file. Returns
 /// records emitted, or -1 if the slot is empty.
 int diveLogExportCsv(int slot, void (*sink)(const char*, void*), void* ctx);
-int diveLogList(int* slots, uint32_t* mtimes, int max);
+int diveLogList(int* slots, uint32_t* mtimes, uint32_t* seqs, int max);
+
+/// The dive-sequence range on the partition, for the boot banner: false when no
+/// dive carries one (a board whose dives all predate the sequence field). This
+/// is the bench's only view of the eviction order — `10 dives` and
+/// `10 dives, seq 3..12` are different facts, and only the second one says the
+/// newest dive survived.
+bool diveLogSeqRange(uint32_t& lo, uint32_t& hi);
 
 /// Mounts the dive log at boot and reports what is on it. Until 2026-11-23 the
 /// filesystem was only mounted by DIVE START, so on the surface `LOG LIST`
@@ -137,6 +149,29 @@ int diveLogList(int* slots, uint32_t* mtimes, int max);
 /// readable dive count, or -1 when the log could not be mounted at all; `note`
 /// carries why, for the boot banner.
 int diveLogBoot(char* note, size_t cap);
+// ---- wall clock: the dive log's timestamp ---------------------------------
+// No RTC chip, no NTP through an AP with no uplink: the time comes from a client
+// at the surface (`TIME SET <epoch>`, or the built-in page posting the phone's
+// clock). The carry in RTC no-init memory survives the resets the firmware does
+// to itself; an EN cycle or a battery pull loses it (measured on the bench: EN
+// boots as POWERON_RESET) — which is the whole design: set it at the surface,
+// and say out loud, in the boot banner, when it has not been set.
+
+/// Adopts a clock carried in RTC no-init memory if, and only if, it can be
+/// trusted (magic + range). Call before the boot banner.
+void clockBootRestore();
+
+/// Mirrors the running clock into RTC no-init memory. Call once per control
+/// cycle: without the mirror the carried value would freeze at the instant it
+/// was set, and a reset eight hours later would resume eight hours in the past.
+/// A RAM write, not flash.
+void clockTick();
+
+/// Renders the clock for the boot banner: either the UTC instant plus how it got
+/// here, or an explicit "unset". The banner is the instrument on this bench, so
+/// "no clock" has to be as readable as a date is.
+void clockBootText(char* out, size_t cap);
+
 long unsigned diveLogUsedBytes();
 long unsigned diveLogTotalBytes();
 bool diveLogMountFormatted();

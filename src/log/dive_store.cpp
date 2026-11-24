@@ -51,76 +51,104 @@ void DiveStore::pathFor(int slot, char* out, size_t cap) {
     snprintf(out, cap, "/dive%d.bin", slot);
 }
 
-int DiveStore::nextSlot() const {
-    // Which slots are taken, asked for BY NAME. The obvious implementation —
-    // open "/" and match the directory entries against `diveN.bin` — was what
-    // this used to do, and on this core the scan produced nothing that matched:
-    // every DIVE START therefore concluded the FIFO was empty and wrote slot 1
-    // again. Ten dives were requested, one was kept, and nothing anywhere looked
-    // wrong — `LOG LIST` always answered with the newest dive, which is exactly
-    // what a diver would expect from a working log until the third dive. Measured
-    // on the bench 2026-11-24: a boot reporting `1 dive`, a DIVE START/END cycle,
-    // and the boot after it reporting `1 dive` again.
+int DiveStore::scanFifo(uint32_t* seq, uint32_t* epoch, bool* present) const {
+    // Slot occupancy is asked for BY NAME. The obvious implementation — open
+    // "/" and match the directory entries against `diveN.bin` — is what this
+    // used to do, and on this core the scan produced nothing that matched, so
+    // every DIVE START concluded the FIFO was empty and wrote slot 1 again. Ten
+    // dives were requested and one was kept, and nothing anywhere looked wrong:
+    // `LOG LIST` always answered with the newest dive, which is what a diver
+    // would expect from a working log until the third dive. Measured on the bench
+    // 2026-11-24: a boot reporting `1 dive`, a DIVE START/END cycle, and the boot
+    // after it reporting `1 dive` again.
     //
-    // The first free slot ends the search: finding one tells us everything DIVE
-    // START needs, so the usual case is a handful of probes and no header reads.
-    // Only a full FIFO has to open all ten, because eviction is by start epoch.
-    for (int s = 1; s <= DiveStore::kMaxDives; s++) {
+    // The Arduino VFS also logs a missing file at error level
+    // (`open(): /littlefs/dive9.bin does not exist, no permits for creation`), one
+    // line per empty slot, and `exists()` first does not silence it — measured,
+    // the lines arrived anyway. They are core noise; the verdict is the boot
+    // banner's `log:` line (BENCH.md).
+    int held = 0;
+    for (int s = 0; s < kMaxDives; s++) {
+        seq[s] = 0u;
+        epoch[s] = 0u;
+        present[s] = false;
+        if (!mounted_) continue;
         char p[24];
-        pathFor(s, p, sizeof(p));
-        if (!LittleFS.exists(p)) return s;
-    }
-
-    int oldest = 0;
-    uint32_t oldestTime = 0xFFFFFFFFu;
-    for (int s = 1; s <= DiveStore::kMaxDives; s++) {
-        char p[24];
-        pathFor(s, p, sizeof(p));
-        // Epoch 0 for anything unreadable — file that will not open, short read,
-        // failed header CRC. A dive the reader cannot get at is the one to throw
-        // away first, and it has to sort before every readable dive rather than
-        // tie with them, which is what the 0 does.
-        //
-        // What this CANNOT do, measured on the bench 2026-11-24: with no RTC every
-        // real epoch is 0 as well, so all ten keys tie, and a strict `<` keeps the
-        // first slot scanned. Every dive after the tenth then overwrites slot 1:
-        // ten 4 s dives, then 8 s, 40 s, 8 s left the board holding `8, 2, 3, 4, 5,
-        // 7, 7, 9, 10, 10` seconds — the 40 s dive was gone before the next boot.
-        // So the log keeps the nine oldest dives and the very newest, and eats each
-        // recent one. The strict `<` is not the bug; the bug is that there is no
-        // ordering identity to compare. Epoch ordering needs an epoch, and this
-        // board has no clock (no RTC, no NTP over an AP with no uplink). The fix is
-        // a monotonic dive sequence number, not a different comparison — open item,
-        // PLAN 16.
-        uint32_t epoch = 0u;
+        pathFor(s + 1, p, sizeof(p));
+        if (!LittleFS.exists(p)) continue;
+        present[s] = true;
+        held++;
         File f = LittleFS.open(p, "r");
-        if (f) {
-            uint8_t head[HEADER_SIZE];
-            uint8_t slotChk = 0;
-            if (f.read(head, sizeof(head)) != (int)sizeof(head) ||
-                !logfmt::unpackHeader(head, epoch, slotChk))
-                epoch = 0u;
-            f.close();
-        }
-        if (epoch < oldestTime) { oldestTime = epoch; oldest = s; }
+        if (!f) continue;                 // occupied, age unknown
+        uint8_t head[HEADER_SIZE];
+        uint8_t slotChk = 0;
+        if (f.read(head, sizeof(head)) == (int)sizeof(head))
+            logfmt::unpackHeader(head, epoch[s], slotChk, seq[s]);
+        f.close();                        // a header that will not parse stays 0/0
     }
-    return oldest ? oldest : 1;  // full: evict the oldest dive
+    return held;
+}
+
+int DiveStore::nextSlot(uint32_t& seqOut) const {
+    uint32_t seq[kMaxDives], epoch[kMaxDives];
+    bool present[kMaxDives];
+    scanFifo(seq, epoch, present);
+
+    // All ten headers are read even when a slot is free, because the sequence the
+    // new dive carries is max-on-the-partition + 1 and the only durable place
+    // that maximum lives is the dive files themselves. Ten 16-byte reads at DIVE
+    // START, on the command task, at the surface: the control task never runs
+    // this path, and a dive is started once, not per second.
+    seqOut = logfmt::nextSeq(seq, kMaxDives);
+
+    for (int s = 0; s < kMaxDives; s++)
+        if (!present[s]) return s + 1;
+
+    // Full, so one dive has to go. Until 2026-11-24 this asked for the smallest
+    // start epoch, and on a board with no clock every dive has epoch 0: all ten
+    // keys tied, the comparison named the same slot every time, and dives eleven
+    // and twelve landed in slot 1 one after the other. Ten 4 s dives then 8 s,
+    // 40 s, 8 s left the partition holding 8, 2, 3, 4, 5, 7, 7, 9, 10, 10 seconds
+    // — the 40 s dive was gone before the next boot, and the log was keeping
+    // the nine OLDEST dives plus the newest. Neither `<` nor `<=` can fix a tie,
+    // so the decision is made on the dive sequence instead, which exists whether
+    // or not anyone has set a clock. See logfmt::pickEvictSlot and
+    // test_eviction_rotates_when_there_is_no_clock.
+    const int idx = logfmt::pickEvictSlot(seq, epoch, kMaxDives);
+    return idx >= 0 ? idx + 1 : 1;
+}
+
+bool DiveStore::seqRange(uint32_t& lo, uint32_t& hi) const {
+    uint32_t seq[kMaxDives], epoch[kMaxDives];
+    bool present[kMaxDives];
+    scanFifo(seq, epoch, present);
+    lo = hi = 0u;
+    bool any = false;
+    for (int s = 0; s < kMaxDives; s++) {
+        if (!present[s] || seq[s] == logfmt::SEQ_UNKNOWN) continue;
+        if (!any) { lo = hi = seq[s]; any = true; continue; }
+        if (seq[s] < lo) lo = seq[s];
+        if (seq[s] > hi) hi = seq[s];
+    }
+    return any;
 }
 
 bool DiveStore::startDive(uint32_t startEpoch) {
     if (!mounted_ && !begin()) return false;
     if (file_) file_.close();
-    const int slot = nextSlot();
+    uint32_t seq = 0;
+    const int slot = nextSlot(seq);
     char p[24];
     pathFor(slot, p, sizeof(p));
     file_ = LittleFS.open(p, "w");
     if (!file_) return false;
 
-    // Fixed 16 B header: magic, version, start epoch, slot, CRC of the rest.
-    // Records follow, interleaved by time, each type-tagged; the meta trailer
-    // goes at the end (the file is append-only, totals are only known there).
+    // Fixed 16 B header: magic, version, dive sequence, start epoch, slot, CRC
+    // of the rest. Records follow, interleaved by time, each type-tagged; the
+    // meta trailer goes at the end (the file is append-only, totals are only
+    // known there).
     uint8_t head[HEADER_SIZE];
-    logfmt::packHeader(startEpoch, (uint8_t)slot, head);
+    logfmt::packHeader(startEpoch, (uint8_t)slot, seq, head);
     if (file_.write(head, sizeof(head)) != sizeof(head)) {
         file_.close();
         LittleFS.remove(p);
@@ -163,10 +191,22 @@ void DiveStore::endDive(const logfmt::DiveMeta& meta) {
     file_.close();
 }
 
-int DiveStore::list(int* slotOut, uint32_t* mtimeOut, int max) const {
-    if (!mounted_) return 0;
-    int n = 0;
-    for (int s = kMaxDives; s >= 1 && n < max; s--) {  // newest-written first
+int DiveStore::list(int* slotOut, uint32_t* mtimeOut, uint32_t* seqOut,
+                    int max) const {
+    if (!mounted_ || max <= 0) return 0;
+    // Read every occupied slot, then emit newest-written first. "Newest first"
+    // by slot NUMBER was only ever true while slot 1 meant oldest; once the FIFO
+    // rotates, eviction replaces a dive wherever it sits and the slot numbers
+    // carry no order at all. The dive sequence is the write order, so it is the
+    // sort key. Unsequenced dives (seq 0: everything written before 2026-11-24,
+    // or a header that will not parse) sort last, and ties keep the old slot-
+    // descending order — a board of nothing but legacy dives lists exactly as it
+    // did before this field existed, so the change is invisible there and an
+    // improvement everywhere else.
+    struct Row { int slot; uint32_t epoch, seq; };
+    Row rows[kMaxDives];
+    int found = 0;
+    for (int s = 1; s <= kMaxDives; s++) {
         char p[24];
         pathFor(s, p, sizeof(p));
         // A missing FIFO slot is an ordinary state, but the Arduino VFS reports
@@ -175,17 +215,34 @@ int DiveStore::list(int* slotOut, uint32_t* mtimeOut, int max) const {
         // does not silence it — measured 2026-11-24 on a freshly erased partition,
         // ten lines arrived anyway — so there is no cleverer probe here, just core
         // noise. What to read at boot is the store's own verdict, `log: LittleFS
-        // mounted, N dives, used X of Y bytes` (BENCH.md), not these.
+        // mounted, N dives, seq a..b, used X of Y bytes` (BENCH.md), not these.
         File f = LittleFS.open(p, "r");
         if (!f) continue;
         uint8_t head[HEADER_SIZE];
-        uint32_t epoch = 0;
-        uint8_t slotGot = 0;
+        Row r{s, 0u, logfmt::SEQ_UNKNOWN};
+        uint8_t slotInHeader = 0;   // checked by the CRC, not used: the path IS the slot
         if (f.read(head, sizeof(head)) >= (int)HEADER_SIZE)
-            logfmt::unpackHeader(head, epoch, slotGot);
+            logfmt::unpackHeader(head, r.epoch, slotInHeader, r.seq);
         f.close();
-        slotOut[n] = s;
-        if (mtimeOut) mtimeOut[n] = epoch;
+        rows[found++] = r;
+    }
+
+    bool used[kMaxDives] = {false};
+    int n = 0;
+    while (n < max && n < found) {
+        int best = -1;
+        for (int i = 0; i < found; i++) {
+            if (used[i]) continue;
+            if (best < 0) { best = i; continue; }
+            const Row& a = rows[i];
+            const Row& b = rows[best];
+            if (a.seq != b.seq) { if (a.seq > b.seq) best = i; continue; }  // 0 sorts last
+            if (a.slot > b.slot) best = i;                                  // legacy tie: as before
+        }
+        used[best] = true;
+        slotOut[n] = rows[best].slot;
+        if (mtimeOut) mtimeOut[n] = rows[best].epoch;
+        if (seqOut) seqOut[n] = rows[best].seq;
         n++;
     }
     return n;

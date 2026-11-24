@@ -81,10 +81,14 @@ struct Fixture {
         h.onCalAir = [](void*) { if (g_fix) g_fix->hooks.calAir++; };
         h.onCalDepth = [](void*) { if (g_fix) g_fix->hooks.calDepth++; };
         h.onSettings = [](void*) { if (g_fix) g_fix->hooks.settings++; };
-        h.listDives = [](int* slots, uint32_t* mt, int max, void*) {
+        h.listDives = [](int* slots, uint32_t* mt, uint32_t* seq, int max, void*) {
             if (!g_fix) return 0;
             int n = max < 2 ? max : 2;
-            for (int i = 0; i < n; i++) { slots[i] = i + 1; mt[i] = 1700000000u + i; }
+            for (int i = 0; i < n; i++) {
+                slots[i] = i + 1;
+                mt[i] = 1700000000u + i;
+                if (seq) seq[i] = 40u + i;      // the write order, not the epoch
+            }
             return n;
         };
         h.exportDive = [](int slot, UartLink::Sink sink, void* ctx) {
@@ -249,6 +253,12 @@ void test_log_list_and_export_stream_over_the_session() {
     f.send("LOG LIST");
     TEST_ASSERT_TRUE(hasLineStarting("L,1,"));
     TEST_ASSERT_TRUE(hasLineStarting("L,2,"));
+    // The appended fourth field is the dive sequence: on a board with no clock
+    // every epoch in the listing is 0, and without it a client has ten dives and
+    // no order. Appending is the only change allowed to an existing line, and a
+    // three-field client is unaffected by it.
+    TEST_ASSERT_TRUE(hasLineStarting("L,1,1700000000,40"));
+    TEST_ASSERT_TRUE(hasLineStarting("L,2,1700000001,41"));
 
     out.clear();
     f.send("LOG EXPORT 3");

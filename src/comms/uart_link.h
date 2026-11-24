@@ -33,13 +33,20 @@ public:
         void* ctx = nullptr;
         void (*onWifi)(bool on, void* ctx) = nullptr;
         bool (*openDive)(uint32_t epoch, void* ctx) = nullptr;
+        /// The controller's wall time at this instant (0 = no clock). DIVE START
+        /// stamps the dive header with it — until 2026-11-24 the value
+        /// passed here was a literal 0 in this file, which is why every dive on
+        /// a board's flash carried epoch 0 and the FIFO could not order them.
+        uint32_t (*wallEpoch)(void* ctx) = nullptr;
+        bool (*setClock)(uint32_t epoch, void* ctx) = nullptr;
         void (*closeDive)(const logfmt::DiveMeta&, void* ctx) = nullptr;
         bridge::DiveTotals* totals = nullptr;  // in-force totals for closeDive
         void (*appendSnapNow)(void* ctx) = nullptr;    // event-driven snapshot
         bool (*saveSettings)(void* ctx) = nullptr;
         void (*onCalAir)(void* ctx) = nullptr;
         void (*onCalDepth)(void* ctx) = nullptr;
-        int (*listDives)(int* slots, uint32_t* mtimes, int max, void* ctx) = nullptr;
+        int (*listDives)(int* slots, uint32_t* mtimes, uint32_t* seqs, int max,
+                         void* ctx) = nullptr;
         int (*exportDive)(int slot, Sink sink, void* ctx) = nullptr;  // CSV lines
         // settings changed: apply the registry to the live control config and
         // (surface only) persist to NVS. The firmware wires applySettings +

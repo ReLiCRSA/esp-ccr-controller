@@ -104,7 +104,7 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
 <body class="clean">
 <header>
   <div id="brand">ESP-CCR</div>
-  <div id="sysline"><span id="link">connecting&#8230;</span> <span id="clock"></span></div>
+  <div id="sysline"><span id="link">connecting&#8230;</span> <span id="clock"></span> <span id="wclock"></span></div>
   <nav id="tabs">
     <button data-v="status" class="on">Status</button>
     <button data-v="check">Checklist</button>
@@ -212,6 +212,44 @@ function finish(extra){
   var c=busy; busy=null; if(c) c.res(c.lines);
   pump();
 }
+// ---- wall clock ------------------------------------------------------------
+// The controller has no RTC chip and the access point has no uplink, so the
+// phone's own clock IS the dive log's time source: this page posts it every
+// time the socket opens. The board carries that time across its own restarts
+// (panic, watchdog), but an EN cycle or a battery pull loses it - which is
+// exactly why the page posts on every open instead of relying on the carry.
+// The window guard is the firmware's own accepted range (2000..2100): a
+// phone whose clock is wilder than that must not make the log worse, and an
+// honest "no clock" beats a confident wrong date.
+var WCLK=null;
+function syncClock(){
+  var ep=Math.floor(Date.now()/1000);
+  if(ep<946684800||ep>4102444800){
+    toast("phone clock out of range: dives will carry no date","bad");
+    return;
+  }
+  send("TIME SET "+ep).then(function(ls){
+    if(ls.some(function(l){return l.indexOf("ERR")===0;}))
+      toast("controller refused the phone clock","bad");
+    readClock();
+  });
+}
+function readClock(){
+  send("GET TIME").then(function(ls){
+    var t=ls.filter(function(l){return l.indexOf("TIME,")===0;});
+    if(t.length){ WCLK=t[0].split(","); showClock(); }
+  });
+}
+function showClock(){
+  var el=$("wclock"); if(!el) return;
+  if(!WCLK){ el.textContent=""; return; }
+  var ep=+WCLK[1], src=+WCLK[2];
+  // TIME,<epoch>,<source>,<age_s>: source 2 means the number survived a reset
+  // without anyone confirming it since, which is worth saying out loud.
+  el.textContent = ep>0
+    ? "clock "+new Date(ep*1000).toISOString().slice(0,16).replace("T"," ")+"Z"+(src===2?" (carried)":"")
+    : "clock UNSET: dives will carry no date";
+}
 function connect(){
   var url=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws";
   sock=new WebSocket(url);
@@ -223,6 +261,7 @@ function connect(){
       if(!SCHEMA.length) send("GET SCHEMA").then(function(l2){ SCHEMA=[]; l2.forEach(function(l){
         if(l.indexOf("K,")===0) SCHEMA.push(l.split(",").slice(1)); }); buildSettings(); });
       else buildSettings(); });
+    syncClock();   // the page is the surface clock source: post it, then show what landed
     pump(); };
   sock.onclose=function(){
     busy=null; outq=[]; lastRx=0; $("link").textContent="offline";
@@ -272,7 +311,7 @@ function eventName(id,val){
   if(id===2) return "alarm "+(ALARMS[val]||("bit"+val))+" cleared";
   var n={3:"mode",4:"setpoint",5:"cell excluded",6:"cell rejoin",7:"CAL AIR",8:"CAL O2",
          9:"cell proof PASS",10:"cell proof FAIL",11:"clamp ON",12:"clamp OFF",
-         13:"pre-dive PASS",14:"RESET"};
+         13:"pre-dive PASS",14:"RESET",15:"clock unset"};
   return (n[id]||("event "+id))+" ("+val+")";
 }
 
@@ -413,11 +452,16 @@ function refreshDives(){
   send("LOG LIST").then(function(ls){
     var rows=ls.filter(function(l){return l.indexOf("L,")===0});
     if(!rows.length){ $("divelist").innerHTML='<span class="hint">no dives recorded</span>'; return; }
-    var h='<table><tr><th>#</th><th>start</th><th></th></tr>';
+    // L,<slot>,<epoch>,<seq>: the firmware lists newest-written first, and the
+    // sequence is what makes that claim true when the clock was never set. The
+    // seq column is on the right because that is where new information goes.
+    var h='<table><tr><th>#</th><th>start</th><th>seq</th><th></th></tr>';
     rows.forEach(function(l){
-      var f=l.split(","), slot=+f[1], ep=+f[2];
-      var when=ep>100000?new Date(ep*1000).toLocaleString():"no clock";
-      h+="<tr><td>"+slot+"</td><td>"+when+"</td><td><button class='act' data-slot='"+slot+
+      var f=l.split(","), slot=+f[1], ep=+f[2], seq=f.length>3?+f[3]:0;
+      var when=ep>100000?new Date(ep*1000).toLocaleString()
+                        :"no clock at that start";
+      h+="<tr><td>"+slot+"</td><td>"+when+"</td><td>"+(seq>0?seq:"&#8212;")+
+         "</td><td><button class='act' data-slot='"+slot+
          "'>view</button> <a class='act' style='display:inline-block;padding:12px' href='/dive/"+
          slot+".csv'>csv</a></td></tr>";
     });

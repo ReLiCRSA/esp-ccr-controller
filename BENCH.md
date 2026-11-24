@@ -86,8 +86,9 @@ one marked exception is the settings-schema renderer, which runs once from
 
 `hw_accept.py` checks the boot console (fresh boot banner, ≥2 HB lines
 matching the soak_logger contract, no SAFE/FATAL, `settings: N keys from
-NVS`, `control: SP=…`, `web: AP "…"`, and `log: LittleFS mounted, N dives,
-used X of Y bytes`) and then runs the **refusal matrix**
+NVS`, `control: SP=…`, `web: AP "…"`, `log: LittleFS mounted, N dives,
+seq a..b, used X of Y bytes`, and a `clock:` line) and then runs the
+**refusal matrix**
 over the wired handset: `AUTO` cold → `ERR predive required`; `SET SP2`
 mid-dive → `ERR dive locked`; `WIFI ON` mid-dive → `ERR wifi locked in
 dive`; `CAL AIR` mid-dive → `ERR cal locked in dive`; overlong line →
@@ -359,9 +360,34 @@ Expected boot order (post-A5e firmware):
 reset reason: power-on
 settings: N keys from NVS
 control: SP=0.40/0.70/1.00/1.30 cells=111 wall=1.45 cutoff=1.60 ...
+log: LittleFS mounted, N dives, seq a..b, used X of Y bytes
+clock: unset: nothing has set the clock since power-up, dives will carry no date
 web: AP "ESP-CCR-xxxx" on 192.168.4.1 (heap ...)
 HB st=... (every 5 s)
 ```
+
+`seq a..b` is the eviction evidence: a full FIFO always lists ten dives, so
+only the sequence range says the NEWEST dive survived. On 2026-11-24 it did
+not — every dive carried epoch 0 (no RTC), the eviction comparison tied, and
+dives eleven and twelve both landed in slot 1, keeping the nine OLDEST dives
+plus the newest (PLAN 16). `seq n/a` means every dive on the partition
+predates the sequence field.
+
+`clock:` after every boot is the dive log's calendar stated out loud. There is
+no RTC chip and no NTP through the AP, so a client at the surface sets it —
+the web page posts its phone's clock automatically on load, or `TIME SET
+<epoch>` on UART2 (docs/HANDSET_PROTOCOL.md, Wall clock). The carry in RTC
+no-init memory survives the resets the firmware performs on itself (panic,
+watchdog, SAFE `ACK`); **EN and the battery pack both lose it** — measured
+2026-11-24, the bench EN pulse boots as `rst:0x1 (POWERON_RESET)` and the
+magic guard turns the leftover silicon-garbage into an honest `unset` rather
+than a confident wrong date. So the bench rule is: **set the clock at the
+surface after every power-up.** A dive started before that is still recorded,
+with `clock-unset` in its CSV and an `E,,15` row in the file.
+`hw_accept.py --dive-persist` asserts the chain it can: `TIME SET` accepted →
+the closed dive carries a non-zero sequence **and a real epoch** → after the
+EN reset the boot still states the clock (as `unset`, correctly, after a
+power-down) and the dive's sequence is still in the `seq a..b` range.
 
 Then by hand, in this order (each mirrors a sim scenario):
 

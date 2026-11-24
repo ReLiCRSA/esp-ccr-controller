@@ -9,7 +9,12 @@
 // Uplink:    GET [*|KEY] | SET KEY=VAL | CHECK | AUTO | MANUAL | ACK |
 //            CAL AIR | CAL O2 | CAL O2 CONFIRM | CAL DEPTH | TEST CELLS |
 //            CELLPROOF OVERRIDE | PULSE | DECO | DIVE START|END |
-//            LOG LIST | LOG EXPORT n | WIFI ON|OFF
+//            LOG LIST | LOG EXPORT n | WIFI ON|OFF | TIME SET <epoch>
+// There is no RTC on the board and no NTP through an AP with no uplink, so wall
+// time is handed to the controller by a client at the surface. It is a command,
+// not a settings key: a settings key lives in NVS, and resurrecting a saved
+// epoch after a battery pull would date every dive in the log with a number
+// that is quietly wrong.
 // ============================================================================
 #pragma once
 
@@ -23,7 +28,8 @@ constexpr int MAX_STOPS = 8;
 
 enum class Kind : uint8_t {
     GET, SET, CHECK, AUTO, MANUAL, ACK, CAL, TESTCELLS, CELLPROOF_OVERRIDE,
-    PULSE, DECO, DIVE_START, DIVE_END, LOG_LIST, LOG_EXPORT, WIFI, UNKNOWN,
+    PULSE, DECO, DIVE_START, DIVE_END, LOG_LIST, LOG_EXPORT, WIFI, TIME_SET,
+    UNKNOWN,
 };
 
 enum class CalAction : uint8_t { NONE, AIR, O2, O2_CONFIRM, DEPTH };
@@ -35,6 +41,8 @@ struct Command {
     CalAction cal = CalAction::NONE;
     bool logExport = false;   // LOG EXPORT vs LOG LIST
     uint16_t logIndex = 0;
+    uint32_t epoch = 0;       // TIME SET: the digits as a number; the router
+                              // decides whether the value is believable
 };
 
 // Returns false and sets *err (static string) on malformed input.

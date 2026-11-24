@@ -252,6 +252,19 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
                                           r.text, sizeof(r.text)));
         return;
     }
+    if (std::strcmp(key, "TIME") == 0) {
+        // TIME,<epoch>,<source>,<age_s>. Epoch 0 means there is no clock, and
+        // that is the answer a bench needs to hear, not a 1970 date.
+        // source: 0 unset, 1 set since this boot, 2 carried across a reset.
+        char buf[48];
+        const uint32_t e = clock_ ? wallclock::epoch(*clock_, nowMs_) : 0u;
+        const uint32_t src = clock_ ? clock_->source : (uint32_t)wallclock::UNSET;
+        const uint32_t age = clock_ ? wallclock::ageS(*clock_, nowMs_) : 0u;
+        const int n = std::snprintf(buf, sizeof(buf), "TIME,%u,%u,%u\n",
+                                    e, src, age);
+        replyText(r, buf, static_cast<size_t>(n));
+        return;
+    }
     if (std::strcmp(key, "CELLS") == 0) { buildCellsLine(r); return; }
     if (std::strcmp(key, "PROOF") == 0) {
         const cellproof::Output& cp = loop_.cellproof();
@@ -452,6 +465,21 @@ void CommandRouter::exec(const char* line, Response& r) {
                                               r.text, sizeof(r.text)));
             break;
 
+        case Kind::TIME_SET: {
+            // Range-checked here, applied by the transport. Deliberately allowed
+            // mid-dive: the dive header is written at DIVE START, so setting the
+            // clock during a dive cannot rewrite the dive that is running, and a
+            // surface PC that has only now noticed the clock is unset should be
+            // able to fix it before the NEXT dive rather than be refused.
+            if (!wallclock::sane(cmd.epoch)) {
+                replyErr(r, "epoch out of range");
+                break;
+            }
+            clockEpoch_ = cmd.epoch;
+            r.actions |= ACT_CLOCK_SET;
+            replyOk(r, "TIME");
+            break;
+        }
         case Kind::DIVE_START: startDive(r); break;
         case Kind::DIVE_END:   endDive(r);   break;
 

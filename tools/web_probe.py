@@ -189,6 +189,19 @@ def http_probe(host, out):
     ext = [l.strip()[:90] for l in page.splitlines() if EXTERNAL.search(l)]
     checks.append(("page references nothing external", not ext,
                    ext[0] if ext else "the AP has no uplink: a CDN link is a dead page"))
+    # The page must POST the clock, not merely display one: the controller has
+    # no RTC and the AP has no uplink, so the dive log only carries dates if the
+    # surface client supplies wall time. A page that shows the clock but never
+    # sets it leaves dive dates to whether someone remembers to type a command.
+    posts = re.search(r'send\("TIME SET\s*"', page)
+    checks.append(("page posts the phone clock on open (TIME SET)", bool(posts),
+                   posts.group(0) if posts else
+                   "no TIME SET in the served page: dives will carry no date "
+                   "unless someone sets the clock by hand"))
+    reads = re.search(r'"GET TIME"', page)
+    checks.append(("page shows the controller's clock state", bool(reads),
+                   reads.group(0) if reads else "no GET TIME: the page cannot "
+                                                "say whether the clock landed"))
     linked = sorted(set(re.findall(r'(?:href|src)="([^"]+)"', page)))
     out.append(f"  page links: {linked}")
     return checks, page, got
@@ -517,6 +530,18 @@ def dive_row_equality(host, port, checks):
             if a != b:
                 print(f"      first difference:\n        http: {a}\n        uart: {b}")
                 break
+
+    # The identity row's v3 append: a human-readable UTC start, rendered by the
+    # firmware from the stored epoch (one truth on the flash). `clock-unset` is
+    # the honest answer when the dive started with no clock — a wrong date is
+    # worse than no date, but this gate exists to make sure "no date" is loud
+    # and rare, not the default.
+    head_row = next((l for l in http_rows if l.startswith("DIVE,")), "")
+    m = re.match(r"^DIVE,(\d+),(\d+),(\d+),(\d+),"
+                 r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|clock-unset)$", head_row)
+    checks.append(("dive CSV identity row is the v3 shape with a date field",
+                   bool(m) and m.group(5) != "clock-unset",
+                   head_row or "no DIVE, row in the export"))
     ser.close()
 
 

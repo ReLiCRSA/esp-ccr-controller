@@ -52,7 +52,8 @@ void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
         // The log is opened by whoever holds the file. If it fails, say so
         // out loud on the same socket the dive just started on: an unlogged
         // dive is acceptable, an *unannounced* unlogged dive is not.
-        if (hw_.openDive && !hw_.openDive(0, hw_.ctx)) {
+        const uint32_t wall = hw_.wallEpoch ? hw_.wallEpoch(hw_.ctx) : 0u;
+        if (hw_.openDive && !hw_.openDive(wall, hw_.ctx)) {
             const size_t n = proto::formatErr("LOG FAILED: dive unrecorded", buf, sizeof(buf));
             emit(sink, ctx, buf, n);
         }
@@ -60,6 +61,15 @@ void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
     if (actions & CommandRouter::ACT_DIVE_END) {
         if (hw_.closeDive)
             hw_.closeDive(hw_.totals ? hw_.totals->toMeta() : logfmt::DiveMeta{}, hw_.ctx);
+    }
+    if (actions & CommandRouter::ACT_CLOCK_SET) {
+        // Same rule as the dive log: if the clock did not get set, say so on the
+        // socket the command arrived on. A client that was told OK and then
+        // finds the epoch is still 0 has learned nothing about what failed.
+        if (!hw_.setClock || !hw_.setClock(router_.clockEpochPending(), hw_.ctx)) {
+            const size_t n = proto::formatErr("clock not set", buf, sizeof(buf));
+            emit(sink, ctx, buf, n);
+        }
     }
     if (actions & CommandRouter::ACT_LOG_LIST) streamLogList(sink, ctx);
     if (actions & CommandRouter::ACT_LOG_EXPORT)
@@ -147,12 +157,18 @@ void UartLink::streamLogList(Sink sink, void* ctx) {
         return;
     }
     int slots[10];
-    uint32_t epochs[10];
-    const int n = hw_.listDives(slots, epochs, 10, hw_.ctx);
+    uint32_t epochs[10], seqs[10];
+    const int n = hw_.listDives(slots, epochs, seqs, 10, hw_.ctx);
     char buf[48];
     for (int i = 0; i < n; i++) {
-        const int m = std::snprintf(buf, sizeof(buf), "L,%d,%u\n", slots[i],
-                                    (unsigned)epochs[i]);
+        // `L,<slot>,<epoch>,<seq>`: the fourth field is appended, so a v1 client
+        // reading three fields is unchanged. It exists because on a board with no
+        // clock every dive carries epoch 0, and a handset or browser then has ten
+        // dives and no way to say which is the newest. The sequence is the order
+        // dives were written, and it is the same number the boot banner reports
+        // as a range.
+        const int m = std::snprintf(buf, sizeof(buf), "L,%d,%u,%u\n", slots[i],
+                                    (unsigned)epochs[i], (unsigned)seqs[i]);
         emit(sink, ctx, buf, static_cast<size_t>(m));
         linesOut_++;
     }

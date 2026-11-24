@@ -201,6 +201,7 @@ Two honest caveats a handset must not paper over (details in §8):
 | `GET PROOF` | `PROOF,` line |
 | `GET FAULT` | `FAULT,` line |
 | `GET HIST` | 3 × `HIST,` lines / `ERR no histogram` |
+| `GET TIME` | `TIME,<epoch>,<source>,<age_s>` — wall clock (see Wall clock below) |
 | `GET SCHEMA` | one `K,` line per settings key |
 | `GET <KEY>` | `<KEY>=<value>` for a settings key |
 | `GET *` | one `<KEY>=<value>` line per settings key (32 keys today) |
@@ -218,12 +219,58 @@ The authoritative key list with types, ranges and flags is **self-describing at
 runtime via `GET SCHEMA`** — build the handset settings UI from that, not from
 a hard-coded table. Section 6 lists today's keys for reference.
 
+### Wall clock (`TIME SET`)
+
+The controller has **no RTC chip**, and its access point has no uplink, so
+there is nothing to take time from: a client at the surface IS the time
+source. This is a command, deliberately **not** a settings key — settings
+live in NVS, and resurrecting a saved epoch after a battery pull would date
+every dive in the log with a number from a previous life, in silence.
+
+| Command | Reply |
+|---|---|
+| `TIME SET <epoch>` | `OK TIME` / `ERR epoch out of range` / `ERR safe mode` |
+| `GET TIME` | `TIME,<epoch>,<source>,<age_s>` |
+
+* `<epoch>` is unix seconds, decimal digits. The accepted window is
+  **2000-01-01 .. 2100-01-01**; anything outside is refused and changes
+  nothing (a plausible-looking wrong epoch is worse than no epoch — every
+  reader of the log would believe it).
+* `<source>`: `0` never set since this power-up, `1` set by a command,
+  `2` carried across a reset the **firmware performed on itself** (panic,
+  watchdog, SAFE-mode `ACK` — RTC no-init memory survives those). It does
+  **not** survive the EN pin or a battery pull: on this board EN is a
+  CHIP_PU power-down, measured on the bench 2026-11-24 — the next boot
+  reports `rst:0x1 (POWERON_RESET)` and the clock is honestly `unset`, never
+  a date from a previous life.
+* `<age_s>`: seconds since the clock was set.
+* Allowed during a dive: the dive header was stamped at `DIVE START`, so a
+  mid-dive `TIME SET` cannot rewrite the running dive, and a surface client
+  that has only now noticed the unset clock should fix it before the **next**
+  dive rather than be refused. Refused in SAFE mode: the chain is not running,
+  so no client may author anything.
+* A battery pull **or an EN cycle** clears the clock. **Set it at the surface
+  after every power-up.** A dive started with the clock unset is still
+  recorded (epoch 0, an `E,,15` row inside the dive file, and `clock-unset`
+  in the CSV date column) — refusing to log a dive over a calendar is the
+  worse failure.
+
+The built-in web page posts its own clock (`TIME SET`) every time its
+WebSocket opens, so a phone at the surface is normally the one setting it.
+
 ### Dive log
 
 | Command | Answer |
 |---|---|
-| `LOG LIST` | `OK` then zero or more `L,<slot>,<epoch>` lines |
-| `LOG EXPORT n` (n = 1..10) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<codec_version>,<row_format>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5) |
+| `LOG LIST` | `OK` then zero or more `L,<slot>,<epoch>,<seq>` lines, **newest-written first** (by `<seq>`; unsequenced legacy dives list last, slot-descending) |
+| `LOG EXPORT n` (n = 1..10) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<codec_version>,<row_format>,<iso_utc>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5) |
+
+The fourth `L,` field, `<seq>`, is the dive sequence: the order dives were
+written, 1 upward, `0` = unknown (files written before 2026-11-24). Without
+it a full FIFO on a board with no clock is ten dives and no order — slot
+numbers stop meaning anything once eviction rotates, and the epoch is 0 when
+nobody set the clock. It is also the key eviction orders by (PLAN 16: with
+every epoch 0, eviction hammered slot 1 and destroyed the newest dives).
 
 ### SAFE mode (what a handset can and cannot do)
 
@@ -329,6 +376,7 @@ the split: only the marked ids are actually published by today's firmware.
 | 12 | clamp OFF | 0 | **no** (reserved) |
 | 13 | pre-dive PASS | 0 | **no** (reserved) |
 | 14 | controller reset | — | **no** (reserved) |
+| 15 | dive started with no wall clock | 0 | dive **file** only (written into the dive at `DIVE START`; not streamed live) |
 
 Do not build a "CAL AIR done" or "pre-dive passed" *notification* on those
 reserved ids — they never arrive. Learn the same facts from what is live now:
@@ -367,7 +415,8 @@ one line per cell (3 lines). 38 bins of 0.05 bar covering 0.00–1.90 bar
 (bin width printed in centibar: 5). Counts per bin. Display-only.
 
 ```
-L,<slot>,<epoch>          dive directory entry (slot 1..10)
+L,<slot>,<epoch>,<seq>    dive directory entry (slot 1..10, seq 0 = unknown/pre-2026-11-24)
+TIME,<epoch>,<source>,<age_s>  wall clock answer (GET TIME); epoch 0 = no clock, source 0 unset / 1 set / 2 carried across a reset
 K,<key>,<T>,<min>,<max>,<flags>,<default>   settings schema; T ∈ F I U B S (STRING defaults are text)
 <KEY>=<value>             settings GET answer
 ```
@@ -380,7 +429,7 @@ exactly the same bytes. They used to be two writers with two shapes;
 `tools/web_probe.py` compares them on the bench now.
 
 ```
-DIVE,<slot>,<start_epoch>,<codec_version>,<row_format>
+DIVE,<slot>,<start_epoch>,<codec_version>,<row_format>,<iso_utc>
 S,<t_s>,<depth_m>,<voted>,<c0>,<c1>,<c2>,<sp>,0x<alarm16>,<cns>,<ceiling_m>,<ndl>,<deco_min>,<pulses>,<batt>,<mode>,<temp_c>,<flags>,<ceiling_cm>
 E,<t_s>,<id>,<value>
 M,<duration_s>,<max_depth_cm>,<min_ppo2>,<max_ppo2>,<pulses>,<cns_peak_pct>,<snapshots>,<events>,<gf_low>,<gf_high>,<sp1>,<sp2>,<sp3>,<sp4>
@@ -396,6 +445,13 @@ fields of a v2 row and gets what it got before.
 |---|---|---|---|
 | v1 (2026-11-22) | 14 | 8 | the original contract |
 | v2 (2026-11-23) | 19 | 15 | `mode`, `temp_c`, `flags`, `ceiling_cm`; `gf_low`, `gf_high`, `sp1`…`sp4` |
+| v3 (2026-11-24) | 19 | 15 | `DIVE,` line gains a 6th field: start as ISO-8601 UTC (`clock-unset` when the dive started with no clock). `S,`/`M,` unchanged |
+
+The `iso_utc` field is **rendered from the stored epoch, never stored**: one
+truth on the flash, and a dive written before v3 still exports a correct date.
+The renderer is the firmware's own (`logfmt::isoUtc`, closed-form civil date)
+— not newlib's `gmtime`/`strftime`, whose time and float tables do not belong
+on the task that answers clients.
 
 Two corrections worth knowing, both of which were documentation errors rather
 than wire errors:

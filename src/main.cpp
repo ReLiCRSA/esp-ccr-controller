@@ -455,6 +455,11 @@ static void controlTask(void*) {
         else if (st.alarms.anyWarning) hudSetError(ErrLevel::WARNING);
         else hudSetError(ErrLevel::NONE);
 
+        // Keeps a carried clock honest across a reset: the mirror in RTC
+        // no-init memory is the wall time as of this cycle, so the boot after a
+        // reset resumes the same instant instead of the instant the clock was set.
+        comms::clockTick();
+
         g_hbControl.seq++;
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -734,14 +739,34 @@ void setup() {
     // LittleFS mount that fails is formatted by begin(), and that is the one
     // thing about this filesystem a diver must never learn after the dive.
     char logNote[72];
+    // Before the banner, and before anything can start a dive: a clock carried
+    // across a reset is adopted only if its magic and range hold (a battery pull
+    // leaves plausible-looking garbage in that memory).
+    comms::clockBootRestore();
+    char clockNote[96];
+    comms::clockBootText(clockNote, sizeof(clockNote));
+
     const int logDives = comms::diveLogBoot(logNote, sizeof(logNote));
     if (logDives < 0)
         Serial.printf("log: ** LittleFS %s — dives will not be recorded\n", logNote);
-    else
-        Serial.printf("log: LittleFS mounted, %d dive%s, used %lu of %lu bytes%s%s\n",
-                      logDives, logDives == 1 ? "" : "s",
+    else {
+        // `seq a..b` is the eviction evidence. A full FIFO always lists ten
+        // dives, so the count alone cannot say whether the newest dive survived:
+        // on 2026-11-24 it did not, and nothing on the console said so (PLAN 16).
+        char seqTxt[32] = "";
+        uint32_t seqLo = 0, seqHi = 0;
+        if (logDives > 0 && comms::diveLogSeqRange(seqLo, seqHi))
+            snprintf(seqTxt, sizeof(seqTxt), ", seq %lu..%lu",
+                     (unsigned long)seqLo, (unsigned long)seqHi);
+        else if (logDives > 0)
+            snprintf(seqTxt, sizeof(seqTxt), ", seq n/a");   // dives predate the field
+        Serial.printf("log: LittleFS mounted, %d dive%s%s, used %lu of %lu bytes%s%s\n",
+                      logDives, logDives == 1 ? "" : "s", seqTxt,
                       comms::diveLogUsedBytes(), comms::diveLogTotalBytes(),
                       logNote[0] ? " ** " : "", logNote[0] ? logNote : "");
+    }
+
+    Serial.printf("clock: %s\n", clockNote);
 
     size_t schemaKeys = 0;
     settings::Registry::definitions(schemaKeys);

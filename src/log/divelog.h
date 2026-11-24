@@ -29,6 +29,16 @@ constexpr uint32_t DIVE_MAGIC = 0x56444252; // "RBDV" little-endian
 // and one wrong guess desynchronises every row after it. Records produced
 // by pack* are unchanged — the tag belongs to the file, not the codec.
 constexpr uint8_t DIVE_VERSION = 3;
+// The version did NOT move when the four unused header bytes gained a meaning
+// (the dive sequence, below): the layout, size and CRC coverage of the header
+// are unchanged, a reader that ignores those bytes still decodes epoch and slot
+// correctly, and bumping the number would have made every dive already on a
+// board's flash unreadable by the firmware that replaced it. `unpackHeader`
+// reads the sequence out of files written before the change as 0 = unknown.
+// SEQ_MAX is 24 bits because that is what the three contiguous spare bytes
+// (out[5..7]) hold; out[13] stays padding. At one dive a day that is 45—odd
+// years, and the counter saturates rather than wrapping, so an overflow cannot
+// make a new dive look older than an existing one.
 // The FIFO depth, in one place: the file store, the command parser's index
 // range and the web's /dive/<n>.csv routes all have to agree on it, and two
 // of them are host-compiled while the store is not, so the constant lives
@@ -49,6 +59,12 @@ enum EventId : uint16_t {
     EVT_CAL_AIR = 7, EVT_CAL_O2 = 8, EVT_CELLPROOF_PASS = 9,
     EVT_CELLPROOF_FAIL = 10, EVT_CLAMP_ON = 11, EVT_CLAMP_OFF = 12,
     EVT_PREPASS = 13, EVT_RESET = 14,
+    // 15: this dive was started with no wall clock, so its header epoch is 0 and
+    // its exported date reads `clock-unset`. It belongs in the dive file rather
+    // than only on the console: the dive log is the artifact a diver reads later,
+    // and "this dive has no date" has to travel with it. Event ids are
+    // append-only, so this is a new number, never a re-used one.
+    EVT_CLOCK_UNSET = 15,
 };
 
 struct Snapshot {
@@ -104,9 +120,55 @@ size_t packMeta(const DiveMeta& m, uint8_t out[64]);      // incl. magic+version
 bool unpackMeta(const uint8_t in[64], DiveMeta& out);     // false on magic/CRC fail
 
 // ---- file header: fixed 16 B at the front of every dive file ---------------
+// magic 'RBDV'(4) version(1) seq(3) startEpoch(4) slot(1) pad(1) crc16(2),
+// the CRC covering the first 14 bytes.
 constexpr size_t HEADER_SIZE = 16;
-void packHeader(uint32_t startEpoch, uint8_t slot, uint8_t out[HEADER_SIZE]);
-bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch, uint8_t& slot);
+
+/// The dive's position in the order dives were written. `0` means "unknown":
+/// every file written before 2026-11-24, and any file whose header could not be
+/// read. See `nextSeq`/`pickEvictSlot` for why the FIFO needs this at all.
+constexpr uint32_t SEQ_UNKNOWN = 0u;
+constexpr uint32_t SEQ_MAX = 0x00FFFFFFu;
+
+void packHeader(uint32_t startEpoch, uint8_t slot, uint32_t seq,
+                uint8_t out[HEADER_SIZE]);
+bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch,
+                  uint8_t& slot, uint32_t& seq);
+
+// ---- FIFO ordering identity (pure; the file walking stays in dive_store) ----
+// Eviction asks "which of these ten dives is the oldest?". Answering it from the
+// start epoch needs a clock, and this board has none: no RTC chip, and no NTP
+// through an access point with no uplink, so until 2026-11-24 every dive was
+// stamped epoch 0, all ten keys tied, and the comparison named the same slot
+// every time. On the bench that put the eleventh and twelfth dives in slot 1
+// one after the other: the log kept the nine oldest dives and the very newest
+// and silently ate everything in between (BENCH.md, PLAN 16).
+// A sequence number fixes it without a clock: `nextSeq` is max(existing)+1, so
+// it is monotonic across reboots — it is derived from the dive files
+// themselves, not from NVS or a timer — and it costs three header bytes
+// that were padding.
+//
+/// Sequence for the next dive: one past the highest on the partition, 1 for an
+/// empty log, saturating at SEQ_MAX (a saturated counter stops ordering, which
+/// is a 16.7-million-dive problem and is stated rather than hidden).
+uint32_t nextSeq(const uint32_t* seq, int n);
+
+/// Index (0-based, so slot = index + 1) of the dive to evict, or -1 for n <= 0.
+/// Unknown-age dives go first: they predate every sequenced one, so a board
+/// upgrading into this format sheds its pre-change dives before it sheds any
+/// others. Among sequenced dives, smallest seq; then smallest epoch (a real
+/// clock's ordering, which is still the right answer when two dives somehow
+/// share a seq); then the lower slot, so the choice is reproducible rather than
+/// whatever the scan order happened to be.
+int pickEvictSlot(const uint32_t* seq, const uint32_t* epoch, int n);
+
+// ---- wall clock rendering (pure, no libc time, no locale, no TZ) -----------
+/// "2026-11-24T09:00:00Z" from a unix epoch, UTC, fixed 20 characters. Returns
+/// the length written, or 0 if `cap` is too small. Epoch 0 (no clock) renders
+/// `kNoClock`, so a dive exported without a clock says so in the field where a
+/// reader expects a date instead of showing 1970-01-01.
+constexpr const char* kNoClock = "clock-unset";
+size_t isoUtc(char* out, size_t cap, uint32_t epoch);
 
 
 // ---- CRC16-CCITT (used for record integrity on flash) ----
@@ -128,6 +190,7 @@ struct RawRecord {
 struct ScanResult {
     bool headerOk = false;
     uint32_t startEpoch = 0;
+    uint32_t seq = SEQ_UNKNOWN;
     int snapshots = 0;
     int events = 0;
     bool metaOk = false;       // a complete dive ends with a valid trailer
@@ -149,7 +212,10 @@ ScanResult scanRecords(const uint8_t* img, size_t len,
 // of a v2 row gets exactly what it got in v1; new information goes on the right.
 // `ROW_FORMAT_VERSION` rides on the `DIVE,` line so a reader can tell how many
 // columns to expect without counting.
-constexpr uint8_t ROW_FORMAT_VERSION = 2;
+// v3 appends one column to the right of the `DIVE,` identity line: the dive
+// start as ISO-8601 UTC. Nothing existing moved or changed units, so a v1/v2
+// parser reading the first five fields still gets exactly what it got before.
+constexpr uint8_t ROW_FORMAT_VERSION = 3;
 
 size_t diveCsvLine(char* out, size_t cap, uint8_t slot, uint32_t startEpoch);
 size_t snapshotCsvLine(char* out, size_t cap, const Snapshot& s);
@@ -175,6 +241,7 @@ struct ImageRecord {
     const void* record;  // packed Snapshot or Event, tag excluded
 };
 size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
-                 const ImageRecord* recs, size_t n, const DiveMeta* meta);
+                 uint32_t seq, const ImageRecord* recs, size_t n,
+                 const DiveMeta* meta);
 
 } // namespace logfmt

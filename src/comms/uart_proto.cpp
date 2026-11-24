@@ -159,6 +159,24 @@ bool parseCommand(const char* line, Command& out, const char** err) {
         }
         *err = "unknown LOG action"; return false;
     }
+    if (std::strcmp(verb, "TIME") == 0) {
+        if (!*rest) { *err = "TIME needs SET"; return false; }
+        char* a = tok(const_cast<char*>(rest), &rest);
+        if (std::strcmp(a, "SET") != 0) { *err = "unknown TIME action"; return false; }
+        if (!*rest) { *err = "TIME SET needs <epoch>"; return false; }
+        char* num = tok(const_cast<char*>(rest), &rest);
+        if (*rest) { *err = "TIME SET takes one value"; return false; }
+        char* endp = nullptr;
+        const unsigned long v = std::strtoul(num, &endp, 10);
+        if (endp == num || *endp) { *err = "epoch must be digits"; return false; }
+        out.kind = Kind::TIME_SET;
+        out.epoch = (uint32_t)v;
+        copyField(out.value, sizeof(out.value), num);
+        // The range is NOT checked here on purpose: "epoch out of range" is a
+        // refusal the router owns (it knows what a believable dive date is), and
+        // a parse refusal would put policy in the grammar.
+        return true;
+    }
     if (std::strcmp(verb, "WIFI") == 0) {
         if (!*rest) { *err = "WIFI needs ON/OFF"; return false; }
         char* a = tok(const_cast<char*>(rest), &rest);

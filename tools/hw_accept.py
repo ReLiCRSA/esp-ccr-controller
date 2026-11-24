@@ -52,10 +52,20 @@ RESET_REASON = re.compile(r"^reset reason: ")
 SETTINGS_LINE = re.compile(r"^settings: (\d+) keys from NVS")
 CONTROL_LINE = re.compile(r"^control: SP=[\d.]+/")
 WEB_AP_LINE = re.compile(r'^web: AP "([A-Za-z0-9_-]+)" on 192\.168\.4\.1')
-# `log: LittleFS mounted, 1 dive, used 36864 of 1441792 bytes`. Group 4 is the
-# firmware's warning: it is empty on a clean mount and says so when the mount
-# failed and the partition had to be formatted (which erases dive history).
-LOG_LINE = re.compile(r"^log: LittleFS mounted, (\d+) dives?, used (\d+) of (\d+) bytes(.*)$")
+# `log: LittleFS mounted, 10 dives, seq 3..12, used 36864 of 1441792 bytes`.
+# The `seq a..b` group is the eviction evidence: a full FIFO always lists ten
+# dives, so only the sequence range says whether the NEWEST dive survived (a
+# board whose dives all predate the sequence field says `seq n/a`). Group `note`
+# is the firmware's warning: empty on a clean mount, and it says so when the
+# mount failed and the partition had to be formatted (which erases dive history).
+LOG_LINE = re.compile(
+    r"^log: LittleFS mounted, (?P<dives>\d+) dives?"
+    r"(?:, seq (?:n/a|(?P<seqlo>\d+)\.\.(?P<seqhi>\d+)))?"
+    r", used (?P<used>\d+) of (?P<total>\d+) bytes(?P<note>.*)$")
+# `clock: 2026-11-24T09:12:03Z (set 41 s ago)`, or `unset: ...`, or a value
+# `carried across a reset, not verified since`. The boot must always state it:
+# a dive log whose dates nobody can account for is the defect this replaced.
+CLOCK_LINE = re.compile(r"^clock: ")
 # The firmware's own FIFO depth (logfmt::MAX_DIVE_SLOTS, src/log/divelog.h). A
 # full FIFO evicts a dive instead of growing, so "one more dive than before" is
 # only the right expectation while a slot is free.
@@ -82,6 +92,13 @@ OVERLONG = "X" * 120
 # ^T,. A burst check requires TWO matching lines within `burst_window` of each
 # other, which the unsolicited cadence alone cannot produce (2 Hz = 500 ms
 # apart), so a real reply is the only way to satisfy it.
+#
+# The clock entries stamp the board with the bench PC's wall time, which is
+# what the dive log gets dated with: the controller has no RTC and the AP has
+# no uplink, so a client at the surface IS the time source. Doing it here means
+# every later phase (dive-persist, web_probe's CSV check) sees real dates
+# instead of epoch 0, and `TIME SET 7` keeps the refusal honest.
+_NOW_EPOCH = int(time.time())
 PROTOCOL_CHECKS = [
     ("DIVE END", r"^(OK|ERR no dive)", "clean slate before the sequence"),
     ("GET T", r"^T,", "telemetry line parses", "burst"),
@@ -94,6 +111,11 @@ PROTOCOL_CHECKS = [
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
     ("SET SP2=2.5", r"^ERR", "range refusal"),
+    # The clock goes up before the matrix's own dive, so THAT dive is stamped
+    # with a real epoch too, and every later phase sees dated logs.
+    (f"TIME SET {_NOW_EPOCH}", r"^OK TIME", "wall clock accepted from the bench"),
+    ("TIME SET 7", r"^ERR epoch out of range", "implausible epoch refused, clock unchanged"),
+    ("GET TIME", r"^TIME,\d{10},1,", "clock set since this boot, read back"),
     # "dwell:2.0" holds the dive OPEN before the next command. Without it the
     # whole matrix runs in under a second: DIVE START and DIVE END land 0.45 s
     # apart, the deferred radio teardown (loopTask polls at 1 s, stop() drains
@@ -196,8 +218,12 @@ def grade_boot(lines, expect_web):
         # is answered with a format, which erases every dive on the partition;
         # until 2026-11-23 that happened in silence and was indistinguishable
         # from a diver who had simply not dived.
-        note = LOG_LINE.search(ll).group(4).strip()
+        note = LOG_LINE.search(ll).group("note").strip()
         checks.append(("dive log mount did not format (history intact)", not note, ll))
+    cl = next((l for l in lines if CLOCK_LINE.search(l)), None)
+    checks.append(("wall clock stated at boot", cl is not None,
+                   cl or "no `clock:` line: the boot does not say whether dives "
+                         "will carry a date"))
     return checks
 
 
@@ -447,9 +473,12 @@ def run_dive_persist(console, port, baud, watch, settle=1.5):
     time.sleep(settle)
 
     def slots():
-        """Slot numbers `LOG LIST` reports, after the standard line-buffer flush
-        (un-terminated bytes in the controller's buffer would be parsed with
-        this command; see the flush comment in run_protocol)."""
+        """Dives `LOG LIST` reports, as (slot, epoch, seq) rows, after the
+        standard line-buffer flush (un-terminated bytes in the controller's
+        buffer would be parsed with this command; see the flush comment in
+        run_protocol). The firmware lists newest-written first, and `seq` is
+        the field that makes that claim mean something on a board with no
+        clock — the whole point of the sequence number."""
         ser.reset_input_buffer()
         ser.write(b"\r\n")
         ser.flush()
@@ -463,7 +492,9 @@ def run_dive_persist(console, port, baud, watch, settle=1.5):
             if l.startswith("L,"):
                 parts = l.split(",")
                 if len(parts) > 1 and parts[1].isdigit():
-                    out.append(int(parts[1]))
+                    ep = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                    sq = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+                    out.append((int(parts[1]), ep, sq))
         return out
 
     before = slots()
@@ -490,28 +521,66 @@ def run_dive_persist(console, port, baud, watch, settle=1.5):
     ll = next((l for l in new_boot if LOG_LINE.search(l)), None)
 
     # A closed dive must appear in the list. The count only has to grow while a
-    # slot is free: the FIFO holds ten dives and a full one evicts, so once it is
-    # full the set stays at ten and the new dive replaces an old one. Asserting
-    # "+1" in the full case would fail a run that worked as designed — and the
-    # eviction order itself is an open question (PLAN 16), not something this
-    # check is allowed to quietly bless.
+    # slot is free: the FIFO holds ten dives and a full one evicts, so once it
+    # is full the set stays at ten and the new dive replaces an old one.
+    # Asserting "+1" in the full case would fail a run that worked as designed.
+    # What the old check could NOT say was WHICH dive got evicted, because a
+    # full FIFO lists ten slots whatever the order of writing was — measured on
+    # the bench 2026-11-24, the eviction hammered slot 1 and ate the newest
+    # dives while every count still passed (PLAN 16). The sequence number is
+    # what lets this check name the newest dive and prove it survived.
     want = min(len(before) + 1, MAX_DIVE_SLOTS)
+    slotset = lambda rows: [s for s, _e, _q in rows]
     checks.append(("dive closed this run is in LOG LIST",
                    len(mid) == want,
-                   f"before {before or '[]'} ({len(before)}), after DIVE END "
-                   f"{mid or '[]'} ({len(mid)}), expected {want}"
+                   f"before {slotset(before) or '[]'} ({len(before)}), after DIVE END "
+                   f"{slotset(mid) or '[]'} ({len(mid)}), expected {want}"
                    + (", FIFO full so one dive is evicted"
                       if len(before) >= MAX_DIVE_SLOTS else "")))
     checks.append(("dive history survives a reset",
                    bool(mid) and set(after) == set(mid),
-                   f"{len(mid)} slots before the reset, {len(after)} after: "
+                   f"{len(mid)} dives before the reset, {len(after)} after: "
                    f"{after or '[]'}"))
     checks.append(("the new boot reports its dive log", ll is not None,
                    ll or "no `log:` line: the boot banner does not say what the "
                          "filesystem holds"))
+
+    seqs_mid = [q for (_s, _e, q) in mid]
+    new_seq = max(seqs_mid) if seqs_mid else 0
+    checks.append(("the closed dive carries a dive sequence",
+                   new_seq > 0 and seqs_mid.count(new_seq) == 1,
+                   f"sequences in LOG LIST: {seqs_mid}; 0 means the file predates "
+                   f"the sequence field and must not repeat as a live one"))
+    stamped = next((r for r in mid if r[2] == new_seq), None)
+    checks.append(("the closed dive is stamped with the wall clock",
+                   bool(stamped) and stamped[1] >= 946684800,   # 2000-01-01
+                   f"newest dive (seq {new_seq}) epoch "
+                   f"{stamped[1] if stamped else '-'}: TIME SET in the protocol "
+                   f"phase is what makes this a date, not 0"))
+
     if ll:
-        note = LOG_LINE.search(ll).group(4).strip()
+        m = LOG_LINE.search(ll)
+        note = m.group("note").strip()
         checks.append(("reset did not format the log (history intact)", not note, ll))
+        hi = m.group("seqhi")
+        checks.append(("the boot banner states the dive-sequence range",
+                       hi is not None or not seqs_mid, ll))
+        checks.append(("the newest dive's sequence survived the reset",
+                       hi is not None and int(hi) == new_seq,
+                       f"boot banner top vs LOG LIST newest: {hi} vs {new_seq}"))
+    cl = next((l for l in new_boot if CLOCK_LINE.search(l)), None)
+    # Measured on this bench 2026-11-24: the EN pulse is a CHIP_PU power-down
+    # (the new boot reports `rst:0x1 (POWERON_RESET)`), and it wipes the RTC
+    # no-init carry exactly like a battery pull. So the honest expectation
+    # after THIS reset is `clock: unset` — the gate is that the boot says so
+    # out loud instead of resurrecting a plausible date from silicon garbage
+    # (the magic+range rejection, host-pinned by test_carry_needs_both_magic_and_range).
+    # The carry itself covers the resets the firmware performs on itself
+    # (panic, watchdog, SAFE ACK), which keep RTC memory.
+    checks.append(("the boot after the reset states the clock honestly",
+                   cl is not None and ("unset" in cl or "carried" in cl),
+                   cl or "no `clock:` line: dives after a power cycle would be "
+                         "undated in silence"))
     return checks
 
 

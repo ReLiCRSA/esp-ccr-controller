@@ -49,9 +49,21 @@ public:
     /// Write the final meta (totals) and close. Safe to call if not recording.
     void endDive(const logfmt::DiveMeta& meta);
 
-    /// Newest-first slot numbering for the handset `LOG LIST`:
-    /// fills idx[] (slot number, 1..10) and exists/mtime arrays.
-    int list(int* slotOut, uint32_t* mtimeOut, int max) const;
+    /// The dive-sequence range currently on the partition (false when no dive
+    /// carries one, which is the state of a board whose dives predate 2026-11-24).
+    /// The boot banner prints it because that is the only place the bench can see
+    /// whether eviction rotated through the slots or overwrote the same one: the
+    /// slot list alone cannot tell, since a full FIFO always lists ten slots.
+    bool seqRange(uint32_t& lo, uint32_t& hi) const;
+
+    /// Newest-written-first for the handset `LOG LIST`: fills slotOut[] (slot
+    /// number, 1..10) and, when given, mtimeOut[] (the dive's start epoch) and
+    /// seqOut[] (the dive sequence). The sequence is the field that says which
+    /// of these dives is actually the most recent: on a board with no clock
+    /// every start epoch is 0, and once the FIFO rotates the slot numbers carry
+    /// no order either. Unsequenced dives list last; among them the order is
+    /// slot-descending, exactly as before the sequence existed.
+    int list(int* slotOut, uint32_t* mtimeOut, uint32_t* seqOut, int max) const;
 
     /// Stream one dive, decoded, through a line sink (UART chunk, WebSocket
     /// frame...). CSV header first; stops at the first corrupt record.
@@ -65,7 +77,15 @@ public:
     void eraseAll();
 
 private:
-    int nextSlot() const;          // 1..10, evicting oldest when full
+    /// 1..10, evicting the oldest dive when the FIFO is full. `seqOut` is the
+    /// sequence the chosen dive must carry: max on the partition + 1, derived
+    /// from the dive files themselves so it survives a reboot with no clock and
+    /// needs nothing stored anywhere else.
+    int nextSlot(uint32_t& seqOut) const;
+    /// One pass over the ten slots: which hold a dive file, and what each header
+    /// says. Empty slots and unreadable headers come back as 0/0, which
+    /// logfmt::pickEvictSlot reads as "age unknown" and evicts first.
+    int scanFifo(uint32_t* seq, uint32_t* epoch, bool* present) const;
     static void pathFor(int slot, char* out, size_t cap);
     File file_;
     bool mounted_ = false;

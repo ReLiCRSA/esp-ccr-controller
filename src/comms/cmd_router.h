@@ -28,6 +28,7 @@
 
 #include "comms/settings.h"
 #include "comms/uart_proto.h"
+#include "comms/wallclock.h"
 #include "control/calibration.h"
 #include "control/cellhist.h"
 #include "control/loop.h"
@@ -68,6 +69,8 @@ public:
         ACT_LOG_EXPORT = 1 << 10,  // ...or one dive, logExportIndex()
         ACT_SAFE_ACK = 1 << 11,    // SAFE-mode ACK: the transport restarts
                                    // the controller clean (see setSafeLockout)
+        ACT_CLOCK_SET = 1 << 12,   // TIME SET arrived: the transport writes the
+                                   // wall clock (this class does not own one)
     };
 
 
@@ -139,6 +142,15 @@ public:
         return w;
     }
 
+    /// The controller's wall clock, published by whoever owns it (the session).
+    /// Null is allowed and reads as "no clock", so a transport that has not
+    /// wired one up yet is not answering a made-up date.
+    void setClock(const wallclock::State* c) { clock_ = c; }
+
+    /// The epoch TIME SET asked for, valid until the next command. The router
+    /// checked the range; the transport performs the write.
+    uint32_t clockEpochPending() const { return clockEpoch_; }
+
     /// Deco picture as the protocol wants it (shared by `DECO`, `GET D` and
     /// the periodic D, line in the UART task).
     static proto::DecoInfo decoInfoOf(const ctrl::Loop& loop, bool hasVote);
@@ -171,6 +183,8 @@ private:
     bool wifiOn_ = true;       // diver-visible master switch (WIFI ON|OFF)
     bool wifiAutoOff_ = false; // radio dropped by DIVE START, not by the diver
     bool depthCalPending_ = false;
+    const wallclock::State* clock_ = nullptr;
+    uint32_t clockEpoch_ = 0;
     const cellhist::Hist* hist_ = nullptr;
     bool o2Armed_ = false;     // first step of the two-step CAL O2 seen here;
                                // the O2Sequencer itself lives in the firmware

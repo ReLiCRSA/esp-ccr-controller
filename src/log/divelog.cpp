@@ -176,9 +176,15 @@ size_t row(char* out, size_t cap, const char* fmt, ...) {
 // value is either an integer or a scaled integer rendered by fixedScaled, which
 // is the point of the X1000 fields in `Snapshot`.
 size_t diveCsvLine(char* out, size_t cap, uint8_t slot, uint32_t startEpoch) {
-    return row(out, cap, "DIVE,%u,%u,%u,%u\n", static_cast<unsigned>(slot),
+    // Field 6 is the v3 append: the same instant as field 2, readable without a
+    // converter. Rendered from the epoch rather than stored, so there is one
+    // truth on the flash and a dive written before this change still exports a
+    // correct date. Epoch 0 exports `clock-unset`, not 1970-01-01.
+    char iso[24];
+    if (!isoUtc(iso, sizeof(iso), startEpoch)) return 0;
+    return row(out, cap, "DIVE,%u,%u,%u,%u,%s\n", static_cast<unsigned>(slot),
                static_cast<unsigned>(startEpoch), static_cast<unsigned>(DIVE_VERSION),
-               static_cast<unsigned>(ROW_FORMAT_VERSION));
+               static_cast<unsigned>(ROW_FORMAT_VERSION), iso);
 }
 
 size_t snapshotCsvLine(char* out, size_t cap, const Snapshot& s) {
@@ -286,10 +292,10 @@ ScanResult emitCsvRows(const uint8_t* img, size_t len,
                        void (*sink)(const char* line, void*), void* ctx) {
     ScanResult sc = scanRecords(img, len, nullptr, nullptr);
     if (!sc.headerOk) return sc;
-    uint32_t epoch = 0;
+    uint32_t epoch = 0, seq = 0;
     uint8_t slot = 0;
-    unpackHeader(img, epoch, slot);
-    char head[48];
+    unpackHeader(img, epoch, slot, seq);
+    char head[64];   // "DIVE,10,4294967295,3,3,9999-12-31T23:59:59Z" is 45 bytes
     if (diveCsvLine(head, sizeof(head), slot, epoch)) sink(head, ctx);
     RowSink rs{sink, ctx, {}};
     return scanRecords(img, len, rowCb, &rs);
@@ -311,7 +317,8 @@ size_t toCsvImage(const uint8_t* img, size_t len, char* out, size_t outCap) {
 }
 
 size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
-                 const ImageRecord* recs, size_t n, const DiveMeta* meta) {
+                 uint32_t seq, const ImageRecord* recs, size_t n,
+                 const DiveMeta* meta) {
     size_t need = HEADER_SIZE + (meta ? 1u + 64u : 0u);
     for (size_t i = 0; i < n; ++i) {
         const size_t sz = recs[i].tag == REC_SNAPSHOT ? SNAPSHOT_SIZE
@@ -323,7 +330,7 @@ size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
 
     uint8_t* p = out;
     uint8_t head[HEADER_SIZE];
-    packHeader(startEpoch, slot, head);
+    packHeader(startEpoch, slot, seq, head);
     std::memcpy(p, head, HEADER_SIZE);
     p += HEADER_SIZE;
     for (size_t i = 0; i < n; ++i) {
@@ -344,21 +351,32 @@ size_t packImage(uint8_t* out, size_t cap, uint32_t startEpoch, uint8_t slot,
 
 namespace logfmt {
 
-void packHeader(uint32_t startEpoch, uint8_t slot, uint8_t out[HEADER_SIZE]) {
+void packHeader(uint32_t startEpoch, uint8_t slot, uint32_t seq,
+                uint8_t out[HEADER_SIZE]) {
     for (size_t i = 0; i < HEADER_SIZE; ++i) out[i] = 0;
     out[0] = 'R'; out[1] = 'B'; out[2] = 'D'; out[3] = 'V';
     out[4] = DIVE_VERSION;
+    // out[5..7]: the dive sequence. Saturating, never wrapping: a counter that
+    // came back round to 1 would make the newest dive look like the oldest and
+    // get it evicted first, which is the bug this field exists to prevent.
+    if (seq > SEQ_MAX) seq = SEQ_MAX;
+    out[5] = (uint8_t)(seq);
+    out[6] = (uint8_t)(seq >> 8);
+    out[7] = (uint8_t)(seq >> 16);
     out[8] = (uint8_t)(startEpoch);
     out[9] = (uint8_t)(startEpoch >> 8);
     out[10] = (uint8_t)(startEpoch >> 16);
     out[11] = (uint8_t)(startEpoch >> 24);
     out[12] = slot;
+    // out[13] stays zero: reserved, and inside the CRC, so a field added there
+    // later cannot be mistaken for an old zero.
     const uint16_t crc = crc16(out, 14);
     out[14] = (uint8_t)crc;
     out[15] = (uint8_t)(crc >> 8);
 }
 
-bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch, uint8_t& slot) {
+bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch,
+                  uint8_t& slot, uint32_t& seq) {
     if (in[0] != 'R' || in[1] != 'B' || in[2] != 'D' || in[3] != 'V') return false;
     if (in[4] != DIVE_VERSION) return false;
     const uint16_t crc = crc16(in, 14);
@@ -366,7 +384,87 @@ bool unpackHeader(const uint8_t in[HEADER_SIZE], uint32_t& startEpoch, uint8_t& 
     startEpoch = (uint32_t)in[8] | ((uint32_t)in[9] << 8) |
                  ((uint32_t)in[10] << 16) | ((uint32_t)in[11] << 24);
     slot = in[12];
+    seq = (uint32_t)in[5] | ((uint32_t)in[6] << 8) | ((uint32_t)in[7] << 16);
     return true;
+}
+
+// ---- FIFO ordering identity ------------------------------------------------
+// Eviction asks "which of these ten dives is the oldest", and answering it from
+// the start epoch needs a clock this board does not have. Until 2026-11-24 every
+// dive was stamped epoch 0, all ten keys tied, and the comparison named the same
+// slot every time: the eleventh and twelfth dives went into slot 1 one after the
+// other, so the log kept the nine oldest dives plus the newest and ate the ones
+// in between (measured on the bench, PLAN 16). A sequence number fixes that with
+// no clock and no NVS, because `nextSeq` is max(existing)+1 — the order is
+// derived from the dive files themselves, so it survives a reboot.
+
+uint32_t nextSeq(const uint32_t* seq, int n) {
+    uint32_t hi = 0;
+    for (int i = 0; i < n; i++)
+        if (seq[i] > hi) hi = seq[i];
+    return hi >= SEQ_MAX ? SEQ_MAX : hi + 1;   // empty log: 0 + 1 = 1
+}
+
+int pickEvictSlot(const uint32_t* seq, const uint32_t* epoch, int n) {
+    if (n <= 0) return -1;
+    int best = 0;
+    for (int i = 1; i < n; i++) {
+        const bool bUnk = seq[best] == SEQ_UNKNOWN, iUnk = seq[i] == SEQ_UNKNOWN;
+        if (bUnk != iUnk) {          // unknown age is the one to give up first
+            if (iUnk) best = i;
+            continue;
+        }
+        if (seq[i] != seq[best]) { if (seq[i] < seq[best]) best = i; continue; }
+        if (epoch && epoch[i] != epoch[best]) {
+            if (epoch[i] < epoch[best]) best = i;   // a real clock still wins ties
+            continue;
+        }
+        // Identical keys: keep the lower index, written down rather than left to
+        // fall out of the scan order — an implicit scan-order rule is what
+        // made the old eviction behaviour invisible until it destroyed a dive.
+    }
+    return best;
+}
+
+// ---- wall clock rendering --------------------------------------------------
+namespace {
+// Civil date from days since 1970-01-01: Howard Hinnant's closed form. No month
+// table, no locale, no TZ, same answer on the host tests and on the target, and
+// fixed-point only — `strftime`/`gmtime` would pull newlib's time and float
+// formatting into the task that answers clients, which is the stack that has run
+// out before (PLAN 16).
+void civilFromDays(int64_t z, int& y, int& m, int& d) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned)(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const int64_t yy = (int64_t)yoe + era * 400;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    // mp counts months from March, so Nov/Dec are mp 8/9 shifted by -9, not +3.
+    // Getting this wrong is not loud: 1970-01-15 renders as 1969-11-15, a date
+    // that looks plausible in a dive log. Caught by the host tests.
+    m = (int)(mp + (mp < 10 ? 3 : -9));
+    y = (int)(yy + (m <= 2));
+}
+}  // namespace
+
+size_t isoUtc(char* out, size_t cap, uint32_t epoch) {
+    if (epoch == 0) {   // no clock: say so where a reader expects a date
+        const size_t n = std::strlen(kNoClock);
+        if (cap < n + 1) return 0;
+        std::memcpy(out, kNoClock, n + 1);
+        return n;
+    }
+    if (cap < 21) return 0;
+    int y, mo, d;
+    civilFromDays((int64_t)(epoch / 86400u), y, mo, d);
+    unsigned sod = epoch % 86400u;
+    const int h = (int)(sod / 3600u); sod %= 3600u;
+    const int mi = (int)(sod / 60u), s = (int)(sod % 60u);
+    return (size_t)std::snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                                 y, mo, d, h, mi, s);
 }
 
 ScanResult scanRecords(const uint8_t* img, size_t len,
@@ -374,11 +472,12 @@ ScanResult scanRecords(const uint8_t* img, size_t len,
     ScanResult res;
     res.bytesConsumed = 0;
     if (len < HEADER_SIZE) return res;
-    uint32_t epoch = 0;
+    uint32_t epoch = 0, seq = 0;
     uint8_t slot = 0;
-    if (!unpackHeader(img, epoch, slot)) return res;
+    if (!unpackHeader(img, epoch, slot, seq)) return res;
     res.headerOk = true;
     res.startEpoch = epoch;
+    res.seq = seq;
     res.bytesConsumed = HEADER_SIZE;
 
     size_t p = HEADER_SIZE;

@@ -246,4 +246,46 @@ size_t formatErr(const char* reason, char* out, size_t cap) {
     return (n > 0 && static_cast<size_t>(n) < cap) ? static_cast<size_t>(n) : 0;
 }
 
+// ---- uplink line assembly --------------------------------------------------
+//
+// What a broken implementation does differently, since that is the question
+// that keeps a check honest: a truncated line reaching the router (the 2026
+// defect — an over-long SET writes), or the tail of one physical line becoming
+// a second command (the other half of it, observed on the bench as the trailing
+// `ZZZ...` of `GET ZZZ...` answering `ERR unknown command`). Both cases below.
+LineReader::Out LineReader::push(int c, uint32_t nowMs) {
+    if (c == '\n' || c == '\r') {
+        if (swallowing_) {
+            // Whole line on the floor, and this was the end of it. The NEXT
+            // byte starts a fresh line: recovery is never rate limited.
+            swallowing_ = false;
+            return Out::NOTHING;
+        }
+        if (len_ == 0) return Out::NOTHING;   // blank line / second half of CRLF
+        buf_[len_] = '\0';
+        len_ = 0;   // dispatched: the next byte starts a fresh line, or a blank
+                    // terminator would re-dispatch the same command forever
+        return Out::LINE;
+    }
+    if (swallowing_) return Out::NOTHING;     // still the same discarded line
+    if (len_ < MAX_LINE) {
+        buf_[len_++] = static_cast<char>(c);
+        return Out::NOTHING;
+    }
+    // Past the cap. Swallow to the terminator FIRST — that part is the recovery
+    // and it always runs. Only the text is rate limited.
+    swallowing_ = true;
+    len_ = 0;
+    if (!haveErrAt_ || nowMs - errAt_ > kErrGapMs) {
+        haveErrAt_ = true;
+        errAt_ = nowMs;
+        const size_t n = formatErr("line too long", err_, sizeof(err_));
+        if (n) {
+            err_[n] = '\0';
+            return Out::TOO_LONG;
+        }
+    }
+    return Out::NOTHING;
+}
+
 } // namespace proto

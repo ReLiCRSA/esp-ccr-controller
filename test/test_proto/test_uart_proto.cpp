@@ -1,6 +1,8 @@
 #include <unity.h>
 
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "comms/uart_proto.h"
 
@@ -158,6 +160,132 @@ void test_format_err_event() {
     TEST_ASSERT_EQUAL('\n', buf[n - 1]);
 }
 
+// ---- LineReader: the uplink framing rule, now visible to this suite --------
+//
+// Written because the same rule, inline in uart2_task.cpp, was wrong in two
+// ways and both were observed on the bench (PLAN 16): the tail of an over-long
+// line became a SECOND command, and inside the error rate-limit window the
+// TRUNCATED prefix became a command — an over-long `SET SP2=0.33` + junk wrote
+// 0.330. The question for each case: what would a broken build do differently?
+struct Feed {
+    LineReader rx;
+    int lines = 0;
+    int errs = 0;
+    char last[MAX_LINE + 1] = {0};
+    char err[64] = {0};
+
+    void put(const char* s, uint32_t atMs) {
+        for (; *s; ++s) {
+            switch (rx.push(static_cast<unsigned char>(*s), atMs)) {
+                case LineReader::Out::LINE:
+                    ++lines;
+                    std::strncpy(last, rx.line(), sizeof(last) - 1);
+                    last[sizeof(last) - 1] = '\0';
+                    break;
+                case LineReader::Out::TOO_LONG:
+                    ++errs;
+                    std::strncpy(err, rx.errText(), sizeof(err) - 1);
+                    err[sizeof(err) - 1] = '\0';
+                    break;
+                case LineReader::Out::NOTHING:
+                default:
+                    break;
+            }
+        }
+    }
+};
+
+void test_line_reader_assembles_and_ignores_blanks() {
+    Feed f;
+    f.put("GET T\r\n", 0);
+    TEST_ASSERT_EQUAL_INT(1, f.lines);
+    TEST_ASSERT_EQUAL_STRING("GET T", f.last);
+
+    // A bare newline is what the bench tools send to flush a bridge's boot
+    // banner; it must draw nothing on its own.
+    f.put("\n\r\n", 500);
+    TEST_ASSERT_EQUAL_INT(1, f.lines);
+    TEST_ASSERT_EQUAL_INT(0, f.errs);
+
+    // Exactly MAX_LINE characters is NOT an overflow: the cap is a capacity,
+    // and a build that rejects its own longest valid line breaks the protocol.
+    Feed g;
+    char ok[MAX_LINE + 3];
+    std::memset(ok, 'B', MAX_LINE); ok[MAX_LINE] = '\n'; ok[MAX_LINE + 1] = '\0';
+    g.put(ok, 0);
+    TEST_ASSERT_EQUAL_INT(1, g.lines);
+    TEST_ASSERT_EQUAL_INT(0, g.errs);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(MAX_LINE), static_cast<int>(std::strlen(g.last)));
+}
+
+void test_line_reader_overflow_drops_the_whole_line() {
+    // The 2026 defect's first half: the bytes after the cap were collected and
+    // terminated as a second command, so `GET ZZZ...` answered `ERR unknown
+    // command` for its own tail. Here the physical line yields NO line at all.
+    Feed f;
+    char junk[MAX_LINE + 210];
+    std::snprintf(junk, sizeof(junk), "GET %sZ\n", std::string(MAX_LINE, 'Z').c_str());
+    f.put(junk, 0);
+    TEST_ASSERT_EQUAL_INT(0, f.lines);          // nothing reached the router
+    TEST_ASSERT_EQUAL_INT(1, f.errs);
+    TEST_ASSERT_EQUAL_STRING("ERR line too long\n", f.err);
+
+    // Recovery is immediate: the next line assembles normally.
+    f.put("GET SP2\n", 50);
+    TEST_ASSERT_EQUAL_INT(1, f.lines);
+    TEST_ASSERT_EQUAL_STRING("GET SP2", f.last);
+}
+
+void test_line_reader_overflow_cannot_execute_a_write() {
+    // The half the first bug report got wrong: with the ERR suppressed by the
+    // rate limit, the old code left len at MAX_LINE and the terminator
+    // dispatched the truncated first 64 bytes. Bench-observed: this exact shape
+    // answered `OK SAFETY` and left SP2 at 0.330. Zero lines is the whole
+    // verdict — the router must never see it, rate-limited or not.
+    Feed f;
+    char first[MAX_LINE + 130];
+    std::snprintf(first, sizeof(first), "GET SP2\nSET SP2=0.33%s\n",
+                  std::string(120, 'Z').c_str());
+    f.put(first, 0);
+    TEST_ASSERT_EQUAL_INT(1, f.lines);              // only the GET SP2 ever ran
+    TEST_ASSERT_EQUAL_STRING("GET SP2", f.last);    // NOT a phantom SET
+    TEST_ASSERT_EQUAL_INT(1, f.errs);
+
+    // Same overflowing line again, inside the error window: the TEXT is
+    // suppressed, the DISCARD is not — still no command, and still no write.
+    char again[MAX_LINE + 130];
+    std::snprintf(again, sizeof(again), "SET SP2=0.33%s\n", std::string(120, 'Z').c_str());
+    f.put(again, 1000);
+    TEST_ASSERT_EQUAL_INT(1, f.lines);
+    TEST_ASSERT_EQUAL_INT(1, f.errs);               // rate limited: no second text
+    TEST_ASSERT_EQUAL_STRING("GET SP2", f.last);
+    f.put("GET SP2\n", 1500);
+    TEST_ASSERT_EQUAL_INT(2, f.lines);
+    TEST_ASSERT_EQUAL_STRING("GET SP2", f.last);
+}
+
+void test_line_reader_rate_limit_gates_the_text() {
+    // "Gate the message, never the recovery" — checked from both sides: the
+    // window suppresses repeats, and the window re-arms.
+    Feed f;
+    std::string big = std::string(MAX_LINE + 40, 'X') + "\n";
+    f.put(big.c_str(), 100);
+    f.put(big.c_str(), 1000);            // inside the 2 s window
+    f.put(big.c_str(), 100 + LineReader::kErrGapMs + 1);   // just outside it
+    TEST_ASSERT_EQUAL_INT(0, f.lines);
+    TEST_ASSERT_EQUAL_INT(2, f.errs);
+
+    // Unsigned subtraction makes the window wrap-safe: a board that has been up
+    // ~50 days must not go quiet on overflow, and one that just wrapped must
+    // not stampede.
+    Feed w;
+    std::string junk = std::string(MAX_LINE + 40, 'Y') + "\n";
+    w.put(junk.c_str(), 0xFFFFFF00u);
+    w.put(junk.c_str(), 0xFFFFFF00u + LineReader::kErrGapMs + 10);   // wrapped
+    TEST_ASSERT_EQUAL_INT(0, w.lines);
+    TEST_ASSERT_EQUAL_INT(2, w.errs);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_simple_verbs);
@@ -169,5 +297,9 @@ int main() {
     RUN_TEST(test_format_telemetry_shape);
     RUN_TEST(test_format_deco_stops_and_overflow);
     RUN_TEST(test_format_err_event);
+    RUN_TEST(test_line_reader_assembles_and_ignores_blanks);
+    RUN_TEST(test_line_reader_overflow_drops_the_whole_line);
+    RUN_TEST(test_line_reader_overflow_cannot_execute_a_write);
+    RUN_TEST(test_line_reader_rate_limit_gates_the_text);
     return UNITY_END();
 }

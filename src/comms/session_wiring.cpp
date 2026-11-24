@@ -35,8 +35,12 @@ extern settings::Registry g_settings;
 extern bridge::Telemetry g_bridgeTel;
 extern bridge::EventRing g_bridgeEvents;
 extern bridge::DiveTotals g_bridgeTotals;
-extern bool g_calAirRequest;
-extern bool g_calDepthRequest;
+// `volatile` because these are cross-task flags: the command task sets them and
+// ControlTask reads/clears them (main.cpp defines them volatile). A declaration
+// that drops the qualifier lets the compiler treat a flag as loop-invariant, and
+// the linker cannot see the disagreement.
+extern volatile bool g_calAirRequest;
+extern volatile bool g_calDepthRequest;
 
 namespace comms {
 

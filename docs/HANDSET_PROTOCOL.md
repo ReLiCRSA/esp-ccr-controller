@@ -1,4 +1,9 @@
-# ESP-CCR Handset Protocol — v1 (2026-11-23)
+# ESP-CCR Handset Protocol — v1 (revised 2026-11-24)
+
+Revision of 2026-11-24: uplink overflow is now dropped whole on both transports
+(§1). No line, id or field was added, removed or renumbered, so the version stays
+v1 — a v1 client needs no change; what changed is that the firmware now does what
+this document always said a long line should do.
 
 The complete contract between the ESP-CCR nitrox CCR controller and any client
 that commands it: the wired **handset** (UART2) and the built-in **web page**
@@ -24,7 +29,7 @@ host suites `test/test_proto/`, `test/test_uartlink/`, `test/test_session/`.
 | Settings | **115200 baud, 8N1**, idle-low, 3.3 V logic |
 | Wiring | handset RXD ← GPIO17, handset TXD → GPIO16, **common ground mandatory** |
 | Framing | plain text, one command or one record per line; `\n` or `\r` (or both) terminate |
-| Uplink limit | **max 64 characters** per command line. The 65th character discards what was buffered so far and answers `ERR line too long` (at most one per 2 s); the **characters after it still form a line**, so an overlong command can end up executing its own tail as a second command. Keep commands ≤64 chars — the library refuses longer ones before they reach the wire |
+| Uplink limit | **max 64 characters** per command line. The 65th answers `ERR line too long` (at most one per 2 s) and the **whole line is then discarded**, terminator included: neither its tail nor its truncated prefix is ever executed. Keep commands ≤64 chars — the library refuses longer ones before they reach the wire |
 | Downlink size | every downlink line fits in **1024 bytes**; clients should buffer ≥1024 |
 | Auth / handshake | none on UART. The link is passive: the controller starts pushing telemetry immediately and forever |
 
@@ -70,41 +75,51 @@ Note also that the link is **passive in both directions**: downlink lines
 port is open, before any command has been sent. A client must not treat those as
 replies.
 
-### Over-long lines (read from the code, observed on the bench, 2026-11-23)
+### Over-long lines (rule fixed 2026-11-24; the bench observations below are what
+### the firmware did before the fix)
 
-A line longer than `proto::MAX_LINE` (64 characters) is handled as it overflows,
-not at the terminator:
+A line longer than `proto::MAX_LINE` (64 characters) is **dropped whole**:
 
-* `ERR line too long` is printed **at the moment the limit is passed**.
-* The line buffer is then reset, so **the rest of that same physical line starts
-  a new line** - a 204-character send is therefore answered twice: `ERR line too
-  long` and, at the newline, `ERR unknown command` for the leftover tail.
-* That error is rate limited to **one per 2 s**, so a wall of junk cannot storm
-  the 6 KB-stack UART task with error replies.
+* `ERR line too long` is sent **once**, when the limit is passed.
+* Everything after that point on the same physical line is discarded, including
+  the terminator — the line never reaches the command router, in any form. It is
+  not split in two, and the truncated first 64 bytes are never executed.
+* The error text is rate limited to **one per 2 s**, so a wall of junk cannot
+  storm the 6 KB-stack UART task with error replies. The rate limit gates the
+  *message* only: a suppressed overflow is still discarded, and the next line is
+  processed normally.
+* A line of exactly 64 characters is valid — 64 is a capacity, not a refusal.
 
-**The rate limit currently changes the outcome, not just the message - recorded
-as a defect, not as intended behaviour** (`uart2_task.cpp:63-73`). In the
-suppressed case `len` is *not* reset, so the terminator dispatches the truncated
-first 64 bytes as a command. Verified on the bench 2026-11-23:
+Both transports take that verdict, so an over-long send gets the same answer over
+UART2 and over `/ws` (verified: `web_probe.py` compares them byte for byte).
 
-| Send (each 204 bytes) | Answer | Effect |
+**What this replaced, and why the rule is now strict.** Until 2026-11-24 the UART
+task handled overflow as it happened rather than at the terminator: it reset the
+buffer and kept reading, so the rest of one physical line became a *second*
+command; and in the rate-limited case it did not reset the buffer at all, so the
+terminator dispatched the truncated first 64 bytes. Observed on the bench
+2026-11-23 (pre-fix firmware):
+
+| Send (each 204 bytes) | Answer then | Effect |
 |---|---|---|
-| `GET SP2 ZZZ…` (fresh 2 s window) | `ERR line too long`, then `ERR unknown command` | refused |
+| `GET SP2 ZZZ…` (fresh 2 s window) | `ERR line too long`, then `ERR unknown command` | refused, and its tail ran as a phantom command |
 | the same line again inside that window | `SP2=0.700` | **executed truncated** |
 | `SET SP2=0.33 YYY…` after arming the window | `OK SAFETY`, and `GET SP2` read back `0.330` | **the write landed** |
 | the same `SET` after the window expired | `ERR line too long`, value unchanged | refused |
 
-So the refusal is only guaranteed for the first overflow in two seconds. A
-handset library never sends more than 64 bytes, so this needs a corrupted or
-mangled stream to reach - which is exactly why the rule should be strict:
-rate-limit the *message*, always discard to the next terminator.
+A handset library never sends more than 64 bytes, so reaching this needs a
+corrupted or mangled stream — which is exactly why the rule is strict now. A
+client that receives an over-long line from its own side should assume nothing
+happened, and should not retry blindly if the command had an effect: it cannot
+know whether the controller saw the bytes at all. `hw_accept.py`'s framing phase
+proves the three properties above on real wires.
 
 The web transport differs in framing only: a WebSocket frame arrives whole, so
 the server answers `ERR line too long` once, marks that answer `#1 dropped`, and
 discards the frame (`web_server.cpp:136-146`). Same session, same router, same
-refusal text - which is why `tools/web_probe.py` compares the eight
-state-neutral commands **byte for byte** and the over-long case only on its
-refusal.
+refusal text — and since 2026-11-24 the **same verdict**, which is why
+`tools/web_probe.py` compares all nine state-neutral commands, the over-long case
+included, **byte for byte**.
 
 The web transport (`ws://<controller>/ws`) feeds the same lines; it adds
 WebSocket-only conventions:
@@ -540,14 +555,16 @@ not.
   in `LOG LIST` and downloaded over the web, but a handset could not export it.
 * `E,` ring is 32 deep: a burst can drop events (the controller counts drops);
   a handset should not treat `E,` as a reliable archive — the dive file is.
-* **Uplink overflow does not resynchronise to the next newline.** At 65
-  characters the UART task throws away the buffered 64, answers
-  `ERR line too long` (≥2 s apart) and starts collecting again mid-word — so a
-  100-character line can execute characters 66..100 as a command. That is a
-  firmware hardening item (§16), and the client rule stands regardless: never
+* **Uplink overflow is dropped whole** (fixed 2026-11-24, and a defect until
+  then). At 65 characters the UART task answers `ERR line too long` and discards
+  everything up to the next terminator, so neither the tail nor the truncated
+  first 64 bytes reaches the command router. Before the fix it *did* resynchronise
+  mid-word — a 100-character line could execute characters 66..100 as a command,
+  and an overflow inside the error rate-limit window executed the truncated
+  prefix (an over-long `SET SP2=0.33` wrote 0.330). Client rule unchanged: never
   send a line the library has not length-checked. (The library itself drops an
-  oversized *downlink* line whole, which is the behaviour a handset wants from
-  a corrupt stream.)
+  oversized *downlink* line whole, which is the behaviour a handset wants from a
+  corrupt stream — the firmware now behaves the same way.)
 * **`OK` means "the command was accepted", not "the effect happened".** Three
   calibration paths are parsed, replied and armed but have no firmware
   consumer yet: `CAL O2` (`cal::O2Sequencer` is host-tested, never

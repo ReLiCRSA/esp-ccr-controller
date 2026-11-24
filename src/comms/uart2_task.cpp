@@ -3,14 +3,15 @@
 //
 // All protocol behaviour lives in comms::Session / UartLink / CommandRouter
 // (host-tested); all hardware side effects live in session_wiring.cpp. This
-// file moves bytes and nothing else: line assembly with a length cap, the
-// periodic downlink, and the watchdog.
+// file moves bytes and nothing else: it feeds them to proto::LineReader (the
+// length cap and the overflow rule, host-tested), runs the periodic downlink,
+// and feeds the watchdog.
 //
 // Hang rules for this task: the read never blocks past the stream timeout, an
-// overlong burst gets one ERR and is dropped (no echo storm, no unbounded
-// buffer), and the watchdog is fed once per pump. If Serial2 ever wedges, this
-// task dies into the supervisor's SAFE policy — logging dies before control,
-// never the other way round.
+// overlong burst gets one ERR and its whole line is dropped (no echo storm, no
+// unbounded buffer, no truncated command executed), and the watchdog is fed
+// once per pump. If Serial2 ever wedges, this task dies into the supervisor's
+// SAFE policy — logging dies before control, never the other way round.
 // ============================================================================
 #include "uart2_task.h"
 
@@ -44,33 +45,25 @@ void uart2Task(void*) {
         return;
     }
 
-    char line[proto::MAX_LINE + 2];
-    size_t len = 0;
-    uint32_t overflowArmed = 0;
+    proto::LineReader rx;
 
     for (;;) {
         while (Serial2.available()) {
             const int c = Serial2.read();
             if (c < 0) break;
-            if (c == '\n' || c == '\r') {
-                if (len) {
-                    line[len] = '\0';
-                    session().handleLine(line, millis(), sinkWrite, nullptr);
-                    len = 0;
-                }
-                continue;
-            }
-            if (len < proto::MAX_LINE) {
-                line[len++] = (char)c;
-            } else if (millis() - overflowArmed > 2000) {
-                overflowArmed = millis();
-                len = 0;
-                char buf[48];
-                const size_t n = proto::formatErr("line too long", buf, sizeof(buf));
-                if (n) {
-                    buf[n] = '\0';
-                    Serial2.print(buf);
-                }
+            // Line assembly is proto::LineReader (host-tested): an over-long
+            // line is dropped WHOLE, so a truncated command can never reach the
+            // router. See PLAN 16 and test_uart_proto's overflow cases.
+            switch (rx.push(c, millis())) {
+                case proto::LineReader::Out::LINE:
+                    session().handleLine(rx.line(), millis(), sinkWrite, nullptr);
+                    break;
+                case proto::LineReader::Out::TOO_LONG:
+                    Serial2.print(rx.errText());
+                    break;
+                case proto::LineReader::Out::NOTHING:
+                default:
+                    break;
             }
         }
         session().pump(sinkWrite, nullptr, millis());

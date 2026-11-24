@@ -48,6 +48,45 @@ struct Command {
 // Returns false and sets *err (static string) on malformed input.
 bool parseCommand(const char* line, Command& out, const char** err);
 
+// ---- uplink line assembly --------------------------------------------------
+// Bytes in, one whole command line out. This used to be written inline in
+// uart2_task.cpp, which meant the native suite could not see the rule at all —
+// and the rule was wrong there (2026-11-23, PLAN 16): on overflow the old code
+// reset the buffer but kept reading, so the REST of the physical line was
+// terminated as a second command; and when the ERR fell inside its own rate
+// limit window the buffer was not reset at all, so the terminator dispatched the
+// TRUNCATED first 64 bytes as a command. Bench-observed: an over-long
+// `SET SP2=0.33` + 120 junk bytes answered `OK SAFETY` and wrote 0.330. Framing
+// decides whether the router sees a command at all, so this is not cosmetic.
+//
+// The rule, now in one host-tested place: an over-long line is DROPPED WHOLE —
+// the rate limit gates the error TEXT, never the recovery. Same verdict the
+// handset client library already applies to itself (`overflowing_`) and the same
+// verdict the web transport already takes (a whole WS frame is discarded).
+class LineReader {
+public:
+    enum class Out : uint8_t { NOTHING, LINE, TOO_LONG };
+
+    /// Feed one received byte. `nowMs` is the CALLER's clock: the reader owns
+    /// its own rate limit so the byte mover never has to time anything.
+    Out push(int c, uint32_t nowMs);
+
+    const char* line() const { return buf_; }      // valid after LINE
+    const char* errText() const { return err_; }   // valid after TOO_LONG
+
+    // Error text for one over-long line is emitted at most once per this long,
+    // so a wall of junk cannot storm a 6 KB-stack task with error replies.
+    static constexpr uint32_t kErrGapMs = 2000;
+
+private:
+    char buf_[MAX_LINE + 1] = {0};
+    char err_[48] = {0};
+    size_t len_ = 0;
+    bool swallowing_ = false;   // rest of this line is on the floor
+    bool haveErrAt_ = false;
+    uint32_t errAt_ = 0;
+};
+
 // ---- downlink formatters: return length written, 0 on overflow ----
 struct Telemetry {
     float depthM;

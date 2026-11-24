@@ -248,16 +248,25 @@ send a newline first and discard what it draws; a bare newline answered
 `ERR unknown command` is the proof that bytes were pending, and both tools print
 it instead of letting the first check of the run fail mysteriously.
 
-**Same path, second trap: `ERR line too long` is rate limited to one per 2 s, and
-in the suppressed case the line is not discarded** — the controller dispatches
-the truncated first 64 bytes as a command. So the over-long case in
-`hw_accept.py`'s refusal matrix is only meaningful because the matrix overflows
-once; and an over-long `SET` that lands inside that window **takes effect** —
+**Same path, second trap, now closed (fixed 2026-11-24): `ERR line too long` is
+rate limited to one per 2 s — and until the fix, in the suppressed case the line
+was not discarded**, so the controller dispatched the truncated first 64 bytes as
+a command. An over-long `SET` landing inside that window **took effect** —
 observed 2026-11-23 (`SET SP2=0.33` plus 120 junk bytes answered `OK SAFETY` and
 `GET SP2` read back `0.330`; restored afterwards, and refused with the value
-unchanged once the window had expired). Recorded as an open defect in PLAN 16 and
-in `docs/HANDSET_PROTOCOL.md`: rate-limit the message, always discard to the
-terminator.
+unchanged once the window had expired). `proto::LineReader` now drops an
+over-long line whole, terminator included, and the rate limit gates only the
+error text (`docs/HANDSET_PROTOCOL.md`, PLAN 16). `hw_accept.py` has a framing
+phase for it, and the phase is worth reading as a bench procedure: it reads the
+baseline `SP2`, sends an over-long `SET SP2=0.33 <junk>` in a fresh error window,
+sends a second one **inside** that window, then reads `SP2` again — the correct
+answers are one `ERR line too long`, then silence, then the unchanged value.
+Two lessons from proving it. The junk must start with a **space**: glued straight
+onto the digits (`0.31ZZZ…`) the settings parser rejects the value as "not a
+number" and the "did it write?" check passes for the wrong reason. And the phase
+only means something if it can fail — flashing the pre-fix semantics made the
+bench reproduce the 2026 observation exactly (`ERR unknown command` from the
+line's own tail, then `OK SAFETY` and `SP2=0.310` written in the muted window).
 
 **B. Bridge firmware (`handset/bridge_esp32`, recommended).** The spare board
 runs a byte-for-byte pipe PC↔controller and *observes* the stream with the

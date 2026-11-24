@@ -80,10 +80,9 @@ MARKER_RE = re.compile(r"#\d+( dropped)?")
 # legitimately answers differently on the same transport, which proves nothing
 # about the other one.
 #
-# mode "identical" - the non-stream reply lines must be byte-identical.
-# mode "refusal"   - only the refusal text must match, because the two
-#   transports legitimately answer an over-long line a different number of
-#   times (see the overlong entry below for why).
+# mode "identical"   - the non-stream reply lines must be byte-identical.
+# "fresh-window"     - extra flag: wait out the UART task's 2 s overflow-error
+#   rate limit first, or that answer is legitimately missing (silence).
 MATRIX = [
     ("AUTO", "cold-boot lockout", "identical"),
     ("SET SP2=2.5", "range refusal", "identical"),
@@ -93,17 +92,16 @@ MATRIX = [
     ("GET FAULT", "fuse/duty picture", "identical"),
     ("SET SP2=0.70", "surface write lands", "identical"),
     ("GET SP2", "and reads back", "identical"),
-    # The overlong case refuses with the same words on both transports, but the
-    # number of replies legitimately differs, and the code says why. UART2
-    # (uart2_task.cpp:63-73) answers `ERR line too long` AT THE MOMENT the line
-    # passes MAX_LINE, sets len = 0, and lets the REST of that physical line
-    # start a new line buffer - so the trailing `ZZZ...` is dispatched as its own
-    # command and answered `ERR unknown command`. It is also rate limited: that
-    # error appears at most once per 2 s, so a wall of junk cannot storm a
-    # 6 KB-stack task with error replies. The web path (web_server.cpp:136-146)
-    # gets the whole frame at once, answers once and discards it, and marks the
-    # marker `dropped`. Same session, same refusal, different framing.
-    ("GET " + "Z" * 200, "overlong line refused", "refusal"),
+    # The over-long case now agrees on both transports byte for byte, which is
+    # itself the result: UART2 used to answer `ERR line too long` AT THE MOMENT
+    # the line passed MAX_LINE, reset its buffer and let the REST of that
+    # physical line become a second command — and inside its own 2 s rate-limit
+    # window it did not reset the buffer at all, so the truncated prefix ran
+    # (an over-long `SET SP2=0.33` wrote 0.330, PLAN 16). proto::LineReader drops
+    # the whole line, and `fresh-window` starts the check in an unmuted error
+    # window so it is about the protocol, not about whatever the last tool in the
+    # pipeline sent. The web path always discarded the whole frame.
+    ("GET " + "Z" * 200, "overlong line dropped whole", "identical", "fresh-window"),
 ]
 
 
@@ -347,7 +345,7 @@ def ws_probe(host):
     checks.append(("server sends the #boot hello on connect", bool(boots),
                    boots[0] if boots else f"control lines: {hello}"))
 
-    for cmd, why, mode in MATRIX:
+    for cmd, why, mode, *opt in MATRIX:
         ws.send(cmd)
         answer, marker, unsol, _ctl = ws.lines_until_marker()
         # The marker is how the browser knows the answer is finished. A count
@@ -357,7 +355,7 @@ def ws_probe(host):
         checks.append((f"{cmd!r} answers with a matching line marker ({why})", ok,
                        f"{len(answer)} answer lines, marker {marker!r}, "
                        f"{len(unsol)} streamed lines ignored"))
-        if mode == "refusal":
+        if "fresh-window" in opt:
             # `dropped` is how the server says "the command you sent arrived
             # truncated" (web_server.cpp:144). Without it the page cannot tell a
             # truncated command from a command that was understood and answered
@@ -418,14 +416,11 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
         print(f"  note: stray bytes were pending in the controller's line "
               f"buffer - a bare newline drew {drew}")
     try:
-        for cmd, why, mode in cmds:
-            if mode == "refusal":
-                # UART2's `ERR line too long` is rate limited to one per 2 s and,
-                # in the suppressed case, the line is NOT discarded - the
-                # truncated prefix is dispatched instead (see
-                # docs/HANDSET_PROTOCOL.md). Starting from a fresh window keeps
-                # this check about the protocol rather than about whatever the
-                # last tool in the pipeline happened to send.
+        for cmd, why, mode, *opt in cmds:
+            if "fresh-window" in opt:
+                # UART2's `ERR line too long` is rate limited to one per 2 s, so
+                # a stale window would answer this command with silence and the
+                # comparison would be about timing, not framing.
                 time.sleep(2.1)
             ws.send(cmd)
             web, marker, _u, _c = ws.lines_until_marker()
@@ -434,17 +429,8 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
                 same = web == uart and bool(web)
                 detail = f"web {web[:2]} | uart {uart[:2]} | marker {marker}"
             else:
-                # An over-long line: the refusal text must agree; the line COUNT
-                # legitimately differs (UART2 also parses the leftover tail as a
-                # second command). Asserting byte equality here would be asserting
-                # a false thing about the protocol, and asserting nothing would be
-                # a vacuous check - so this asserts the refusal, and says why the
-                # rest differs.
-                same = (any(l.startswith("ERR line too long") for l in web)
-                        and any(l.startswith("ERR line too long") for l in uart))
-                detail = (f"web {web} | uart {uart} | both refuse with "
-                          f"'line too long'; UART2 additionally answers the "
-                          f"leftover tail as its own line")
+                same = False
+                detail = f"unknown comparison mode {mode!r} in the check table"
             checks.append((f"{cmd!r} agrees on both transports ({why})", same, detail))
             print(f"  [{'PASS' if same else 'FAIL'}] {cmd[:40]!r}")
             if not same:

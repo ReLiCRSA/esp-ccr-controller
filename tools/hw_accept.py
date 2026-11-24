@@ -451,10 +451,115 @@ def run_protocol(port, baud, log, settle=1.5):
     return results
 
 
+TELEM = re.compile(r"^[TDE],")
+
+
+def _send_and_drain(ser, payload, t0, log, window=1.0):
+    """Send one payload, then collect every NON-telemetry reply line that
+    arrives in the window. Silence is a result here: for a dropped line the
+    correct answer is no line at all, so the window is held open rather than
+    broken off at the first timeout (the unsolicited downlink is 2 Hz, so a
+    quiet port really is quiet)."""
+    ser.write(payload.encode())
+    ser.flush()
+    log.append(f"[{time.time() - t0:7.2f}s] >> {payload.strip()[:40]!r}"
+               + ("..." if len(payload.strip()) > 40 else ""))
+    out = []
+    end = time.time() + window
+    while time.time() < end:
+        line = ser.readline().decode(errors="replace").strip()
+        if not line:
+            continue
+        if TELEM.match(line):
+            continue
+        out.append(line)
+        log.append(f"[{time.time() - t0:7.2f}s] << {line}")
+    return out
+
+
+def run_framing(port, baud, log, settle=1.5):
+    """Can an over-long line make the controller do something? (PLAN 16.)
+
+    The matrix's own over-long entry only proves the words `ERR line too long`
+    appear. That was not enough: the code behind those words had TWO faults, and
+    both were about what happens to the REST of the line. `uart2_task.cpp` reset
+    its buffer on overflow but kept reading, so the tail of one physical line was
+    terminated as a SECOND command; and when the ERR fell inside its own 2 s rate
+    limit the buffer was not reset at all, so the terminator dispatched the
+    TRUNCATED first 64 bytes. Bench-observed on 2026-11-23: an over-long
+    `SET SP2=0.33` plus 120 junk bytes answered `OK SAFETY` and left SP2 at 0.330
+    — an over-long WRITE landing. Framing decides whether the router sees a
+    command at all, so this phase asserts the three things that matter: the
+    refusal is the only answer (no phantom second command), a rate-limited
+    overflow is still dropped whole, and neither write changed anything.
+
+    The two overflows go back to back on purpose: the second one is sent inside
+    the error window, which is exactly the case the old code got wrong.
+    """
+    import serial
+
+    ser = serial.Serial(port, baud, timeout=1.0)
+    checks = []
+    t0 = T_ORIGIN
+    try:
+        time.sleep(settle)
+        ser.reset_input_buffer()
+        ser.write(b"\r\n")
+        ser.flush()
+        end = time.time() + 0.6
+        drew = []
+        while time.time() < end:
+            l = ser.readline().decode(errors="replace").strip()
+            if l and not TELEM.match(l):
+                drew.append(l)
+        if drew:
+            log.append(f"[{time.time() - t0:7.2f}s] (flushed stray bytes: {drew})")
+
+        # Precondition: the value an over-long write must not change.
+        base = [l for l in _send_and_drain(ser, "GET SP2\r\n", t0, log)
+                if l.startswith("SP2=")]
+        want = base[0] if base else None
+        checks.append(("framing: SP2 baseline readable", want is not None,
+                       want or "no SP2= reply, the phase proves nothing"))
+        if want is None:
+            return checks
+
+        # Fresh error window, so check 1 is about framing and not about whatever
+        # the previous tool in the pipeline sent.
+        time.sleep(2.2)
+        # The space before the junk is the whole point of the payload: the
+        # settings parser tolerates a tail that starts after a space
+        # (settings.cpp:131), so a truncated `SET SP2=0.33 <junk>` is a VALID
+        # write — which is the shape that landed on the bench 2026-11-23
+        # (`OK SAFETY`, SP2 read back 0.330). Glue the junk straight onto the
+        # digits instead and the registry rejects it for a different reason,
+        # and this check would be about the parser rather than about framing.
+        junk = "SET SP2=0.33 " + "Z" * 120 + "\r\n"
+        got = _send_and_drain(ser, junk, t0, log)
+        checks.append(("over-long line: only `ERR line too long`, no second command",
+                       got == ["ERR line too long"],
+                       f"want ['ERR line too long'], got {got}"))
+
+        # Immediately again: inside the 2 s window the ERR text is suppressed,
+        # and THAT is the case that used to execute the truncated prefix.
+        got2 = _send_and_drain(ser, "SET SP2=0.31 " + "Z" * 120 + "\r\n", t0, log)
+        checks.append(("overflow inside the error window answers nothing",
+                       got2 == [], f"want silence, got {got2}"))
+
+        back = [l for l in _send_and_drain(ser, "GET SP2\r\n", t0, log)
+                if l.startswith("SP2=")]
+        checks.append(("neither over-long SET wrote",
+                       bool(back) and back[0] == want,
+                       f"{want} -> {back[:1] or '(no reply: the link died)'}"))
+        checks.append(("the line after a dropped line still works",
+                       bool(back), back[0] if back else "no reply after the dropped line"))
+    finally:
+        ser.close()
+    return checks
+
+
 def run_dive_persist(console, port, baud, watch, settle=1.5):
     """Does a closed dive survive a reset?
-
-    `dive_store.h` promises "a reset between dives must cost at most the last
     record, never the dive". Nothing on the bench had ever tested that promise,
     and when the dive-CSV work asked the question the answer looked like "no":
     after a boot, `LOG LIST` answered empty and `GET /dive/<n>.csv` answered
@@ -690,6 +795,19 @@ def main() -> int:
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
             failures += 0 if ok else 1
         (logdir / f"accept_{stamp}_handset.log").write_text("\n".join(proto_log) + "\n")
+
+        # Line framing, on the wire: see run_framing for why the matrix's own
+        # over-long entry was not enough. Inside the console watch on purpose —
+        # a framing bug that wedged the uart2 task would show up as a lost
+        # stack headroom or a reboot, not as a wrong reply.
+        print("\n--- line framing (over-long lines cannot execute) ---")
+        frame_log = []
+        for name, ok, detail in run_framing(args.handset, args.baud, frame_log,
+                                            args.handset_settle):
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+            failures += 0 if ok else 1
+        (logdir / f"accept_{stamp}_framing.log").write_text(
+            "\n".join(frame_log) + "\n")
 
         if args.watch_tail > 0:
             print(f"\n--- watching the console for {args.watch_tail:.0f} s "

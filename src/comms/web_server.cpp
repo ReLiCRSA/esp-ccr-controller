@@ -58,6 +58,10 @@ uint32_t g_framesIn = 0, g_framesOut = 0;
 /// Per-client receive buffer: command lines are short, and a fragmenting or
 /// overlong client cannot make this grow. Allocated on connect, freed on
 /// disconnect (the library does not manage _tempObject for WS clients).
+/// The verdict — an over-long line is DROPPED WHOLE, never truncated-and-run —
+/// is the same one the UART path takes via `proto::LineReader` (see PLAN 16);
+/// a WebSocket frame arrives whole, so "whole" is decided here by a flag rather
+/// than by swallowing to the next terminator.
 struct ClientLine {
     size_t len = 0;
     bool overflow = false;

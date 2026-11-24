@@ -197,6 +197,12 @@ PROTOCOL_CHECKS = [
     # softAP + captive DNS + server start are all inside that one console line.
     ("DIVE END", r"^OK DIVE", "dive closes", "dwell:4.0"),
     ("LOG LIST", r"^(OK|L,)", "log store answers"),
+    # The density is not decoration: since 2026-11-24 it is the one number both
+    # depth paths use — the depth in the `T,` row and the ambient pressure the
+    # deco engine plans against. Reading it back is what lets the bench check
+    # the two agree, below.
+    ("GET WATER_DENSITY", r"^WATER_DENSITY=",
+     "the density the depth scale runs on is readable by the client"),
 ]
 
 # `GET T` and `GET D` answer with the same line shape the controller streams
@@ -293,6 +299,73 @@ def grade_depth(lines, expect_depth):
                         f"the console says no data while the chain believes there is")
                        if als else f"{nodata.group(0)} with no HB al= to compare"))
     return checks
+
+
+
+# The firmware's own surface reference: SURFACE_PRESSURE_BAR in
+# include/config/defaults.h. Stated here as a number on purpose — the tool is
+# the independent witness, and if it imported the firmware's formula it could
+# not catch the firmware's formula being wrong.
+SURFACE_BAR = 1.013
+
+
+def depth_from_bar_abs(bar_abs):
+    """Depth from an absolute pressure, stated in the tool, from the physics.
+
+    rho [kg/L] * g / 100 = bar per metre — the /100 is the whole lesson of
+    2026-11-24: written /100000 with a kg/L density, every depth came out 1000x
+    too deep and the bench dosed for 37 m in an open room.
+
+    Sea-water density (1.025) is assumed, and that is honest at the surface,
+    which is the only place this comparison can be made: the announce is a
+    SURFACE reading, so the depth being compared is centimetres, and the whole
+    legal density range (0.990..1.100) moves that by 0.004 m. A density that
+    never reaches the conversion is therefore invisible here — the arithmetic is
+    pinned on the host (test/test_depthscale), and C3-a's squeeze leg, holding a
+    few metres while the density changes, is the wire demonstration.
+
+    Never negative, mirroring the firmware's rule for what a diver reads: above
+    the reference plane (altitude, weather, a sensor drifting high) the answer
+    is 0 m, not a negative depth to dose against.
+    """
+    bar_per_m = 1.025 * 9.80665 / 100.0
+    return max(0.0, (bar_abs - SURFACE_BAR) / bar_per_m)
+
+
+def grade_depth_scale(lines, stream):
+    """The console's hPa and the handset's metres must describe one sample.
+
+    This is the check the 1000x scale error cannot survive: the announce said
+    1016.7 hPa while the same build streamed `T,37.04` on a bench sitting in an
+    open room. Nothing downstream could see it, because the setpoint bands and
+    the deco engine were both acting on the wrong metres *consistently*.
+    Tolerance is 5 cm of water (~0.5 hPa): generous for weather between the boot
+    line and the telemetry row, and three orders of magnitude tighter than the
+    error being hunted.
+    """
+    ready = next((DEPTH_READY.search(l) for l in lines if DEPTH_READY.search(l)), None)
+    if not ready:
+        return []          # no reading on the console: nothing to compare
+    try:
+        hpa = float(ready.group("hp"))
+    except (TypeError, ValueError):
+        return []
+    trow = next((l for l in stream if l.startswith("T,")), None)
+    if not trow:
+        return [("a `T,` row exists to compare with the depth announce", False,
+                 f"announce said `{ready.group(0)}` and no `T,` row arrived: the "
+                 f"two views of the same sensor cannot be reconciled")]
+    try:
+        shown = float(trow.split(",")[1])
+    except (IndexError, ValueError):
+        return [("the `T,` row's depth column parses", False, f"row: {trow}")]
+    want = depth_from_bar_abs(hpa / 1000.0)
+    return [("the depth on the wire is the announce's pressure",
+             abs(shown - want) <= 0.05,
+             f"`{ready.group(0)}` wants {want:.3f} m below the surface reference "
+             f"({SURFACE_BAR} bar); the wire says {shown:.2f} m [{trow}] — "
+             f"1016.7 hPa became `T,37.04` on 2026-11-24, which is a kg/L density "
+             f"divided by 100000 instead of 100")]
 
 
 def grade_boot(lines, expect_web, expect_depth=False):
@@ -597,6 +670,58 @@ WIRE_PRE_FIX = ["E,0,1,4", "E,0,6,0", "E,0,6,1", "E,0,6,2", "E,34,4,110",
 DIVE_WANT = {"GF_LOW": "GF_LOW=30", "GF_HIGH": "GF_HIGH=85",
              "SP1": "SP1=0.400", "SP2": "SP2=0.550", "SP3": "SP3=1.000",
              "SP4": "SP4=1.300"}
+
+def selftest_scale():
+    """The announce-vs-`T,`-row grader, proven on lying captures.
+
+    Both rows are real: `T,0.04,…` is what this bench streams at the surface
+    with the LPS28DFW fitted, and `T,37.04,…` is what the same bench streamed on
+    2026-11-24 with the 1000x scale error in `BAR_PER_M_SEAWATER` — same room,
+    same sensor, same announce. The altitude pair is synthetic in one way only
+    (a sensor reading 1000.0 hPa is a mountain or a weather front, not this
+    bench): it pins the rule that the depth a diver reads never goes negative.
+    """
+    t_ok = "T,0.04,0.214,0.214,0.214,0.214,0.400,STANDBY,FLAGS0x10,1.56"
+    t_broken = "T,37.04,0.213,0.213,0.213,0.215,1.000,STANDBY,FLAGS0x10,1.56"
+    high_boot = [l.replace("1016.7 hPa", "1000.0 hPa") for l in DEPTH_BOOT_OK]
+    cases = [
+        # name, console lines, handset stream, expected failing check (None = clean)
+        ("an honest surface: announce and `T,` agree", DEPTH_BOOT_OK, [t_ok], None),
+        ("the 1000x scale error: 1016.7 hPa streamed as 37.04 m", DEPTH_BOOT_OK,
+         [t_broken], "is the announce's pressure"),
+        ("no telemetry row to compare against", DEPTH_BOOT_OK, [],
+         "a `T,` row exists"),
+        ("an unparseable depth column", DEPTH_BOOT_OK, ["T,x.y,0.214"],
+         "depth column parses"),
+        ("above the reference plane the diver reads 0 m, not a negative depth",
+         high_boot, ["T,0.00,0.214,0.214,0.214,0.214,0.400,STANDBY,FLAGS0x10,1.56"],
+         None),
+        ("a negative depth on the wire is a lie about the same sensor",
+         high_boot, ["T,-0.13,0.214,0.214,0.214,0.214,0.400,STANDBY,FLAGS0x10,1.56"],
+         "is the announce's pressure"),
+    ]
+    checks = []
+    for name, lines, stream, want in cases:
+        got = grade_depth_scale(lines, stream)
+        failed = [c[0] for c in got if not c[1]]
+        if want is None:
+            checks.append((f"depth scale: {name}", bool(got) and not failed,
+                           f"expected graded checks, none failed: {failed}"))
+        else:
+            checks.append((f"depth scale: {name}", any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
+    # A sensor-less boot has nothing to reconcile: silence is the honest answer,
+    # and it must not become a failure (that would make --expect-depth wrong on
+    # a bench with no depth sensor fitted).
+    checks.append(("depth scale: no announce, nothing claimed",
+                   grade_depth_scale(DEPTH_BOOT_OK[:1], [t_ok]) == [],
+                   "a bench with no depth sensor must not be graded on one"))
+    nodata = ["depth: ** LPS28DFW @0x5D identified, no sane pressure within 3 s "
+              "(reads 0.0 hPa) - depth will not be used"]
+    checks.append(("depth scale: an announce with no reading cannot be reconciled",
+                   grade_depth_scale(nodata, [t_ok]) == [],
+                   "comparing a placeholder hPa against a depth would be inventing one"))
+    return checks
 
 
 def grade_dive_file(drows, want, wire=()):
@@ -1776,7 +1901,8 @@ def main() -> int:
     if args.selftest:
         # No board, no ports: this section is about the grader, not the machine.
         fails = 0
-        for name, ok_, detail in [*selftest_depth(), *selftest_dive_file(),
+        for name, ok_, detail in [*selftest_depth(), *selftest_scale(),
+                                  *selftest_dive_file(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1
@@ -1871,6 +1997,19 @@ def main() -> int:
         for name, ok, detail in grade_stream(proto_stream):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + ("" if ok else f": {detail}"))
             failures += 0 if ok else 1
+
+        # One sensor, two views: the console prints the pressure, the handset
+        # gets the metres. They come from the same sample, so a scale error in
+        # the conversion shows up as the two disagreeing — which is precisely
+        # how the 1000x bug looked, and nothing downstream could see it because
+        # the setpoint bands and the deco engine were both acting on the wrong
+        # metres consistently.
+        if args.expect_depth:
+            print("\n--- depth: the console's hPa and the wire's metres agree ---")
+            for name, ok, detail in grade_depth_scale(lines, proto_stream):
+                print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
+                      + ("" if ok else f": {detail}"))
+                failures += 0 if ok else 1
 
         # Line framing, on the wire: see run_framing for why the matrix's own
         # over-long entry was not enough. Inside the console watch on purpose —

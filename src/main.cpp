@@ -39,6 +39,7 @@
 #include "comms/telemetry_bridge.h"
 #include "comms/session.h"
 
+#include "util/depthscale.h"
 #include "util/numfmt.h"
 #include "util/stackwatch.h"
 #include "control/cellhist.h"
@@ -177,9 +178,13 @@ static void sensorTask(void*) {
         if (g_depth.poll(now)) {
             const float p = g_depth.pressureBar();
             if (p > 0.2f) {      // a sane absolute pressure before deriving depth
-                g_depthM = (p > SURFACE_PRESSURE_BAR)
-                               ? (p - SURFACE_PRESSURE_BAR) / BAR_PER_M_SEAWATER
-                               : 0.0f;
+                // The same conversion the deco engine uses, from the same
+                // density the diver set (`WATER_DENSITY`): a depth on the wire
+                // and a ceiling/NDL must be measured with one ruler. See
+                // util/depthscale.h for why this line used to be its own
+                // arithmetic and what that cost.
+                g_depthM = static_cast<float>(depthscale::depthFromSensorBar(
+                    p, SURFACE_PRESSURE_BAR, g_ctrlCfg.deco.waterDensity));
                 g_depthValid = true;
                 depthSane = true;
             }

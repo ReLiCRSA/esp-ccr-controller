@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "util/depthscale.h"
+
 namespace deco {
 
 namespace {
@@ -56,13 +58,14 @@ void Zhl16Ccr::reset() {
 }
 
 double Zhl16Ccr::barToDepthM(double bar) const {
-    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665; // Pa per m
-    return (bar - cfg_.pSurfaceBar) * 1e5 / rhoG;
+    // One conversion for the whole board (util/depthscale.h): the depth this
+    // engine plans against is the depth the control path measured, to the last
+    // digit, from the same density setting.
+    return depthscale::depthFromAmbientBar(bar, cfg_.pSurfaceBar, cfg_.waterDensity);
 }
 
 double Zhl16Ccr::depthToBar(double depthM) const {
-    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665;
-    return cfg_.pSurfaceBar + depthM * rhoG / 1e5;
+    return depthscale::ambientBarAtDepthM(depthM, cfg_.pSurfaceBar, cfg_.waterDensity);
 }
 
 void Zhl16Ccr::step(double dtSec, double pAmbBar, double ppO2Bar) {
@@ -115,8 +118,9 @@ double Zhl16Ccr::ndlMinutes(double pAmbBar, double ppO2Bar, double maxMin) const
     // depth, so binary-search it; ~12 ascent simulations, each ~90 tissue
     // steps — cheap enough for a 1 Hz telemetry publish.
     const double ppN2Bottom = std::max(0.0, pAmbBar - cfg_.ph2oBar - cfg_.pco2Bar - ppO2Bar);
-    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665;
-    auto d2b = [&](double m) { return cfg_.pSurfaceBar + m * rhoG / 1e5; };
+    auto d2b = [&](double m) {
+        return depthscale::ambientBarAtDepthM(m, cfg_.pSurfaceBar, cfg_.waterDensity);
+    };
 
     auto ascentClears = [&](const double t0[NCOMP]) {
         double sim[NCOMP];
@@ -173,12 +177,13 @@ Zhl16Ccr::Schedule Zhl16Ccr::schedule(double pAmbBar) const {
     std::copy(pt_, pt_ + NCOMP, sim);
 
     const double grid = cfg_.stopGridM;
-    const double rhoG = cfg_.waterDensity * 1000.0 * 9.80665;
-    auto d2b = [&](double m) { return cfg_.pSurfaceBar + m * rhoG / 1e5; };
+    auto d2b = [&](double m) {
+        return depthscale::ambientBarAtDepthM(m, cfg_.pSurfaceBar, cfg_.waterDensity);
+    };
 
     auto ceilingDepth = [&]() -> double {
         const double bar = ceilingBarFrom(sim, gf_);
-        return (bar - cfg_.pSurfaceBar) * 1e5 / rhoG;
+        return barToDepthM(bar);   // the same depth the rest of the board publishes
     };
 
     const double startM = std::max(0.0, barToDepthM(pAmbBar));

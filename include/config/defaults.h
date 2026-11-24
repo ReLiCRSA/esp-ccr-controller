@@ -159,27 +159,44 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
 // interim wet-test fallback; both drivers live on Wire1 (pins.h) so a wet
 // harness fault cannot reach the cell bus. The BMP085 that once held this
 // role never ACKed once and was removed 2026-11-23. Depth is derived from
-// absolute pressure with sea-water density.
+// absolute pressure and a water density, both below.
+//
+// Absolute pressure -> depth. 1 bar of sea water (1.025 kg/l) = 9.948 m, so
+// 100 hPa of weather is about 1 m of water.
+//
+// There is no conversion constant here any more, and that is deliberate. The
+// formula lives in one place — `src/util/depthscale.h` — and BOTH paths call
+// it: the control path that turns the sensor's bar reading into the depth on
+// the `T,` row, and the deco engine that turns depths into ambient pressure for
+// tissue modelling. The comment used to read "kept as one constant because the
+// depth the control chain sees and the depth the deco engine converts must
+// agree" while the deco engine quietly carried its own copy of the arithmetic
+// in three places, written out with a different type and a different density
+// source. That is how a 1000x error survived: the constant here was wrong and
+// the engine's copy was right, so no comparison the machine could make with
+// itself showed anything.
+//
+// UNITS MATTER, and getting them wrong is silent: rho*g is Pa/m only if rho is
+// in kg/m3, and 1 bar = 100 000 Pa, so a density given in kg/L converts to bar/m
+// as density * g / 100. Written as / 100000 with a kg/L density — as this was
+// until 2026-11-24 — the constant is 1000x too small and every depth is 1000x
+// too deep: with the depth sensor live for the first time the bench reported
+// `T,37.04` at the surface (ambient 1016.7 hPa against SURFACE_PRESSURE_BAR
+// 1013.0) and the setpoint engine walked from SP1 0.40 bar to SP3 1.00 bar while
+// the machine was sitting on a table. Depth had never been valid on any bench
+// before that day, so nothing downstream had ever seen a non-zero number to
+// disbelieve. The scale is now pinned against literals in
+// `test/test_depthscale` — not derived from this file, which would inherit an
+// error here rather than catch one.
+//
+// The density below is the COMPILE-TIME default for the `WATER_DENSITY`
+// setting; that setting is what both paths actually use at run time, so a diver
+// switching between sea and fresh moves the depth on the wire and the deco
+// plan together, on one ruler.
 #define PRESSURE_ENABLE             1
 #define WATER_DENSITY_KGL           1.025f
 #define SURFACE_PRESSURE_BAR        1.013f
 #define PRESSURE_STALE_MS           3000
-// Absolute pressure -> depth. 1 bar of sea water (1.025 kg/l) = 9.947 m.
-// Kept as one constant because the depth the control chain sees and the depth
-// the deco engine converts must agree; the MS5837 swap changes only the
-// driver, never this.
-//
-// UNITS MATTER HERE, and getting them wrong is silent: rho*g is Pa/m only if
-// rho is in kg/m3, and 1 bar = 100 000 Pa, so a density given in kg/L converts
-// to bar/m as density * g / 100. Written as / 100000 with a kg/L density — as
-// this was until 2026-11-24 — the constant is 1000x too small and every depth
-// is 1000x too deep: with the depth sensor live for the first time the bench
-// reported `T,37.04` at the surface (ambient 1016.7 hPa against
-// SURFACE_PRESSURE_BAR 1013.0) and the setpoint engine walked from SP1 0.40 bar
-// to SP3 1.00 bar while the machine was sitting on a table. Depth had never
-// been valid on any bench before that day, so nothing downstream had ever seen
-// a non-zero number to disbelieve.
-#define BAR_PER_M_SEAWATER          (WATER_DENSITY_KGL * 9.80665f / 100.0f)
 
 // --- HUD pattern timing (ms) ------------------------------------------------------
 #define HB_AUTO_ON_MS               500     // 1 Hz

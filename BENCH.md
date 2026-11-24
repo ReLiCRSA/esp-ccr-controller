@@ -15,13 +15,13 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 249 cases
+pio test -e native            # host gate, currently 256 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 127 checks
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/dive-file graders, no board: 34 cases
+                                 --cal-air --predive --dive-persist    # 129 checks
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/dive-file graders, no board: 42 cases
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
 ```
 
@@ -763,19 +763,116 @@ depth 1000× too deep — 3.7 hPa of ambient weather became 37 m, which crossed
 the surface: 2.5× the intended ppO₂, plus `CELLPROOF_DEPTH` "crossed" instantly
 and the deco engine fed 37 m. The constant's own comment said the right thing
 ("1 bar of sea water (1.025 kg/l) = 9.947 m"); the expression contradicted it.
-Nothing in the host suite could see it: **no test references `BAR_PER_M_SEAWATER`
+Nothing in the host suite could see it: **no test referenced `BAR_PER_M_SEAWATER`
 at all** — the `p → depth` line lives in `main.cpp`, outside every tested unit —
 and a test that computed expected depth *from the macro* would inherit the error
-anyway. Recorded as an open test gap, not yet closed.
+anyway. Recorded the same day as an open test gap; **closed later the same day,
+and closing it found a second defect** (see "one conversion, one density" below).
 `src/deco/zhl16c.cpp` has always had the conversion right (`waterDensity * 1000.0
-* 9.80665`), which is the second reason this was invisible: the two paths
-disagreed and only one of them feeds the `T,` row.
+* 9.80665`, written out three times), which is the second reason this was
+invisible: the two paths disagreed and only one of them feeds the `T,` row.
 Why it hid for so long: no depth sensor had EVER been valid on this bench, so
 `pressureValid` was false and `depthM` was pinned to 0 in every log ever taken.
 A constant that is only wrong once its input exists.
 Verified on the wire, both directions: same squeeze, `T,0.04` and `sp=0.400` at
 the surface (predicted 0.037 m from the announce's independent 1016.7 hPa, and
 a thumb press worth ~100 hPa read 1.0 m, not 1000 m).
+
+**One conversion, one density — the test gap closed, and what it found
+(fixed 2026-11-24).** The gap was "no test touches the conversion". Writing that
+test meant reading both call sites again, and they were not the same
+measurement: `main.cpp` divided by the compile-time `BAR_PER_M_SEAWATER`
+(`WATER_DENSITY_KGL`, 1.025), while the deco engine used `cfg_.waterDensity` —
+which `SET WATER_DENSITY` overwrites (schema range 0.990…1.100, so a diver in a
+fresh-water quarry sets 1.000). One ruler said 9.948 m/bar, the other 10.197:
+**2.5% at every depth**, so the depth on the wire and the setpoint bands came
+from one scale and the ceiling, NDL and tissue model from another. Neither side
+was wrong in its own terms, which is why no comparison the machine makes with
+itself could see it.
+
+The fix is one formula in one file, `src/util/depthscale.h` (`barPerM`,
+`depthFromBarDelta`, `ambientBarAtDepthM`, `depthFromAmbientBar`,
+`depthFromSensorBar`), `constexpr`, and called by both paths: the `T,` depth line
+in `main.cpp`, and all three `rhoG` sites in `zhl16c.cpp` (including the two
+private lambdas the NDL binary search and the stop-grid walk build with).
+`BAR_PER_M_SEAWATER` is **deleted** from `defaults.h` — a constant nobody is
+allowed to call is worse than none, and the comment that lived there is now a
+warning about the units. The density is now also single-source: the `WATER_DENSITY`
+setting, via `cfg.deco.waterDensity`, at both sites. (The correct figure that used
+to headline that comment, "1 bar = 9.947 m", is 9.948 m at 1.025 kg/L.)
+
+Host gate, `test/test_depthscale`, 6 cases, and **every expected number is a
+hand-worked literal** (`0.1005181625` bar/m at sea, `0.0980665` fresh, 9.94844 m
+per bar, `0.0368` m for this bench's surface offset), never derived from the code
+under test — round-trip tests cannot catch a scale error at all, because a wrong
+constant round-trips perfectly. Proven by mutation, host side:
+
+| injected bug | what reddens |
+|---|---|
+| `/1e5` again (the original unit error) | 3 cases: `Expected 0.1005182 Was 0.0001005182`, `Expected 0.0368 Was 36.80915`, and the deco cross-ruler case |
+| density argument ignored, 1.025 hard-coded in the helper | the fresh-water anchor (`Expected 0.0980665 Was 0.1005182`) |
+| `zhl16c.cpp` writes its own `rhoG` again | the source scan (`re-derives the scale (9.80665)`) |
+| the NDL binary search's own depth grid handed a literal density | the scan's second rule (`calls depthscale::ambientBarAtDepthM( without the configured density`) — **and nothing else** |
+| the 3 m stop-grid walk's depth grid handed a literal density | the same scan rule, alone |
+| `main.cpp` uses `WATER_DENSITY_KGL` rather than the live config | the same scan rule, named for `main.cpp` |
+| the never-negative floor dropped for the diver's depth | `Expected 0 Was -0.02984535` |
+
+The middle three rows are the honest limit of the numeric coverage, stated
+plainly: the two private depth grids inside the deco engine (the NDL binary
+search and the stop-grid walk) are guarded by the **scan**, not by an assertion
+about a plan. Their published numbers are quantised — stops on a 3 m grid, the
+`D,` ceiling in whole metres — so a plan-level "fresh versus sea must move the
+ceiling" probe was written, measured (the ceiling does move: 11.15 m at 1.025,
+11.43 m at 1.000 for the same 30 m/25 min profile), and then **dropped**: no
+mutation made it the only witness, since the ruler test or the scan already
+caught every subset of call sites. A check that can never be the only witness is
+decoration. What is therefore pinned: one formula, one density reaching every
+call, and the two public conversions (`barToDepthM`/`depthToBar`) numerically at
+three densities. What is **not** pinned: exact stop minutes and NDL at a density
+other than the shipping 1.025 — `test/test_deco` pins schedules at 1.025 only.
+If fresh-water deco shape ever matters commercially, that is the test to write.
+
+The last row is worth repeating as a toolchain trap: `TEST_ASSERT_EQUAL(0.0, …)`
+in this repo's Unity is the **integer** variant, silently truncates, and passed on
+`-0.0298` while the bug was live. Float assertions here must be
+`TEST_ASSERT_FLOAT_WITHIN` / `_EQUAL_FLOAT` / `_GREATER_THAN_FLOAT` — and this
+Unity is built **without double support**, so `TEST_ASSERT_*_WITHIN_MESSAGE` on
+doubles fails to compile ("Unity Double Precision Disabled").
+
+Bench side, the property is now a C2 check rather than arithmetic in a script:
+`hw_accept.py` reads the boot announce's hPa and the first `T,` row's metres and
+requires them to be the same sample, on the density the diver set
+(`GET WATER_DENSITY`, now also in the protocol matrix so a client can read the
+ruler back — it answered `WATER_DENSITY=1.025`), tolerance 5 cm of water —
+~0.5 hPa, generous for weather between the two rows and three orders of magnitude
+tighter than the error being hunted. The tool states the physics itself
+(`depth_from_bar_abs`), it does not import the firmware's formula, or it could not
+catch the firmware's formula being wrong. Four grader mutations each reddened
+exactly their own case: the tool's scale given the old `/100000` (the honest boot
+goes red), the tolerance widened to 50 m (the 1000× capture stops failing), the
+never-negative clamp removed (the altitude pair goes red), and a silent
+`return []` instead of failing when no `T,` row arrives (the vacuous-pass case).
+`--selftest` is 42 cases; the full bench gate is **129 checks, 0 failures**
+(the two new ones: `GET WATER_DENSITY` in the matrix, and "the depth on the wire
+is the announce's pressure"), `web_probe.py` 62 checks 0 failures, native 256.
+
+**What the surface check cannot see, and the leg that can.** At the surface the
+depth is centimetres, so the whole legal density range moves it by 0.004 m:
+a density that stops reaching the conversion is invisible in `T,` at two
+decimals. That is pinned on the host (fresh-water anchor + the scan rule), and
+the wire demonstration is a squeeze leg with the density moved:
+
+```
+# handset side, holding the port at a few metres (NOT at the surface):
+SET WATER_DENSITY=1.000        # fresh: the ruler changes under the diver
+expect  T, depth moves ~2.5% at constant pressure, and ceiling/NDL move with it
+SET WATER_DENSITY=1.025        # restore; check with GET WATER_DENSITY
+```
+
+Optional, not in the C2 gate (it needs a steady squeeze held long enough to read
+a `D,` ceiling, and the density is invisible at the surface, so it cannot be
+automated off a boot line). Recorded here so the next bench day does not have to
+re-derive why the surface comparison is not enough.
 
 **The announce must describe a reading, not a lock (fixed 2026-11-24).** Every
 healthy boot used to print `depth: LPS28DFW @0x5D ready, 0.0 hPa`. That was not

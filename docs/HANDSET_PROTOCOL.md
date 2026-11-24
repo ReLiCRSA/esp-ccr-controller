@@ -632,6 +632,20 @@ Note: GF_* and ascent rates stay writable **during** a dive (normal diving:
 the schedule moves, the gas plan does not); setpoints, alarms and injection do
 not.
 
+**`WATER_DENSITY` is the ruler, not a cosmetic preference.** Since 2026-11-24 it
+is the one density behind *every* depth this controller publishes: the metres in
+the `T,` row, the setpoint tiers those metres select, and the ambient pressures
+the deco engine models and derives its ceiling and NDL from. Before that they
+disagreed — telemetry used a compile-time 1.025 while the deco engine used this
+setting — which put a fresh-water diver's ceiling 2.5% away from the depth he was
+reading. A handset that displays depth should therefore read the value back
+(`GET WATER_DENSITY`) rather than assume 1.025, and a dive file's depths mean
+whatever the setting was during the dive. It is currently writable mid-dive
+(no `dive-lock` flag): changing it at 20 m moves the displayed depth and the plan
+together, by ~2.5% across the legal range, which is a scale change under the
+diver's feet rather than a refusal. Making it dive-locked would be a protocol-
+visible refusal and is under discussion, not decided.
+
 ## 7. Compatibility rules (how this protocol evolves)
 
 1. **Append-only.** New `E,` ids, new settings keys, new stop pairs inside

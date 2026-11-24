@@ -149,9 +149,43 @@ void test_mid_dive_setconfig_keeps_the_chains_memory() {
     loop.endDive(now);
 }
 
+void test_what_the_dive_file_quotes_reaches_the_config() {
+    // The dive file's `M,` row publishes gf_low/gf_high/sp1..4 read off the LIVE
+    // control config, and since 2026-11-24 both depth paths take the water
+    // density from there too. So these keys are quoted back at a diver as facts
+    // about the dive that was just closed: a SET that answers OK and never
+    // lands is the ack-with-no-consumer bug wearing new clothes, and the file
+    // then reports a plan the machine never ran on.
+    //
+    // Checking the DEFAULTS would prove nothing: the config struct's defaults
+    // and the registry's are the same numbers, so an applier that forgot a key
+    // still matches. Every assertion here starts from a value the registry
+    // CHANGES.
+    Registry reg = freshReg();
+    set(reg, "GF_LOW", "45");
+    set(reg, "GF_HIGH", "70");
+    set(reg, "SP1", "0.35");
+    set(reg, "SP2", "0.65");
+    set(reg, "SP3", "0.95");
+    set(reg, "SP4", "1.25");
+    set(reg, "WATER_DENSITY", "1.000");
+
+    ctrl::Config cfg = defaultCfg();
+    TEST_ASSERT_EQUAL_UINT8(comms::CLAMP_NONE, applySettings(reg, cfg));
+
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 45.0f, cfg.deco.gfLow);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 70.0f, cfg.deco.gfHigh);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.35f, cfg.sp.sp[0]);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.65f, cfg.sp.sp[1]);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.95f, cfg.sp.sp[2]);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.25f, cfg.sp.sp[3]);
+    TEST_ASSERT_FLOAT_WITHIN(0.0005f, 1.000f, cfg.deco.waterDensity);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_defaults_apply_clean_and_complete);
+    RUN_TEST(test_what_the_dive_file_quotes_reaches_the_config);
     RUN_TEST(test_cross_key_combos_are_clamped_and_reported);
     RUN_TEST(test_mid_dive_setconfig_keeps_the_chains_memory);
     return UNITY_END();

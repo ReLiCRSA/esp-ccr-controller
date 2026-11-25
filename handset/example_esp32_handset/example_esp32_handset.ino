@@ -80,6 +80,8 @@ struct View {
     bool haveCal = false;
     hs::DepthSource ds{};          // which chip owns depth, and is it live (DS,)
     bool haveDs = false;
+    hs::WifiState wifi{};          // is the AP up, and who holds it down (WIFI,)
+    bool haveWifi = false;
 } view;
 
 // A callback writer: hs::Link calls this for every command it sends.
@@ -132,6 +134,16 @@ static void onDs(const hs::DepthSource& d, void* ctx) {
     View& v = *static_cast<View*>(ctx);
     v.ds = d;
     v.haveDs = true;
+}
+
+static void onWifi(const hs::WifiState& w, void* ctx) {
+    // The AP is policy-driven: past WIFI_OFF_DEPTH and after WIFI_IDLE_MIN idle
+    // minutes the controller drops it by itself, and brings it back on its own.
+    // `on` is what is true, not what was last typed — a WIFI ON at depth is
+    // honored as intent while the depth hold keeps the radio down.
+    View& v = *static_cast<View*>(ctx);
+    v.wifi = w;
+    v.haveWifi = true;
 }
 
 static void onLine(const char* line, void* ctx) {
@@ -309,6 +321,13 @@ static void draw() {
         if (hs::depthSourceText(view.ds, dsTxt, sizeof(dsTxt)))
             Serial.printf(view.ds.used ? "  [%s]" : "  ** %s **", dsTxt);
     }
+    // Radio state, stated only when it is NOT the simple case: an AP that is
+    // up and holding needs no banner; a radio someone is holding down does.
+    if (view.haveWifi && !view.wifi.on) {
+        char wfTxt[96];
+        if (hs::wifiStateText(view.wifi, wfTxt, sizeof(wfTxt)))
+            Serial.printf("  ** %s **", wfTxt);
+    }
     if (!view.linkUp) Serial.printf("   *** LINK DOWN ***");
     if (view.lastErr[0]) { Serial.printf("  ERR:%s", view.lastErr); view.lastErr[0] = 0; }
     else if (view.lastNote[0]) { Serial.printf("  (%s)", view.lastNote); view.lastNote[0] = 0; }
@@ -338,6 +357,7 @@ void setup() {
     h.onClock = onClock;
     h.onCalAir = onCalAir;
     h.onDepthSource = onDs;
+    h.onWifiState = onWifi;
     h.onLinkDown = onLinkDown;
     h.onLinkUp = onLinkUp;
     hsLink.begin(putLine, nullptr, h);
@@ -349,6 +369,7 @@ void setup() {
     hsLink.getTime();             // do we have a clock at all? (spec §3)
     hsLink.getCalAir();           // and are the cells calibrated? (spec §3)
     hsLink.getDepthSource();      // and which chip is the depth coming from? (spec §4)
+    hsLink.getWifiState();        // and is the radio actually up? (spec §4)
     Serial.println("ESP-CCR handset up");
     Serial.println("clock unset? type the unix epoch and Enter, e.g. 1795517641");
 }
@@ -420,6 +441,11 @@ void loop() {
     // this is one 40-character line per 10 s against a 2 Hz downlink.
     static uint32_t lastDsMs = 0;
     if (view.linkUp && now - lastDsMs > 10000u) { lastDsMs = now; hsLink.getDepthSource(); }
+    // ... and the radio. Same 10 s rhythm: the policy's own clocks are minutes
+    // and a dive, so asking faster answers nothing — but at 10 s a phone that
+    // wonders "why can't I join the AP" learns why well inside a page retry.
+    static uint32_t lastWifiMs = 0;
+    if (view.linkUp && now - lastWifiMs > 10000u) { lastWifiMs = now; hsLink.getWifiState(); }
 
     alarmPattern(now);
     runBuzzer(now);

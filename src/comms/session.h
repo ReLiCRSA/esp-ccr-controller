@@ -91,6 +91,29 @@ public:
     /// SAFE mode: refuse every command but ACK (see CommandRouter::setSafeLockout).
     void setSafeLockout(bool on) { if (router_) router_->setSafeLockout(on); }
 
+    /// One radio-policy step (see CommandRouter::wifiTick). Called from
+    /// loopTask, under the same session lock that serializes every command —
+    /// the policy has one writer at a time because it shares the transport's
+    /// lock, not because two writers agreed on a field. Never call from
+    /// ControlTask: control must not wait on the task that answers clients.
+    /// Returns 0 no change, +1 radio should come up, -1 should go down.
+    int wifiTick(uint32_t nowMs, bool depthUsed, float depthM, uint8_t stations) {
+        if (!router_) return 0;
+        if (lock_.acquire) { lock_.acquire(lock_.ctx); lockWaits_++; }
+        router_->setNowMs(nowMs);
+        const int c = router_->wifiTick(nowMs, depthUsed, depthM, stations);
+        if (lock_.release) lock_.release(lock_.ctx);
+        return c;
+    }
+    /// Post-tick verdicts for the caller to apply and print. Plain bool/enum
+    /// reads of state that only the (locked) tick and command paths write: no
+    /// lock needed for a word, and loopTask must not print under the lock.
+    bool wifiRadioWanted() const { return router_ && router_->wifiRadioWanted(); }
+    uint8_t wifiHoldCause() const {
+        return router_ ? router_->wifiHold()
+                       : static_cast<uint8_t>(CommandRouter::WH_DIVER);
+    }
+
     /// Runs `fn` with the session lock held, for work that touches the same
     /// hardware the commands touch (a dive-file export answering an HTTP
     /// request, say). Anything that must not race with DIVE START|END belongs

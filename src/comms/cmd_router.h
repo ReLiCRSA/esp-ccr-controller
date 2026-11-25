@@ -16,8 +16,12 @@
 //   * FL_DIVE_LOCK keys refused while a dive runs; FL_SAFETY writes reply
 //     `OK SAFETY` so the client can event-log them; every write sets
 //     ACT_SETTINGS so exactly one applier reloads the control config.
-//   * DIVE START drops the radio (wifiAutoOff_) and auto-restores it at
-//     dive end — unless the diver turned WiFi off beforehand.
+//   * The radio is one policy with three holders (2026-11-26): DIVE (DIVE
+//     START drops it, dive end restores it unless the diver had WiFi off),
+//     DEPTH (off past WIFI_OFF_DEPTH, back after WIFI_ON_HOLD_S below
+//     WIFI_ON_DEPTH), IDLE (off after WIFI_IDLE_MIN minutes with no station
+//     associated). Diver intent outranks the machine: auto never re-arms a
+//     WIFI OFF, and only the words can clear IDLE. See wifiTick below.
 //   * Diver outranks the machine: ACK and CELLPROOF OVERRIDE are honoured
 //     and replied honestly, never silently re-imposed.
 // ============================================================================
@@ -132,6 +136,63 @@ public:
     bool diving() const { return loop_.diveActive(); }
     /// True when DIVE START turned the radio off (so dive end knows to restore).
     bool wifiAutoOff() const { return wifiAutoOff_; }
+
+    // ---- radio policy (2026-11-26): the radio is intent AND not held -------
+    // `wifiEnabled()` stays what WIFI ON|OFF changes and remembers: the
+    // diver's intent. `wifiRadioWanted()` is what the transport OBEYS —
+    // intent AND no holder AND not SAFE-locked. The holders:
+    //
+    //   DIVE   — today's mechanism, unchanged: DIVE START drops the radio and
+    //            leaves wifiAutoOff_ so dive end knows to restore the intent.
+    //            Restored at end even at depth: the intent comes back; if the
+    //            DEPTH latch is up (it tracks depth whether or not anyone
+    //            asked for a radio), the radio stays down until the diver is
+    //            actually shallow.
+    //   DEPTH  — depth > WIFI_OFF_DEPTH: held off immediately, commanded dive
+    //            or not — a diver who forgot DIVE START still has an antenna
+    //            on the loop. Released only after depth stays < WIFI_ON_DEPTH
+    //            for WIFI_ON_HOLD_S straight; the 1..2 m band changes nothing,
+    //            so a safety stop does not flap the radio. Stale/held depth
+    //            (`GET DS`'s used=0) freezes the latch: the policy refuses to
+    //            drive a radio from a number that is not being measured.
+    //   IDLE   — radio up and no station associated for WIFI_IDLE_MIN minutes
+    //            (0 = never). Any association rewinds the window; so does the
+    //            radio coming up, so a long dive cannot end with the AP dying
+    //            the instant dive end restores it. Words clear it (WIFI ON is
+    //            an intent event), depth does not: a dive that went down past
+    //            2 m rewinds the window for the surface stretch that follows.
+    //
+    // Rules with tests pinned to them: auto never overrides the diver (every
+    // depth/idle release restores the intent, never overrules a WIFI OFF);
+    // the policy never writes NVS; SAFE lockout outranks everything, so no
+    // policy path brings up the AP of a controller that came up in SAFE.
+    //
+    // wifiTick() runs on loopTask UNDER THE SESSION LOCK — the same lock that
+    // serializes every exec() — so these fields have one writer at a time.
+    // ControlTask never calls it: control must never wait on the task that
+    // answers clients (the telemetry_bridge rule).
+    enum WifiHold : uint8_t {
+        WH_NONE = 0,     // radio up
+        WH_DIVER = 1,    // WIFI OFF: the diver's own choice
+        WH_DIVE = 2,     // DIVE START, awaiting DIVE END
+        WH_DEPTH = 3,    // past the off depth, or not yet shallow long enough
+        WH_IDLE = 4,     // no station associated for WIFI_IDLE_MIN minutes
+    };
+
+    /// What the physical radio should be: intent, no holder, not SAFE. This —
+    /// not wifiEnabled() — is what the ACT_WIFI path hands to web::setRadio.
+    bool wifiRadioWanted() const {
+        return wifiOn_ && !depthHeld_ && !idleHeld_ && !safeLockout_;
+    }
+    /// Why the radio is down (WH_NONE when up). The console transition line
+    /// and GET WIFI both answer from this, so they cannot disagree.
+    uint8_t wifiHold() const;
+
+    /// One policy step. Inputs from loopTask: millis(), the depth snapshot
+    /// with its used flag (GET DS's), and the associated-station count.
+    /// Returns 0 when nothing changed, +1 when the radio should come up,
+    /// -1 when it should go down — loopTask applies that and prints why.
+    int wifiTick(uint32_t nowMs, bool depthUsed, float depthM, uint8_t stations);
     uint16_t logExportIndex() const { return logExportIdx_; }
 
     /// The rolling per-cell histograms ControlTask feeds (PLAN 9: the web
@@ -186,6 +247,7 @@ private:
     void buildCellsLine(Response& r);
     void buildCalAirLine(Response& r);
     void buildDepthSourceLine(Response& r);
+    void buildWifiLine(Response& r);
 
     ctrl::Loop& loop_;
     settings::Registry& reg_;
@@ -194,6 +256,14 @@ private:
 
     bool wifiOn_ = true;       // diver-visible master switch (WIFI ON|OFF)
     bool wifiAutoOff_ = false; // radio dropped by DIVE START, not by the diver
+    bool depthHeld_ = false;   // WH_DEPTH latch (tracks depth even at intent off)
+    uint8_t wifiStations_ = 0; // last station count the policy was fed (GET WIFI
+                               // echoes it: the idle rule's INPUT, made visible)
+    bool idleHeld_ = false;    // WH_IDLE latch; cleared by intent events only
+    bool wifiPrimed_ = false;  // first tick adopts the state silently, no line
+    bool wifiLastWanted_ = false;
+    uint32_t shallowSinceMs_ = 0;  // 0 = not shallow; the WIFI_ON_HOLD_S timer
+    uint32_t idleSinceMs_ = 0;     // 0 = not counting; start of the idle window
     const wallclock::State* clock_ = nullptr;
     uint32_t clockEpoch_ = 0;
     const cellhist::Hist* hist_ = nullptr;

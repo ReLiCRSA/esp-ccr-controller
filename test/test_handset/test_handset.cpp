@@ -19,7 +19,8 @@ Link link;
 struct Captured {
     int telemetry = 0, deco = 0, events = 0, ok = 0, err = 0;
     int settings = 0, schema = 0, pre = 0, cells = 0, proof = 0, fault = 0;
-    int logList = 0, diveHeader = 0, clock = 0, calAir = 0, depthSrc = 0, raw = 0, linkDown = 0, linkUp = 0;
+    int logList = 0, diveHeader = 0, clock = 0, calAir = 0, depthSrc = 0, wifiState = 0,
+        raw = 0, linkDown = 0, linkUp = 0;
     Telemetry t{};
     Deco d{};
     Event e{};
@@ -34,6 +35,7 @@ struct Captured {
     Clock ck{};
     CalAir ca{};
     DepthSource ds{};
+    WifiState wf{};
     char okNote[64] = {0}, errReason[64] = {0}, rawLine[1200] = {0};
 };
 Captured cap;
@@ -55,6 +57,7 @@ void hDive(const DiveHeader& h, void*) { cap.dh = h; cap.diveHeader++; }
 void hClock(const Clock& c, void*) { cap.ck = c; cap.clock++; }
 void hCalAir(const CalAir& c, void*) { cap.ca = c; cap.calAir++; }
 void hDepthSource(const DepthSource& d, void*) { cap.ds = d; cap.depthSrc++; }
+void hWifiState(const WifiState& w, void*) { cap.wf = w; cap.wifiState++; }
 void hRaw(const char* l, void*) { std::strncpy(cap.rawLine, l, 1199); cap.raw++; }
 void hDown(void*) { cap.linkDown++; }
 void hUp(void*) { cap.linkUp++; }
@@ -73,6 +76,7 @@ void reset() {
     h.onLogList = hLog; h.onDiveHeader = hDive; h.onClock = hClock;
     h.onCalAir = hCalAir; h.onLine = hRaw;
     h.onDepthSource = hDepthSource;
+    h.onWifiState = hWifiState;
     h.onLinkDown = hDown; h.onLinkUp = hUp;
     link.begin(writer, nullptr, h);
     sent[0] = 0;
@@ -546,6 +550,95 @@ void test_depth_source_line_and_wording() {
     TEST_ASSERT_EQUAL_CHAR('\0', tiny[0]);
 }
 
+void test_wifi_state_line_words_and_append_only() {
+    // The radio is policy-driven now (spec §4): a client that wants "can I
+    // connect" needs this line, and the ways it goes wrong in a client mirror
+    // the DS ones — the line falling through unclaimed, and a field read as
+    // something it is not.
+    link.feedText("WIFI,1,0,597\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, cap.wifiState, "WIFI, line never reached onWifiState");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, cap.raw,
+                                  "WIFI, fell through to onLine: dispatch does not claim it");
+    TEST_ASSERT_TRUE(cap.wf.on);
+    TEST_ASSERT_EQUAL_UINT8(WifiState::HOLD_NONE, cap.wf.heldBy);
+    TEST_ASSERT_EQUAL_UINT32(597u, cap.wf.idleLeftS);
+
+    // The command string, byte for byte: a controller that never sees this
+    // exact line never answers it.
+    link.getWifiState();
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("GET WIFI", sent, "getWifiState sent the wrong line");
+
+    // on=0 after a WIFI ON at depth is the HONEST answer, not a failure to
+    // parse or a contradiction: intent on, held by depth. The client acts on
+    // `on`, not on what it last typed.
+    link.feedText("WIFI,0,3,0\n");
+    TEST_ASSERT_FALSE_MESSAGE(cap.wf.on, "a held radio read as up");
+    TEST_ASSERT_EQUAL_UINT8(WifiState::HOLD_DEPTH, cap.wf.heldBy);
+
+    // Namespace discipline: the settings keys WIFI_IDLE_MIN etc. are KEY=value
+    // answers, and the comma in WIFI, is what keeps them apart. Feed one of
+    // each; each must reach its own handler.
+    link.feedText("WIFI_IDLE_MIN=10\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, cap.settings,
+                                  "WIFI, dispatch swallowed the WIFI_* settings answer");
+    TEST_ASSERT_EQUAL_STRING("WIFI_IDLE_MIN", cap.s.key);
+
+    // Append-only: a cause this library predates (5) and a field appended on
+    // the right both parse — the protocol grows rightward and the client must
+    // grow with it rather than refuse the line.
+    link.feedText("WIFI,0,5,0,42\n");
+    TEST_ASSERT_EQUAL_UINT8(5, cap.wf.heldBy);
+    TEST_ASSERT_FALSE(cap.wf.on);
+
+    // The stations field (appended 2026-11-26, after a bench run found the
+    // countdown frozen with nobody able to see WHY — the bench PC's own wlan0
+    // was the station). Present parses; absent means "that controller never
+    // said", which is not the same number as "zero stations".
+    link.feedText("WIFI,1,0,600,2\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(2, cap.wf.stations, "stations field not parsed");
+    link.feedText("WIFI,1,0,600\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(-1, cap.wf.stations,
+        "a controller that never sent the field must not read as zero stations");
+
+    // A truncated line is refused, not guessed: "WIFI,1,0" with no countdown
+    // would otherwise silently mean "idle-off in 0 s" = never.
+    const int before = cap.wifiState, rawBefore = cap.raw;
+    link.feedText("WIFI,1,0\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(before, cap.wifiState, "a truncated WIFI, line was accepted");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(rawBefore + 1, cap.raw,
+                                  "a rejected WIFI, line should reach onLine, not vanish");
+
+    // Wording: sentences a diver can act on, and unknown causes printed as
+    // numbers rather than dressed in a stale word.
+    WifiState w{};
+    char txt[120];
+    w.on = true; w.heldBy = WifiState::HOLD_NONE; w.idleLeftS = 597;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "auto-off"), txt);
+    w.idleLeftS = 0;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "never"), txt);
+    w.on = false; w.heldBy = WifiState::HOLD_DIVER;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "diver"), txt);
+    w.heldBy = WifiState::HOLD_DIVE;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "dive"), txt);
+    w.heldBy = WifiState::HOLD_DEPTH;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "depth"), txt);
+    w.heldBy = WifiState::HOLD_IDLE;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "idle"), txt);
+    w.heldBy = 9;   // a cause from a future firmware
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "9"), txt);
+    // on=0 with reason "none" is a contradiction; the wording must notice.
+    w.heldBy = WifiState::HOLD_NONE;
+    TEST_ASSERT_GREATER_THAN_INT(0, wifiStateText(w, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "none"), txt);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_parse_T_line);
@@ -565,5 +658,6 @@ int main() {
     RUN_TEST(test_command_builders_exact_strings);
     RUN_TEST(test_link_health_timeouts);
     RUN_TEST(test_depth_source_line_and_wording);
+    RUN_TEST(test_wifi_state_line_words_and_append_only);
     return UNITY_END();
 }

@@ -222,10 +222,10 @@ outright.
 
 | Command | Reply | Notes |
 |---|---|---|
-| `DIVE START` | `OK DIVE` / `ERR dive active` (+ `ERR LOG FAILED: dive unrecorded` if the dive file could not open) | starts logging; **also turns the WiFi radio off** and remembers to restore it at dive end — unless the diver had already turned WiFi off themselves |
-| `DIVE END` | `OK DIVE` / `ERR no dive` | closes the dive file; restores WiFi only if `DIVE START` dropped it |
-| `WIFI ON` | `OK` / `ERR wifi locked in dive` | the radio never comes back on during a dive |
-| `WIFI OFF` | `OK` | diver's choice is remembered; dive end will not re-enable |
+| `DIVE START` | `OK DIVE` / `ERR dive active` (+ `ERR LOG FAILED: dive unrecorded` if the dive file could not open) | starts logging; **also turns the WiFi radio off** and remembers to restore it at dive end — unless the diver had already turned WiFi off themselves. Since 2026-11-26 the *radio* returns when the depth hold clears (§4 `WIFI,`), not automatically at dive end: a dive ended at 8 m restores the intent and keeps the antenna off the loop |
+| `DIVE END` | `OK DIVE` / `ERR no dive` | closes the dive file; restores the WiFi **intent** only if `DIVE START` dropped it; the radio itself follows the policy — read `GET WIFI` |
+| `WIFI ON` | `OK` / `ERR wifi locked in dive` | the radio never comes back on during a dive. Out of the dive the word sets the **intent**: it answers `OK` and starts the radio when nothing holds it, and answers `OK` while a DEPTH hold keeps the radio down (`GET WIFI` then reads `WIFI,0,3,0` — the intent is on, the reason is depth). It also clears an IDLE hold — that is the word's exact answer to "nobody connected, so we sat down" |
+| `WIFI OFF` | `OK` | diver's choice is remembered; dive end will not re-enable, and **no auto-on ever overrides it** — depth and idle only ever restore what the machine took |
 
 ### Status queries
 
@@ -238,12 +238,13 @@ outright.
 | `GET PROOF` | `PROOF,` line |
 | `GET FAULT` | `FAULT,` line |
 | `GET DS` | `DS,<locked>,<used>,<healthy>,<age_s>,<identity>` — which chip is producing the metres, and whether the controller is using it (see §4) |
+| `GET WIFI` | `WIFI,<on>,<held_by>,<idle_left_s>,<stations>` — whether the radio is up, who is holding it down, and how many stations are on it (see §4) |
 | `GET HIST` | 3 × `HIST,` lines / `ERR no histogram` |
 | `GET CALAIR` | `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>` — the air calibration's verdict (§3) |
 | `GET TIME` | `TIME,<epoch>,<source>,<age_s>` — wall clock (see Wall clock below) |
 | `GET SCHEMA` | one `K,` line per settings key |
 | `GET <KEY>` | `<KEY>=<value>` for a settings key |
-| `GET *` | one `<KEY>=<value>` line per settings key (32 keys today) |
+| `GET *` | one `<KEY>=<value>` line per settings key (36 keys today) |
 
 ### Settings
 
@@ -498,6 +499,61 @@ to ask. A client that can see both may compare them: they name the same chip or
 the firmware is lying to one of them.
 
 ```
+WIFI,<on>,<held_by>,<idle_left_s>,<stations>
+```
+Added 2026-11-26. Whether the radio is physically up, and if it is not, who is
+holding it down. The radio stopped being just a switch that day: the controller
+brings it down by itself past the dive depth and after long idle, and brings it
+back on its own — and an autonomous action with no query behind it is unknowable
+to the diver's phone. This line is that query.
+
+| field | meaning |
+|---|---|
+| `on` | the AP is **up**. This is what the transport obeys — not what the diver last typed. `WIFI ON` can read `on=0` honestly |
+| `held_by` | why it is down: `0` nothing (radio up), `1` diver (`WIFI OFF`), `2` dive in progress, `3` depth, `4` idle — no station associated for `WIFI_IDLE_MIN` minutes. **Append-only enum**: new causes append at the end, never renumber |
+| `idle_left_s` | whole seconds until the idle hold would fire; `0` when the radio is down or `WIFI_IDLE_MIN=0` ("never off") |
+| `stations` | stations associated on the AP as of the last policy tick (loopTask reads the driver's count every 250 ms; `0` while the radio is down). This is the idle rule's **input**, published for the same reason `used` is: a countdown that never counts down is a mystery until you can see someone is connected — then it is the feature working |
+
+Unlike `DS,`'s `identity`, `held_by` **is** a value to switch on: these are
+states this machine defines, not a driver's wording.
+
+The rules a client may rely on:
+
+* **Depth hold:** past `WIFI_OFF_DEPTH` the radio goes down immediately —
+  commanded dive or not, because the milliamps and the antenna-on-the-loop
+  argument does not care whether `DIVE START` was typed. It returns only after
+  depth stays below `WIFI_ON_DEPTH` for `WIFI_ON_HOLD_S` *straight*: the
+  `WIFI_ON_DEPTH`–`WIFI_OFF_DEPTH` band changes nothing, and a dip back into it
+  restarts the timer, so a safety stop never flaps the AP.
+* **Stale depth freezes the latch.** Read `used` in `DS,`: when it is 0, the
+  controller is printing *held* metres, and this policy refuses to drive a radio
+  from a number that is not being measured — no transition in either direction
+  while depth is stale, and the straight-shallow timer starts when the source
+  comes back, not at the last believed sample.
+* **Idle hold:** radio up and no station associated for `WIFI_IDLE_MIN` minutes
+  → down. Any associated station rewinds the window (the driver's station count
+  — a phone connected with no page open IS here), and so does the radio coming
+  up: a 14-minute dive never ends with the AP dying the instant dive end
+  restores it. Only an intent event (`WIFI ON`/`WIFI OFF`) clears the hold —
+  never depth, and never the hold releasing itself.
+* **Auto never overrides the diver.** Depth and idle holds only ever restore
+  what the machine itself took. A `WIFI OFF` survives every auto-on path.
+* **SAFE outranks everything:** a controller in safe mode never brings its AP up
+  (and `GET WIFI` itself answers `ERR safe mode`).
+* **`WIFI_ON_DEPTH` above `WIFI_OFF_DEPTH` oscillates, by design** — the
+  firmware does not silently correct settings (§6). Do not "fix" the flap
+  client-side; show `held_by` and let the setting be seen wrong.
+
+An older controller answers `ERR unknown key` — *"this controller cannot say"*
+(§7 rule 6), which is not `WIFI,0,...`: show nothing about the reason, not
+"held by nothing".
+
+Each transition is also printed once on the controller's USB console —
+`wifi: radio down (depth)`, `wifi: radio up (clear)` — in words, for the human
+and the bench watcher. Those words are **not** protocol (§7 rule 5); the numbers
+on this line are the stable thing to switch on.
+
+```
 HIST,<cell>,<window_s>,<windows>,<bin_width_centi>,<horizon_age_s>,<samples>,<bin0>,...,<bin37>
 ```
 one line per cell (3 lines). 38 bins of 0.05 bar covering 0.00–1.90 bar
@@ -666,6 +722,24 @@ safety (replies `OK SAFETY`).
 | VBAT_MIN | F | 10.5 | 3.0–30.0 | safety |
 | AP_SSID | S | `ESP-CCR` | len 1–16 | dive-lock |
 | AP_PASS | S | `diveonly` | len 8–31 | dive-lock |
+| WIFI_IDLE_MIN | U | 10 | 0–240 (**0 = never off**) | — |
+| WIFI_OFF_DEPTH | F | 2.0 | 0.5–30 | — |
+| WIFI_ON_DEPTH | F | 1.0 | 0.2–20 | — |
+| WIFI_ON_HOLD_S | U | 60 | 0–240 | — |
+
+**The four `WIFI_*` keys tune one state machine** (the radio policy behind
+`GET WIFI`, §4). They are plain writable keys: `SET WIFI_IDLE_MIN=1` takes
+effect within a tick, no reboot — that is how the bench proves the idle fire in
+a minute instead of ten. `WIFI_ON_DEPTH` must stay **below** `WIFI_OFF_DEPTH`:
+the schema bounds are per-key and cannot express a key-vs-key rule, and the
+firmware will not silently clamp the inversion (silent correction is a settings
+lie). Set inverted, the hold releases below `WIFI_ON_DEPTH` after
+`WIFI_ON_HOLD_S` and immediately re-latches above `WIFI_OFF_DEPTH`, so the AP
+flaps with period `WIFI_ON_HOLD_S` — visible on `GET WIFI`, and a host case
+records that behaviour so it is a documented consequence, not an undefined one.
+None of these keys are dive-locked (they tune the radio, which is *already*
+dropped mid-dive, and the console/serial operator may want the idle rule off
+before a surface) and none are safety-flagged.
 
 Note: GF_* and ascent rates stay writable **during** a dive (normal diving:
 the schedule moves, the gas plan does not); setpoints, alarms and injection do
@@ -805,6 +879,21 @@ dive and was rewritten afterwards.
   wire as `CALAIR,` and as an `E,<t>,7,<code>` row (§3). Rule that survives:
   never infer an effect from `OK`. Prove it with a read-back of the state the
   command was supposed to change (`GET CALAIR`, `GET TIME`, `GET SP2`, `GET DS`, …).
+* **The radio is a policy, not just a switch** (2026-11-26). `WIFI ON|OFF` is
+  the diver's **intent**; the physical AP additionally refuses itself to depth
+  (past `WIFI_OFF_DEPTH`, default 2.0 m) and to idleness (no associated station
+  for `WIFI_IDLE_MIN` minutes, default 10, `0` = never off), and returns on its
+  own only below `WIFI_ON_DEPTH` (default 1.0 m) for `WIFI_ON_HOLD_S` straight
+  (default 60 s). Defaults as shipped: a pack that sits on a bench surfaces an
+  AP for ten minutes and then goes quiet — that is the feature, not a fault.
+  `GET WIFI` (§4) is the read-back that `OK` was never: the phone's question
+  "can I connect, and if not why" is one line, `held_by` is an append-only
+  enum, and the console prints every transition in words (`wifi: radio down
+  (depth)`) which are debug output, not protocol (§7 rule 5). Auto never
+  overrides a diver's `WIFI OFF`, stale depth freezes the depth latch rather
+  than inventing a transition, SAFE outranks the whole machine, and no policy
+  transition is ever persisted — the intent in NVS stays whatever the diver
+  last typed.
 * **`GET DS` says where the depth came from, not that it is accurate.** It answers
   which chip holds the slot, whether the control path is using it, and how stale
   its last reading is — the three things a depth number cannot show about itself.

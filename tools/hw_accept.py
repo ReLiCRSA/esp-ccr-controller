@@ -172,7 +172,7 @@ PROTOCOL_CHECKS = [
     ("DIVE END", r"^(OK|ERR no dive)", "clean slate before the sequence"),
     ("GET T", r"^T,", "telemetry line parses", "burst"),
     ("GET D", r"^D,", "deco picture on request", "burst"),
-    ("GET *", r"^[A-Z0-9_]+=", "full settings listing"),
+    ("GET *", r"^[A-Z0-9_]+=", "full settings listing", "collect"),
     ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server"),
     ("GET HIST", r"^(HIST,|ERR no histogram)", "histogram answer, or the truth"),
     ("GET FAULT", r"^FAULT,", "fuse/stuck-open/duty on request"),
@@ -181,6 +181,12 @@ PROTOCOL_CHECKS = [
     # announce in grade_depth_source below, because `1,1,1,0,...` says nothing until
     # you know which chip the console named at boot and whether "in use" is true.
     ("GET DS", r"^DS,\d,\d,\d,\d+,", "depth source answers on request"),
+    # Radio policy (2026-11-26): the matrix asks only for the SHAPE here; the
+    # MEANING is graded by grade_wifi below, because `WIFI,1,0,598` says nothing
+    # until you know the AP was up at boot, what WIFI_IDLE_MIN is on this board,
+    # and whether the countdown agrees with that setting from the same session.
+    ("GET WIFI", r"^WIFI,\d,\d,\d+,\d+$",
+     "radio state, hold reason and station count answer on request"),
     ("AUTO", r"^ERR predive required", "AUTO lockout on a cold boot"),
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
@@ -247,6 +253,12 @@ PROTOCOL_CHECKS = [
     ("GET WATER_DENSITY", r"^WATER_DENSITY=",
      "the ruler is readable mid-dive, to ask which value the dive is using"),
     ("WIFI ON", r"^ERR wifi locked in dive", "radio stays down in a dive"),
+    # And WHO is holding it, in the machine's own words: off, blamed on the dive,
+    # no idle countdown while down. The refusal above says the request was denied;
+    # this line says the state is the one the denial promises. (held_by is an
+    # append-only enum: 0 none, 1 diver, 2 dive, 3 depth, 4 idle.)
+    ("GET WIFI", r"^WIFI,0,2,0,0$",
+     "mid-dive: radio down, reason dive, countdown parked, no stations"),
     ("CAL AIR", r"^ERR cal locked in dive", "calibration never under a diver"),
     ("FROBNICATE", r"^ERR unknown command", "unknown commands do nothing"),
     (OVERLONG, r"^ERR line too long", "line buffer cannot be flooded"),
@@ -1278,6 +1290,131 @@ def selftest_depth_source():
                    "an identity nobody announced at boot was accepted"))
     return checks
 
+WIFI_LINE = re.compile(r"^WIFI,(\d),(\d+),(\d+)(?:,(\d+))?$")
+
+
+def grade_wifi(pairs, boot_lines):
+    """`GET WIFI` against the settings and the boot console — one machine, two views.
+
+    The line has three fields and they are NOT independent: the countdown must
+    agree with the WIFI_IDLE_MIN that the SAME session read from `GET *`, an up
+    radio has no hold, a down radio has no countdown, and a dive in progress is
+    blamed on the dive. Each cross-field rule below is a way the three fields
+    could tell three different stories; the lying captures in selftest_wifi()
+    prove each rule fires.
+    """
+    checks = []
+    getstar = next((r for c, r in pairs if c == "GET *"), None)
+    idle_min = None
+    if getstar:
+        row = next((l for l in getstar if l.startswith("WIFI_IDLE_MIN=")), None)
+        if row:
+            try:
+                idle_min = int(float(row.split("=", 1)[1]))
+            except ValueError:
+                pass
+    # Scan the pair for the WIFI, line rather than trusting pair[0]: a matrix
+    # window can open on a leaked tail from the PREVIOUS command's answer, and
+    # a grader that reads line one then parses nothing has found a harness bug,
+    # not a firmware lie. (Found on the bench 2026-11-26, when GET * grew and
+    # its tail started landing in the next window.)
+    replies = [next((l for l in r if WIFI_LINE.match(l)), None)
+               for c, r in pairs if c == "GET WIFI"]
+    replies = [l for l in replies if l]
+    checks.append(("the radio leg ran twice (boot and mid-dive)", len(replies) >= 2,
+                   f"{len(replies)} `GET WIFI` answers — want the boot shape AND "
+                   f"the mid-dive one, or the reason column was never tested"))
+    if len(replies) < 2 or idle_min is None:
+        if idle_min is None:
+            checks.append(("WIFI_IDLE_MIN is readable from GET *", False,
+                           "GET * did not list the key: the countdown has no ruler"))
+        return checks
+
+    def parse(l):
+        m = WIFI_LINE.match(l)
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+    for what, l in (("boot", replies[0]), ("mid-dive", replies[1])):
+        f = parse(l)
+        if f is None:
+            checks.append((f"radio: {what} answer parses", False, f"{what} answered {l!r}"))
+            continue
+        on, held, left = f
+        checks.append((f"radio: {what} fields agree with each other ({l})",
+                       (on and held == 0) or (not on and 1 <= held <= 4 and left == 0),
+                       "an up radio cannot also be held, and a down radio has no "
+                       "countdown running — the three fields told different stories"))
+        bound = (left <= idle_min * 60) if on else True
+        checks.append((f"radio: {what} countdown agrees with WIFI_IDLE_MIN={idle_min}",
+                       bound,
+                       f"{l} — the countdown promises a fire the setting does not "
+                       f"(GET * and GET WIFI are the same registry: a mismatch is "
+                       f"one of them lying)"))
+    # Bench-specific: this run reset the board minutes ago, the matrix opened its
+    # dive with the radio up, and the boot console announced the AP. A radio that
+    # the IDLE rule had already taken down before the first GET WIFI means the
+    # board's persisted WIFI_IDLE_MIN is not the default — a previous interrupted
+    # --wifi-idle run — and every later radio check runs in a state the operator
+    # did not choose.
+    on0, held0, _ = parse(replies[0]) or (0, 9, 0)
+    ap_boot = any(l.startswith("web: AP ") for l in boot_lines)
+    checks.append(("radio: the AP was still up when the matrix started",
+                   (on0 == 1) or not ap_boot,
+                   f"{replies[0]} at boot with the AP announced this run — held by "
+                   f"{held0}; if that is 4 (idle), the persisted WIFI_IDLE_MIN is "
+                   f"short: the --wifi-idle leg restores 10, check for an aborted run"))
+    mid = parse(replies[1])
+    checks.append(("radio: mid-dive is blamed on the dive",
+                   mid == (0, 2, 0),
+                   f"{replies[1]} — mid-dive, with intent taken by DIVE START, the "
+                   f"closest reason is the dive (2): any other number means the "
+                   f"reason column and the dive disagree"))
+    return checks
+
+
+def selftest_wifi():
+    """Proves the grade_wifi cross-field rules can fail. Same discipline as the
+    surface-log and dive-export selftests: one known lie per case, and a case
+    that cannot fail is decoration."""
+    boot = ['web: AP "ESP-CCR-ABCD" on 192.168.4.1']
+    def pairs_with(first, second, idle="10"):
+        star = [f"WIFI_IDLE_MIN={idle}", "AP_SSID=ESP-CCR"]
+        return [("GET *", star), ("GET WIFI", [first]), ("GET WIFI", [second])]
+    honest = ("WIFI,1,0,598", "WIFI,0,2,0")
+    cases = [
+        ("an honest boot+dive pair", pairs_with(*honest), boot, None),
+        ("an up radio that also claims a holder",
+         pairs_with("WIFI,1,3,598", honest[1]), boot, "fields agree with each other"),
+        ("a down radio blamed on nothing",
+         pairs_with("WIFI,0,0,0", honest[1]), boot, "fields agree with each other"),
+        ("a down radio still counting down",
+         pairs_with("WIFI,0,4,90", honest[1]), boot, "fields agree with each other"),
+        ("a countdown longer than the setting allows",
+         pairs_with("WIFI,1,0,601", honest[1]), boot, "countdown agrees"),
+        ('WIFI_IDLE_MIN=0 but a countdown is running',
+         pairs_with("WIFI,1,0,300", honest[1], idle="0"), boot, "countdown agrees"),
+        ("the mid-dive pair never ran",
+         pairs_with(honest[0], honest[0])[:2], boot, "leg ran twice"),
+        ("the boot radio had already idled out",
+         pairs_with("WIFI,0,4,0", honest[1]), boot, "AP was still up"),
+        ("mid-dive blames the diver, not the dive",
+         pairs_with(honest[0], "WIFI,0,1,0"), boot, "blamed on the dive"),
+        ("GET * does not carry the ruler key",
+         [("GET *", ["AP_SSID=ESP-CCR"]), ("GET WIFI", [honest[0]]),
+          ("GET WIFI", [honest[1]])], boot, "WIFI_IDLE_MIN is readable"),
+    ]
+    checks = []
+    for name, pr, bl, expect in cases:
+        got = grade_wifi(pr, bl)
+        failed = [c[0] for c in got if not c[1]]
+        if expect is None:
+            checks.append((name, not failed, f"unexpected failures: {failed}"))
+        else:
+            checks.append((name, any(expect in f for f in failed),
+                           f"no failure matching {expect!r}; failures seen: {failed}"))
+    return checks
+
+
 def grade_dive_file(drows, want, wire=()):
     """Grade one exported dive against itself, and against the settings it claims.
 
@@ -1593,6 +1730,18 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
     downs = sum(1 for l in lines if l.startswith("web: radio off"))
     ups = sum(1 for l in lines if l.startswith("web: AP "))
     window = f"{len(lines)} console lines were captured in the watch window"
+    # The policy's own line per transition (2026-11-26). `web: radio off` counts
+    # the teardown, but since the radio went policy-driven the reason matters:
+    # the matrix opens and closes exactly one dive with the radio up on entry,
+    # so the machine must have printed BOTH halves naming the dive. A radio
+    # that came back for the wrong reason, or a transition no line marks, is
+    # the family of drift these paired witnesses exist to catch.
+    pd_ = sum(1 for l in lines if l.startswith("wifi: radio down"))
+    pu_ = sum(1 for l in lines if l.startswith("wifi: radio up"))
+    checks.append(("the radio policy printed the dive's transitions",
+                   pd_ >= 1 and pu_ >= 1,
+                   f"{pd_} down / {pu_} up 'wifi:' lines; {window} — the handset "
+                   f"answers OK DIVE either way; this line is where the reason lives"))
     checks.append(("DIVE START took the radio down", downs >= 1,
                    f"{downs} 'web: radio off' lines; {window}"))
     checks.append(("DIVE END brought the radio back", ups >= downs and ups >= 1,
@@ -1767,6 +1916,16 @@ def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
         for check in PROTOCOL_CHECKS:
             cmd, want, why = check[0], check[1], check[2]
             burst = len(check) > 3 and check[3] == "burst"
+            # "collect": a multi-line answer must be captured WHOLE, so the
+            # window does not stop at the first match. GET * grew from 32 to 36
+            # lines and the WIFI_* keys sit at the END of the table — a
+            # first-match window provably cannot see them, and a grader that
+            # reads the ruler from GET * (grade_wifi does) was reading a line
+            # list that had been amputated at the first key. (The single-line
+            # entries keep first-match semantics: for them the rest of the
+            # window is the NEXT command's answer, and draining it early used
+            # to smear tails across neighbouring windows.)
+            collect = len(check) > 3 and check[3] == "collect"
             dwell = 0.0
             if len(check) > 3 and check[3].startswith("dwell:"):
                 dwell = float(check[3].split(":", 1)[1])
@@ -1795,7 +1954,8 @@ def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
                         log.append(f"[{time.time() - t0:7.2f}s] << {line}")
                         if pat.match(line):
                             ok = True
-                            break
+                            if not collect:
+                                break
                 if ok or seen:
                     break
                 log.append(f"[{time.time() - t0:7.2f}s] (no line at all for "
@@ -2202,6 +2362,451 @@ def run_predive(port, baud, watch, settle=1.5, log=None, web_host=None, boot_hi=
     return checks
 
 
+def _handset_session(port, baud, settle, log):
+    """Open the handset port and clear the bridge's boot noise (opening the
+    port resets the spare-ESP32 bridge). Returns the open Serial; caller closes."""
+    import serial
+    ser = serial.Serial(port, baud, timeout=1.0)
+    time.sleep(settle)
+    ser.reset_input_buffer()
+    ser.write(b"\r\n")
+    ser.flush()
+    end = time.time() + 0.6
+    while time.time() < end:
+        ser.readline()
+    return ser
+
+
+def _ask(ser, log, cmd, window=2.0):
+    ser.write((cmd + "\r\n").encode())
+    ser.flush()
+    out, end = [], time.time() + window
+    while time.time() < end:
+        l = ser.readline().decode(errors="replace").strip()
+        if not l:
+            break
+        if not l.startswith(("T,", "D,")):
+            log.append(f"[{time.time() - T_ORIGIN:7.2f}s] << {l}")
+            out.append(l)
+    return out
+
+
+def run_wifi_depth(port, baud, watch, settle=1.5, squeeze_wait=90.0, log=None):
+    """The DEPTH half of the radio policy, on the real sensor.
+
+    The bench's thumb pressure sensor reaches ~5.5 m, so this leg drives the
+    same latch the diver's actual depth will: past WIFI_OFF_DEPTH the radio must
+    drop with reason 3 (depth) and the console must name it; after release, the
+    AP must return no sooner than WIFI_ON_HOLD_S of STRAIGHT shallow water. The
+    timing witnesses are why the capture records timestamps, not just outcomes:
+    a firmware that drops on depth but restores the moment depth dips back is a
+    different machine, and only the clock can tell them apart.
+
+    Operator part: squeeze on cue, release on cue. If either cue goes unmet the
+    leg FAILS with the reason — opt-in means un-run is a report, not a skip.
+    """
+    log = log if log is not None else []
+    cap = {}
+    ser = _handset_session(port, baud, settle, log)
+    try:
+        offD = onD = holdS = None
+        for l in _ask(ser, log, "GET WIFI_OFF_DEPTH"):
+            if "=" in l:
+                offD = float(l.split("=", 1)[1])
+        for l in _ask(ser, log, "GET WIFI_ON_DEPTH"):
+            if "=" in l:
+                onD = float(l.split("=", 1)[1])
+        for l in _ask(ser, log, "GET WIFI_ON_HOLD_S"):
+            if "=" in l:
+                holdS = float(l.split("=", 1)[1])
+        cap.update(offD=offD, onD=onD, holdS=holdS)
+        if offD is None or onD is None or holdS is None:
+            cap["unreadable"] = True
+            return cap
+
+        print(f"\n  >>> SQUEEZE the thumb pressure sensor past {offD} m now <<<")
+        t0, maxd, t_deep = time.time(), None, None
+        while time.time() - t0 < squeeze_wait:
+            for l in _ask(ser, log, "GET T"):
+                try:
+                    d = float(l.split(",")[1])
+                except (ValueError, IndexError):
+                    continue
+                maxd = d if maxd is None else max(maxd, d)
+                if d > offD:
+                    t_deep = time.time()
+                    break
+            if t_deep:
+                break
+        cap.update(max_depth=maxd, t_deep=t_deep)
+        if not t_deep:
+            return cap
+
+        off_line = None
+        t_end = time.time() + 5.0
+        while time.time() < t_end and off_line is None:
+            for l in _ask(ser, log, "GET WIFI"):
+                if l.startswith("WIFI,0,"):
+                    off_line = l
+                    break
+        cap["off_line"] = off_line
+        cap["console_down"] = any(l.startswith("wifi: radio down (depth)") for l in watch)
+
+        print("  >>> RELEASE the squeeze now <<<")
+        t0, t_shallow = time.time(), None
+        while time.time() - t0 < squeeze_wait:
+            for l in _ask(ser, log, "GET T"):
+                try:
+                    d = float(l.split(",")[1])
+                except (ValueError, IndexError):
+                    continue
+                if d < onD:
+                    t_shallow = time.time()
+                    break
+            if t_shallow:
+                break
+        cap["t_shallow"] = t_shallow
+        if not t_shallow:
+            return cap
+
+        # Hold witness: at shallow+20 s the straight-shallow timer has 40 s to
+        # run, so the radio must still be down. This is the check a flap-prone
+        # firmware cannot pass.
+        time.sleep(20.0)
+        mid_line = next((l for l in _ask(ser, log, "GET WIFI") if l.startswith("WIFI,")), None)
+        cap["mid_line"] = mid_line
+
+        up_line, t_up = None, None
+        t_end = t_shallow + holdS + 15.0
+        while time.time() < t_end and up_line is None:
+            for l in _ask(ser, log, "GET WIFI"):
+                if l.startswith("WIFI,1,"):
+                    up_line, t_up = l, time.time()
+                    break
+        cap.update(up_line=up_line, t_up=t_up,
+                   console_up=any(l.startswith("wifi: radio up") for l in watch))
+    finally:
+        ser.close()
+    return cap
+
+
+def grade_wifi_depth(cap):
+    checks = []
+    if cap.get("unreadable"):
+        return [("the WIFI_* settings are readable", False,
+                 "GET WIFI_OFF_DEPTH/WIFI_ON_DEPTH/WIFI_ON_HOLD_S did not answer — "
+                 "the leg cannot name its own thresholds")]
+    offD, onD, holdS = cap["offD"], cap["onD"], cap["holdS"]
+    md = cap.get("max_depth")
+    checks.append(("the squeeze actually crossed the off depth",
+                   md is not None and cap.get("t_deep") is not None,
+                   f"max depth seen {md} m (off depth {offD} m) — the operator cue "
+                   f"was not met, so the leg did not run"))
+    if not cap.get("t_deep"):
+        return checks
+    off_line = cap.get("off_line")
+    m = WIFI_LINE.match(off_line) if off_line else None
+    checks.append(("depth past the threshold took the radio down",
+                   m is not None and m.group(1) == "0",
+                   f"{off_line!r} — the radio stayed up (or answered something else) "
+                   f"past {offD} m: the milliamps argument is the whole feature"))
+    checks.append(("and blamed the depth, not something else",
+                   m is not None and m.group(2) == "3",
+                   f"{off_line!r} — held_by must be 3 (depth): a radio down for a "
+                   f"different reason here means the latch and the reason column "
+                   f"disagree"))
+    checks.append(("the console said depth too",
+                   cap.get("console_down") is True,
+                   "no 'wifi: radio down (depth)' console line for a wire that "
+                   "says the radio is down: two views of one machine"))
+    if not cap.get("t_shallow"):
+        checks.append(("the release crossed back under the on depth", False,
+                       f"never observed below {onD} m — the return half was never witnessed"))
+        return checks
+    mid = cap.get("mid_line")
+    mm = WIFI_LINE.match(mid) if mid else None
+    checks.append(("the 60 s straight-shallow hold held",
+                   mm is not None and mm.group(1) == "0",
+                   f"{mid!r} at shallow+20 s — back up before {holdS} s straight is "
+                   f"the flap this leg exists to catch"))
+    up_line, t_up = cap.get("up_line"), cap.get("t_up")
+    mu = WIFI_LINE.match(up_line) if up_line else None
+    checks.append(("the radio came back after the hold",
+                   mu is not None and mu.group(1) == "1",
+                   f"{up_line!r} within {holdS + 15:.0f} s of shallow — a diver "
+                   f"surfacing to no AP is the fault this half witnesses"))
+    if mu and mu.group(1) == "1":
+        lat = t_up - cap["t_shallow"]
+        checks.append((f"and no sooner than the hold allows (back after {lat:.0f} s)",
+                       holdS - 5.0 <= lat <= holdS + 15.0,
+                       f"back at {lat:.0f} s after first shallow: outside "
+                       f"{holdS:.0f} s straight the timer is not being kept"))
+    checks.append(("the console said the radio came up",
+                   cap.get("console_up") is True,
+                   "no 'wifi: radio up' line for a radio the wire says came back"))
+    return checks
+
+
+def run_wifi_idle(port, baud, watch, settle=1.5, log=None, wlan=None, boot_lines=()):
+    """The IDLE half of the radio policy, hands-free: one setting, one minute,
+    a countdown you can watch shrink, and the word that restores the radio.
+
+    The leg sends `WIFI ON` first — an intent event, which rewinds the
+    firmware's window to that instant — and only then sets WIFI_IDLE_MIN=1, so
+    the fire is a deterministic ~60 s from the intent event (the timestamps
+    below are measured from THERE, because that is where the machine restarted
+    its clock; from the SET the same honest fire reads 7 s early). The countdown field is sampled
+    mid-window and required to be strictly shrinking: a frozen countdown and a
+    running one answer the same 'off in N s' once, and differently forever.
+    """
+    log = log if log is not None else []
+    cap = {}
+    ser = _handset_session(port, baud, settle, log)
+    try:
+        cap["before"] = next((l for l in _ask(ser, log, "GET WIFI") if l.startswith("WIFI,")), None)
+        cap["station_seen"] = 0
+        if wlan and cap["before"]:
+            m = WIFI_LINE.match(cap["before"])
+            if m and int(m.group(4) or 0) > 0:
+                # The bench PC joins the AP itself (NM autojoin, from any past
+                # web_probe). nmcli is the bench machine's own lever; asked for
+                # by name via --wifi-idle-wlan, so the tool never touches a
+                # network it was not told to.
+                _nmcli(log, ["device", "disconnect", wlan])
+                t_end = time.time() + 20.0
+                while time.time() < t_end:
+                    l = next((x for x in _ask(ser, log, "GET WIFI") if x.startswith("WIFI,")), None)
+                    cap["before"] = l or cap["before"]
+                    mm = WIFI_LINE.match(cap["before"])
+                    if mm and int(mm.group(4) or 0) == 0:
+                        break
+                    time.sleep(2.0)
+        # The window is timed from the INTENT EVENT, not from the SET:
+        # `WIFI ON` is the applyWifi that rewinds the firmware's window, and it
+        # is the firmware that keeps the clock. Measuring from the SET (which
+        # lands ~7 s later — every _ask eats its full window because the 2 Hz
+        # stream prevents the blank-line break) reddened an honest board on the
+        # first bench run: the fire was 63 s after WIFI ON, exactly the setting,
+        # and 56 s after arming, which is not anything's setting at all.
+        t_anchor = time.time()
+        ok = any(l.startswith("OK") for l in _ask(ser, log, "WIFI ON"))
+        cap["intent_ok"] = ok
+        armed = any(l.startswith("OK") for l in _ask(ser, log, "SET WIFI_IDLE_MIN=1"))
+        rb = next((l for l in _ask(ser, log, "GET WIFI_IDLE_MIN") if "=" in l), None)
+        cap["armed_ok"] = armed
+        cap["armed_readback"] = rb.split("=", 1)[1] if rb else None
+
+        on_obs, off_line, t_off = [], None, None
+        while time.time() - t_anchor < 135.0:
+            time.sleep(4.0)
+            l = next((x for x in _ask(ser, log, "GET WIFI") if x.startswith("WIFI,")), None)
+            if l is None:
+                continue
+            m = WIFI_LINE.match(l)
+            if m and m.group(1) == "1":
+                on_obs.append((time.time() - t_anchor, int(m.group(3)),
+                               int(m.group(4) or 0)))
+                if int(m.group(4) or 0) > cap["station_seen"]:
+                    cap["station_seen"] = int(m.group(4) or 0)
+            elif m:
+                off_line, t_off = l, time.time() - t_anchor
+                break
+        cap.update(on_obs=on_obs, off_line=off_line, t_off=t_off,
+                   console_down=any(l.startswith("wifi: radio down (idle") for l in watch))
+
+        _ask(ser, log, "WIFI ON")
+        cap["restore_line"] = next((l for l in _ask(ser, log, "GET WIFI") if l.startswith("WIFI,")), None)
+        cap["console_up"] = any(l.startswith("wifi: radio up") for l in watch)
+        any(l.startswith("OK") for l in _ask(ser, log, "SET WIFI_IDLE_MIN=10"))
+        rb = next((l for l in _ask(ser, log, "GET WIFI_IDLE_MIN") if "=" in l), None)
+        cap["restore_readback"] = rb.split("=", 1)[1] if rb else None
+        if wlan:
+            # Rejoin what we took off, so a later web_probe run starts from the
+            # state it assumes. The AP name and passphrase are read from the
+            # machine, not assumed: names carry a MAC tail, passphrases are the
+            # diver's.
+            ap_name = next((l.split('"')[1] for l in boot_lines
+                            if l.startswith("web: AP ") and len(l.split('"')) > 1), None)
+            ap_pass = None
+            for l in _ask(ser, log, "GET AP_PASS"):
+                if l.startswith("AP_PASS="):
+                    ap_pass = l.split("=", 1)[1]
+            if ap_name and ap_pass:
+                _nmcli(log, ["device", "wifi", "connect", ap_name, "password", ap_pass])
+    finally:
+        ser.close()
+    return cap
+
+
+def _nmcli(log, argv):
+    """One nmcli call, outcome logged. Bench-machine-only lever; the caller
+    asked for it by interface name."""
+    import subprocess
+    try:
+        r = subprocess.run(["nmcli"] + argv, capture_output=True, text=True, timeout=20)
+        log.append(f"[{time.time() - T_ORIGIN:7.2f}s] (nmcli {' '.join(argv)!r}: "
+                   f"rc={r.returncode} {r.stdout.strip()[:80]}{r.stderr.strip()[:80]})")
+        return r.returncode == 0
+    except Exception as e:                              # noqa: BLE001
+        log.append(f"[{time.time() - T_ORIGIN:7.2f}s] (nmcli failed: {e})")
+        return False
+
+
+def grade_wifi_idle(cap):
+    checks = []
+    b = WIFI_LINE.match(cap.get("before") or "")
+    # Attribution before cascade. A station on the AP makes this leg's premise
+    # false and its failure SHAPE misleading: the countdown sits at exactly the
+    # full window forever and nothing ever fires, which looks like a dead timer
+    # and is the rewind rule working. Found on the bench 2026-11-26 by the one
+    # station the harness always forgets: the bench PC's own wlan0, autojoined
+    # to ESP-CCR from an earlier web_probe. When stations were seen, say THAT
+    # and stop — four cascading "timer" failures would send the next operator
+    # hunting a firmware bug that does not exist.
+    if cap.get("station_seen"):
+        checks.append(("no station was associated during the leg", False,
+                       f"{cap['station_seen']} station(s) seen on the AP — the "
+                       f"idle rule cannot fire while anything is connected, and "
+                       f"the countdown pinned at the full window is the rewind, "
+                       f"not a stall. Disconnect (the bench PC autojoins ESP-CCR; "
+                       f"--wifi-idle-wlan wlan0 does it for you) and rerun"))
+        checks.append(("WIFI_IDLE_MIN restored to 10 before the leg exits",
+                       cap.get("restore_readback") in ("10", "10.0", "10.000"),
+                       f"readback {cap.get('restore_readback')!r}"))
+        return checks
+    checks.append(("the leg started with the radio up",
+                   b is not None and b.group(1) == "1",
+                   f"{cap.get('before')!r} at leg start — with the radio already "
+                   f"held down, the 60 s window this leg grades never started"))
+    checks.append(("WIFI_IDLE_MIN=1 armed and read back",
+                   cap.get("armed_ok") and cap.get("armed_readback") in ("1", "1.0", "1.000"),
+                   f"ok={cap.get('armed_ok')} readback={cap.get('armed_readback')!r} — "
+                   f"without the read-back the fire could be the old 10-minute rule"))
+    obs = cap.get("on_obs") or []
+    shrinking = len(obs) >= 2 and obs[-1][1] < obs[0][1]
+    checks.append(("the countdown was seen shrinking",
+                   shrinking,
+                   f"observations {obs} — a frozen or absent idle_left_s field means "
+                   f"the 'off in N s' promise was decoration"))
+    late = [o for o in obs if o[0] >= 50.0]
+    checks.append(("the radio was still up after 50 s of a 60 s window",
+                   bool(late),
+                   f"last on-observation: {obs[-1] if obs else None} s after the "
+                   f"WIFI ON that armed the window — if the fire beat the window "
+                   f"the timer is not the setting"))
+    off_line, t_off = cap.get("off_line"), cap.get("t_off")
+    m = WIFI_LINE.match(off_line) if off_line else None
+    checks.append(("one idle minute with no station took the radio down",
+                   m is not None and m.group(1) == "0",
+                   f"never went off within the sample window of the intent event: "
+                   f"last answer {off_line!r}"))
+    checks.append(("and blamed the idle rule, by number",
+                   m is not None and m.group(2) == "4",
+                   f"{off_line!r} — held_by must be 4 (idle): the reason column is "
+                   f"the only part of this line a phone can act on"))
+    if m and m.group(1) == "0" and t_off is not None:
+        checks.append((f"and fired on the minute, not before ({t_off:.0f} s)",
+                       60.0 <= t_off <= 130.0,
+                       f"fired at {t_off:.0f} s after the intent event that "
+                       f"rewound the window: the window is the setting"))
+    checks.append(("the console said idle too",
+                   cap.get("console_down") is True,
+                   "no 'wifi: radio down (idle...' console line for a radio the "
+                   "wire says the idle rule took down"))
+    r = WIFI_LINE.match(cap.get("restore_line") or "")
+    checks.append(("WIFI ON cleared the idle hold (words outrank idle)",
+                   r is not None and r.group(1) == "1",
+                   f"{cap.get('restore_line')!r} after WIFI ON — words are exactly "
+                   f"the intent event that clears an idle hold; depth they cannot "
+                   f"clear, and this leg proves the pair apart"))
+    checks.append(("the console said the radio came up",
+                   cap.get("console_up") is True,
+                   "no 'wifi: radio up' line for a radio the wire says came back"))
+    checks.append(("WIFI_IDLE_MIN restored to 10 before the leg exits",
+                   cap.get("restore_readback") in ("10", "10.0", "10.000"),
+                   f"readback {cap.get('restore_readback')!r} — leaving the board "
+                   f"armed at 1 minute makes its next surface quiet by surprise"))
+    return checks
+
+
+def selftest_wifi_legs():
+    """Lying transcripts for the two radio-policy legs. Same discipline: each
+    case breaks exactly one rule, and the grader must name it."""
+    honest_depth = dict(offD=2.0, onD=1.0, holdS=60.0, max_depth=5.4, t_deep=1.0,
+                        off_line="WIFI,0,3,0,0", console_down=True, t_shallow=21.0,
+                        mid_line="WIFI,0,3,0,0", up_line="WIFI,1,0,600,0", t_up=81.5,
+                        console_up=True)
+    depth_cases = [
+        ("depth leg: honest transcript", honest_depth, None),
+        ("depth leg: operator never squeezed",
+         {**honest_depth, "max_depth": 0.4, "t_deep": None}, "squeeze actually crossed"),
+        ("depth leg: radio stayed up at depth",
+         {**honest_depth, "off_line": None}, "took the radio down"),
+        ("depth leg: wrong reason (blamed the dive)",
+         {**honest_depth, "off_line": "WIFI,0,2,0,0"}, "blamed the depth"),
+        ("depth leg: console silent",
+         {**honest_depth, "console_down": False}, "console said depth"),
+        ("depth leg: came back early (flap)",
+         {**honest_depth, "mid_line": "WIFI,1,0,600,0"}, "hold held"),
+        ("depth leg: timer too short",
+         {**honest_depth, "t_up": 51.0}, "no sooner than the hold"),
+        ("depth leg: never came back",
+         {**honest_depth, "up_line": None, "t_up": None}, "came back after the hold"),
+        ("depth leg: up without a console line",
+         {**honest_depth, "console_up": False}, "console said the radio came up"),
+    ]
+    honest_idle = dict(before="WIFI,1,0,540,0", intent_ok=True, armed_ok=True,
+                       armed_readback="1", on_obs=[(10.4, 50, 0), (30.4, 30, 0),
+                                                   (50.4, 10, 0)],
+                       off_line="WIFI,0,4,0,0", t_off=62.1, console_down=True,
+                       restore_line="WIFI,1,0,60,0", console_up=True,
+                       restore_readback="10", station_seen=0)
+    idle_cases = [
+        ("idle leg: honest transcript", honest_idle, None),
+        ("idle leg: started with the radio down",
+         {**honest_idle, "before": "WIFI,0,4,0,0"}, "started with the radio up"),
+        ("idle leg: setting never armed",
+         {**honest_idle, "armed_readback": "10"}, "armed and read back"),
+        ("idle leg: frozen countdown",
+         {**honest_idle, "on_obs": [(10.4, 50, 0), (30.4, 50, 0), (50.4, 50, 0)]},
+         "countdown was seen shrinking"),
+        ("idle leg: a station was on the AP all along",
+         {**honest_idle, "station_seen": 1, "on_obs": [(10.4, 60, 1), (30.4, 60, 1),
+                                                       (50.4, 60, 1)],
+          "off_line": None, "t_off": None, "console_down": False},
+         "station was associated"),
+        ("idle leg: no observation inside the window",
+         {**honest_idle, "on_obs": [(10.4, 50)]}, "still up after 50 s"),
+        ("idle leg: never turned off",
+         {**honest_idle, "off_line": None, "t_off": None}, "no station took the radio down"),
+        ("idle leg: wrong reason (depth)",
+         {**honest_idle, "off_line": "WIFI,0,3,0,0"}, "blamed the idle rule"),
+        ("idle leg: fired at 20 s, not 60",
+         {**honest_idle, "t_off": 20.3}, "fired on the minute"),
+        ("idle leg: last up-observation too early to trust the clock",
+         {**honest_idle, "on_obs": [(10.4, 50, 0), (30.4, 30, 0)]},
+         "still up after 50 s"),
+        ("idle leg: console silent",
+         {**honest_idle, "console_down": False}, "console said idle"),
+        ("idle leg: WIFI ON did not restore",
+         {**honest_idle, "restore_line": "WIFI,0,4,0,0"}, "cleared the idle hold"),
+        ("idle leg: up with no console line",
+         {**honest_idle, "console_up": False}, "console said the radio came up"),
+        ("idle leg: left armed at 1",
+         {**honest_idle, "restore_readback": "1"}, "restored to 10"),
+    ]
+    checks = []
+    for name, cap, expect in [*depth_cases, *idle_cases]:
+        got = grade_wifi_depth(cap) if "offD" in cap else grade_wifi_idle(cap)
+        failed = [c[0] for c in got if not c[1]]
+        if expect is None:
+            checks.append((name, not failed, f"unexpected failures: {failed}"))
+        else:
+            checks.append((name, any(expect in f for f in failed),
+                           f"no failure matching {expect!r}; failures seen: {failed}"))
+    return checks
+
+
 def run_dive_persist(console, port, baud, watch, settle=1.5, boot_n=None):
     """Does a closed dive survive a reset?
     record, never the dive". Nothing on the bench had ever tested that promise,
@@ -2449,6 +3054,31 @@ def main() -> int:
                          "needed) to prove the graders can "
                          "fail. Run it after touching the graders or the formats.")
     ap.add_argument("--replay", default=None)
+    ap.add_argument("--wifi-depth", action="store_true",
+                    help="opt-in radio-policy leg with the REAL depth sensor: it "
+                         "asks you to squeeze the thumb pressure sensor past "
+                         "WIFI_OFF_DEPTH, requires the radio to drop with the "
+                         "DEPTH reason and the console to say so, then asks you "
+                         "to release and requires the AP back no sooner than "
+                         "WIFI_ON_HOLD_S of straight shallow water. ~2-3 min of "
+                         "operator action; run it while watching the bench.")
+    ap.add_argument("--wifi-squeeze-wait", type=float, default=90.0,
+                    help="seconds to wait for the operator to cross the depth "
+                         "threshold in --wifi-depth (both directions)")
+    ap.add_argument("--wifi-idle", action="store_true",
+                    help="opt-in radio-policy leg, no hands needed: sets "
+                         "WIFI_IDLE_MIN=1, rewinds the window with WIFI ON, and "
+                         "requires the idle hold to fire ~60 s later (protocol "
+                         "reason 4 AND the console line), the countdown to be "
+                         "seen shrinking, WIFI ON to restore, and the setting to "
+                         "come back to 10. Adds ~100 s.")
+    ap.add_argument("--wifi-idle-wlan", default=None, metavar="IFACE",
+                    help="interface the bench PC itself may be joined to the "
+                         "AP on (usually wlan0): the leg disconnects it before "
+                         "arming the one-minute window and rejoins it after. "
+                         "The bench laptop autojoins ESP-CCR from any earlier "
+                         "web_probe, and a connected station makes the idle "
+                         "rule CORRECTLY refuse to fire.")
     ap.add_argument("--dive-persist", action="store_true",
                     help="after the protocol checks, close a dive, read that dive "
                          "back out of flash and grade it against what the link "
@@ -2464,10 +3094,10 @@ def main() -> int:
         # No board, no ports: this section is about the grader, not the machine.
         fails = 0
         for name, ok_, detail in [*selftest_depth(), *selftest_scale(),
-                                  *selftest_depth_source(),
+                                  *selftest_depth_source(), *selftest_wifi(),
                                   *selftest_density_lock(),
                                   *selftest_value_caps(),
-                                  *selftest_dive_file(),
+                                  *selftest_dive_file(), *selftest_wifi_legs(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1
@@ -2599,6 +3229,12 @@ def main() -> int:
                   + ("" if ok_ else f": {detail}"))
             failures += 0 if ok_ else 1
 
+        print("\n--- radio policy: three fields, one state, read twice ---")
+        for name, ok_, detail in grade_wifi(proto_pairs, lines):
+            print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
+                  + ("" if ok_ else f": {detail}"))
+            failures += 0 if ok_ else 1
+
         print("\n--- value caps: an unwritable value is refused, not shortened ---")
         for name, ok, detail in grade_value_caps(proto_pairs):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
@@ -2657,6 +3293,29 @@ def main() -> int:
                 print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
                 failures += 0 if ok_ else 1
             (logdir / f"accept_{stamp}_predive.log").write_text("\n".join(pre_log) + "\n")
+
+        # Radio-policy legs (2026-11-26). Opt-in because --wifi-depth needs the
+        # operator's thumb and both cost minutes. Run BEFORE the watch tail so
+        # the console watcher is still open for their `wifi:` transition lines.
+        if args.wifi_depth and not args.replay:
+            print("\n--- radio policy: depth hold, on the real sensor (thumb squeeze) ---")
+            wl = []
+            cap = run_wifi_depth(args.handset, args.baud, watch,
+                                 args.handset_settle, squeeze_wait=args.wifi_squeeze_wait,
+                                 log=wl)
+            for name, ok_, detail in grade_wifi_depth(cap):
+                print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
+                failures += 0 if ok_ else 1
+            (logdir / f"accept_{stamp}_wifi_depth.log").write_text("\n".join(wl) + "\n")
+        if args.wifi_idle and not args.replay:
+            print("\n--- radio policy: idle hold (one minute, no station) ---")
+            wl = []
+            cap = run_wifi_idle(args.handset, args.baud, watch, args.handset_settle,
+                                log=wl, wlan=args.wifi_idle_wlan, boot_lines=lines)
+            for name, ok_, detail in grade_wifi_idle(cap):
+                print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
+                failures += 0 if ok_ else 1
+            (logdir / f"accept_{stamp}_wifi_idle.log").write_text("\n".join(wl) + "\n")
 
         if args.watch_tail > 0:
             print(f"\n--- watching the console for {args.watch_tail:.0f} s "

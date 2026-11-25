@@ -221,6 +221,52 @@ Three client rules:
   the controller's own staleness gate is far tighter, and if you only need to know
   at link-up, ask once.
 
+### The radio: is the AP up, and who is holding it down
+
+```cpp
+h.onWifiState = [](const hs::WifiState& w, void*) {
+    char txt[96];
+    if (hs::wifiStateText(w, txt, sizeof(txt))) show(txt);
+};
+hsLink.getWifiState();            // once at link-up, then every ~10 s
+```
+
+Since 2026-11-26 the AP is a **policy**, not just whatever `wifiOn()`/`wifiOff()`
+left it at. The controller drops the radio by itself past `WIFI_OFF_DEPTH`
+(default 2 m) — dive started or not — and after `WIFI_IDLE_MIN` minutes with no
+station associated (default 10, `0` = never), and brings it back on its own once
+depth stays below `WIFI_ON_DEPTH` (default 1 m) for `WIFI_ON_HOLD_S` straight
+(default 60 s). A handset that assumes "I turned it on, so it is on" is wrong at
+depth, on a bench, and ten minutes after anyone walked away — and the phone
+trying to join has no other way to learn why it cannot.
+
+```
+WIFI,<on>,<held_by>,<idle_left_s>,<stations>
+WIFI,1,0,597,0                    up, nobody connected; idle-off fires in 597 s
+WIFI,1,0,600,2                    up; two stations connected (window keeps rewinding)
+WIFI,0,1,0,0                      off: the diver's WIFI OFF
+WIFI,0,2,0,0                      off: dive in progress
+WIFI,0,3,0,0                      off: depth hold (even after WIFI ON — intent set, held anyway)
+WIFI,0,4,0,0                      off: idle; WIFI ON restores it
+```
+
+`stations` is the policy's input on the wire (`WifiState::stations`, `-1` = an
+older controller that never sent it — never read it as 0). A countdown frozen
+at the full window with `stations > 0` is the idle rule **working**: someone is
+connected. The bench learned this the sharp way, from its own laptop's wlan0.
+
+Client rules, same family as `DS,`:
+
+* **Act on `on`, not on what you typed.** `WIFI ON` at depth answers `OK` — that
+  is the intent, honestly accepted — while the radio stays down and `GET WIFI`
+  says so. Read it back.
+* **`held_by` IS an enum to switch on** (unlike `identity` in `DS,`) — but it is
+  **append-only**: handle unknown numbers as "a reason this firmware predates";
+  `wifiStateText()` already prints those as numbers instead of lying.
+* **Words vs holds:** `WIFI ON|OFF` never clears a DEPTH hold (only depth
+  does); it does clear an IDLE hold. Auto never overrides a diver's `WIFI OFF`.
+* **10 s polling is plenty** — the policy's clocks are minutes and dives.
+
 ### Reading the dive log from a handset
 
 `logList()` answers one `L,<slot>,<epoch>,<seq>` row per stored dive,

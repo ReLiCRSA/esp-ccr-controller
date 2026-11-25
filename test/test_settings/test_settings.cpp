@@ -146,7 +146,8 @@ void test_every_key_reaches_its_own_declared_bounds() {
     // keys had an unreachable MIN (SP1..SP4 at 0.20, SP_HYST 0.1, ALLO_LOW 0.05,
     // CAL_O2_FI 0.85, CAL_O2_TARGET 0.80, CELLPROOF_MAXSP 0.60, WATER_DENSITY
     // 0.990) and three an unreachable MAX (ALLO_CUTOFF 1.80, CELLPROOF_SP 1.40,
-    // CELLPROOF_MIN 1.30) — 13 of the 30 numeric keys. The type is what both the
+    // CELLPROOF_MIN 1.30) — 13 of the 30 numeric keys then in the table (34
+    // today: the four WIFI_* policy keys joined). The type is what both the
     // schema and the storage use,
     // so parsing AND comparing in float is the fix — and this loop is what keeps
     // the whole table honest, rather than the one key that happened to be under
@@ -195,8 +196,10 @@ void test_every_key_reaches_its_own_declared_bounds() {
                                    std::to_string(d.maxv)).c_str());
         ++checked;
     }
-    // A loop that walked nothing is decoration: the table has 30 numeric keys.
-    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(25, checked,
+    // A loop that walked nothing is decoration: the table has 34 numeric keys,
+    // and a floor this close to the real count means a key that vanishes from
+    // the table reddens this case rather than quietly lowering the tally.
+    TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(30, checked,
                                              "the boundary walk covered too few keys");
 }
 

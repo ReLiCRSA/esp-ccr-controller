@@ -194,10 +194,22 @@ void CommandRouter::applyWifi(Response& r, bool on) {
         replyErr(r, "wifi locked in dive");
         return;
     }
-    if (wifiOn_ == on) { replyOk(r); return; }
+    // The action is raised on the EFFECTIVE radio state changing, not on the
+    // intent changing. A WIFI ON that lands while the DEPTH latch holds the
+    // radio sets intent (and is answered OK, truthfully — GET WIFI then shows
+    // `WIFI,0,3,0`: wanted on, held by depth) but does not fool the transport
+    // into a setRadio(true) the policy would fight a tick later.
+    const bool before = wifiRadioWanted();
     wifiOn_ = on;
+    // Intent events rewind the idle window, and WIFI ON specifically clears an
+    // IDLE hold: "nothing has connected, so we sat down" is exactly the state a
+    // diver's WIFI ON is answering. DEPTH is not cleared by words — only by
+    // depth. (And WIFI OFF always clears the idle latch: the diver owns the
+    // reason the radio is down now.)
+    idleHeld_ = false;
+    idleSinceMs_ = nowMs_;
     if (!on && loop_.diveActive()) wifiAutoOff_ = false;  // diver's own choice
-    r.actions |= CommandRouter::ACT_WIFI;
+    if (wifiRadioWanted() != before) r.actions |= CommandRouter::ACT_WIFI;
     replyOk(r);
 }
 
@@ -208,13 +220,15 @@ void CommandRouter::startDive(Response& r) {
     // next control tick — see the post* contract in loop.h.
     loop_.postStartDive(nowMs_);
     logExportIdx_ = 0;
+    const bool radioBefore = wifiRadioWanted();
     if (wifiOn_) {            // drop the radio, remember to restore it later
         wifiOn_ = false;
         wifiAutoOff_ = true;
-        r.actions |= ACT_WIFI;
     } else {
         wifiAutoOff_ = false;  // diver had it off: dive end must not turn it on
     }
+    idleHeld_ = false;         // the dive owns the reason the radio is down
+    if (wifiRadioWanted() != radioBefore) r.actions |= ACT_WIFI;
     r.actions |= ACT_DIVE_START;
     replyOk(r, "DIVE");
 }
@@ -223,11 +237,19 @@ void CommandRouter::endDive(Response& r) {
     if (!loop_.diveActive()) { replyErr(r, "no dive"); return; }
     loop_.postEndDive(nowMs_);
     r.actions |= ACT_DIVE_END;
+    const bool radioBefore = wifiRadioWanted();
     if (wifiAutoOff_) {        // restore what DIVE START took away
         wifiAutoOff_ = false;
         wifiOn_ = true;
-        r.actions |= ACT_WIFI;
     }
+    idleHeld_ = false;
+    // Deliberate behaviour change of the radio policy (2026-11-26): dive end
+    // restores the INTENT, and at depth the DEPTH latch keeps the physical
+    // radio down until the diver is below WIFI_ON_DEPTH for WIFI_ON_HOLD_S.
+    // A dive ended at 8 m used to bring the AP up at 8 m; that was the very
+    // milliamps the dive drop exists to save. On the surface the restore is
+    // unchanged, so every existing bench check still sees the AP come back.
+    if (wifiRadioWanted() != radioBefore) r.actions |= ACT_WIFI;
     replyOk(r, "DIVE");
 }
 
@@ -331,6 +353,138 @@ void CommandRouter::buildDepthSourceLine(Response& r) {
     replyText(r, buf, static_cast<size_t>(n));
 }
 
+// ---- radio policy -----------------------------------------------------------
+// See cmd_router.h for the rules; this is the machine those rules describe.
+// It reads its four WIFI_* settings fresh every tick: SET WIFI_IDLE_MIN=1
+// must take effect without a reboot, and four float reads on a task that has
+// nothing else to do are free.
+
+int CommandRouter::wifiTick(uint32_t nowMs, bool depthUsed, float depthM,
+                            uint8_t stations) {
+    wifiStations_ = stations;   // GET WIFI echoes the policy's own input
+    // State as this tick FINDS it, before any update: the priming comparison
+    // is against reality, not against a post-update snapshot (a controller
+    // that booted with the AP up at 5 m has its first down caused by THIS
+    // tick — suppressing it because it is the first tick would leave the AP
+    // up at depth forever).
+    const bool wantedAtEntry = wifiRadioWanted();
+    const float offD = reg_.getFloat(reg_.find("WIFI_OFF_DEPTH"));
+    const float onD = reg_.getFloat(reg_.find("WIFI_ON_DEPTH"));
+    const uint32_t holdS =
+        static_cast<uint32_t>(reg_.getFloat(reg_.find("WIFI_ON_HOLD_S")));
+    const uint32_t idleM =
+        static_cast<uint32_t>(reg_.getFloat(reg_.find("WIFI_IDLE_MIN")));
+
+    // DEPTH tracks whether or not anyone wants a radio: a dive with no DIVE
+    // START, and a DIVE END at depth, both need the latch already up when
+    // they get here. Stale depth freezes the latch — no transition is
+    // inferred from a held number (GET DS says who is believed).
+    if (depthUsed) {
+        if (!depthHeld_) {
+            if (depthM > offD) {
+                depthHeld_ = true;
+                shallowSinceMs_ = 0;
+                idleHeld_ = false;   // a dive is the end of any idle story
+                idleSinceMs_ = nowMs;  // and the surface window starts fresh
+            }
+        } else if (depthM < onD) {
+            if (shallowSinceMs_ == 0) shallowSinceMs_ = nowMs;
+            if (nowMs - shallowSinceMs_ >= holdS * 1000u) {
+                depthHeld_ = false;
+                shallowSinceMs_ = 0;
+            }
+        } else {
+            shallowSinceMs_ = 0;  // back inside the hysteresis band: the
+                                  // straight-time timer restarts, so a diver
+                                  // hovering at 1.5 m is never "shallow"
+        }
+    }
+
+    // IDLE counts only while the radio is genuinely up — and the window
+    // STARTS when the radio becomes up, before any fire check. Both halves
+    // matter: a latch that released itself by its own report would flap, and
+    // a fire evaluated against the pre-dive window would greet a surfacing
+    // diver with "idle" instead of an AP (the old window is dive time, and a
+    // 14-minute dive would end with the radio held down by a timer that was
+    // never running — the rule under test, found by the test, not by reading).
+    const bool upOtherwise = wifiOn_ && !depthHeld_ && !safeLockout_;
+    const bool wasUp = wifiLastWanted_;
+    if (!upOtherwise || !idleM) {
+        // Other holders (or the diver, or SAFE) own the reason the radio is
+        // down; and SET WIFI_IDLE_MIN=0 releases a hold its rule no longer
+        // arms — leaving the radio down under "never sit down" is a settings
+        // lie with an antenna attached.
+        idleHeld_ = false;
+    } else if (idleHeld_) {
+        // stays down until an intent event clears it (applyWifi), never by
+        // itself: a self-releasing idle hold flaps the AP once an idle-min forever
+    } else if (!wasUp) {
+        idleSinceMs_ = nowMs;   // this tick is where "up" begins: nothing has
+                                // been idle-counted while the radio was down
+    } else if (stations > 0) {
+        idleSinceMs_ = nowMs;
+    } else if (wifiPrimed_ && nowMs - idleSinceMs_ >= idleM * 60000u) {
+        idleHeld_ = true;
+    }
+
+    const bool wanted = wifiRadioWanted();
+    int change = 0;
+    if (!wifiPrimed_) {          // the first tick compares against reality:
+        wifiPrimed_ = true;      // surface boot compares equal and prints
+        wifiLastWanted_ = wantedAtEntry;   // nothing; depth boot falls through
+        idleSinceMs_ = nowMs;    // to the change branch below
+    }
+    if (wanted != wifiLastWanted_) {
+        change = wanted ? 1 : -1;
+        wifiLastWanted_ = wanted;   // the idle window restart for an up was
+                                    // already done above, BEFORE the fire check
+    }
+    return change;
+}
+
+uint8_t CommandRouter::wifiHold() const {
+    if (wifiRadioWanted()) return WH_NONE;
+    if (wifiAutoOff_) return WH_DIVE;   // the dive took it: closest reason
+    if (!wifiOn_) return WH_DIVER;
+    if (depthHeld_) return WH_DEPTH;
+    return WH_IDLE;
+}
+
+// `WIFI,<on>,<held_by>,<idle_left_s>,<stations>` — the radio's state, the
+// reason, and the count behind the reason. held_by is a small enum (see
+// WifiHold), not free text: unlike the DS identity, these are states THIS
+// machine defines, and a client switches on them (append-only applies: new
+// causes append, never renumber).
+// idle_left_s: whole seconds until the idle hold would fire, 0 when the
+// radio is not up or WIFI_IDLE_MIN is 0 ("never"). A client that wants "can
+// I connect?" reads `on`; one that wants "why can't I" reads held_by.
+// stations: what the idle rule last saw associated (the driver's count, read
+// on loopTask — at most one tick stale). It is the policy's INPUT, published
+// for the same reason `used` is: without it, a countdown that never counts
+// down is a mystery, and with it the answer is on the line — someone IS
+// connected, and the rule refusing to fire is the feature working. 0 when
+// the radio is down (there is nothing to associate to).
+void CommandRouter::buildWifiLine(Response& r) {
+    const bool on = wifiRadioWanted();
+    const uint8_t hold = wifiHold();
+    uint32_t left = 0;
+    if (on) {
+        const uint32_t idleM =
+            static_cast<uint32_t>(reg_.getFloat(reg_.find("WIFI_IDLE_MIN")));
+        if (idleM && wifiPrimed_ && nowMs_ >= idleSinceMs_) {
+            const uint32_t tot = idleM * 60u;
+            const uint32_t used = (nowMs_ - idleSinceMs_) / 1000u;
+            left = used < tot ? tot - used : 0u;
+        }
+    }
+    char buf[48];
+    const int n = std::snprintf(buf, sizeof(buf), "WIFI,%d,%u,%u,%u\n",
+                                on ? 1 : 0, static_cast<unsigned>(hold),
+                                static_cast<unsigned>(left),
+                                static_cast<unsigned>(wifiStations_));
+    replyText(r, buf, static_cast<size_t>(n));
+}
+
 void CommandRouter::getSpecial(Response& r, const char* key) {
     if (std::strcmp(key, "T") == 0) {
         proto::Telemetry t;
@@ -402,6 +556,7 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         return;
     }
     if (std::strcmp(key, "DS") == 0) { buildDepthSourceLine(r); return; }
+    if (std::strcmp(key, "WIFI") == 0) { buildWifiLine(r); return; }
     if (std::strcmp(key, "HIST") == 0) {
         if (!hist_) { replyErr(r, "no histogram"); return; }
         replyInPlace(r, cellhist::formatLines(*hist_, nowMs_, r.text, sizeof(r.text)));

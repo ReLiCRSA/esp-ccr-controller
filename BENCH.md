@@ -15,16 +15,22 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 273 cases
+pio test -e native            # host gate, currently 278 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 149 checks
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file graders, no board: 75 cases
-tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 69 checks
-tools/.../python tools/web_probe.py --selftest  # the dive-identity graders, no board: 13 cases
+                                 --cal-air --predive --dive-persist    # 170 checks
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio graders, no board: 107 cases
+tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 71 checks
+tools/.../python tools/web_probe.py --selftest  # dive-identity + cross-transport scrub graders, no board: 20 cases
 ```
+
+Two radio-policy legs are opt-in on top of the run above: `--wifi-idle
+--wifi-idle-wlan wlan0` (one-minute idle hold, no hands — the wlan flag
+disconnects the bench PC's own autojoined station first, see "The radio is
+policy now") and `--wifi-depth` (needs the operator's thumb on the pressure
+sensor).
 
 `--expect-depth` is how the operator says *this bench has a depth sensor fitted*:
 it turns C3-a's boot line into three graded checks. Without it, a boot with no
@@ -189,7 +195,7 @@ completion proven, so every cycle is graded on what the firmware itself reports:
 
 | Per cycle | Why |
 |---|---|
-| `web: radio off (dive)` within `--max-down` (default 3 s) of `WIFI OFF` | the intent was recorded *and* carried out |
+| `web: radio off` + `wifi: radio down (…)` within `--max-down` (default 3 s) of `WIFI OFF` | the intent was recorded *and* carried out (the `wifi:` line is the policy's, and names the cause; since 2026-11-26 the `web:` line no longer claims "dive") |
 | `web: AP "…" on <ip> (heap N)` within `--max-up` (default 6 s) of `WIFI ON` | the diver gets a surface UI back; `OK` on the command means only that the intent was recorded |
 | exactly N down and N up over N cycles | a pending change that gets reversed before loopTask acts is silently cancelled (coalescing), which is correct for a 0.5 s dive and a fault for a real one |
 | identical AP **name** every cycle, and a MAC tail present | a renamed AP, or one without the `-XXXX` tail, is a network the phone that joined before the dive cannot rejoin |
@@ -211,6 +217,75 @@ on healthy hardware is worse than no check.
 **What that tool still cannot prove:** the page and the WebSocket actually
 serving after a radio cycle. `radio_stress.py` never opens the network — it reads
 the console. For that there is `tools/web_probe.py`, next section.
+
+### The radio is policy now: auto-off/auto-on, and how the bench watches a machine that acts by itself (added 2026-11-26)
+
+`WIFI ON|OFF` is the diver's **intent**; the physical AP additionally refuses itself
+to depth and to idleness, and returns on its own. The state is one query on either
+transport — `GET WIFI` → `WIFI,<on>,<held_by>,<idle_left_s>,<stations>` — and one
+console line per transition, `wifi: radio down (depth)` / `wifi: radio up (clear)`.
+`web: radio off` still prints on every teardown, but it lost its `(dive)` suffix:
+since the policy, the reason is not always the dive, and the reason-bearing line
+is the policy's. (The matrix's console watcher counts both.)
+
+Four keys tune it, plain `SET`, live without a reboot (spec §6): `WIFI_IDLE_MIN`
+(**0 = never off**, default 10), `WIFI_OFF_DEPTH` (2.0), `WIFI_ON_DEPTH` (1.0),
+`WIFI_ON_HOLD_S` (60). `WIFI_ON_DEPTH` above `WIFI_OFF_DEPTH` **oscillates by
+design** — the firmware will not silently fix settings it cannot express a bound
+for; watch it flap on `GET WIFI` and fix the settings.
+
+Two opt-in legs, both graded on the wire AND the console (and provable — every
+grader has lying captures in `hw_accept.py --selftest`):
+
+- **`--wifi-idle [--wifi-idle-wlan wlan0]` (~100 s, no hands needed).** Sends
+  `WIFI ON` (an intent event — it rewinds the idle window to *now*, so the fire is
+  a deterministic minute away rather than whenever boot's window aged out), sets
+  `WIFI_IDLE_MIN=1`, then samples `GET WIFI` every 5 s and requires: the countdown
+  seen strictly shrinking, the radio still up after 50 s of a 60 s window, a fire
+  at 60–125 s blamed on **4 (idle)** with the console agreeing, `WIFI ON` restoring
+  it (words outrank idle; they cannot outrank depth — that half is the other leg),
+  and the setting restored to 10 on the way out.
+  **`--wifi-idle-wlan wlan0` exists because of a specific bench trap:** the bench
+  PC's own `wlan0` autojoins ESP-CCR from any earlier `web_probe`, and a connected
+  station makes the idle rule **correctly refuse to fire**. The first idle run
+  failed with the countdown pinned at exactly 60 s forever — which is not a dead
+  timer, it is the rewind rule working, and it is undiagnosable unless the station
+  count is on the wire. So `WIFI,` carries `stations` (field 5, the policy's input
+  published like `DS,`'s `used`), the leg names the ghost station if it sees one
+  instead of cascading four timer-shaped failures, and `--wifi-idle-wlan` uses
+  `nmcli` to disconnect the interface before arming and rejoin it (name and
+  passphrase read from the machine, not assumed) afterwards. If you skip the flag,
+  `stations > 0` in the failure text tells you what to unplug.
+- **`--wifi-depth` (~2–3 min, needs the operator's thumb).** The script reads the
+  thresholds off the machine, prints `>>> SQUEEZE <<<`, polls `GET T` until the
+  real sensor reads past `WIFI_OFF_DEPTH` (the thumb reaches ~5.5 m), and requires
+  the radio down with reason **3 (depth)** within 5 s plus the console line. Then
+  `>>> RELEASE <<<`, polls back under `WIFI_ON_DEPTH`, and requires the radio
+  **still down at shallow+20 s** — the straight-shallow hold, the check a flap-prone
+  build cannot pass — then up within `WIFI_ON_HOLD_S`+15 s and no sooner than the
+  hold allows, console line included. If the cue goes unmet the leg FAILS with
+  "operator cue not met": opt-in means un-run is a report, not a silent skip.
+
+The mid-dive reason column is graded in the ordinary matrix too: `GET WIFI`
+mid-dive must be exactly `WIFI,0,2,0,0` — the refusal `ERR wifi locked in dive`
+says a request was denied; this line says the state is the one the denial promises.
+And `grade_wifi` cross-grades the three changing fields against each other and
+against the settings the same session read (`GET *`): an up radio has no holder,
+a down radio has no countdown, the countdown never exceeds `WIFI_IDLE_MIN×60`, and
+mid-dive is blamed on the dive — 10 lying captures in `--selftest` prove each rule
+can fire.
+
+Two harness lessons from getting this green, both old families. The matrix window
+stopped at the **first** matching line, which `GET *` — now 36 keys, and the four
+`WIFI_*` keys sit at the END of the table — provably truncated: the ruler grader
+was reading an amputated line list. `GET *` has a `collect` window now; single-line
+entries keep first-match. And `grade_wifi` read `pair[0]`, which on the leaked
+tails these windows trade can be the *previous* answer's line — the grader scans
+the pair instead.
+
+The policy's console/protocol witnesses also made the old `WIFI OFF → "web: radio
+off (dive)"` row in the radio-stress table read false, so it was changed with it;
+`radio_stress.py` matches the prefix and needed no change.
 
 ### The surface web stack, with a station joined (`tools/web_probe.py`)
 

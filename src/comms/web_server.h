@@ -59,6 +59,12 @@ void service();
 
 bool isOn();
 
+/// Associated stations on the AP (0 when the radio is down). The radio policy's
+/// idle input: "nothing is connected" must be the driver's answer, not a
+/// WebSocket client count — a phone can sit associated with no page open, and
+/// that phone is connected for every purpose the idle timeout cares about.
+uint8_t stationCount();
+
 /// Live WebSocket clients (the status page shows it; a dive with a browser
 /// still connected before the radio drops is worth seeing).
 size_t clientCount();

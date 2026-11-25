@@ -34,6 +34,12 @@
 // that holds the slot but has gone quiet leaves the depth on `T,` HELD rather than
 // measured, and the `T,` row itself cannot tell you that. See spec §3.
 //
+// RADIO POLICY: the AP is no longer only what WIFI ON|OFF left it — the controller
+// drops it past WIFI_OFF_DEPTH and after WIFI_IDLE_MIN idle minutes, and brings it
+// back on its own — so "can I connect, and if not why" is a query, not knowledge:
+// `getWifiState()`, `onWifiState`, `wifiStateText()`. `held_by` is an append-only
+// enum; switch on the numbers, handle unknown ones as "some newer reason". See §4.
+//
 // WALL CLOCK: the controller has no RTC chip and its access point has no
 // uplink, so a client at the surface is its time source — `timeSet(epoch)`,
 // `getTime()`, `onClock`. A handset that keeps time itself should set the
@@ -172,6 +178,88 @@ inline int depthSourceText(const DepthSource& d, char* buf, std::size_t cap) {
     return w;
 }
 
+// `WIFI,<on>,<held_by>,<idle_left_s>,<stations>` — whether the AP is physically
+// up, and if
+// not, who is holding it down (spec §4, added 2026-11-26). `on` is what the
+// transport OBEYS, not what was last typed: after `WIFI ON` at depth the honest
+// answer is on=0, held_by=DEPTH. The holds:
+//
+//   DIVE   — dropped by DIVE START; dive end restores intent, and the radio
+//            follows DEPTH below.
+//   DEPTH  — past WIFI_OFF_DEPTH the radio is down immediately; it returns only
+//            after depth stays below WIFI_ON_DEPTH for WIFI_ON_HOLD_S straight.
+//            No word clears this hold — only depth does.
+//   IDLE   — no station associated for WIFI_IDLE_MIN minutes (0 = never). A
+//            `WIFI ON` clears it; depth does not.
+//
+// An older controller answers `ERR unknown key`, which means "this controller
+// cannot say" — not "held by nothing". Never show a reason you did not read.
+struct WifiState {
+    enum Hold : uint8_t {       // append-only: newer controllers append causes
+        HOLD_NONE = 0,          // radio up
+        HOLD_DIVER = 1,         // the diver's own WIFI OFF — auto never overrides
+        HOLD_DIVE = 2,          // dive in progress
+        HOLD_DEPTH = 3,         // past the off depth, or not shallow long enough
+        HOLD_IDLE = 4,          // no station associated for WIFI_IDLE_MIN minutes
+    };
+    bool on;             // AP is up
+    uint8_t heldBy;      // one of Hold, or a cause this library predates
+    uint32_t idleLeftS;  // seconds until the idle hold would fire; 0 when the
+                         // radio is down or WIFI_IDLE_MIN=0 ("never off")
+    int16_t stations;    // stations associated as of the last policy tick — the
+                         // idle rule's INPUT, on the wire. A countdown that
+                         // never shrinks while this is > 0 is the rule working,
+                         // not a stall. -1: this controller did not send the
+                         // field (it predates the append; 0 would be a lie).
+};
+
+// Wording for a handset with a display and no text of its own, in the same
+// spirit as depthSourceText(): the sentence states the conclusion, and a future
+// cause prints "reason <n>" rather than lying with a stale word. Returns bytes
+// written (excluding NUL), 0 if the buffer is too small; never a partial sentence.
+inline int wifiStateText(const WifiState& w, char* buf, std::size_t cap) {
+    if (!buf || cap == 0) return 0;
+    int n;
+    if (w.on) {
+        if (w.idleLeftS)
+            n = std::snprintf(buf, cap, "wifi AP up: auto-off in %lu s "
+                                        "if nothing connects",
+                              static_cast<unsigned long>(w.idleLeftS));
+        else
+            n = std::snprintf(buf, cap, "wifi AP up: never auto-offs "
+                                        "(WIFI_IDLE_MIN=0)");
+    } else switch (w.heldBy) {
+        case WifiState::HOLD_DIVER:
+            n = std::snprintf(buf, cap, "wifi off: the diver turned it off "
+                                        "(WIFI ON to restore)");
+            break;
+        case WifiState::HOLD_DIVE:
+            n = std::snprintf(buf, cap, "wifi off: dive in progress");
+            break;
+        case WifiState::HOLD_DEPTH:
+            n = std::snprintf(buf, cap, "wifi off: held at depth (returns when "
+                                        "shallow for WIFI_ON_HOLD_S straight)");
+            break;
+        case WifiState::HOLD_IDLE:
+            n = std::snprintf(buf, cap, "wifi off: idle, no station connected "
+                                        "(WIFI ON to restore)");
+            break;
+        case WifiState::HOLD_NONE:
+            // on=0 with reason "nothing": a controller newer than this library
+            // appended a cause before defining it, or lied. Say the numbers.
+            n = std::snprintf(buf, cap, "wifi off: reported reason is 'none' "
+                                        "(controller newer than this library?)");
+            break;
+        default:
+            n = std::snprintf(buf, cap, "wifi off: reason %u "
+                                        "(newer controller: this library predates it)",
+                              static_cast<unsigned>(w.heldBy));
+            break;
+    }
+    if (n < 0 || static_cast<std::size_t>(n) >= cap) { buf[0] = '\0'; return 0; }
+    return n;
+}
+
 struct Setting { char key[24]; char value[40]; };      // "KEY=value" answers
 // `L,<slot>,<epoch>,<seq>`. `seq` is the fourth field, appended 2026-11-24;
 // 0 means the dive predates the field (or the controller is older), and 0 is
@@ -241,6 +329,7 @@ struct Handlers {
     void (*onDiveHeader)(const DiveHeader&, void*) = nullptr;
     void (*onClock)(const Clock&, void*) = nullptr;
     void (*onDepthSource)(const DepthSource&, void*) = nullptr;
+    void (*onWifiState)(const WifiState&, void*) = nullptr;
     void (*onCalAir)(const CalAir&, void*) = nullptr;
     // Everything else: CSV export rows (S,/M,), HIST, lines, WebSocket '#'
     // markers, and any line a future controller adds. Observing is optional;
@@ -467,6 +556,26 @@ inline bool parseDepthSource(const char* line, DepthSource& d) {
     return true;
 }
 
+inline bool parseWifiState(const char* line, WifiState& w) {
+    if (!starts(line, "WIFI,")) return false;
+    char buf[32];
+    std::strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+    char* f[6];
+    const int n = split(buf, f, 6);
+    if (n < 4) return false;               // WIFI,<on>,<held_by>,<idle_left_s>[,stations]
+    w.on = pl(f[1]) != 0;
+    w.heldBy = static_cast<uint8_t>(pl(f[2]));
+    w.idleLeftS = static_cast<uint32_t>(pl(f[3]));
+    // The stations field was appended 2026-11-26 (the bench PC's own wlan0
+    // proved a client cannot guess it): four-field lines from an in-between
+    // controller parse with stations = -1, "not sent", never 0 — 0 claims
+    // "nobody is connected", which that controller never said. A sixth field
+    // a future controller appends is ignored here, the way the DS parser
+    // honours whatever grows after `identity`.
+    w.stations = n >= 5 ? static_cast<int16_t>(pl(f[4])) : -1;
+    return true;
+}
+
 inline bool parseSchema(const char* line, SchemaEntry& s) {
     if (!starts(line, "K,")) return false;
     char buf[kRxLineCap];
@@ -605,6 +714,7 @@ public:
     bool wifiOff()             { return send("WIFI OFF"); }
     bool getTime()             { return send("GET TIME"); }
     bool getDepthSource()      { return send("GET DS"); }
+    bool getWifiState()        { return send("GET WIFI"); }
     // `TIME SET <epoch>`: the controller has no RTC, so this client IS the time
     // source (spec §3). Out-of-window epochs are refused HERE, with no bytes on
     // the wire: a handset whose own timekeeping has gone to soup should hear it
@@ -664,6 +774,12 @@ private:
             // in position 1.
             DepthSource d;
             if (parseDepthSource(line, d)) { callS<DepthSource>(h_.onDepthSource, d); return; }
+        } else if (starts(line, "WIFI,")) {
+            // Before the KEY=value fallback: a `WIFI,` answer has no '=', and
+            // note the SETTINGS key is WIFI_* never WIFI, — the comma test keeps
+            // the two namespaces apart.
+            WifiState w;
+            if (parseWifiState(line, w)) { callS<WifiState>(h_.onWifiState, w); return; }
         } else if (starts(line, "K,")) {
             SchemaEntry s; if (parseSchema(line, s)) { callS<SchemaEntry>(h_.onSchema, s); return; }
         }

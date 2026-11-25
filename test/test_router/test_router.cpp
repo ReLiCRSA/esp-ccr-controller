@@ -821,6 +821,277 @@ void test_a_depth_source_name_cannot_run_past_its_field() {
     TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,1,1,1,4,"), r.text);
 }
 
+// ---- radio policy: depth/idle holds, GET WIFI, and who outranks whom -------
+
+namespace {
+// One policy step at a wall time, from the loopTask call site's point of view.
+int wt(Bench& b, uint32_t atMs, bool depthUsed, float depthM, uint8_t stations) {
+    b.now = atMs;
+    return b.router.wifiTick(atMs, depthUsed, depthM, stations);
+}
+} // namespace
+
+void test_the_wifi_policy_holds_on_depth_and_releases_shallow_and_straight() {
+    // Defaults: off past 2.0 m, back below 1.0 m after 60 s straight, idle 10 min.
+    Bench b;
+    CommandRouter::Response r;
+
+    // Prime: the first tick adopts reality and reports nothing — a controller
+    // that booted with the AP up at the surface prints no fake transition.
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, wt(b, 1000u, true, 0.0f, 0u),
+                                  "the first tick invented a radio transition");
+    TEST_ASSERT_TRUE(b.router.wifiRadioWanted());
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("WIFI,1,0,600,0\n", r.text,
+                                     "fresh boot, no station: the countdown should own the line");
+
+    // The off threshold is strictly greater: 2.0 m exactly is not "past 2 m".
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 5000u, true, 2.0f, 0u));
+    TEST_ASSERT_TRUE(b.router.wifiRadioWanted());
+
+    // Past it: down, held by depth, and GET WIFI says who.
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 6000u, true, 2.2f, 0u));
+    TEST_ASSERT_FALSE(b.router.wifiRadioWanted());
+    TEST_ASSERT_EQUAL_UINT8(CommandRouter::WH_DEPTH, b.router.wifiHold());
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,0,3,0,0\n", r.text);
+
+    // The hysteresis band is a band: 1.5 m is neither "past 2" nor "below 1",
+    // and ten straight minutes of it changes nothing. A diver hovering a
+    // safety stop must not flap the radio.
+    for (uint32_t t = 7000u; t <= 607000u; t += 30000u) {
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0, wt(b, t, true, 1.5f, 0u),
+                                      "the hysteresis band moved the radio");
+        TEST_ASSERT_FALSE(b.router.wifiRadioWanted());
+    }
+
+    // Below 1 m but not for 60 straight seconds: still held — and the timer
+    // restarts when the diver dips back into the band (59 s shallow, one dip,
+    // then shallow again: the first 59 s must not count).
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 637000u, true, 0.5f, 0u));   // shallow starts
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 666000u, true, 0.5f, 0u));   // 29 s
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 696000u, true, 0.5f, 0u));   // 59 s: not yet
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 700000u, true, 1.5f, 0u));   // dip: restarts
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 759000u, true, 0.5f, 0u));   // timer restarts here
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 760000u, true, 0.5f, 0u));   // 1 s: far from it
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 818000u, true, 0.5f, 0u));   // 59 s from the restart
+    TEST_ASSERT_FALSE(b.router.wifiRadioWanted());
+    TEST_ASSERT_EQUAL_INT(1, wt(b, 819000u, true, 0.5f, 0u));   // 60 s straight: up
+    TEST_ASSERT_TRUE(b.router.wifiRadioWanted());
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,1,0,600,0\n", r.text);         // window restarted
+
+    // STALE DEPTH FREEZES THE LATCH. This is GET DS's used=0 case wearing
+    // a hard hat: a locked-but-unused sensor leaves the last depth HELD, and
+    // driving a radio from a held number is policy inventing a measurement.
+    // At depth, held: the source goes quiet for an hour at a fake-shallow
+    // value; the latch must not budge, and the shallow timer must not even
+    // start — the value is not believed, so it cannot be evidence.
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 860000u, true, 5.0f, 0u));
+    for (uint32_t t = 920000u; t <= 4400000u; t += 600000u)
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0, wt(b, t, false, 0.0f, 0u),
+                                      "stale depth moved the radio policy");
+    // And when the source comes back shallow, the 60 s starts THEN — the hour
+    // of unbelieved silence is not 60 s of straight shallow water.
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 4400000u, true, 0.0f, 0u));
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 4459000u, true, 0.0f, 0u));
+    TEST_ASSERT_FALSE(b.router.wifiRadioWanted());
+    TEST_ASSERT_EQUAL_INT(1, wt(b, 4460000u, true, 0.0f, 0u));
+    TEST_ASSERT_EQUAL_UINT8(CommandRouter::WH_NONE, b.router.wifiHold());
+}
+
+void test_the_idle_hold_counts_only_real_time_up_and_words_clear_it() {
+    Bench b;
+    CommandRouter::Response r;
+    wt(b, 1000u, true, 0.0f, 0u);                 // prime at the surface
+
+    // The countdown is protocol-visible: 540 s left at one minute in.
+    b.now = 61000u;
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,1,0,540,0\n", r.text);
+
+    // Any association rewinds the window — the driver's station count, not a
+    // WebSocket count: a phone sitting associated with no page open IS here.
+    for (uint32_t t = 501000u; t <= 600000u; t += 10000u)
+        TEST_ASSERT_EQUAL_INT(0, wt(b, t, true, 0.0f, 1u));       // station up
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 601000u, true, 0.0f, 0u));     // just left
+    TEST_ASSERT_TRUE(b.router.wifiRadioWanted());                 // not 10 min of EMPTY
+    // The idle rule's INPUT on the wire: the countdown alone cannot distinguish
+    // "nobody is connected and the window is aging" from "someone IS connected
+    // and the window keeps rewinding" — the stations field can, and a bench
+    // that cannot tell those apart cannot tell a working idle rule from a stuck
+    // one (found on the bench 2026-11-26, by the bench PC's own wlan0).
+    wt(b, 602000u, true, 0.0f, 2u);
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,1,0,600,2\n", r.text);
+
+    // Ten straight minutes of nothing. (The stations=2 witness above ran a
+    // tick at 602000 — a station rewinds the window, so the fire is 600 s from
+    // THERE, and the arithmetic here matches that, not a rounded story about
+    // the earlier rewind loop.)
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 1201000u, true, 0.0f, 0u));    // 599 s from the witness
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 1202000u, true, 0.0f, 0u));   // exactly 10 min: down
+    TEST_ASSERT_FALSE(b.router.wifiRadioWanted());
+    TEST_ASSERT_EQUAL_UINT8(CommandRouter::WH_IDLE, b.router.wifiHold());
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,0,4,0,0\n", r.text);
+
+    // Words clear idle (it is the command's exact answer to "nobody is
+    // here, so we sat down") and do NOT touch depth. The action bit rides
+    // the EFFECTIVE change: idle was holding, so this is a real up.
+    b.run("WIFI ON", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_WIFI);
+    TEST_ASSERT_TRUE(b.router.wifiRadioWanted());
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,1,0,600,0\n", r.text);
+
+    // The idle latch never releases itself: with nothing connected and no
+    // command, an hour must not bring the radio back (a self-clearing idle
+    // hold flaps the AP once a quarter-hour forever).
+    // The command applied the radio immediately (the ACT above); the NEXT
+    // tick is where the policy sees up: it reports +1 and starts that
+    // radio's own window at 1790000 — a new fire belongs at 2390000, never
+    // before, and it never "remembers" the pre-WIFI-On window. Between:
+    TEST_ASSERT_EQUAL_INT(1, wt(b, 1790000u, true, 0.0f, 0u));    // up seen, window starts
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 2389000u, true, 0.0f, 0u));    // 599 s in
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 2390000u, true, 0.0f, 0u));   // 600 s: idle again
+    wt(b, 2391000u, true, 0.0f, 0u);
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 2691000u, true, 0.0f, 0u));    // 5 min held: no flap
+
+    // WIFI_IDLE_MIN=0 means never, and it takes effect without a reboot:
+    // a bench that sets 1 must see the fire one minute later.
+    b.run("SET WIFI_IDLE_MIN=0", r);
+    // The setting releases the hold it governs, on the next tick (loopTask
+    // is at most 250 ms from this command on the real board — no command
+    // path needs to know the policy exists):
+    TEST_ASSERT_EQUAL_INT(1, wt(b, 2692000u, true, 0.0f, 0u));    // reports the up
+    TEST_ASSERT_TRUE(b.router.wifiRadioWanted());
+    for (uint32_t t = 3592000u; t <= 10001000u; t += 900000u)
+        TEST_ASSERT_EQUAL_INT(0, wt(b, t, true, 0.0f, 0u));       // hours: never
+
+    // And a live one-minute setting fires like clockwork — with a station
+    // tick to start the window honestly (the hours of idleM=0 above did not
+    // quietly age a window that had not been running).
+    b.run("SET WIFI_IDLE_MIN=1", r);
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 10002000u, true, 0.0f, 1u));   // window start
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 10061000u, true, 0.0f, 0u));   // 59 s
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 10062000u, true, 0.0f, 0u));  // 60 s: live without reboot
+    b.run("SET WIFI_IDLE_MIN=10", r);
+}
+
+void test_the_diver_outranks_the_machine_and_depth_outranks_the_words() {
+    Bench b;
+    CommandRouter::Response r;
+    wt(b, 1000u, true, 0.0f, 0u);
+
+    // Diver says off. A whole depth cycle must not resurrect the radio:
+    // every depth release restores the INTENT, never overrules it.
+    b.run("WIFI OFF", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_WIFI);
+    TEST_ASSERT_EQUAL_UINT8(CommandRouter::WH_DIVER, b.router.wifiHold());
+    // The tick reports the diver's own down (the command applied the radio;
+    // the tick is the printer — loopTask prints every transition, whoever
+    // caused it). The latch tracked depth on the same tick without an extra
+    // report: intent was already holding the radio, so nothing changed then.
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 5000u, true, 5.0f, 0u));
+    TEST_ASSERT_EQUAL_UINT8(CommandRouter::WH_DIVER, b.router.wifiHold());
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 61000u, true, 0.0f, 0u));     // shallow 60 s: latch down
+    TEST_ASSERT_EQUAL_UINT8(CommandRouter::WH_DIVER, b.router.wifiHold());
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,0,1,0,0\n", r.text);
+
+    // Words cannot clear depth. At 5 m, WIFI ON sets the intent — and raises
+    // NO radio action, because the effective state is unchanged. The client
+    // gets OK (truthful: intent is set) and GET WIFI shows the hold.
+    // Intent is OFF at this point; at 5 m the latch is up and the words set
+    // intent WITHOUT raising a radio action (effective state is unchanged:
+    // held by depth either way). This is the wire's copy of "words cannot
+    // clear depth".
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 65000u, true, 5.0f, 0u));
+    b.run("WIFI ON", r);
+    TEST_ASSERT_TRUE(b.router.wifiEnabled());
+    TEST_ASSERT_FALSE_MESSAGE(r.actions & CommandRouter::ACT_WIFI,
+                              "WIFI ON at depth asked for the radio the policy holds");
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,0,3,0,0\n", r.text);
+
+    // A commanded dive at depth: DIVE START at 5 m changes no effective state
+    // (the radio was already down for depth) — and GET WIFI reports DIVE while
+    // the dive runs, because the dive is the closer reason.
+    const uint32_t tDive = 66000u;
+    b.now = tDive;
+    b.run("DIVE START", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_DIVE_START);
+    TEST_ASSERT_FALSE(r.actions & CommandRouter::ACT_WIFI);
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,0,2,0,0\n", r.text);
+
+    // DIVE END AT DEPTH (the behaviour change of this batch): intent is
+    // restored, the DEPTH latch holds the radio, and no setRadio is asked for.
+    b.now = tDive + 30000u;
+    b.run("DIVE END", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_DIVE_END);
+    TEST_ASSERT_FALSE_MESSAGE(r.actions & CommandRouter::ACT_WIFI,
+                              "dive end brought the radio up at depth");
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,0,3,0,0\n", r.text);            // depth again, not dive
+
+    // The diver ascends: 60 straight seconds below 1 m, and only now does
+    // the radio come up — from the latch clearing, on the intent the dive
+    // end restored.
+    TEST_ASSERT_EQUAL_INT(0, wt(b, tDive + 31000u, true, 0.5f, 0u));
+    TEST_ASSERT_EQUAL_INT(0, wt(b, tDive + 90000u, true, 0.5f, 0u));
+    TEST_ASSERT_EQUAL_INT(1, wt(b, tDive + 91000u, true, 0.5f, 0u));
+    b.run("GET WIFI", r);
+    TEST_ASSERT_EQUAL_STRING("WIFI,1,0,600,0\n", r.text);
+
+    // Surface dive, the old behaviour: nothing about dive start/end at the
+    // surface changes, so every existing dive-cycle check stays honest.
+    b.now += 1000u;
+    b.run("DIVE START", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_WIFI);        // up->down
+    b.run("DIVE END", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_WIFI);        // down->up
+
+    // SAFE outranks everything — and it is reachable WITH a live policy tick:
+    // the SAFE boot path initialises the session (handset gets ACK-only) while
+    // web never starts and loopTask still runs wifiTick. Without the SAFE term
+    // in wifiRadioWanted(), a SAFE board's policy believes its radio should be
+    // up — and a later idle fire would drive setRadio(false) on a radio that
+    // was never on, then any intent event setRadio(true) on the one board SAFE
+    // exists to keep silent. The tick is the only actor here, so the tick is
+    // where the outranking must show.
+    b.router.setSafeLockout(true);
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, b.now + 1000u, true, 0.0f, 0u));   // reports the down
+    TEST_ASSERT_FALSE(b.router.wifiRadioWanted());
+    for (uint32_t t = b.now + 10000u; t <= b.now + 70000u; t += 10000u)
+        TEST_ASSERT_EQUAL_INT(0, wt(b, t, true, 0.0f, 0u));            // stays down
+    b.router.setSafeLockout(false);   // ACK reboots for real in firmware; the
+                                      // lockout term alone is under test
+    TEST_ASSERT_EQUAL_INT(1, wt(b, b.now + 80000u, true, 0.0f, 0u));   // intent, restored
+}
+
+void test_the_wifi_policy_oscillates_by_design_when_the_depths_are_inverted() {
+    // WIFI_ON_DEPTH above WIFI_OFF_DEPTH is a configuration the schema cannot
+    // express as a key-vs-key bound (min/max are per key). The policy does NOT
+    // silently clamp it — silent correction is a settings lie, the same family
+    // as shortening a passphrase. It runs as written, which oscillates, and
+    // this case is the sentence in the settings table made executable: what an
+    // inversion DOES is documented by the test, not by a promise.
+    Bench b;
+    CommandRouter::Response r;
+    b.run("SET WIFI_OFF_DEPTH=1.0", r);
+    b.run("SET WIFI_ON_DEPTH=5.0", r);
+    b.run("SET WIFI_ON_HOLD_S=10", r);
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 1000u, true, 3.0f, 0u));      // latches: 3 > 1
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 6000u, true, 3.0f, 0u));       // "below 5" timer starts here
+    TEST_ASSERT_EQUAL_INT(0, wt(b, 11000u, true, 3.0f, 0u));      // 5 s of the 10
+    TEST_ASSERT_EQUAL_INT(1, wt(b, 16000u, true, 3.0f, 0u));      // 10 s: up
+    TEST_ASSERT_EQUAL_INT(-1, wt(b, 17000u, true, 3.0f, 0u));     // re-latched: down again
+    // Flap period = WIFI_ON_HOLD_S. This is why the schema ranges keep the two
+    // apart (ON max 20 < OFF max 30 is not the guard — the ranges merely make
+    // the honest settings the easy ones to type).
+}
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_auto_lockout_holds_over_the_router);
@@ -843,5 +1114,9 @@ int main() {
     RUN_TEST(test_time_set_is_range_checked_and_delegated);
     RUN_TEST(test_get_depth_source_names_the_chip_and_says_if_it_is_used);
     RUN_TEST(test_a_depth_source_name_cannot_run_past_its_field);
+    RUN_TEST(test_the_wifi_policy_holds_on_depth_and_releases_shallow_and_straight);
+    RUN_TEST(test_the_idle_hold_counts_only_real_time_up_and_words_clear_it);
+    RUN_TEST(test_the_diver_outranks_the_machine_and_depth_outranks_the_words);
+    RUN_TEST(test_the_wifi_policy_oscillates_by_design_when_the_depths_are_inverted);
     return UNITY_END();
 }

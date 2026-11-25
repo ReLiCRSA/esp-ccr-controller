@@ -465,7 +465,11 @@ void stop() {
     // AsyncWebSocket::enable() is NOT a way to close them (in 3.12.1 it only
     // gates canHandle(), i.e. whether a new upgrade is accepted), so a call to
     // it here would be a no-op dressed up as teardown.
-    Serial.println("web: radio off (dive)");
+    // No reason suffix here: since the radio policy (2026-11-26) this teardown
+    // runs for depth and idle just as much as for dives, and this module does
+    // not know which. The policy prints the one reason-bearing line per
+    // transition on loopTask (main.cpp: `wifi: radio down (<cause>)`).
+    Serial.println("web: radio off");
 }
 
 // Radio intent is state; the action belongs on loopTask. See web_server.h.
@@ -497,6 +501,16 @@ void service() {
 bool isOn() { return g_on; }
 
 size_t clientCount() { return g_ws ? g_ws->count() : 0; }
+
+uint8_t stationCount() {
+    // The driver's answer, capped to uint8_t (an AP this tiny will never see
+    // 255 stations; the cap is for the policy's signature, not the hardware).
+    // Read on loopTask only — the same task that performs radio teardowns,
+    // so this ioctl never lands on a task with control duty.
+    if (!g_on) return 0;
+    const uint8_t n = static_cast<uint8_t>(WiFi.softAPgetStationNum());
+    return n > 10u ? 10u : n;
+}
 
 uint32_t minFreeHeap() { return g_minHeap; }
 

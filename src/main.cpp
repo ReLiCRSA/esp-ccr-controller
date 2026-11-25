@@ -979,6 +979,19 @@ void setup() {
         Serial.println();
 }
 
+// Console word for the radio policy's hold cause. Words, not numbers: this
+// line is what a bench log and a troubleshooting diver read, and "down (3)"
+// answers nothing. The numbers stay on GET WIFI, where a client switches.
+static const char* wifiHoldWord(uint8_t h) {
+    switch (h) {
+        case comms::CommandRouter::WH_DIVER: return "diver's WIFI OFF";
+        case comms::CommandRouter::WH_DIVE:  return "dive in progress";
+        case comms::CommandRouter::WH_DEPTH: return "depth";
+        case comms::CommandRouter::WH_IDLE:  return "idle: no station for WIFI_IDLE_MIN";
+        default:                             return "clear";
+    }
+}
+
 void loop() {
     // The radio comes up and down HERE, not in the task that answered the
     // command: wifi teardown is slow and races the driver's own worker
@@ -993,6 +1006,27 @@ void loop() {
             vTaskDelay(pdMS_TO_TICKS(50));   // let the command path finish first
             comms::web::serviceRadio();
             break;                            // re-phase the tick after a teardown
+        }
+
+        // Radio policy: the depth/idle decisions (comms::CommandRouter::
+        // wifiTick — off past WIFI_OFF_DEPTH, back below WIFI_ON_DEPTH after
+        // WIFI_ON_HOLD_S, off after WIFI_IDLE_MIN idle minutes). They run
+        // HERE because loopTask is the task the radio physically obeys, and
+        // they take the session lock, which serializes them with every
+        // command. Depth arrives with its used flag — the same flag GET DS
+        // publishes — so a HELD depth (the used=0 case) can neither drop
+        // the radio nor bring it back: stale input freezes the latch rather
+        // than inventing a transition. loopTask waiting on a long LOG EXPORT
+        // to release the lock delays a radio decision by that export, never
+        // anything with a diver's breath on it.
+        const int wc = comms::session().wifiTick(millis(), g_depthSrc.used,
+                                                 g_depthM,
+                                                 comms::web::stationCount());
+        if (wc) {
+            comms::web::setRadio(comms::session().wifiRadioWanted());
+            Serial.printf("wifi: radio %s (%s)\n",
+                          comms::session().wifiRadioWanted() ? "up" : "down",
+                          wifiHoldWord(comms::session().wifiHoldCause()));
         }
         vTaskDelay(pdMS_TO_TICKS(250));
     }

@@ -43,7 +43,11 @@ void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
         }
     }
     if (actions & CommandRouter::ACT_WIFI)
-        if (hw_.onWifi) hw_.onWifi(router_.wifiEnabled(), hw_.ctx);
+        // wifiRadioWanted(), NOT wifiEnabled(): the intent may be ON while a
+        // holder (dive/depth/idle) legitimately keeps the physical radio down.
+        // Passing the intent here is how a transport ends up fighting the
+        // policy one tick later.
+        if (hw_.onWifi) hw_.onWifi(router_.wifiRadioWanted(), hw_.ctx);
     if (actions & CommandRouter::ACT_CAL_AIR)
         if (hw_.onCalAir) hw_.onCalAir(hw_.ctx);
     if (actions & CommandRouter::ACT_DIVE_START) {

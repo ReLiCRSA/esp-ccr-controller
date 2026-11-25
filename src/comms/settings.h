@@ -34,7 +34,7 @@ struct Def {
 
 class Registry {
 public:
-    static constexpr size_t NDEFS = 32; // keep in sync via static_assert in .cpp
+    static constexpr size_t NDEFS = 36; // keep in sync via static_assert in .cpp
     static const Def* definitions(size_t& count);
 
     void resetToDefaults();

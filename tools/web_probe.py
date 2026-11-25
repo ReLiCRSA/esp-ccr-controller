@@ -25,9 +25,10 @@ What it verifies, and what each part is for:
            the over-long case that the marker says `dropped`.
   EQUALITY each command sent twice, BACK TO BACK, once over the WebSocket and
            once on UART2. Twelve must be byte-identical (one command path, two
-           transports: the project's central claim); `GET DS` is compared with its
-           `age_s` field excepted (seconds since the sensor's last good read, and
-           the two sends are ~0.4 s apart); the over-long case is compared on its
+           transports: the project's central claim); `GET DS` and `GET WIFI` are
+           each compared with one timing field excepted (`age_s` is seconds since
+           the sensor's last good read, `idle_left_s` a live countdown, and the
+           two sends are ~0.4 s apart); the over-long case is compared on its
            refusal only, because UART2 additionally dispatches the leftover tail as
            its own line - docs/HANDSET_PROTOCOL.md says why.
   DIVE     --dive-cycle: the probe posts the clock first (a surface client IS
@@ -107,6 +108,16 @@ MATRIX = [
     # both transports — there is one command path, and a web bridge that answered
     # depth provenance out of its own copy is exactly what this catches.
     ("GET DS", "which chip owns depth, and whether it is being used",
+     "identical-except-age"),
+    # The radio's state (2026-11-26), same discipline as DS: `idle_left_s` is a
+    # countdown sampled ~0.4 s apart, and `stations` is whatever associated
+    # between the two sends — both excepted. `on` and `held_by` are NOT: the
+    # policy lives in the shared router, so a web answer and a handset answer
+    # about WHO HOLDS THE RADIO must be the same bytes even though the radio
+    # changes state on its own between the two sends far more readily than a
+    # sensor age does. A disagreement there is two command surfaces with two
+    # opinions — the thing this whole section exists to catch.
+    ("GET WIFI", "is the radio up, and who is holding it down",
      "identical-except-age"),
     # Calibration honesty. `CAL O2` and `CAL DEPTH` are in the grammar but have no
     # consumer on the board, so they must be REFUSED — and refused the same way on
@@ -564,18 +575,8 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
                 same = web == uart and bool(web)
                 detail = f"web {web[:2]} | uart {uart[:2]} | marker {marker}"
             elif mode == "identical-except-age":
-                def scrub(lines):
-                    out = []
-                    for l in lines:
-                        f = l.split(",")
-                        # isdigit() here is a check, not a convenience: an answer
-                        # whose age field is not a number is not a DS, answer.
-                        if len(f) >= 6 and f[0] == "DS" and f[4].isdigit():
-                            f[4] = "<age>"
-                        out.append(",".join(f))
-                    return out
-                got = [l for l in web if l.startswith("DS,")]
-                same = scrub(web) == scrub(uart) and bool(got)
+                got = [l for l in web if l.startswith(("DS,", "WIFI,"))]
+                same = scrub_timing(web) == scrub_timing(uart) and bool(got)
                 detail = (f"web {web[:2]} | uart {uart[:2]} | marker {marker} — "
                           f"age field excepted (the sends are ~0.4 s apart)")
             else:
@@ -590,6 +591,58 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
     finally:
         ws.close()
         ser.close()
+
+
+def scrub_timing(lines):
+    """Blank the ONE timing field of each age-counted answer, keep every other byte.
+
+    `identical-except-age` has to name its exception exactly, or the exception
+    becomes a loophole: if the scrubber blanked a whole line, a web bridge with
+    a different opinion about the radio would sail through. DS idx 4 is the age
+    of the last good sensor read; WIFI idx 3 is the idle countdown and idx 4
+    the station count — both can move between two sends 0.4 s apart (a phone
+    does not schedule its joins around the probe). isdigit() is a check, not a
+    convenience: an answer whose timing field is not a number is not that
+    answer, and gets compared byte for byte like everything else.
+    """
+    out = []
+    for l in lines:
+        f = l.split(",")
+        if len(f) >= 6 and f[0] == "DS" and f[4].isdigit():
+            f[4] = "<age>"
+        if len(f) >= 4 and f[0] == "WIFI" and f[3].isdigit():
+            f[3] = "<left>"
+        if len(f) >= 5 and f[0] == "WIFI" and f[4].isdigit():
+            f[4] = "<stations>"
+        out.append(",".join(f))
+    return out
+
+
+def selftest_scrub():
+    """The exception itself is under test: two transports may differ in the
+    timing field and NOWHERE ELSE on these lines."""
+    cases = [
+        ("DS ages 0 s apart agree",
+         ["DS,1,1,1,4,LPS28DFW @0x5D"], ["DS,1,1,1,0,LPS28DFW @0x5D"], True),
+        ("DS disagreeing on used must not scrub equal",
+         ["DS,1,1,1,0,LPS28DFW @0x5D"], ["DS,1,0,1,0,LPS28DFW @0x5D"], False),
+        ("WIFI countdowns 0.4 s apart agree",
+         ["WIFI,1,0,600,0"], ["WIFI,1,0,599,0"], True),
+        ("WIFI station counts one join apart agree",
+         ["WIFI,1,0,600,0"], ["WIFI,1,0,599,1"], True),
+        ("WIFI disagreeing on on/held must not scrub equal",
+         ["WIFI,1,0,600,0"], ["WIFI,0,3,0,0"], False),
+        ("WIFI disagreeing on the reason only must not scrub equal",
+         ["WIFI,0,2,0,0"], ["WIFI,0,4,0,0"], False),
+        ("a WIFI line with a non-numeric countdown is compared whole",
+         ["WIFI,1,0,x"], ["WIFI,1,0,5"], False),
+    ]
+    out = []
+    for name, a, b, want in cases:
+        same = scrub_timing(a) == scrub_timing(b)
+        out.append((name, same == want,
+                    f"scrubbed to {scrub_timing(a)} vs {scrub_timing(b)}"))
+    return out
 
 
 def parse_log_list(lines):
@@ -1083,7 +1136,7 @@ def main() -> int:
 
     if args.selftest:
         fails = 0
-        for name, ok_, detail in selftest_identity():
+        for name, ok_, detail in [*selftest_identity(), *selftest_scrub()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
                   + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1

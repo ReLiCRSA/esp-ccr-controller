@@ -19,7 +19,7 @@ down would PASS — the state machine would be broken and the report would say t
 opposite. A deferred action needs its completion proven, so every cycle is now
 graded on the console lines the firmware prints for the radio itself:
 
-    WIFI OFF  ->  "web: radio off (dive)"            within --max-down
+    WIFI OFF  ->  "web: radio off"                   within --max-down
     WIFI ON   ->  web: AP "<ssid>" on <ip> (heap N)  within --max-up
 
 plus: the AP name identical every cycle (a MAC read that fails after a teardown

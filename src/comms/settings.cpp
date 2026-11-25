@@ -16,7 +16,7 @@ namespace settings {
 
 namespace {
 
-constexpr size_t TCOUNT = 32;
+constexpr size_t TCOUNT = 36;
 
 // key                  type     default  min      max      flags        str-default
 const Def kTable[TCOUNT] = {
@@ -73,6 +73,19 @@ const Def kTable[TCOUNT] = {
     // system (strings)
     {"AP_SSID", Type::STRING, 0, 1, 16, FL_DIVE_LOCK, "ESP-CCR"},
     {"AP_PASS", Type::STRING, 0, 8, 31, FL_DIVE_LOCK, "diveonly"},
+    // radio policy (2026-11-26). These tune ONE state machine — CommandRouter's
+    // wifi policy, answered on the wire by GET WIFI and printed on the console
+    // at every transition. WIFI_IDLE_MIN 0 means "never auto-off": the AP stays
+    // up with nobody connected, which is what a diver on a boat may want and what
+    // a pack on the bench does not. WIFI_ON_DEPTH must stay below WIFI_OFF_DEPTH
+    // or the hold oscillates (released below ON, re-set above OFF, every
+    // WIFI_ON_HOLD_S) — the schema cannot express key-vs-key bounds, so this one
+    // sentence is the guard, and test_the_wifi_policy_oscillates_by_design records
+    // what an inversion does rather than pretending it cannot happen.
+    {"WIFI_IDLE_MIN", Type::UINT8, 10.0f, 0.0f, 240.0f, FL_NONE, nullptr},
+    {"WIFI_OFF_DEPTH", Type::FLOAT, 2.0f, 0.5f, 30.0f, FL_NONE, nullptr},
+    {"WIFI_ON_DEPTH", Type::FLOAT, 1.0f, 0.2f, 20.0f, FL_NONE, nullptr},
+    {"WIFI_ON_HOLD_S", Type::UINT8, 60.0f, 0.0f, 240.0f, FL_NONE, nullptr},
 };
 
 static_assert(sizeof(kTable) / sizeof(kTable[0]) == TCOUNT, "TCOUNT drift");

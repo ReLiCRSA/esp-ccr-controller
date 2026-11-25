@@ -245,6 +245,29 @@ def grade_page(page: str):
                       "held_by is rendered as a number (or the word list is never "
                       "used): the bench log and the phone would describe the same "
                       "state differently")
+
+    # ---- dive verdict rows on the page (2026-11-26) ------------------------
+    # The dive file always carried E, verdict rows and the download always
+    # showed them; the page's dive view charted `S,` rows and dropped every
+    # verdict — a surface reader could not see that the proof failed or that
+    # someone lifted the clamp. The dive parse's row shape (E,t,id,val — no
+    # name column) differs from the live stream's handler, so these greps are
+    # dive-specific: the live `f[0]==="E"` branch alone proves nothing here.
+    parses = re.search(r'f\[0\]==="E"&&f\.length===4', page)
+    checks.append(("dive view reads the file's verdict rows", bool(parses),
+                   parses.group(0) if parses else
+                   "the dive CSV's E, rows are parsed away: the chart shows where "
+                   "the diver went and nothing about what the machine decided"))
+    words2 = re.search(r'eventName\(id,val\)\+"</div>"', page)
+    checks.append(("dive verdicts use the same words as the live events", bool(words2),
+                   words2.group(0) if words2 else
+                   "dive rows render raw ids: one event, two vocabularies, and the "
+                   "divergent one is the history the diver reads back"))
+    none_case = re.search(r'no verdict rows in this dive', page)
+    checks.append(("a verdict-free dive says so out loud", bool(none_case),
+                   none_case.group(0) if none_case else
+                   "zero rows renders as nothing: silence where a reader needs "
+                   "'the file held no verdicts', not an absence to be guessed"))
     return checks
 
 
@@ -270,6 +293,15 @@ def selftest_page():
         ("hold reason rendered as a number (words deleted)",
          '"down &#183; "+(HOLD[hold]||"reason "+hold)', '"down "+hold',
          "radio hold reason is a word on the page, as on the console"),
+        ("dive view drops the verdict rows (parse deleted)",
+         'if(f[0]==="E"&&f.length===4) evts.push(f);', '',
+         "dive view reads the file's verdict rows"),
+        ("dive verdicts rendered as raw ids (words deleted)",
+         'eventName(id,val)+"</div>"', '(id+" "+f[3])+"</div>"',
+         "dive verdicts use the same words as the live events"),
+        ("verdict-free dive renders silence instead of the fact",
+         '"no verdict rows in this dive"', '""',
+         "a verdict-free dive says so out loud"),
     ]
     for label, needle, lie, expect_red in LIES:
         if needle not in page:

@@ -72,6 +72,9 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
 .hist i{flex:1;background:var(--accent);opacity:.85;min-height:2px}
 .hist i.z{visibility:hidden}
 .hint{color:var(--dim);font-size:13px}
+.verdicts{margin-top:8px}
+.vrow{font-size:13px;padding:2px 8px;border-left:3px solid var(--dim);margin:2px 0}
+.vrow.bad{border-left-color:#ff5b5b}.vrow.warn{border-left-color:#ffb020}.vrow.ok{border-left-color:#39d98a}
 @media(min-width:900px){main{display:grid;grid-template-columns:2fr 1fr;gap:14px;align-items:start}}
 </style>
 </head>
@@ -592,17 +595,40 @@ function refreshHist(){
 function showDive(slot){
   var v=$("diveview"); v.hidden=false; v.innerHTML="loading dive "+slot+"&#8230;";
   fetch("/dive/"+slot+".csv").then(function(r){ return r.text(); }).then(function(txt){
-    var snaps=[],meta=null;
+    var snaps=[],meta=null,evts=[];
     txt.split("\n").forEach(function(l){
       var f=l.split(",");
       if(f[0]==="S"&&f.length>14) snaps.push({t:+f[1],d:+f[2],p:+f[3],sp:+f[8],al:+f[9]});
       if(f[0]==="M") meta=f;
+      // The verdict rows. The chart says where the diver went; only these
+      // say what the machine decided on the way: which alarm edges fired,
+      // whether the cell proof failed, whether someone lifted the clamp and
+      // how the calibration ended. The download has always carried them; a
+      // surface reader could not see them at all (2026-11-26 queue item).
+      if(f[0]==="E"&&f.length===4) evts.push(f);
     });
     if(!snaps.length){ v.innerHTML="dive "+slot+": no readable records"; return; }
     var h="<h3 style='margin-top:0'>dive "+slot+"</h3><canvas id='cv"+slot+"'></canvas>";
     if(meta) h+="<div class='hint'>duration "+Math.round(+meta[1]/60)+" min &#183; max "+
       (+meta[2]/100).toFixed(1)+" m &#183; ppO2 "+(+meta[3]/1000).toFixed(2)+" .. "+
       (+meta[4]/1000).toFixed(2)+" &#183; pulses "+meta[5]+" &#183; CNS peak "+meta[6]+"%</div>";
+    // Verdicts in file order — which is occurrence order (the dive-file
+    // grader pins the file's E, rows against the wire's sequence, so the
+    // page may trust "after the failure came the lift" without sorting).
+    // Words come from eventName, the same map the live toasts use: one
+    // vocabulary for what the machine said, whether it said it now or in a
+    // dive the diver reads back an hour later.
+    h+="<div class='verdicts'><div class='hint'>"+(evts.length?
+      "verdicts this dive: "+evts.length:
+      "no verdict rows in this dive")+"</div>";
+    for(var e=0;e<evts.length;e++){
+      var f=evts[e], id=+f[2], val=+f[3], ts=+f[1];
+      var kind=(id===1||id===10||id===11||id===7&&val>=5)?"bad":
+               (id===2||id===6||id===12)?"ok":"warn";
+      h+="<div class='vrow "+kind+"'>+"+Math.floor(ts/60)+":"+("0"+(ts%60)).slice(-2)+
+        " &#183; "+eventName(id,val)+"</div>";
+    }
+    h+="</div>";
     v.innerHTML=h;
     drawChart($("cv"+slot),snaps);
   }).catch(function(){ v.innerHTML="could not read dive "+slot; });

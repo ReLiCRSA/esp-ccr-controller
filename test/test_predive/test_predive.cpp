@@ -120,8 +120,15 @@ void test_restart_after_failure() {
 // wants to see — so the rig was certified "on the surface" by the failure of
 // its own depth sensor. The step must answer the prior question first: is
 // there a depth at all?
+//
+// The grace window changed WHEN the verdict arrives, not whether it does: one
+// silent cycle is no longer a fault (a shared-Wire1 hiccup must not abort a
+// 2-minute sequence), but a bus that never answers still ends in FAIL, and the
+// wait is bounded and named. Both halves are asserted here, because each half
+// is the failure mode of the other: an immediate FAIL condemns a transient, and
+// a grace with no bound is a pre-dive that never returns a verdict.
 void test_dead_depth_bus_fails_the_depth_step() {
-    Config c; c.warmupMs = 0;
+    Config c; c.warmupMs = 0;  // depthGraceMs: the 3000 ms default
     Sequencer s{c};
     Inputs in = airGood();
     uint32_t t = 0;
@@ -132,16 +139,39 @@ void test_dead_depth_bus_fails_the_depth_step() {
     in.depthValid = false;
     runUntil(s, in, Step::S_DEPTH, t);
     TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
-    s.update(in, t += 100);
-    TEST_ASSERT_TRUE_MESSAGE(s.failed(), "the DEPTH step passed with no depth sensor");
-    TEST_ASSERT_FALSE_MESSAGE(s.allPassed(), "pre-dive PREPASS with a dead depth bus");
+
+    // ---- mid-grace: not believed, not condemned, and visible as silence -----
+    const uint32_t tArm = t + 100;  // the first silent cycle arms the clock
+    for (int i = 0; i < 20; ++i) s.update(in, t += 100);  // 1.9 s of silence
+    TEST_ASSERT_FALSE_MESSAGE(s.failed(), "the DEPTH step condemned a silent bus inside the grace");
+    TEST_ASSERT_EQUAL_UINT8(Status::RUNNING, s.status(Step::S_DEPTH));
+    TEST_ASSERT_TRUE_MESSAGE(s.depthBusSilent(),
+                             "a silent depth bus was not visible as silence (the `PRE,` line "
+                             "cannot tell this wait from a rig off the surface, so the "
+                             "sequencer has to be able to say it)");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("depth bus silent, waiting", s.depthWhy(),
+                                     "the depth wait did not say what it is waiting on");
+
+    // ---- past the grace: the C1 verdict still arrives, bounded and named ----
+    while (!s.failed() && t < tArm + c.depthGraceMs + 1000) s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(), "the DEPTH step never failed on a dead depth bus");
+    TEST_ASSERT_TRUE_MESSAGE(t >= tArm + c.depthGraceMs,
+                             "the depth FAIL landed before the grace had run");
+    TEST_ASSERT_TRUE_MESSAGE(t <= tArm + c.depthGraceMs + 100,
+                             "the depth FAIL was not bounded by the grace: the sequence hung "
+                             "past it instead of returning a verdict");
     TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s.status(Step::S_DEPTH));
+    TEST_ASSERT_FALSE_MESSAGE(s.allPassed(), "pre-dive PREPASS with a dead depth bus");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("depth bus never answered (grace expired)", s.depthWhy(),
+                                     "the depth FAIL did not say the grace is what expired");
+    TEST_ASSERT_FALSE(s.depthBusSilent());  // a verdict, not a wait, any more
 }
 
 // A bus that is alive but telling nonsense is refused too — the validity flag
 // is not a licence for any number the driver happens to be holding. A sane but
 // off-surface depth WAITS (the diver can still surface, and the existing depth
-// gate test pins that); only "there is no measurement" is a verdict.
+// gate test pins that); only "there is no measurement" is ever a verdict, and
+// that one waits out the grace before it lands.
 void test_invalid_and_wild_depth_both_refused() {
     Config c; c.warmupMs = 0;
     Sequencer s{c};
@@ -161,7 +191,9 @@ void test_invalid_and_wild_depth_both_refused() {
     TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
     TEST_ASSERT_FALSE(s.failed());
 
-    // and a held sample behind an invalid flag fails, whatever number it holds
+    // and a held sample behind an invalid flag is not a measurement either: it
+    // waits out the grace like any other silent cycle, then FAILs. Whatever
+    // number the driver happens to be holding never decides the verdict.
     Sequencer s2{c};
     Inputs in2 = airGood();
     in2.depthM = 0.05f;
@@ -169,9 +201,18 @@ void test_invalid_and_wild_depth_both_refused() {
     t = 0;
     s2.start(t);
     runUntil(s2, in2, Step::S_DEPTH, t);
+    const uint32_t tArm = t + 100;
     s2.update(in2, t += 100);
-    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s2.status(Step::S_DEPTH));
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(Status::RUNNING, s2.status(Step::S_DEPTH),
+                                    "a held sample behind an invalid flag was condemned on "
+                                    "one cycle");
+    while (!s2.failed() && t < tArm + c.depthGraceMs + 1000) s2.update(in2, t += 100);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(Status::FAIL, s2.status(Step::S_DEPTH),
+                                    "a held sample behind a dead bus never reached its FAIL");
     TEST_ASSERT_TRUE(s2.failed());
+    TEST_ASSERT_TRUE_MESSAGE(t >= tArm + c.depthGraceMs,
+                             "a held sample behind an invalid flag failed inside the grace");
+    TEST_ASSERT_EQUAL_STRING("depth bus never answered (grace expired)", s2.depthWhy());
 }
 
 // A bus that recovers is not a fault the diver has to restart for: while the
@@ -189,6 +230,202 @@ void test_depth_step_recovers_with_the_bus() {
     TEST_ASSERT_EQUAL_UINT8(Status::PASS, s.status(Step::S_DEPTH));
 }
 
+// ---------------------------------------------------------------------------
+// The grace window (follow-up #2). C1 closed the hole where a dead depth bus
+// PASSed the DEPTH step; the fix condemned it on a single cycle, which meant a
+// shared-Wire1 hiccup landing exactly then aborted a 2-minute sequence. These
+// tests pin the middle ground: an unmeasured depth is never believed, never
+// condemned on one cycle, and never allowed to hang the sequence either.
+// ---------------------------------------------------------------------------
+
+// Shorter than the grace: the dropout the diver should never have to notice.
+void test_depth_bus_silent_shorter_than_the_grace_passes() {
+    Config c; c.warmupMs = 0;  // depthGraceMs: the 3000 ms default
+    Sequencer s{c};
+    Inputs in = airGood();
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_DEPTH, t);
+    TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
+
+    // 2 s of silence, inside the grace, and fed the exact number the old
+    // firmware fabricated — it must not be what decides anything.
+    in.depthValid = false;
+    in.depthM = 0.0f;
+    for (int i = 0; i < 20; ++i) s.update(in, t += 100);
+    TEST_ASSERT_FALSE_MESSAGE(s.failed(), "a 2 s depth dropout aborted the pre-dive");
+    TEST_ASSERT_TRUE(s.depthBusSilent());  // and it was visible while it lasted
+    TEST_ASSERT_EQUAL_UINT8(Status::RUNNING, s.status(Step::S_DEPTH));
+
+    // The bus answers: the step judges the sample it got and the sequence
+    // finishes. No restart, no lost work — WARMUP/AIR/SOLENOID keep their verdicts.
+    in.depthValid = true;
+    in.depthM = 0.05f;
+    s.update(in, t += 100);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(Status::PASS, s.status(Step::S_DEPTH),
+                                    "a depth dropout shorter than the grace failed the DEPTH step");
+    TEST_ASSERT_FALSE(s.depthBusSilent());
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("", s.depthWhy(),
+                                     "the depth step kept complaining after the bus came back");
+    for (int i = 0; i < 5; ++i) s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.allPassed(),
+                             "pre-dive did not finish after a depth dropout shorter than the grace");
+    TEST_ASSERT_FALSE(s.failed());
+}
+
+// Longer than the grace: the FAIL must land on the grace's schedule, not wait to
+// see whether the bus eventually comes back. This is the ms5837 deep-backoff
+// trade written down: a driver that resumes at 4 s loses the step, because a
+// pre-dive that polls a bus the dive itself already called dead is not serving
+// the diver.
+void test_depth_bus_silent_longer_than_the_grace_fails_when_the_grace_expires() {
+    Config c; c.warmupMs = 0;
+    Sequencer s{c};
+    Inputs in = airGood();
+    uint32_t t = 0;
+    s.start(t);
+    in.depthValid = false;
+    in.depthM = 0.0f;
+    runUntil(s, in, Step::S_DEPTH, t);
+    const uint32_t tArm = t + 100;
+
+    // 5 s of silence, twice the grace: the verdict arrives at the grace, well
+    // before the silence ends, and it is bounded (no hang).
+    uint32_t tFail = 0;
+    for (int i = 0; i < 50 && !s.failed(); ++i) {
+        s.update(in, t += 100);
+        if (s.failed() && tFail == 0) tFail = t;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(), "5 s of silent depth bus produced no verdict");
+    TEST_ASSERT_TRUE_MESSAGE(tFail >= tArm + c.depthGraceMs,
+                             "the depth FAIL landed before the grace had run");
+    TEST_ASSERT_TRUE_MESSAGE(tFail <= tArm + c.depthGraceMs + 100,
+                             "the depth FAIL was not bounded by the grace (silent hang)");
+    TEST_ASSERT_TRUE_MESSAGE(tFail + 1000 < tArm + 5000,
+                             "the depth FAIL waited for the bus to come back instead of "
+                             "landing on the grace's schedule");
+    TEST_ASSERT_EQUAL_STRING("depth bus never answered (grace expired)", s.depthWhy());
+
+    // A verdict is a verdict: the bus coming back 2 s later does not un-fail the
+    // sequence, and AUTO stays locked until someone starts the check again.
+    in.depthValid = true;
+    in.depthM = 0.05f;
+    for (int i = 0; i < 10; ++i) s.update(in, t += 100);
+    TEST_ASSERT_TRUE(s.failed());
+    TEST_ASSERT_FALSE(s.allPassed());
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s.status(Step::S_DEPTH));
+
+    // The escape hatch, pinned so it cannot rot: a maintainer who wants the old
+    // single-cycle verdict sets the grace to zero and gets exactly that.
+    Config c0 = c;
+    c0.depthGraceMs = 0;
+    Sequencer s0{c0};
+    Inputs in0 = airGood();
+    in0.depthValid = false;
+    uint32_t t0 = 0;
+    s0.start(t0);
+    runUntil(s0, in0, Step::S_DEPTH, t0);
+    s0.update(in0, t0 += 100);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(Status::FAIL, s0.status(Step::S_DEPTH),
+                                    "depthGraceMs = 0 did not restore the one-cycle verdict");
+}
+
+// The off-by-one, pinned deliberately on one side. The grace FAILs on a cycle
+// whose bus is STILL silent at or past depthGraceMs of continuous silence, so the
+// verdict is always a statement about the bus and never about a sample that
+// actually arrived. Three legs:
+//   * a measurement landing exactly on the boundary tick is JUDGED (here: PASS);
+//   * a bus still silent on that same tick FAILs on it — a dead bus delivers no
+//     measurement, so it can never interpose its own reprieve;
+//   * an off-surface measurement on the boundary is judged too, which is what
+//     keeps the grace a patience bound and not a blanket "timeout = FAIL".
+void test_depth_grace_boundary_judges_a_sample_and_condemns_silence() {
+    // Leg 1: sample exactly at the boundary.
+    Config c; c.warmupMs = 0;
+    Sequencer s{c};
+    Inputs in = airGood();
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_DEPTH, t);
+    const uint32_t tArm = t + 100;
+    in.depthValid = false;
+    in.depthM = 0.0f;
+    while (t < tArm + c.depthGraceMs - 100) s.update(in, t += 100);
+    TEST_ASSERT_FALSE_MESSAGE(s.failed(),
+                              "the DEPTH step failed on silence inside its grace");
+    TEST_ASSERT_EQUAL_UINT8(Status::RUNNING, s.status(Step::S_DEPTH));
+    in.depthValid = true;
+    in.depthM = 0.05f;  // in band: judged, and it passes
+    s.update(in, t += 100);  // this cycle is exactly depthGraceMs of silence old
+    TEST_ASSERT_FALSE_MESSAGE(s.failed(),
+                              "a measurement arriving at the grace boundary was condemned "
+                              "instead of judged");
+    TEST_ASSERT_EQUAL_UINT8(Status::PASS, s.status(Step::S_DEPTH));
+
+    // Leg 2: the same tick, but the bus is still silent -> FAIL there, not later.
+    Sequencer s2{c};
+    Inputs in2 = airGood();
+    in2.depthValid = false;
+    in2.depthM = 0.0f;
+    t = 0;
+    s2.start(t);
+    runUntil(s2, in2, Step::S_DEPTH, t);
+    const uint32_t tArm2 = t + 100;
+    while (!s2.failed() && t < tArm2 + c.depthGraceMs + 5000) s2.update(in2, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s2.failed(),
+                             "silence running past the grace produced no verdict at all");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(tArm2 + c.depthGraceMs, t,
+                                     "silence at the grace boundary did not FAIL the step there");
+
+    // Leg 3: measurement at the boundary, off the surface -> still a wait.
+    Sequencer s3{c};
+    Inputs in3 = airGood();
+    uint32_t t3 = 0;
+    s3.start(t3);
+    runUntil(s3, in3, Step::S_DEPTH, t3);
+    const uint32_t tArm3 = t3 + 100;
+    in3.depthValid = false;
+    while (t3 < tArm3 + c.depthGraceMs - 100) s3.update(in3, t3 += 100);
+    in3.depthValid = true;
+    in3.depthM = 12.0f;  // the rig is still down: it may still surface
+    for (int i = 0; i < 40; ++i) s3.update(in3, t3 += 100);
+    TEST_ASSERT_FALSE_MESSAGE(s3.failed(),
+                              "the grace expired on a measurement the step was supposed to wait for");
+    TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s3.current());
+    TEST_ASSERT_EQUAL_UINT8(Status::RUNNING, s3.status(Step::S_DEPTH));
+    TEST_ASSERT_FALSE(s3.depthBusSilent());  // waiting on the diver, not on the bus
+}
+
+// Where the grace clock starts: the first silent cycle the STEP sees, not the
+// moment the bus died. Silence that began during WARMUP (far longer than the
+// grace) must not have spent the DEPTH step's patience in advance — the steps
+// before it have their own patience, and their own verdicts.
+void test_depth_grace_clocks_from_the_step_not_from_the_bus() {
+    Config c; c.warmupMs = 5000;
+    Sequencer s{c};
+    Inputs in = airGood();
+    in.depthValid = false;
+    in.depthM = 0.0f;
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_DEPTH, t);  // ~16 s of silent bus before this step
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(Step::S_DEPTH, s.current(),
+                                    "the DEPTH step never got its own patience");
+    TEST_ASSERT_FALSE(s.failed());
+
+    const uint32_t tArm = t + 100;
+    s.update(in, t += 100);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(Status::RUNNING, s.status(Step::S_DEPTH),
+                                    "the DEPTH step had already failed before its own grace "
+                                    "had a chance to run");
+    while (!s.failed() && t < tArm + c.depthGraceMs + 5000) s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(),
+                             "the DEPTH step hung: a bus that never answers must still FAIL");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(tArm + c.depthGraceMs, t,
+                                     "the depth grace was partly spent by silence the DEPTH "
+                                     "step never saw");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_full_pass_sequence);
@@ -199,5 +436,9 @@ int main() {
     RUN_TEST(test_dead_depth_bus_fails_the_depth_step);
     RUN_TEST(test_invalid_and_wild_depth_both_refused);
     RUN_TEST(test_depth_step_recovers_with_the_bus);
+    RUN_TEST(test_depth_bus_silent_shorter_than_the_grace_passes);
+    RUN_TEST(test_depth_bus_silent_longer_than_the_grace_fails_when_the_grace_expires);
+    RUN_TEST(test_depth_grace_boundary_judges_a_sample_and_condemns_silence);
+    RUN_TEST(test_depth_grace_clocks_from_the_step_not_from_the_bus);
     return UNITY_END();
 }

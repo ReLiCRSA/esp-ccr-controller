@@ -553,6 +553,23 @@ static void controlTask(void*) {
         static bool prevPrePass = false, prevPreFail = false;
         const bool prePass = g_loop->predivePassed();
         const bool preFail = g_loop->prediveFailed();
+
+        // The depth grace, on the console (rising edge only — the step stays
+        // RUNNING for every control cycle of the wait). On the `PRE,` line a
+        // DEPTH step waiting out a silent pressure bus is byte-for-byte
+        // indistinguishable from one waiting for a diver who is off the surface
+        // to climb back up, and no wire field may change to tell them apart. So
+        // the difference is said out loud here, in the module's own words.
+        static bool prevDepthSilent = false;
+        const predive::Sequencer& pseq = g_loop->prediveSeq();
+        const bool depthSilent = pseq.depthBusSilent();
+        if (depthSilent && !prevDepthSilent)
+            Serial.printf("pre-dive depth: %s (grace %u s)\n", pseq.depthWhy(),
+                          (unsigned)(g_ctrlCfg.predive.depthGraceMs / 1000u));
+        else if (!depthSilent && prevDepthSilent && !pseq.failed())
+            Serial.println("pre-dive depth: bus answering again");
+        prevDepthSilent = depthSilent;
+
         if (preFail && !prevPreFail) {
             uint16_t step = static_cast<uint16_t>(g_loop->prediveSeq().current());
             for (int s = 0; s < predive::S_COUNT; ++s)
@@ -561,6 +578,14 @@ static void controlTask(void*) {
                     break;
                 }
             surfacePredive(false, step);
+            // The same verdict in words. The durable row carries the step number
+            // only, and a depth FAIL now means exactly one thing — the bus never
+            // answered — which is a repair, not something the diver can fix by
+            // surfacing and retrying. The `PRE,` status word cannot say that, so
+            // the console does. (Only the depth step has a reason to give today;
+            // the other steps are already named by their number.)
+            const char* why = g_loop->prediveSeq().depthWhy();
+            if (why[0]) Serial.printf("pre-dive: FAIL step %u: %s\n", (unsigned)step, why);
         } else if (prePass && !prevPrePass) {
             surfacePredive(true, 0);
         }
@@ -760,6 +785,7 @@ static void buildControlConfig() {
     g_ctrlCfg.predive.airTolPct = PREDIVE_AIR_TOL_PCT;
     g_ctrlCfg.predive.airStableSamples = PREDIVE_AIR_STABLE;
     g_ctrlCfg.predive.depthMaxM = PREDIVE_DEPTH_MAX_M;
+    g_ctrlCfg.predive.depthGraceMs = PREDIVE_DEPTH_GRACE_MS;
 
     g_ctrlCfg.pulseTest.pulses = PREDIVE_TEST_PULSES;
     g_ctrlCfg.pulseTest.baselineSamples = PREDIVE_TEST_BASELINE;

@@ -152,7 +152,10 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
         // The step asks "is the rig on the surface", which is only answerable
         // with a measurement: a dead depth bus used to arrive here as the 0.0 m
         // main.cpp fabricated for it, and "no sensor" was rewarded with a PASS
-        // (review H3 — closed as part of C1).
+        // (review H3 — closed as part of C1). Feeding the honest flag is also
+        // what lets the step grant the bus cfg_.depthGraceMs of patience instead
+        // of FAILing the first silent cycle: the flag says "not measured", and
+        // the step waits for it to stop saying that.
         pi.depthValid = in.pressureValid;
         pi.vbat = in.vbat;
         pi.nowMs = nowMs;

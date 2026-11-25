@@ -135,6 +135,27 @@
 #define PREDIVE_AIR_TOL_PCT         8.0f
 #define PREDIVE_AIR_STABLE          10
 #define PREDIVE_DEPTH_MAX_M         1.0f
+// How long S_DEPTH waits for the pressure bus to answer AT ALL before it FAILs.
+// An invalid depth sample no longer condemns the step on the cycle it lands (a
+// one-cycle verdict let a shared-Wire1 hiccup abort a 2-minute sequence), but a
+// bus that never answers still ends in FAIL — never a silent hang. The bound is
+// the patience a dive already grants a depth sample (PRESSURE_STALE_MS below,
+// pinned equal by the static_assert there).
+//
+// What it costs, on the real firmware, in the two shapes the fault arrives in:
+//   * bus dies mid-pre-dive: main.cpp only clears depthValid once
+//     PRESSURE_STALE_MS has passed without a sample, so the sequence now waits
+//     3 s + 3 s = 6 s from the last measurement before the FAIL. ms5837's backoff
+//     tops out at 4 s, so a driver in backoff survives this — the case the grace
+//     exists for.
+//   * bus never answered (nothing locked, or locked and never converting):
+//     depthValid is false from boot, so S_DEPTH's own 3 s grace is the whole
+//     wait, and a driver sitting at the 4 s backoff cap can be silent past it and
+//     take a FAIL it would have survived with a longer bound. Deliberate: a
+//     verdict beats a sequence that never returns one. It is a Config field
+//     (predive::Config::depthGraceMs), so the bound is tunable without touching
+//     the state machine.
+#define PREDIVE_DEPTH_GRACE_MS      3000
 // The cell (pulse) test: pulse the valve, every fitted cell must react. The
 // verdict is only trustworthy if the requested pulses actually left the valve,
 // which is why the duty window is checked against them below.
@@ -197,6 +218,13 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
 #define WATER_DENSITY_KGL           1.025f
 #define SURFACE_PRESSURE_BAR        1.013f
 #define PRESSURE_STALE_MS           3000
+// The pre-dive's DEPTH step grants this same bus the same patience before it
+// FAILs the sequence (PREDIVE_DEPTH_GRACE_MS). One policy, pinned: waiting on a
+// depth bus longer than a dive is willing to wait on it would leave the diver
+// watching a pre-dive that is politely polling something the rest of the
+// firmware has already called dead. A shorter pre-dive grace is allowed.
+static_assert(PREDIVE_DEPTH_GRACE_MS <= PRESSURE_STALE_MS,
+              "pre-dive depth grace must not outlast the dive's depth staleness watchdog");
 
 // --- HUD pattern timing (ms) ------------------------------------------------------
 #define HB_AUTO_ON_MS               500     // 1 Hz

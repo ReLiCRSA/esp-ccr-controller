@@ -446,7 +446,12 @@ diver, because a FAIL never re-arms itself).
 PRE,<warmup>,<air>,<solenoid>,<depth>,<battery>,<passed>
 ```
 step status ∈ 0 PENDING, 1 RUNNING, 2 PASS, 3 FAIL; `passed` 0/1. The order of
-the five steps is fixed.
+the five steps is fixed. A `1` on `<depth>` covers two waits the wire does not
+distinguish: the rig is off the surface, or the pressure bus is not answering
+(the step grants it `PREDIVE_DEPTH_GRACE_MS` of patience before FAILing, and the
+console names which). Deliberate — a handset that reads a long-running depth step
+as "not passed yet" is right either way — and a depth FAIL (3) never arrives
+until that grace has run.
 
 ```
 CELLS,<state>,<pass_mask>,<fail_mask>,<requested>

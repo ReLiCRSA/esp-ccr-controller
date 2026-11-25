@@ -433,18 +433,93 @@ void test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alar
 // a PASS. A dead bus used to be handed the 0.0 m that means "on the surface",
 // which is the one answer that makes the depth step happy.
 void test_pre_dive_refuses_a_dead_depth_bus() {
+    Config c = benchCfg();
+    const int32_t graceTicks = (int32_t)(c.predive.depthGraceMs / Loop::kTickMs);
+    Loop loop(c);
+    Plant plant(loop);
+    uint32_t now = 0;
+    loop.prediveStart(now);
+
+    // The bus is dead for the whole pre-dive. The grace means the FAIL is no
+    // longer the first silent cycle — but it must still arrive, on the grace's
+    // schedule, and it must say the grace is what expired (finding C1: an
+    // unmeasured depth may never be believed, and may never hang the sequence).
+    int32_t depthRunTick = -1, failTick = -1;
+    bool silentSeen = false, pendingMidGrace = false;
+    for (int i = 0; i < 400 && !loop.prediveFailed(); ++i) {  // 40 s
+        plant.tick(now, 0.0f, /*fresh=*/true, /*pressureValid=*/false);
+        if (depthRunTick < 0 && loop.prediveStatus(predive::S_DEPTH) == predive::RUNNING)
+            depthRunTick = i;
+        if (depthRunTick >= 0 && loop.prediveSeq().depthBusSilent()) silentSeen = true;
+        if (depthRunTick >= 0 && i == depthRunTick + graceTicks / 2)
+            pendingMidGrace = loop.prediveStatus(predive::S_DEPTH) == predive::RUNNING &&
+                              !loop.prediveFailed();
+        if (loop.prediveFailed()) failTick = i;
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(pendingMidGrace,
+                             "the DEPTH step failed while the grace still had room for the "
+                             "bus to answer");
+    TEST_ASSERT_TRUE_MESSAGE(silentSeen,
+                             "a dead depth bus was never visible as a silent depth bus");
+    TEST_ASSERT_TRUE_MESSAGE(loop.prediveFailed(),
+                             "a dead depth bus produced no FAIL: either the sequence passed "
+                             "without a depth measurement (finding C1) or the grace expired "
+                             "with no verdict (a hang)");
+    TEST_ASSERT_TRUE_MESSAGE(failTick - depthRunTick >= graceTicks,
+                             "the depth FAIL landed before the grace had run");
+    TEST_ASSERT_TRUE_MESSAGE(failTick - depthRunTick <= graceTicks + 2,
+                             "the depth FAIL was not bounded by the grace: the pre-dive hung "
+                             "past it instead of returning a verdict");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(predive::FAIL, loop.prediveStatus(predive::S_DEPTH),
+                                    "the DEPTH step did not fail on a dead bus");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("depth bus never answered (grace expired)",
+                                     loop.prediveSeq().depthWhy(),
+                                     "the pre-dive FAIL did not say the grace is what expired");
+    TEST_ASSERT_FALSE(loop.predivePassed());
+    TEST_ASSERT_FALSE_MESSAGE(loop.requestAuto(true),
+                              "AUTO granted to a rig that cannot measure depth");
+}
+
+// Follow-up #2, end to end: the pressure bus hiccups for 2 s and lands exactly on
+// the DEPTH step. Before the grace that aborted a 2-minute sequence on one cycle;
+// now the sequence rides through it and the dive goes ahead. The pair of asserts
+// is the point — a grace that never fails would be a lockout that never ends, and
+// the dead-bus case above is the other half of the pair.
+void test_pre_dive_rides_through_a_short_depth_bus_dropout() {
     Loop loop(benchCfg());
     Plant plant(loop);
     uint32_t now = 0;
     loop.prediveStart(now);
-    plant.run(now, 0.0f, 15.0f, /*fresh=*/true, /*pressureValid=*/false);
 
-    TEST_ASSERT_TRUE_MESSAGE(loop.prediveFailed(), "pre-dive passed with no depth sensor");
-    TEST_ASSERT_EQUAL_UINT8_MESSAGE(predive::FAIL, loop.prediveStatus(predive::S_DEPTH),
-                                    "the DEPTH step did not fail on a dead bus");
-    TEST_ASSERT_FALSE(loop.predivePassed());
-    TEST_ASSERT_FALSE_MESSAGE(loop.requestAuto(true),
-                              "AUTO granted to a rig that cannot measure depth");
+    // Normal bus until the DEPTH step is running.
+    int i = 0;
+    for (; i < 400 && loop.prediveStatus(predive::S_DEPTH) != predive::RUNNING; ++i)
+        plant.tick(now, 0.0f);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(predive::RUNNING, loop.prediveStatus(predive::S_DEPTH),
+                                    "the pre-dive never reached the DEPTH step");
+
+    // 2 s of silence — inside the grace — fed the exact 0.0 m the old firmware
+    // fabricated for "unknown". It must decide nothing either way.
+    for (int k = 0; k < 20; ++k) plant.tick(now, 0.0f, /*fresh=*/true, /*pressureValid=*/false);
+    TEST_ASSERT_FALSE_MESSAGE(loop.prediveFailed(),
+                              "a 2 s depth dropout aborted the pre-dive sequence");
+    TEST_ASSERT_TRUE_MESSAGE(loop.prediveSeq().depthBusSilent(),
+                             "the dropout was not visible as a silent depth bus");
+    TEST_ASSERT_EQUAL_STRING("depth bus silent, waiting", loop.prediveSeq().depthWhy());
+    TEST_ASSERT_FALSE(loop.predivePassed());  // still running: nothing was thrown away
+
+    // The bus answers again: the step judges the sample it gets and the sequence
+    // finishes on its own, with the earlier steps' verdicts intact.
+    for (int k = 0; k < 100; ++k) plant.tick(now, 0.05f);
+    TEST_ASSERT_TRUE_MESSAGE(loop.predivePassed(),
+                             "the pre-dive did not finish after a depth dropout shorter than "
+                             "the grace");
+    TEST_ASSERT_EQUAL_UINT8(predive::PASS, loop.prediveStatus(predive::S_DEPTH));
+    TEST_ASSERT_EQUAL_UINT8(predive::PASS, loop.prediveStatus(predive::S_SOLENOID));
+    TEST_ASSERT_FALSE(loop.prediveFailed());
+    TEST_ASSERT_TRUE_MESSAGE(loop.requestAuto(true),
+                             "AUTO refused after a pre-dive that passed through a dropout");
 }
 
 int main() {
@@ -458,5 +533,6 @@ int main() {
     RUN_TEST(test_blind_depth_window_still_clocks_cns_and_loads_tissues);
     RUN_TEST(test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alarm);
     RUN_TEST(test_pre_dive_refuses_a_dead_depth_bus);
+    RUN_TEST(test_pre_dive_rides_through_a_short_depth_bus_dropout);
     return UNITY_END();
 }

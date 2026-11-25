@@ -22,7 +22,8 @@ tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
                                  --cal-air --predive --dive-persist    # 149 checks
 tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file graders, no board: 75 cases
-tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 64 checks; the 1 FAIL is the dive-identity grader defect closed in the next section
+tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 69 checks
+tools/.../python tools/web_probe.py --selftest  # the dive-identity graders, no board: 13 cases
 ```
 
 `--expect-depth` is how the operator says *this bench has a depth sensor fitted*:
@@ -611,6 +612,55 @@ the same question without costing bytes at 2 Hz on the in-water link and without
 every existing client to re-validate a row shape. What that gives up is stated plainly:
 a **dive file** still cannot say which sensor its depths came from, so on a board with
 both chips fitted, a logged dive does not carry its own provenance.
+
+### The dive identity check was grading slot numbers, not dives (fixed 2026-11-25)
+
+The `GET DS` run came back with `web_probe.py` **64 checks, 1 failure**:
+
+```
+[FAIL] dive CSV identity row is the v3 shape with a date field: DIVE,10,0,3,3,clock-unset
+```
+
+Nothing about the firmware was wrong. The row is exactly what a dive started with no
+clock must say — and this bench has no clock to keep: EN is a CHIP_PU power-down, and
+`hw_accept --dive-persist` ends with an EN reset, so every dive between that reset and
+the next TIME SET is honestly epoch 0. The grader was the defect, twice over.
+
+1. **It graded `max(slot)`, not the newest dive.** The FIFO reuses slots. The log
+   spelled it out: the run's dated dive sat at `(2, 1795564361, 102)` while slot 10
+   held `(10, 0, 100)` — an undated dive from three power cycles earlier. The check
+   had been green for runs purely because slot 10 had *happened* to hold a dated
+   dive before.
+2. **It demanded that a date exist, and never checked that it was true.** The one
+   lie that matters on this row — the ISO string is rendered by the firmware from
+   the stored epoch, so the two must agree — was unchecked. A truncated epoch
+   printing a plausible 1970 date passed.
+
+The fix grades **agreement**: epoch 0 ⇔ `clock-unset`, and a non-zero epoch ⇔ the
+exact UTC rendering of that epoch, plus the newest dive picked by `seq` from
+`LOG LIST` (slot order only as an explicit fallback when every `seq` is 0 — an
+older controller). The demand that a date must *exist* moved to where it is earned:
+`--dive-cycle` now posts `TIME SET` first — a surface client IS the time source,
+the page's own check already insists the browser page does exactly this — and then
+holds the dive it created to that number. On the bench: `TIME SET 1795565718`,
+dive 4 recorded `DIVE,4,1795565718,3,3,2026-11-25T00:15:18Z`, and the delta
+(0..5 s) is what would catch a dive stamped at *close* rather than at start — same
+shape, same agreement, minutes late (`divelog.h:62`: the header epoch is the start's).
+
+`web_probe.py --selftest` is new: 13 lying cases for the two graders (9 identity
+rows — honest dated, honest undated, invented date, hidden date, date a minute off,
+plausible 1970, v2 five-field row, non-numeric epoch, absent row — and 4 FIFO
+selections, including the exact ten-slot list above, so the `max(slot)` bug cannot
+return unnoticed). Seven mutations, seven reds — the seventh being an *accusation
+printed beside a PASS*: the first version rendered
+`[PASS] ... — clock-unset hides a date the file already stores`, because the
+failure-explaining clause fired on the passing path too. A detail that reads like
+distrust of a line the check just accepted is a defect; the selftest now pins the
+message, not only the verdict.
+
+Gate after: `web_probe.py` **69 checks 0 failures** on the same flashed build.
+The tool now writes the clock on the surface link — deliberate, and the same
+convention the browser page already follows; it changes no control state.
 
 ### Calibration honesty: the reply is a receipt, so the verdict is its own row
 

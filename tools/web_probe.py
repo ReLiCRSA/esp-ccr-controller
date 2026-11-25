@@ -29,15 +29,19 @@ What it verifies, and what each part is for:
            `age_s` field excepted (seconds since the sensor's last good read, and
            the two sends are ~0.4 s apart); the over-long case is compared on its
            refusal only, because UART2 additionally dispatches the leftover tail as
-           its own line - docs/HANDSET_PROTOCOL.md says why. (one command path, two
-           transports: the project's central claim); the over-long case is
-           compared on its refusal only, because UART2 additionally dispatches
-           the leftover tail as its own line - docs/HANDSET_PROTOCOL.md says why.
-  DIVE     --dive-cycle: DIVE START from the browser must take the radio out
-           from under an associated client and kill its socket, the dive must
-           then close over UART2 (the web cannot close the dive that switched
-           itself off), and the AP must come back with a fresh WebSocket
-           working. Needs --handset for exactly that reason.
+           its own line - docs/HANDSET_PROTOCOL.md says why.
+  DIVE     --dive-cycle: the probe posts the clock first (a surface client IS
+           the time source - the page the browser loads does the same), DIVE
+           START from the browser must take the radio out from under a client
+           and kill its socket, the dive must then close over UART2 (the web
+           cannot close the dive that switched itself off), the AP must come
+           back with a fresh WebSocket working, and the dive this run created
+           must carry the clock this run posted - dated, and rendering that
+           epoch, not merely "some date". Needs --handset for exactly that
+           reason.
+
+  --selftest grades the dive identity-row grader on known-good and lying rows;
+           no board, no ports.
 
 Needs a station joined to the controller's AP first: SSID `ESP-CCR-XXXX`, where
 XXXX is the MAC tail a scan shows; WPA2; password = the AP_PASS setting. HOW the
@@ -48,7 +52,7 @@ broadcasting. If the station is not joined, the checks that need it report
 themselves as not evaluated rather than failing the firmware for it.
 
     tools/web_probe.py [--host 192.168.4.1] [--handset /dev/ttyUSB1]
-                       [--dive-cycle] [--no-dns]
+                       [--dive-cycle] [--no-dns] [--selftest]
 
 Exit 0 = every claim held. 1 = one did not. --handset is optional; without it the
 cross-transport equality and dive-cycle phases are skipped and the rest still
@@ -57,6 +61,7 @@ could not observe.
 """
 import argparse
 import base64
+import datetime
 import hashlib
 import os
 import re
@@ -103,16 +108,6 @@ MATRIX = [
     # depth provenance out of its own copy is exactly what this catches.
     ("GET DS", "which chip owns depth, and whether it is being used",
      "identical-except-age"),
-    # Calibration honesty. `CAL O2` and `CAL DEPTH` are in the grammar but have no
-    # consumer on the board, so they must be REFUSED — and refused the same way on
-    # both transports, or a handset has a calibration the phone does not (and vice
-    # versa). `GET CALAIR` is the verdict of the one calibration that does run:
-    # code 0 (nothing asked since this power-up) is deterministic here because this
-    # probe never asks for one, so the two transports have to agree byte for byte.
-    ("CAL DEPTH", "depth tare refused: nothing consumes it", "identical"),
-    ("CAL O2", "O2 calibration refused: no sequencer on the board", "identical"),
-    ("CAL O2 CONFIRM", "no phantom two-step arm to confirm", "identical"),
-    ("GET CALAIR", "the air calibration's real verdict", "identical"),
     # Calibration honesty. `CAL O2` and `CAL DEPTH` are in the grammar but have no
     # consumer on the board, so they must be REFUSED — and refused the same way on
     # both transports, or a handset has a calibration the phone does not (and vice
@@ -597,6 +592,114 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
         ser.close()
 
 
+def parse_log_list(lines):
+    """`L,<slot>,<epoch>,<seq>` lines as tuples; missing fields read 0."""
+    out = []
+    for l in lines:
+        p = l.split(",")
+        if len(p) > 1 and p[1].isdigit():
+            out.append((int(p[1]),
+                        int(p[2]) if len(p) > 2 and p[2].isdigit() else 0,
+                        int(p[3]) if len(p) > 3 and p[3].isdigit() else 0))
+    return out
+
+
+def newest_dive(dives):
+    """The most recent dive, not the highest-numbered slot.
+
+    The FIFO reuses slots, so `max(slot)` is whichever dive last landed in slot
+    10. On this bench that was `(10, 0, 100)` — a dive recorded with no clock,
+    three power cycles back — while the run's own dated dive sat in slot 2 as
+    `(2, 1795564361, 102)`. `seq` (the fourth `L,` field, appended 2026-11-24)
+    is the dive order; a controller that predates the field reports 0 for every
+    row, and then the slot number is the only ordering hint left. All-zero is
+    detected, not assumed.
+    """
+    if not dives:
+        return None
+    if all(d[2] == 0 for d in dives):
+        return max(dives, key=lambda d: d[0])
+    return max(dives, key=lambda d: d[2])
+
+
+def grade_dive_identity(row):
+    """The `DIVE,` identity row, graded against its own epoch. A pure function
+    so --selftest can feed it lies.
+
+    Two defects to catch, and "always demand a date" catches neither while
+    failing dives that were honestly stored undated (EN is a CHIP_PU power-down
+    on this board, so every power cycle ends with an unset clock, and dives
+    recorded before the next TIME SET legitimately carry epoch 0):
+
+      * the date is not the epoch. The ISO string is rendered by the firmware
+        from the stored epoch — one truth on the flash (spec §5). If the two
+        disagree, something is computed wrong: a truncated epoch prints a
+        plausible 1970 date, and a date that merely *looks* like a UTC
+        timestamp is exactly as wrong as a clock a year off.
+      * `clock-unset` beside a non-zero epoch hides a date the file already
+        stores, and a real date beside epoch 0 invents one.
+
+    The shape is graded because the probe runs against this firmware, whose
+    identity row is the v3 six-field one; a five-field row means older firmware,
+    which is a different board state — and worth stating out loud rather than
+    grading a date field that is not there.
+
+    The demand that a date must EXIST lives in dive_cycle(), which sets the
+    clock and then holds the dive it created to that number: the one dive on
+    this bench whose clock state is known at dive time.
+    """
+    checks = []
+    f = row.split(",")
+    shape = (len(f) == 6 and f[0] == "DIVE" and all(x.isdigit() for x in f[1:5]))
+    checks.append(("dive CSV identity row is the v3 shape (slot,epoch,rows,events,date)",
+                   shape, row or "no DIVE, row in the export"))
+    if not shape:
+        return checks
+    epoch = int(f[2])
+    want = ("clock-unset" if epoch == 0 else
+            datetime.datetime.fromtimestamp(
+                epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    reason = ""
+    if f[5] != want:
+        reason = (" — epoch 0 has no date to render; a real date here was invented"
+                  if epoch == 0 else
+                  " — clock-unset hides a date the file already stores"
+                  if f[5] == "clock-unset" else
+                  " — the date and the epoch are not the same moment")
+    checks.append(("the identity row's date is the epoch it carries, in UTC",
+                   f[5] == want,
+                   f"`{row}`: epoch {epoch} renders as {want!r}, the row says "
+                   f"{f[5]!r}{reason}"))
+    return checks
+
+
+def uart_lines(port, cmd, want, window=4.0):
+    """One command on a freshly opened UART2; every reply line starting `want`.
+
+    Opening resets the bridge ESP32 on this bench, so the open gets the same
+    settle-and-flush treatment as uart_answer: bridge boot, one bare newline to
+    draw whatever the controller's line buffer is holding, then the command.
+    """
+    ser = open_quiet(port)
+    try:
+        time.sleep(1.0)
+        ser.reset_input_buffer()
+        ser.write(b"\r\n")
+        ser.flush()
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        ser.write((cmd + "\r\n").encode())
+        ser.flush()
+        got, end = [], time.time() + window
+        while time.time() < end:
+            l = ser.readline().decode(errors="replace").strip()
+            if l.startswith(want):
+                got.append(l)
+        return got
+    finally:
+        ser.close()
+
+
 def dive_row_equality(host, port, checks):
     """`LOG EXPORT n` on the handset and `GET /dive/<n>.csv` on the web are the
     same bytes.
@@ -626,21 +729,22 @@ def dive_row_equality(host, port, checks):
 
     ser.write(b"LOG LIST\r\n")
     ser.flush()
-    slots, end = [], time.time() + 2.5
+    dives, end = [], time.time() + 2.5
     while time.time() < end:
         l = ser.readline().decode(errors="replace").strip()
         if l.startswith("L,"):
-            parts = l.split(",")
-            if len(parts) > 1 and parts[1].isdigit():
-                slots.append(int(parts[1]))
-    if not slots:
+            dives.extend(parse_log_list([l]))
+    newest = newest_dive(dives)
+    if newest is None:
         ser.close()
         checks.append(("dive rows identical on both transports", None,
                        "no dive on the board to export (open and close one, or "
                        "run --dive-cycle)"))
         return
 
-    slot = max(slots)
+    # Newest by sequence, not by slot number: the export must be the dive the
+    # bench most recently made, and the FIFO says which one that is.
+    slot = newest[0]
     try:
         with urllib.request.urlopen(f"http://{host}/dive/{slot}.csv", timeout=10) as r:
             http_rows = [l.strip() for l in r.read().decode(errors="replace").split("\n")
@@ -672,17 +776,17 @@ def dive_row_equality(host, port, checks):
                 print(f"      first difference:\n        http: {a}\n        uart: {b}")
                 break
 
-    # The identity row's v3 append: a human-readable UTC start, rendered by the
-    # firmware from the stored epoch (one truth on the flash). `clock-unset` is
-    # the honest answer when the dive started with no clock — a wrong date is
-    # worse than no date, but this gate exists to make sure "no date" is loud
-    # and rare, not the default.
+    # The identity row, graded against its own epoch rather than against a
+    # demand that every dive be dated. `clock-unset` is the honest field when
+    # the dive started with no clock — see grade_dive_identity for why a check
+    # that insists on a date catches nothing and fails dives that lied in no
+    # way; the insistence belongs where the probe controls the clock.
     head_row = next((l for l in http_rows if l.startswith("DIVE,")), "")
-    m = re.match(r"^DIVE,(\d+),(\d+),(\d+),(\d+),"
-                 r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z|clock-unset)$", head_row)
-    checks.append(("dive CSV identity row is the v3 shape with a date field",
-                   bool(m) and m.group(5) != "clock-unset",
-                   head_row or "no DIVE, row in the export"))
+    checks.extend(grade_dive_identity(head_row))
+    if head_row and len(head_row.split(",")) > 2 and head_row.split(",")[2] == "0":
+        print("  note: the newest dive on this board started with no clock — its "
+              "date field is honestly `clock-unset`. --dive-cycle dates the dive "
+              "it makes; this phase only grades what the firmware stored.")
     ser.close()
 
 
@@ -774,6 +878,18 @@ def dive_cycle(host, handset, checks):
     if before_http != 200:
         return
 
+    # A surface client IS the time source (spec §3): the page the browser loads
+    # posts the phone's clock on open — there is a page check that it does — and
+    # a probe that drives the same dive lifecycle without posting one records an
+    # undated dive and leaves it in the FIFO for the next reader to trip over.
+    # So the probe does what the page does, and then holds the dive it creates
+    # to that number: the only dive on this bench whose clock state is known at
+    # dive time, which is what makes demanding a date fair.
+    epoch = int(time.time())
+    posted = uart_answer(handset, f"TIME SET {epoch}", want="OK")
+    checks.append(("the probe posts the clock like the page does (TIME SET)",
+                   bool(posted), f"UART2 answered {posted!r}, epoch {epoch}"))
+
     ws = Ws(host)
     ws.send("DIVE START")
     answer, marker, _u, _c = ws.lines_until_marker(limit=3.0)
@@ -841,6 +957,114 @@ def dive_cycle(host, handset, checks):
             checks.append(("a fresh WebSocket works after the dive", False,
                            f"{type(e).__name__}: {e}"))
 
+    # The dive this run just made, with the clock this run just posted: it must
+    # be dated, and its identity row must render the epoch it stores (that
+    # agreement is graded by grade_dive_identity on any row; what is added here
+    # is the delta between the epoch we sent and the epoch the dive recorded —
+    # DIVE START reads the clock at most a few seconds after TIME SET lands (0
+    # if it lands in the same second), so a small delta is honest and anything
+    # else is drift or a lost clock). One firmware bug this catches that the
+    # agreement check cannot: a dive stamped at close rather than at start would
+    # carry the END epoch — same shape, same agreement, minutes later than the
+    # dive actually began (divelog.h:62 — the header epoch is the START's).
+    if code == 200 and posted:
+        import urllib.request
+        newest = newest_dive(parse_log_list(uart_lines(handset, "LOG LIST", "L,")))
+        head, stored = "", -1
+        try:
+            if newest is None:
+                raise LookupError("LOG LIST answered no L, rows after the dive")
+            with urllib.request.urlopen(f"http://{host}/dive/{newest[0]}.csv",
+                                        timeout=10) as r:
+                rows = [x.strip() for x in r.read().decode(errors="replace").split("\n")
+                        if x.strip()]
+            head = next((x for x in rows if x.startswith("DIVE,")), "")
+            fields = head.split(",")
+            if len(fields) > 2 and fields[2].isdigit():
+                stored = int(fields[2])
+        except Exception as e:                                    # noqa: BLE001
+            checks.append(("the dive this run created carries the clock this run posted",
+                           False, f"{type(e).__name__}: {e}"))
+        else:
+            checks.extend(grade_dive_identity(head))
+            checks.append(("the dive this run created carries the clock this run posted",
+                           epoch <= stored <= epoch + 5,
+                           f"TIME SET {epoch}, then DIVE START; the dive recorded epoch "
+                           f"{stored} — start-stamped dives sit 0..5 s behind the set; "
+                           f"0/clock-unset means the dive is undated and anything "
+                           f"larger means close-stamping or a lost clock ({stored})"))
+
+
+def selftest_identity():
+    """grade_dive_identity on known-good rows and rows that lie. No board, no
+    ports: the grader is the thing under test.
+
+    The two honest rows are this bench's real shapes — a dive stored with a
+    clock (the one hw_accept --dive-persist closes after its TIME SET) and one
+    stored without (EN is CHIP_PU here, so dives between an EN reset and the
+    next TIME SET carry epoch 0 honestly). The lies are the ways the ISO field
+    and the epoch come apart, plus the older five-field row.
+    """
+    cases = [
+        ("epoch 0 with clock-unset is the honest undated dive",
+         "DIVE,10,0,3,3,clock-unset", None),
+        ("epoch 0 with a real date: a date was invented",
+         "DIVE,10,0,3,3,2026-11-24T23:52:41Z", "was invented"),
+        ("a set epoch rendered clock-unset: the file hides its own date",
+         "DIVE,2,1795564361,3,3,clock-unset", "hides a date"),
+        ("a date a minute off the epoch is not the same dive start",
+         "DIVE,2,1795564361,3,3,2026-11-24T23:53:41Z", "not the same moment"),
+        ("a truncated epoch would print a plausible 1970",
+         "DIVE,2,1795564361,3,3,1970-01-01T00:00:00Z", "not the same moment"),
+        ("the right epoch and the right date: nothing to say",
+         "DIVE,2,1795564361,3,3,2026-11-24T23:52:41Z", None),
+        ("a five-field row is older firmware, and is graded as shape",
+         "DIVE,10,0,3,3", "shape"),
+        ("a non-numeric epoch cannot be agreed with anything",
+         "DIVE,10,x,3,3,clock-unset", "shape"),
+        ("an identity row that is absent is not an empty row",
+         "", "no DIVE, row"),
+    ]
+    out = []
+    for name, row, want in cases:
+        got = grade_dive_identity(row)
+        texts = [f"{c[0]}: {c[2]}" for c in got if not c[1]]
+        ok = (not texts) if want is None else any(want in t for t in texts)
+        # A passing check whose detail accuses the row is its own defect: on the
+        # bench the first version of the agreement check printed
+        # `[PASS] ... — clock-unset hides a date the file already stores`, which
+        # reads like the tool does not trust the line it just passed. The
+        # explanation belongs only to failures.
+        accused = [c[0] for c in got if c[1] and any(w in c[2] for w in
+                     ("was invented", "hides a date", "not the same moment"))]
+        ok = ok and not accused
+        out.append((f"identity: {name}", ok,
+                    f"expected a failure mentioning {want!r}, saw {texts}"
+                    if not ok and want is not None else
+                    f"unexpected failures: {texts}; accusations beside PASS: "
+                    f"{accused}" if not ok else ""))
+
+    # The newest-dive selection, on the FIFO contents that made the old grader
+    # fail: `max(slot)` chose 10 — an undated dive three power cycles old — over
+    # the dated dive this run closed in slot 2. The selection is graded because
+    # it is a bug being fixed, and a fix with no lying case can silently return.
+    fifo = [(2, 1795564361, 102), (1, 1795564074, 101), (10, 0, 100),
+            (9, 1795561041, 99), (8, 1795560755, 98), (7, 0, 97),
+            (6, 1795556362, 96), (5, 1795556075, 95), (4, 0, 94), (3, 1795554592, 93)]
+    sel = newest_dive(fifo)
+    out.append(("select: the newest dive is by sequence, not slot number",
+                sel == fifo[0], f"want slot 2 (seq 102), got {sel}"))
+    out.append(("select: a pre-seq controller falls back to slot order, not to seq order",
+                newest_dive([(2, 1795564361, 0), (10, 0, 0)]) == (10, 0, 0),
+                "every seq zero must pick the slot-order fallback — max-by-seq on a "
+                "tie silently returns whatever row was parsed first"))
+    out.append(("select: no dives is None, not a crash or a fabricated pick",
+                newest_dive([]) is None, f"got {newest_dive([])!r}"))
+    out.append(("select: parse_log_list reads seq 0 as a missing field, not as dive zero",
+                parse_log_list(["L,4,1795554306", "L,9,0,97"]) == [(4, 1795554306, 0), (9, 0, 97)],
+                str(parse_log_list(["L,4,1795554306", "L,9,0,97"]))))
+    return out
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -852,7 +1076,19 @@ def main() -> int:
                     help="open a dive from the WebSocket and prove the radio goes "
                          "down under the client and comes back (needs --handset: "
                          "the web cannot close the dive that switched it off)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="grade the dive identity-row grader on known-good and "
+                         "lying rows; no board, no ports, no network")
     args = ap.parse_args()
+
+    if args.selftest:
+        fails = 0
+        for name, ok_, detail in selftest_identity():
+            print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
+                  + ("" if ok_ else f": {detail}"))
+            fails += 0 if ok_ else 1
+        print(f"\n{fails} failure(s)")
+        return 1 if fails else 0
 
     out = []
     print(f"--- HTTP {args.host}")

@@ -150,6 +150,13 @@ public:
     /// wired one up yet is not answering a made-up date.
     void setClock(const wallclock::State* c) { clock_ = c; }
 
+    /// Which chip owns depth right now, published by SensorTask (it owns the
+    /// arbiter and its drivers). Null, or a board built without a depth sensor,
+    /// answers `DS,0,0,0,0,none` — a stated nothing. `GET DS` always answers: a
+    /// protocol-visible command that vanishes under a build flag tells a client
+    /// less than one that says "no source" out loud.
+    void setDepthSource(const bridge::DepthSource* d) { depthSrc_ = d; }
+
     /// The epoch TIME SET asked for, valid until the next command. The router
     /// checked the range; the transport performs the write.
     uint32_t clockEpochPending() const { return clockEpoch_; }
@@ -178,6 +185,7 @@ private:
     void getSpecial(Response& r, const char* key);
     void buildCellsLine(Response& r);
     void buildCalAirLine(Response& r);
+    void buildDepthSourceLine(Response& r);
 
     ctrl::Loop& loop_;
     settings::Registry& reg_;
@@ -190,6 +198,7 @@ private:
     uint32_t clockEpoch_ = 0;
     const cellhist::Hist* hist_ = nullptr;
     const bridge::CalAir* calAir_ = nullptr;
+    const bridge::DepthSource* depthSrc_ = nullptr;
     uint16_t logExportIdx_ = 0;
 };
 

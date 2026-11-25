@@ -28,6 +28,10 @@
 //     the epoch on the handset's console; a handset that does have a clock
 //     (DS3231, GNSS, a phone) should call hsLink.timeSet() at every link-up,
 //     and everything else here stays as it is.
+//   * Shows which chip is producing the depth and whether the controller is
+//     using it (`GET DS`, spec §4). The `T,` line prints a depth either way — a
+//     held value and a measured one are the same bytes — and the FLAGS byte has no
+//     stale-sensor bit, so asking is the only way a handset can know.
 //   * Two-press confirmation on DIVE START / DIVE END: those two commands
 //     start and stop the recording, so one brush of a button must not.
 //   * No dynamic memory, no RTOS tricks, one loop().
@@ -74,6 +78,8 @@ struct View {
     bool haveClock = false;        // answered at least once since boot
     hs::CalAir cal{};              // the air calibration's verdict (CALAIR,)
     bool haveCal = false;
+    hs::DepthSource ds{};          // which chip owns depth, and is it live (DS,)
+    bool haveDs = false;
 } view;
 
 // A callback writer: hs::Link calls this for every command it sends.
@@ -119,6 +125,15 @@ static void onCalAir(const hs::CalAir& c, void* ctx) {
     v.cal = c;
     v.haveCal = true;
 }
+static void onDs(const hs::DepthSource& d, void* ctx) {
+    // The field to act on is `used`, not `locked`. A source can hold the slot, be
+    // identified and be healthy while its readings stop arriving; the depth on the
+    // `T,` line is then the last good value, and nothing on that line says so.
+    View& v = *static_cast<View*>(ctx);
+    v.ds = d;
+    v.haveDs = true;
+}
+
 static void onLine(const char* line, void* ctx) {
     // Unknown / unstructured (dive CSV rows, HIST, future lines): counted.
     View& v = *static_cast<View*>(ctx);
@@ -284,6 +299,16 @@ static void draw() {
         Serial.printf("  air cal: sampling (%d)", view.cal.samples);
     else
         Serial.printf("  ** CELLS NOT CALIBRATED: %s **", hs::calAirText(view.cal.code));
+    // The depth number above, and what stands behind it. Split out because it is
+    // the one fact on this screen a diver cannot infer from any other part of it:
+    // "18.35 m" looks the same whether a chip measured it 0.4 s ago or the
+    // controller has been holding it for half a minute.
+    if (!view.haveDs) Serial.printf("  depth src ?");
+    else {
+        char dsTxt[96];
+        if (hs::depthSourceText(view.ds, dsTxt, sizeof(dsTxt)))
+            Serial.printf(view.ds.used ? "  [%s]" : "  ** %s **", dsTxt);
+    }
     if (!view.linkUp) Serial.printf("   *** LINK DOWN ***");
     if (view.lastErr[0]) { Serial.printf("  ERR:%s", view.lastErr); view.lastErr[0] = 0; }
     else if (view.lastNote[0]) { Serial.printf("  (%s)", view.lastNote); view.lastNote[0] = 0; }
@@ -312,6 +337,7 @@ void setup() {
     h.onLine = onLine;
     h.onClock = onClock;
     h.onCalAir = onCalAir;
+    h.onDepthSource = onDs;
     h.onLinkDown = onLinkDown;
     h.onLinkUp = onLinkUp;
     hsLink.begin(putLine, nullptr, h);
@@ -322,6 +348,7 @@ void setup() {
     hsLink.getPre();
     hsLink.getTime();             // do we have a clock at all? (spec §3)
     hsLink.getCalAir();           // and are the cells calibrated? (spec §3)
+    hsLink.getDepthSource();      // and which chip is the depth coming from? (spec §4)
     Serial.println("ESP-CCR handset up");
     Serial.println("clock unset? type the unix epoch and Enter, e.g. 1795517641");
 }
@@ -385,6 +412,14 @@ void loop() {
         lastCalMs = now;
         hsLink.getCalAir();
     }
+
+    // ... and the depth source. `locked` cannot change without a power cycle, but
+    // `used`/`healthy`/`age_s` can change at any moment, and a stale depth sensor
+    // has no bit in T,'s FLAGS byte — asking is the only way to find out. 10 s is
+    // generous: the controller's own staleness gate is far tighter than that, and
+    // this is one 40-character line per 10 s against a 2 Hz downlink.
+    static uint32_t lastDsMs = 0;
+    if (view.linkUp && now - lastDsMs > 10000u) { lastDsMs = now; hsLink.getDepthSource(); }
 
     alarmPattern(now);
     runBuzzer(now);

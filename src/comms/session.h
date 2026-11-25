@@ -82,6 +82,12 @@ public:
     /// rather than a date invented out of a zero.
     void setClock(const wallclock::State* c) { if (router_) router_->setClock(c); }
 
+    /// Which chip owns depth (see CommandRouter::setDepthSource). SensorTask
+    /// publishes the snapshot; both transports read the same copy.
+    void setDepthSource(const bridge::DepthSource* d) {
+        if (router_) router_->setDepthSource(d);
+    }
+
     /// SAFE mode: refuse every command but ACK (see CommandRouter::setSafeLockout).
     void setSafeLockout(bool on) { if (router_) router_->setSafeLockout(on); }
 

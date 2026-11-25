@@ -179,6 +179,48 @@ keeps compiling when it does. A button for either must show the refusal — a
 "calibrated" tick from `onOk` would be a lie about the machine.
 
 
+### Depth: which chip produced it, and whether it is being used
+
+```cpp
+h.onDepthSource = [](const hs::DepthSource& d, void*) {
+    char txt[96];
+    if (hs::depthSourceText(d, txt, sizeof(txt))) show(txt);
+};
+hsLink.getDepthSource();          // once at link-up, then every ~10 s
+```
+
+The `T,` line always carries a depth, and it carries it the same way whether a
+chip measured it 0.4 s ago or the controller has been **holding** the last good
+value for half a minute. There is no stale-sensor bit in `T,`'s FLAGS byte either.
+So a handset that shows metres cannot tell a diver which of the two he is looking
+at unless it asks:
+
+```
+DS,<locked>,<used>,<healthy>,<age_s>,<identity>
+DS,1,1,1,0,LPS28DFW @0x5D        measuring, last read under a second ago
+DS,1,0,1,12,LPS28DFW @0x5D       **HELD** — no reading from that chip for 12 s
+DS,0,0,0,0,none                  nothing owns depth: no metres are being made
+```
+
+**Read `used`, not `locked`.** `locked` is the boot decision — the controller picks
+its depth sensor by identity at power-up and keeps it until the next power cycle,
+because swapping the source of depth mid-dive is not a thing a diver can survive
+being surprised by. So `locked` never changes under water; `used` is the live one,
+and `locked=1, used=0` is the case that matters.
+
+Three client rules:
+
+* **`ERR unknown key` is not "no sensor".** Older controllers do not know the
+  command. That answers "this controller cannot say", which is a different fact
+  from `DS,0,0,0,0,none`. Show nothing in the first case; the second is the one
+  that deserves a warning.
+* **`identity` is text, not an enum.** It is the driver's own wording and includes
+  the I2C address it was found at (`@0x5D`); a future controller may reword it.
+  Display it; do not `switch` on it.
+* **One line per query, not one per sample.** Do not ask at 2 Hz. 10 s is plenty —
+  the controller's own staleness gate is far tighter, and if you only need to know
+  at link-up, ask once.
+
 ### Reading the dive log from a handset
 
 `logList()` answers one `L,<slot>,<epoch>,<seq>` row per stored dive,

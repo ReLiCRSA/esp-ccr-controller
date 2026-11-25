@@ -565,6 +565,74 @@ void test_cal_air_verdicts_reach_the_wire_once_each() {
                              "the refusal did not reach the handset downlink");
 }
 
+// ---- the depth-source snapshot (what `GET DS` answers from) -----------------
+
+void test_the_depth_source_publisher_leaves_nothing_to_interpret() {
+    // bridge::publishDepthSource exists so the rules are testable at all: the
+    // call site is in main.cpp, which the native build excludes, so rules written
+    // there would be rules no suite can see. Three of them, each a different lie
+    // on a diver-facing field.
+    struct Padded { bridge::DepthSource ds; char guard[8]; } pad;
+    std::memcpy(pad.guard, "GUARD!!!", sizeof(pad.guard));
+
+    // A named, locked source: every field passes through.
+    bridge::publishDepthSource(pad.ds, true, true, true, 4321u, "LPS28DFW @0x5D");
+    TEST_ASSERT_TRUE(pad.ds.locked);
+    TEST_ASSERT_TRUE(pad.ds.used);
+    TEST_ASSERT_TRUE(pad.ds.healthy);
+    TEST_ASSERT_EQUAL_UINT32(4321u, pad.ds.lastGoodMs);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("LPS28DFW @0x5D", pad.ds.identity,
+                                     "the name a diver needs is not the name the driver gave");
+
+    // Unlocked: there is no source to be used, healthy, or 400 s silent, and
+    // there is no name. Forcing all five together is what lets `DS,0,0,0,0,none`
+    // be read as one complete statement instead of "which of these fields mean
+    // anything this cycle?". A name surviving an unlocked slot sends a reader to
+    // check a chip the arbiter does not own.
+    bridge::publishDepthSource(pad.ds, false, true, true, 400'000u, "LPS28DFW @0x5D");
+    TEST_ASSERT_FALSE(pad.ds.locked);
+    TEST_ASSERT_FALSE_MESSAGE(pad.ds.used, "an unlocked slot is still 'used'");
+    TEST_ASSERT_FALSE_MESSAGE(pad.ds.healthy, "an unlocked slot still claims a healthy driver");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0u, pad.ds.lastGoodMs,
+                                     "an unlocked slot keeps a reading time: `GET DS` would "
+                                     "then report an age for a sensor that owns nothing");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("none", pad.ds.identity,
+                                     "an unlocked slot kept the old sensor's name");
+
+    // A name longer than the array is truncated, not run over. The guard after
+    // the struct is what makes an unbounded copy visible: without it, the copy
+    // lands in whatever follows the global and nothing here notices until a
+    // crash somewhere unrelated.
+    char longish[64];
+    std::memset(longish, 'B', sizeof(longish) - 1);
+    longish[sizeof(longish) - 1] = '\0';
+    bridge::publishDepthSource(pad.ds, true, true, true, 10u, longish);
+    TEST_ASSERT_LESS_OR_EQUAL_INT_MESSAGE(static_cast<int>(sizeof(pad.ds.identity)) - 1,
+                                          static_cast<int>(std::strlen(pad.ds.identity)),
+                                          "a too-long identity overran the array");
+    pad.ds.identity[sizeof(pad.ds.identity) - 1] = '\0';   // belt: the assert above
+    TEST_ASSERT_EQUAL_MEMORY_MESSAGE("GUARD!!!", pad.guard, 4,
+                                     "the identity copy wrote past the struct");
+    TEST_ASSERT_EQUAL_CHAR('\0', pad.ds.identity[std::strlen(pad.ds.identity)]);
+
+    // A null name is a driver bug, and the honest answer to it is "none" — the
+    // alternative is a blank field the reader fills in himself.
+    bridge::publishDepthSource(pad.ds, true, true, true, 10u, nullptr);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("none", pad.ds.identity,
+                                     "a null identity produced an empty field, not 'none'");
+
+    // A source that still holds the slot keeps its name while it goes quiet:
+    // used/healthy drop, age grows, and the name stays, because "which chip" and
+    // "is it answering" are different questions and the answer to the first does
+    // not become "none" just because the second went false.
+    bridge::publishDepthSource(pad.ds, true, true, true, 100u, "MS5837-30BA @0x76");
+    bridge::publishDepthSource(pad.ds, true, false, false, 100u, "MS5837-30BA @0x76");
+    TEST_ASSERT_TRUE(pad.ds.locked);
+    TEST_ASSERT_FALSE(pad.ds.used);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("MS5837-30BA @0x76", pad.ds.identity,
+                                     "a quiet source lost its name");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_command_replies_and_hooks_fire);
@@ -579,5 +647,6 @@ int main() {
     RUN_TEST(test_cellproof_clamp_edges_publish_once);
     RUN_TEST(test_cal_air_verdicts_reach_the_wire_once_each);
     RUN_TEST(test_an_export_hands_the_callers_sink_context_back);
+    RUN_TEST(test_the_depth_source_publisher_leaves_nothing_to_interpret);
     return UNITY_END();
 }

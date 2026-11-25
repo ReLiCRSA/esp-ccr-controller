@@ -15,14 +15,14 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 269 cases
+pio test -e native            # host gate, currently 273 cases
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
 pio run -e esp32 -t upload    # only once the soak has ended
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
-                                 --cal-air --predive --dive-persist    # 141 checks
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/ruler/value-cap/dive-file graders, no board: 62 cases
-tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 62 checks
+                                 --cal-air --predive --dive-persist    # 149 checks
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file graders, no board: 75 cases
+tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 64 checks; the 1 FAIL is the dive-identity grader defect closed in the next section
 ```
 
 `--expect-depth` is how the operator says *this bench has a depth sensor fitted*:
@@ -524,6 +524,93 @@ that runs the longest dive on the host could not have noticed. The rig now calls
 `test_a_row_holds_the_digits_the_wire_gave_for_the_same_sample` pins hand-typed digits
 ("20.30", "0.290", "1115") straight out of a formatted `S,` row, and asserts `,20.29,`
 **never** appears in it.
+
+### Which chip produced the depth (`GET DS`, added 2026-11-25)
+
+The console says it once, at boot: `depth: LPS28DFW @0x5D ready, 1016.7 hPa`. After
+that line, nothing on either transport can answer two questions a diver or a handset
+needs: **which chip** is producing the metres, and **whether the control path is still
+taking them from it**. `T,` prints a depth either way — a held value and a measured one
+are the same bytes on that line — and its FLAGS byte has no stale-sensor bit. So a
+handset showing metres could not tell a diver which of the two he was looking at.
+
+```
+GET DS  ->  DS,<locked>,<used>,<healthy>,<age_s>,<identity>
+            DS,1,1,1,0,LPS28DFW @0x5D      measuring, last read under a second ago
+            DS,1,0,1,12,LPS28DFW @0x5D     HELD — no reading from that chip for 12 s
+            DS,0,0,0,0,none                nothing owns depth
+```
+
+`identity` is the driver's own string, built the moment the chip passes its identity
+gate (`Lps28` snprintfs `"LPS28DFW @0x%02X"` at `src/sensors/lps28.cpp:45` after
+probing both XSA addresses), and `DepthArbiter::sourceName()` only carries it out —
+the arbiter knows no addresses. The address on the wire and the address in the boot
+line are the same string by construction, **which is exactly why the bench can compare
+them**: two transports, one fact.
+
+| injected bug | what reddens |
+|---|---|
+| the command's dispatch removed | `ERR unknown key` at the matrix, and the host case that pins "the command always answers" |
+| `used` aliased to `locked` (a held depth becomes invisible) | the host case for `DS,1,0,` |
+| age not converted to seconds | the exact-string cases (`want 15`, got `15000`) |
+| age computed for a source that never answered | `DS,1,1,1,60,none` instead of `…0,none` |
+| the reply printing a name `locked` does not vouch for | `an unlocked slot named a chip it does not own` |
+| an unbounded copy of the name | `the identity field ran past its array: DS,1,1,1,4,AAAA…SHOULD-NOT-PRINT` |
+| the publisher stops forcing an unlocked slot to nothing | `an unlocked slot is still 'used'` (in `test_uartlink`) |
+| a hand-rolled copy in the publisher | `a too-long identity overran the struct` (the guard after the array is what makes it visible) |
+| client dispatch not claiming `DS,` | `DS, line never reached onDepthSource` (the library's fall-through to `onLine` is the witness) |
+| a truncated `DS,` line accepted by the client | `a truncated DS, line was accepted` |
+| client reading `used` from the `locked` field | `a held depth read as a live one` |
+| `depthSourceText` ignoring a too-small buffer | `depthSourceText wrote a partial sentence` |
+
+Three of those rows are the `test_uartlink` publisher cases, added only because the
+first mutation run showed they had to be: **injecting an unbounded copy in the publisher
+survived**, because `bridge::publishDepthSource` had no test calling it at all — the
+rules had been moved into a function *for* testability and never tested. That function
+exists because `main.cpp`, where the call lives, is excluded from the native build: a
+rule written at the call site is a rule no suite can see.
+
+The reply-buffer detail is worth keeping in mind for the next bounded field: the first
+version copied the name into `char id[ID_MAX + 1]` and asserted the answer never
+contained a sentinel planted after the snapshot array. **That assertion was
+decoration.** Injecting `strcpy` left it green — with a same-size destination, an
+unbounded copy is stopped by whatever stale zero happens to sit at the end of the
+local, so the reply looks correct and the corruption is invisible. The destination is
+now deliberately roomier than the source array (twice the driver's 24 bytes), which is
+what makes an overrun show up in the answer instead of in a later crash. The case that
+"proved" it before the fix is kept, now that it can actually fail.
+
+**Two witnesses on the bench, not one.** `hw_accept.py` puts `GET DS` in the refusal
+matrix (shape only: `^DS,\d,\d,\d,\d+,`) and grades the meaning separately against the
+boot announce: the wire must name the chip the console named, that name+address pair
+must be one the identity gates accept (`DEPTH_IDENTS`), the slot must be owned,
+`used` must be true on a bench whose sensor is reading, `healthy` must be true, and a
+source claimed in use must have read within 5 s (two fields that contradict each other
+are a bug even when both are plausible). 13 lying-capture cases in `--selftest`,
+including the different-address lie, an `LPS22HB @0x5C` handed the slot, `locked` with
+no name, `used=0` (depth held), `age_s=900` beside `used=1`, a truncated line, and the
+leg never running (`ERR unknown key` from older firmware — which means *"cannot say"*,
+not *"no sensor"*, a distinction the spec now states as a client rule).
+
+`web_probe.py` compares the answer across the two transports with **one field
+excepted**, and the exception is stated rather than waved at: `age_s` counts seconds
+since the last good read and the two sends are ~0.4 s apart. The name, the address and
+the three flags must be byte-identical — that is the project's one-command-path claim,
+checked on a field set that has a reason to differ rather than one that doesn't.
+
+`GET DS` is protocol-visible, so it landed as one commit: spec (§3 table, §4 line
+format with the field table, §7 rule 6, §8 limits), `handset/handset_link.h` (struct,
+parser, `onDepthSource`, `getDepthSource()`, `depthSourceText()`), the example
+firmware's readout, `handset/README.md`, and both bench tools. Four new host cases (2 in `test_router`, 1 in
+`test_uartlink` for the publisher, 1 in `test_handset` for the client), and seventeen
+injected bugs, each reddening its own case.
+
+Deliberately **not** done, and chosen: no `ds=` field appended to `HB`, `T,` or the dive
+headers. The queue suggested it; a read-only query plus the existing announce answers
+the same question without costing bytes at 2 Hz on the in-water link and without asking
+every existing client to re-validate a row shape. What that gives up is stated plainly:
+a **dive file** still cannot say which sensor its depths came from, so on a board with
+both chips fitted, a logged dive does not carry its own provenance.
 
 ### Calibration honesty: the reply is a receipt, so the verdict is its own row
 

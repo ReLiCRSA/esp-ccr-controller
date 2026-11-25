@@ -85,6 +85,61 @@ struct CalAir {
 // Publishing those verdicts (payload plus the `E,` event) is declared below,
 // after EventRing.
 
+// ---- which chip owns depth, and whether anyone is using it ------------------
+// Answered on the wire by `GET DS`. The facts live in press::DepthArbiter and its
+// driver, both owned by SensorTask; the router must not reach into them, for two
+// reasons. (1) It is deliberately hardware-free — host tests drive the whole
+// command surface without a bus anywhere near it. (2) `identity()` hands out a
+// pointer into the driver's own char array, which the driver rewrites with
+// snprintf every time it re-identifies after a bus fault; a command task reading
+// that array mid-write can see a prefix with no NUL in it, and printing it with
+// %s reads past the end of the array. So SensorTask copies the facts here and the
+// command tasks read the copy: same shape as CalAir above, one writer.
+//
+// `identity` is not volatile and is not safe to read while `locked` is false —
+// the copy below always holds "none" in that case, so "no source" and "a source,
+// named" are never confused. When locked, the array is always NUL-terminated and
+// at most ID_MAX-1 characters, because it is filled by snprintf with that cap.
+struct DepthSource {
+    static constexpr uint8_t ID_MAX = 24;  // the drivers' own identity buffers
+
+    // Written by SensorTask (it owns the arbiter), read by the command tasks.
+    // Five fields copied without a lock cannot be atomic: whichever order they are
+    // written in, a reader can catch the pair halfway across, and the two
+    // transitions that ever happen here (unlocked -> locked at boot, and a faulted
+    // source's fields being zeroed) want OPPOSITE orders. So consistency is
+    // enforced where it can be — at the reply, which prints "none" unless `locked`
+    // vouches for the name (see CommandRouter::buildDepthSourceLine) — and what
+    // remains is a window of one sensor cycle, at most once per boot, never
+    // mid-dive, because the arbiter's slot is never re-awarded.
+    volatile bool locked = false;    // a source owns depth (locked at boot, and
+                                     // it stays until the next power cycle)
+    volatile bool used = false;      // the CONTROL PATH is taking depth from it
+                                     // right now — false means the metres on the
+                                     // wire are held, not measured
+    volatile bool healthy = false;   // the driver says its last transaction was clean
+    volatile uint32_t lastGoodMs = 0;  // millis() of that source's last good read
+    char identity[ID_MAX] = "none";    // e.g. "LPS28DFW @0x5D" — the address is the
+                                       // driver's, learned at its identity gate
+};
+
+/// SensorTask's one call per cycle into the snapshot above. Deliberately a
+/// function and not five assignments at the call site: the rules it enforces
+/// (below) are the ones a client's display depends on, and main.cpp — where the
+/// call lives — is excluded from the native build, so assignments there would be
+/// a rule with no test anywhere.
+///
+///   * `identity` is copied ONLY while `locked`. An unlocked snapshot always says
+///     "none": "no source" and "a source, named" can never be confused, and a
+///     stale name cannot outlive the slot it belonged to;
+///   * the copy is bounded by the destination and always NUL-terminated — the
+///     name is printed with %s, and the driver rewrites its own array with
+///     snprintf whenever it re-identifies after a bus fault;
+///   * `lastGoodMs` is zeroed unless the source is locked, so an answer's age can
+///     never be computed from "never" (millis 0) and look like an old reading.
+void publishDepthSource(DepthSource& out, bool locked, bool used, bool healthy,
+                        uint32_t lastGoodMs, const char* identity);
+
 class EventRing {
 public:
     static constexpr uint16_t kSize = 32;  // power of two

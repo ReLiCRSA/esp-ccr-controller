@@ -28,6 +28,12 @@
 // NDL/ceiling honesty: Deco::ndlMin == -1 means "unknown, no valid vote" —
 // display it as "---", never as 0 and never as unlimited.
 //
+// DEPTH SOURCE: one command tells a client which chip is producing the metres and
+// whether the controller is using it right now — `getDepthSource()`,
+// `onDepthSource`, `depthSourceText()`. Read `used` rather than `locked`: a source
+// that holds the slot but has gone quiet leaves the depth on `T,` HELD rather than
+// measured, and the `T,` row itself cannot tell you that. See spec §3.
+//
 // WALL CLOCK: the controller has no RTC chip and its access point has no
 // uplink, so a client at the surface is its time source — `timeSet(epoch)`,
 // `getTime()`, `onClock`. A handset that keeps time itself should set the
@@ -119,6 +125,53 @@ inline const char* calAirText(int code) {
     }
 }
 
+// `DS,<locked>,<used>,<healthy>,<age_s>,<identity>` — which chip is producing the
+// metres, and whether the control path is taking them from it right now. Ask with
+// `getDepthSource()`; the same facts appear once on the controller's console at
+// boot ("depth: LPS28DFW @0x5D ready, ..."), and never again, so a handset that
+// wants to show them has to ask.
+//
+// `used` is the field to look at. A source can hold the slot, be identified and
+// be healthy, and still not be feeding the control path — stale bus, no sane
+// sample — in which case the `depthM` on the `T,` row is HELD, not measured. That
+// is invisible on `T,`, which prints a number either way.
+//
+// `identity` names the chip and the I2C address it was found at, or "none" when no
+// source owns depth. It is the driver's own string, so treat it as free text to
+// display rather than something to switch on: a future controller can rename it.
+struct DepthSource {
+    bool locked;        // a source owns depth (chosen at boot, unchanged until
+                        // the next power cycle — nothing swaps it mid-dive)
+    bool used;          // the controller is taking depth from it NOW
+    bool healthy;       // its driver reports clean transactions
+    uint32_t ageS;      // seconds since that source's last good reading (0 when
+                        // there is no source, or it never answered)
+    char identity[32];  // e.g. "LPS28DFW @0x5D", or "none"
+};
+
+// Wording for a handset with a display and no text of its own. Deliberately says
+// what to conclude, not just the flags: "1,1,1" means nothing to a diver, "depth
+// held: no reading from LPS28DFW @0x5D for 12 s" does. Returns bytes written
+// (excluding NUL), 0 if the buffer is too small; never a partial sentence.
+inline int depthSourceText(const DepthSource& d, char* buf, std::size_t cap) {
+    if (!buf || cap == 0) return 0;
+    int w;
+    if (!d.locked || d.identity[0] == '\0' || std::strcmp(d.identity, "none") == 0)
+        w = std::snprintf(buf, cap, "no depth sensor: depth is not being measured");
+    else if (!d.used)
+        w = std::snprintf(buf, cap, "depth HELD: no reading from %s for %lu s",
+                          d.identity, static_cast<unsigned long>(d.ageS));
+    else if (!d.healthy)
+        w = std::snprintf(buf, cap, "%s is answering but faulting (%lu s since the "
+                                    "last clean read)", d.identity,
+                          static_cast<unsigned long>(d.ageS));
+    else
+        w = std::snprintf(buf, cap, "depth from %s, last read %lu s ago",
+                          d.identity, static_cast<unsigned long>(d.ageS));
+    if (w < 0 || static_cast<std::size_t>(w) >= cap) { buf[0] = '\0'; return 0; }
+    return w;
+}
+
 struct Setting { char key[24]; char value[40]; };      // "KEY=value" answers
 // `L,<slot>,<epoch>,<seq>`. `seq` is the fourth field, appended 2026-11-24;
 // 0 means the dive predates the field (or the controller is older), and 0 is
@@ -187,6 +240,7 @@ struct Handlers {
     void (*onLogList)(const LogEntry&, void*) = nullptr;
     void (*onDiveHeader)(const DiveHeader&, void*) = nullptr;
     void (*onClock)(const Clock&, void*) = nullptr;
+    void (*onDepthSource)(const DepthSource&, void*) = nullptr;
     void (*onCalAir)(const CalAir&, void*) = nullptr;
     // Everything else: CSV export rows (S,/M,), HIST, lines, WebSocket '#'
     // markers, and any line a future controller adds. Observing is optional;
@@ -393,6 +447,26 @@ inline bool parseClock(const char* line, Clock& c) {
     return true;
 }
 
+inline bool parseDepthSource(const char* line, DepthSource& d) {
+    if (!starts(line, "DS,")) return false;
+    char buf[64];
+    std::strncpy(buf, line, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+    char* f[8];
+    const int n = split(buf, f, 8);
+    if (n < 6) return false;                 // DS,<locked>,<used>,<healthy>,<age_s>,<identity>
+    d.locked  = pl(f[1]) != 0;
+    d.used    = pl(f[2]) != 0;
+    d.healthy = pl(f[3]) != 0;
+    d.ageS    = static_cast<uint32_t>(pl(f[4]));
+    // Identity is the last field and never contains a comma, so a controller that
+    // appends a sixth field later still leaves this one readable — the protocol's
+    // append-only rule, honoured by the parser rather than assumed.
+    std::strncpy(d.identity, f[5], sizeof(d.identity) - 1);
+    d.identity[sizeof(d.identity) - 1] = '\0';
+    if (d.identity[0] == '\0') std::strncpy(d.identity, "none", sizeof(d.identity) - 1);
+    return true;
+}
+
 inline bool parseSchema(const char* line, SchemaEntry& s) {
     if (!starts(line, "K,")) return false;
     char buf[kRxLineCap];
@@ -530,6 +604,7 @@ public:
     bool wifiOn()              { return send("WIFI ON"); }
     bool wifiOff()             { return send("WIFI OFF"); }
     bool getTime()             { return send("GET TIME"); }
+    bool getDepthSource()      { return send("GET DS"); }
     // `TIME SET <epoch>`: the controller has no RTC, so this client IS the time
     // source (spec §3). Out-of-window epochs are refused HERE, with no bytes on
     // the wire: a handset whose own timekeeping has gone to soup should hear it
@@ -583,6 +658,12 @@ private:
             // Before the KEY=value fallback: a `TIME,` answer has no '=', so it
             // would otherwise be counted as an unknown line.
             Clock c; if (parseClock(line, c)) { callS<Clock>(h_.onClock, c); return; }
+        } else if (starts(line, "DS,")) {
+            // Before the KEY=value fallback (a `DS,` answer has no '='), and note
+            // the `D,` test above cannot swallow it: that one checks for a comma
+            // in position 1.
+            DepthSource d;
+            if (parseDepthSource(line, d)) { callS<DepthSource>(h_.onDepthSource, d); return; }
         } else if (starts(line, "K,")) {
             SchemaEntry s; if (parseSchema(line, s)) { callS<SchemaEntry>(h_.onSchema, s); return; }
         }

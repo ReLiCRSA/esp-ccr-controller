@@ -128,6 +128,12 @@ bridge::DiveTotals g_bridgeTotals;
 // for `GET CALAIR`; the terminal verdicts also go out as `E,<t>,7,<code>`.
 // Until 2026-11-24 this fact existed only as console text.
 bridge::CalAir g_calAirStatus;
+// Which chip owns depth, published by SensorTask (it owns the arbiter and the
+// drivers) and read by `GET DS` on either transport. A copy, not a pointer into
+// the driver: `identity()` is a char array the driver rewrites with snprintf each
+// time it re-identifies after a bus fault, and a command task that read it
+// mid-write could print an unterminated prefix.
+bridge::DepthSource g_depthSrc;
 
 // Rolling per-cell ppO2 histograms for the web histogram page (PLAN 9).
 // One writer: ControlTask, on the control thread, once per cycle -- the
@@ -213,6 +219,25 @@ static void sensorTask(void*) {
             if (dn) Serial.write(dline, dn);
             else Serial.println("depth: ** announce line would not fit");
         }
+        // Publish the depth source for `GET DS`, every cycle. The boot announce
+        // states the choice once, to the console, before any client is listening;
+        // a handset that connects later, or a diver who wants to know whether the
+        // metres are still being measured rather than held, asks this.
+        //
+        // The rules (name only while locked, bounded copy, no age from "never")
+        // live in bridge::publishDepthSource, not here: main.cpp is excluded from
+        // the native build, so rules written at this call site would be rules no
+        // test could see. The arguments are the arbiter's own facts — and
+        // g_depthValid is the same flag that decides whether the control path uses
+        // a sample at all, so `used` cannot drift from the thing it describes.
+        //
+        // A locked source that has gone quiet keeps its name and shows the truth
+        // in used/healthy/age: it is still the chip holding the slot, which is
+        // exactly what the arbiter's boot-lock promises.
+        bridge::publishDepthSource(g_depthSrc, g_depth.locked(), g_depthValid,
+                                   g_depth.healthy(),
+                                   g_depth.locked() ? g_depth.lastGoodMs() : 0u,
+                                   g_depth.sourceName());
 #endif
 
         if (now - lastBat >= VBAT_SAMPLE_INTERVAL_MS) {
@@ -862,6 +887,7 @@ void setup() {
             if (comms::initSession(*g_loop, g_settings, g_bridgeTel, g_bridgeEvents)) {
                 comms::session().setHist(&g_cellHist);
                 comms::session().setCalAir(&g_calAirStatus);
+                comms::session().setDepthSource(&g_depthSrc);
                 comms::session().setSafeLockout(true);
                 if (!comms::startUart2Task())
                     Serial.println("** SAFE MODE: handset offline — power-cycle to clear");
@@ -878,6 +904,7 @@ void setup() {
     } else {
         comms::session().setHist(&g_cellHist);   // GET HIST over either client
         comms::session().setCalAir(&g_calAirStatus);   // GET CALAIR: ControlTask's verdict
+        comms::session().setDepthSource(&g_depthSrc);  // GET DS: SensorTask owns the slot
         if (!comms::startUart2Task())
             Serial.println("** uart2 session NOT started (task create failed)");
         if (!comms::web::start())

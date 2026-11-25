@@ -1922,12 +1922,101 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   setpoints, 0.6% of three-decimal cell readings), so a leg would have been green on the
   broken build. Host-witnessed, and the sweep is why.
 
+- **Which chip produced the depth is now a question the wire can answer (2026-11-25,
+  16).** The queued version of this item asked for "a depth-source field (`ds=`) so a
+  reader of `HB` or a dive header can tell which sensor produced a depth". The answer
+  landed as a **query instead: `GET DS`** — deliberately, and what that gives up is
+  recorded rather than hidden. Appending `ds=` to `T,` costs bytes at 2 Hz on the
+  in-water link and asks every existing client to re-validate a row shape it already
+  consumes; the facts it would carry change at most once per boot (the arbiter awards
+  the depth slot by identity at power-up and never re-awards it — `depth_manager.cpp`
+  is explicit that a faulted source is re-initialised by its own driver but the slot
+  is not re-given), and the boot announce already states the choice once. So:
+  `DS,<locked>,<used>,<healthy>,<age_s>,<identity>`, answered on both transports, with
+  the boot announce left exactly as it was. **What this gives up: a dive file still
+  cannot say which sensor its depths came from.** On a board fitted with both chips, a
+  logged dive carries no provenance. If that ever matters, the field goes on the right
+  of the dive header — the append-only rule already allows it — and not on `T,`.
+
+  The field that makes the command worth having is `used`, not `locked`. A sensor can
+  own the slot, be identified and be healthy while its readings stop arriving; the
+  controller then keeps printing the last good depth, and `T,` looks identical — there
+  is no stale-sensor bit in its FLAGS byte either. So `locked=1, used=0` is the state a
+  handset must be able to see, and it is now the state the client documentation tells
+  builders to look at first ("read `used`, not `locked`", `handset/README.md`).
+
+  The snapshot lives in `bridge::DepthSource`, published by SensorTask, and the router
+  reads the copy rather than the arbiter. Two reasons, one of them measured. (1) The
+  router is deliberately hardware-free; host tests drive the whole command surface with
+  no bus anywhere near it. (2) `DepthSensor::identity()` hands out a pointer into the
+  driver's own `char[24]`, and that array is **rewritten** — `noteFail` puts a locked
+  driver in `BUS_FAULT` (`lps28.cpp:88`), the arbiter keeps calling `begin()` on it
+  (`depth_manager.cpp:8`), and the re-probe snprintfs `identity_` again
+  (`lps28.cpp:45`; same in `ms5837.cpp:108`). A command task reading it live can print
+  a prefix with no NUL in it. Five fields copied without a lock cannot be made atomic —
+  the unlocked→locked transition and a fault-zeroing want opposite write orders — so the
+  invariant is enforced at the reply instead: **`GET DS` prints a name only if `locked`
+  vouches for it**, which makes the misleading pair (a name beside a flag claiming no
+  source) unrepresentable on the wire. What remains is a window of one sensor cycle at
+  most, at most once per boot, never mid-dive.
+
+  The rules that decide the snapshot are a function, `bridge::publishDepthSource`, not
+  assignments at the call site — because the call site is in `main.cpp`, which the
+  native build excludes, and a rule living there is a rule no test can see. That was
+  not a preemptive design choice: the first mutation run injected an unbounded copy in
+  the publisher and **nothing reddened**, because no test called the function at all.
+
+  Witnesses, all proven by injection: **seventeen injections, seventeen reds**
+(11 in the firmware's reply path and snapshot publisher, 6 in the client library). Host: the command answers
+  even with nothing wired (`DS,0,0,0,0,none`, not `ERR unknown key`); the reply is the
+  published state (`DS,1,1,1,15,LPS28DFW @0x5D`); `used` is not an alias of `locked`;
+  age is seconds, from the router's own clock, and is 0 for a source that never
+  answered rather than "the whole uptime"; a publisher that leaves an unlocked slot
+  inconsistent still cannot name a chip it does not own; the client's parser refuses a
+  truncated line instead of guessing (and the rejected line must reach `onLine`, not
+  vanish); `depthSourceText` returns nothing rather than half a sentence on an OLED.
+
+  One of those witnesses had to be rebuilt, and the reason is worth keeping as a lesson
+  next to "a round-trip cannot catch a scale error": the test planted a sentinel after
+  the snapshot array and asserted the answer never contained it. Injecting an unbounded
+  `strcpy` left it **green** — with a destination sized exactly like the source, the
+  copy is stopped by whatever stale zero happens to sit at the end of the local, so the
+  printed field is correct and the overflow is invisible to everything except a later
+  crash. The destination is now roomier than the source on purpose, so an overrun shows
+  up in the answer. A check that cannot be the only witness is decoration, and this one
+  was decoration until it could fail.
+
+  Bench: the matrix asks for the shape, `grade_depth_source` grades the meaning against
+  the boot announce — same chip on both transports, an identity the gates accept, the
+  slot owned, `used` true on a reading bench, `healthy` true, and an age that cannot
+  contradict "in use" — with 13 lying-capture cases in `--selftest` (different address
+  than the console probed, an `LPS22HB @0x5C` handed the slot, locked with no name,
+  depth held, `age_s=900` beside `used=1`, a truncated line, `ERR unknown key` from
+  older firmware, and a leg that never ran). `web_probe.py` adds the cross-transport
+  comparison with **one field excepted and the exception named**: `age_s` is seconds
+  since the last good read and the two sends are ~0.4 s apart; the name, address and
+  flags must be byte-identical. Proven by flashing? No — the graders are proven on
+  lying captures, which is the honest description of what `--selftest` is.
+
+  Protocol-visible, so one commit across spec + client + example + README + conformance
+  (spec §3 table, §4 line format with the field table and the "read `used`" rule, §7
+  rule 6 — a command an older controller lacks answers `ERR unknown key`, which is
+  *"cannot say"*, not *"no sensor"* — §8 limits, including that this says **where** the
+  depth came from and not that it is accurate, since `CAL DEPTH` is still unimplemented
+  and the surface offset measured here is ~0.04 m). Native 273, `--selftest` 75 lying
+  cases. Bench after flashing: `hw_accept.py` **149 checks 0 failures** (141 + the
+  matrix shape row + 7 graded depth-source claims), `u2stk=3096` (was 3088),
+  `stk=1040` unchanged; `web_probe.py` 64 checks **1 failure** — that failure is
+  the dive-identity grader picking `max(slot)` instead of the newest dive and
+  demanding a date from a dive that honestly has none: unrelated to depth, closed
+  in the very next commit.
+
 - **Queued next, none of it waiting on hardware** (2026-11-24, after the
   calibration batch; the surface log is now done, the rest still is not):
-  the small known lies: a depth-source field
-  (`ds=`) so a reader of `HB` or a dive header can tell which sensor produced a
-  depth; WiFi idle auto-off (an open M5 criterion); a `PULSE` button on the page
-  (the command exists, the page has AUTO/MANUAL/ACK).
+  the small known lies: WiFi idle auto-off (an open
+  M5 criterion); a `PULSE` button on the page (the command exists, the page has
+  AUTO/MANUAL/ACK). The depth-source item that used to open this list closed as
+  `GET DS` — the entry above records why a query and not an appended field.
   Added by the dive-file batch: the page's dive view **ignores `E,` rows** — it
   renders the chart from `S,` and one hint line from `M,`, so the verdicts are in
   the file and in the download but a surface reader on the AP never sees that the

@@ -309,6 +309,11 @@ void test_safe_mode_lockout_refuses_everything_but_ack() {
     const char* const forbidden[] = {
         "AUTO", "MANUAL", "DIVE START", "SET SP2=0.55", "CAL AIR", "WIFI ON",
         "WIFI OFF", "CHECK", "GET *", "GET SP2", "LOG EXPORT 1", "CELLPROOF OVERRIDE",
+        // Even a read-only query is refused: SAFE means the control chain is not
+        // deciding, so "which chip owns depth, and is it being used?" has no
+        // truthful answer to give, and a client that reads state from a machine
+        // that is not running is a client that will act on it.
+        "GET DS",
     };
     for (const char* line : forbidden) {
         CommandRouter::Response r;
@@ -684,6 +689,138 @@ void test_a_published_max_length_value_lands_whole() {
                                      "the refused write moved the value anyway");
 }
 
+// ---- GET DS: which chip owns depth, and whether anyone is using it ---------
+
+void test_get_depth_source_names_the_chip_and_says_if_it_is_used() {
+    // The claim a diver can check with his own eyes: the metre reading on `T,`
+    // came from this named chip at this address, and it is being measured rather
+    // than held. Until now the only place that fact was written down was the boot
+    // announce, which says it once, to the console, before any client is listening.
+    Bench b;
+    b.ticks(0.5f, 3.0f, 60.0f);
+
+    // First, with NOTHING wired: the command still answers. A protocol-visible
+    // query that disappears under a build flag or a missing setter tells a client
+    // less than one that says "no source" out loud — and `ERR unknown key` is the
+    // answer a handset reads as "this controller is old", not as "no depth sensor".
+    CommandRouter::Response r;
+    b.run("GET DS", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,0,0,0,0,none"), r.text);
+    TEST_ASSERT_FALSE_MESSAGE(has(r, "unknown key"),
+                              "GET DS is not in the command table at all");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, static_cast<int>(countLines(r.text, r.len)),
+                                  "GET DS answered more than one line");
+
+    bridge::DepthSource ds;
+    ds.locked = ds.used = ds.healthy = true;
+    ds.lastGoodMs = b.now - 15'000u;
+    std::snprintf(ds.identity, sizeof(ds.identity), "LPS28DFW @0x5D");
+    b.router.setDepthSource(&ds);
+
+    b.run("GET DS", r);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("DS,1,1,1,15,LPS28DFW @0x5D\n", r.text,
+                                     "the answer is not the published state");
+
+    // THE field that matters: a source can hold the slot, be identified and be
+    // healthy-looking while the control path has stopped taking depth from it
+    // (stale bus, no sane sample). The metres on the wire are then HELD, and on
+    // `T,` that is indistinguishable from a real reading. `locked` alone could
+    // never say so, which is why used is a separate bit and not an alias.
+    ds.used = false;
+    b.run("GET DS", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,1,0,"), r.text);
+    ds.healthy = false;
+    b.run("GET DS", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,1,0,0,"), r.text);
+
+    // No source: the name must be "none" even though the array still holds the
+    // chip that held the slot before. A five-field snapshot copied without a lock
+    // can be caught mid-update, and the pair that would mislead a reader is a name
+    // beside a flag that claims no source — so the reply derives the name from
+    // `locked` rather than printing whatever is in the array. That makes the
+    // misleading pair unrepresentable on the wire.
+    ds.locked = ds.used = ds.healthy = false;
+    b.run("GET DS", r);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("DS,0,0,0,0,none\n", r.text,
+                                     "an unlocked slot named a chip it does not own");
+
+    // Same rule the other way round, on a snapshot the publisher left inconsistent:
+    // flags say no source, the array still says something else.
+    std::snprintf(ds.identity, sizeof(ds.identity), "MS5837-30BA @0x76");
+    ds.lastGoodMs = b.now - 9000u;
+    b.run("GET DS", r);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("DS,0,0,0,0,none\n", r.text,
+                                     "a stale name printed beside locked=0");
+    std::snprintf(ds.identity, sizeof(ds.identity), "none");
+
+    // Age comes from the same clock the control chain uses, in seconds. A source
+    // that has NEVER answered has lastGoodMs 0 — reporting that as "the whole
+    // uptime" would look like a very old reading instead of no reading, so age is
+    // 0 and `locked` carries the fact.
+    ds.locked = ds.used = ds.healthy = true;   // used is still false from the step above
+    ds.lastGoodMs = 0;
+    b.run("GET DS", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,1,1,1,0,none"), r.text);
+    ds.lastGoodMs = b.now - 250u;   // a quarter of a second: 0 s, not 1
+    b.run("GET DS", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,1,1,1,0,none"), r.text);
+
+    // A client that re-reads must see the current state, not a string rendered
+    // once at boot: the boot announce is a one-shot, this answer is not.
+    std::snprintf(ds.identity, sizeof(ds.identity), "MS5837-30BA @0x76");
+    ds.lastGoodMs = b.now - 7000u;
+    b.run("GET DS", r);
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("DS,1,1,1,7,MS5837-30BA @0x76\n", r.text,
+                                     "GET DS is answering a stale snapshot");
+
+    // And it is a query, not an act: nothing about the machine moved.
+    TEST_ASSERT_FALSE(b.loop.diveActive());
+    TEST_ASSERT_EQUAL_UINT32(0u, r.actions);
+}
+
+void test_a_depth_source_name_cannot_run_past_its_field() {
+    // The identity string is not a promise. It lives in a char[24] the sensor
+    // driver rewrites with snprintf every time it re-identifies after a bus
+    // fault (lps28.cpp noteFail -> BUS_FAULT, depth_manager.cpp:8 re-begin,
+    // lps28.cpp:45 snprintf), and the answer is printed with %s. An unbounded
+    // copy — a strcpy, or a memcpy that trusts the source to be terminated —
+    // reads past the array and prints whatever sits after it. The snapshot here
+    // is padded with a sentinel to make that visible rather than merely unlikely.
+    struct Padded {
+        bridge::DepthSource ds;
+        char sentinel[16];
+    } pad;
+    pad.sentinel[0] = '\0';
+    std::memcpy(pad.sentinel, "SHOULD-NOT-PRINT", sizeof(pad.sentinel));
+    std::memset(pad.ds.identity, 'A', sizeof(pad.ds.identity));   // no NUL at all
+    pad.ds.locked = pad.ds.used = pad.ds.healthy = true;
+    pad.ds.lastGoodMs = 1000u;   // b.now is 5000: age 4 s
+
+    Bench b;
+    b.now = 5000u;
+    b.router.setDepthSource(&pad.ds);
+    CommandRouter::Response r;
+    b.run("GET DS", r);
+
+    TEST_ASSERT_NULL_MESSAGE(std::strstr(r.text, "SHOULD-NOT-PRINT"),
+                             (std::string("the identity field ran past its array: ") + r.text).c_str());
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, static_cast<int>(countLines(r.text, r.len)),
+                                  "a runaway identity field emitted more than one line");
+    const char* comma = std::strrchr(r.text, ',');
+    TEST_ASSERT_NOT_NULL(comma);
+    const int field = static_cast<int>(std::strlen(comma + 1) - 1);   // less the newline
+    // Exactly the array's own 24 bytes: an un-terminated array cannot make the
+    // reply longer than the array, and a copy that stops early would make it
+    // shorter, which is the other way this field goes wrong (a driver that
+    // re-identifies mid-read hands out a prefix).
+    TEST_ASSERT_EQUAL_INT_MESSAGE(static_cast<int>(bridge::DepthSource::ID_MAX), field,
+                                  (std::string("the identity field is not the array, whole: ") + r.text).c_str());
+    for (int i = 0; i < field; ++i)
+        TEST_ASSERT_EQUAL_CHAR_MESSAGE('A', comma[1 + i],
+                                       "the identity field holds a byte that is not in the array");
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "DS,1,1,1,4,"), r.text);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_auto_lockout_holds_over_the_router);
@@ -704,5 +841,7 @@ int main() {
     RUN_TEST(test_unimplemented_calibrations_are_refused_not_acked);
     RUN_TEST(test_get_calair_reports_the_verdict_not_the_request);
     RUN_TEST(test_time_set_is_range_checked_and_delegated);
+    RUN_TEST(test_get_depth_source_names_the_chip_and_says_if_it_is_used);
+    RUN_TEST(test_a_depth_source_name_cannot_run_past_its_field);
     return UNITY_END();
 }

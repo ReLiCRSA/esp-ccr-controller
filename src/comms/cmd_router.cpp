@@ -271,6 +271,66 @@ void CommandRouter::buildCalAirLine(Response& r) {
     replyText(r, buf, static_cast<size_t>(n));
 }
 
+// `DS,<locked>,<used>,<healthy>,<age_s>,<identity>` — which chip is producing the
+// metres, and whether the control path is actually taking them from it.
+//
+// This exists because "depth: 12.3 m" does not say who measured it. The board can
+// carry two depth sensors, the arbiter chooses one at boot by identity and keeps
+// it until the next power cycle, and the boot announce states that choice once.
+// A client that connects later, or a diver reviewing a machine mid-dive, had no
+// way to ask. `<used>` is the field that matters most: a source can be locked and
+// identified and still not be feeding the control path (stale bus, no sane
+// sample), in which case the metres on the wire are HELD, not measured — which
+// reads identically on `T,` and is not visible anywhere else.
+//
+// `<identity>` is the driver's own string, including the I2C address it was found
+// at, and it is copied out under a bound rather than passed to %s directly: the
+// driver rewrites that array with snprintf whenever it re-identifies after a bus
+// fault, and an array mid-rewrite may have no NUL inside the part copied so far.
+// A source that has not been identified never reaches this reply as a name — the
+// publisher keeps "none" there.
+void CommandRouter::buildDepthSourceLine(Response& r) {
+    // The guard that matters: the name is printed ONLY if `locked` vouches for it.
+    // A five-field snapshot copied without a lock can always be caught mid-update
+    // (see bridge::DepthSource), and the one misleading pair is a name paired with
+    // a flag that does not claim a source — which would send a reader to check a
+    // chip the arbiter does not own. Printing "none" unless locked is true makes
+    // that pair unrepresentable on the wire.
+    //
+    // The destination is deliberately ROOMIER than the source array (twice the
+    // driver's 24 bytes) so that a copy which ignores its bound shows up in the
+    // answer instead of quietly overwriting the frame: with a same-size-plus-one
+    // destination, an unbounded strcpy is stopped by whatever stale zero happened
+    // to be sitting at the end of the local, the reply looks fine, and the
+    // corruption is invisible to everything except a crash later. The copy itself
+    // is bounded by the SOURCE's declared size, and always terminated.
+    char id[2 * bridge::DepthSource::ID_MAX];
+    bool locked = false, used = false, healthy = false;
+    uint32_t lastGood = 0;
+    if (depthSrc_ && depthSrc_->locked) {
+        const size_t n = sizeof(depthSrc_->identity) < sizeof(id)
+                             ? sizeof(depthSrc_->identity) : sizeof(id);
+        std::memcpy(id, depthSrc_->identity, n);
+        id[n] = '\0';
+        used = depthSrc_->used;
+        healthy = depthSrc_->healthy;
+        lastGood = depthSrc_->lastGoodMs;
+        locked = true;
+    } else {
+        std::strcpy(id, "none");
+    }
+    // Age only means something about a source that owns depth and has answered
+    // at least once; 0 otherwise, rather than an enormous number derived from
+    // "never" (millis 0) that would look like a very old reading.
+    const uint32_t age = (locked && lastGood && nowMs_ >= lastGood)
+                             ? (nowMs_ - lastGood) / 1000u : 0u;
+    char buf[64];
+    const int n = std::snprintf(buf, sizeof(buf), "DS,%d,%d,%d,%u,%s\n",
+                                locked ? 1 : 0, used ? 1 : 0, healthy ? 1 : 0,
+                                static_cast<unsigned>(age), id);
+    replyText(r, buf, static_cast<size_t>(n));
+}
+
 void CommandRouter::getSpecial(Response& r, const char* key) {
     if (std::strcmp(key, "T") == 0) {
         proto::Telemetry t;
@@ -341,6 +401,7 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
         replyText(r, buf, static_cast<size_t>(n));
         return;
     }
+    if (std::strcmp(key, "DS") == 0) { buildDepthSourceLine(r); return; }
     if (std::strcmp(key, "HIST") == 0) {
         if (!hist_) { replyErr(r, "no histogram"); return; }
         replyInPlace(r, cellhist::formatLines(*hist_, nowMs_, r.text, sizeof(r.text)));

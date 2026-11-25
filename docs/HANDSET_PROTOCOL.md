@@ -237,6 +237,7 @@ outright.
 | `GET CELLS` | `CELLS,` line |
 | `GET PROOF` | `PROOF,` line |
 | `GET FAULT` | `FAULT,` line |
+| `GET DS` | `DS,<locked>,<used>,<healthy>,<age_s>,<identity>` — which chip is producing the metres, and whether the controller is using it (see §4) |
 | `GET HIST` | 3 × `HIST,` lines / `ERR no histogram` |
 | `GET CALAIR` | `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>` — the air calibration's verdict (§3) |
 | `GET TIME` | `TIME,<epoch>,<source>,<age_s>` — wall clock (see Wall clock below) |
@@ -465,6 +466,38 @@ FAULT,<stuck_open_latched>,<output_fuse_tripped>,<solenoid_duty_pct>
 duty 1 decimal, percent.
 
 ```
+DS,<locked>,<used>,<healthy>,<age_s>,<identity>
+```
+Added 2026-11-25. Which chip the depth numbers came from, and whether it is
+currently feeding the control path.
+
+| field | meaning |
+|---|---|
+| `locked` | a depth source owns the slot. Chosen at boot by identity (the dive-rated `MS5837-30BA` is preferred, the `LPS28DFW` is the fallback) and **locked until the next power cycle** — nothing swaps the depth source while a diver is breathing from the machine's numbers |
+| `used` | the control path is taking depth from it **right now**. `locked=1, used=0` means the metres in the `T,` row are **held** (the last good value), not measured |
+| `healthy` | that chip's driver reports clean transactions (false = it is in backoff after consecutive bus faults) |
+| `age_s` | whole seconds since that source's last good reading. `0` when there is no source, or it has never answered — never a number derived from "never" |
+| `identity` | the driver's own string, including the I2C address it was found at: `LPS28DFW @0x5D`, `MS5837-30BA @0x76`, or `none` |
+
+**Read `used`, not `locked`.** This is the whole reason the command exists. A
+sensor can hold the slot, be identified, and be healthy, while its readings stop
+arriving — and `T,` prints a plausible depth either way, because a held value and
+a measured one are the same bytes on that line. A handset that shows depth without
+asking this question cannot tell a diver which of the two he is looking at.
+
+`identity` is **text to display, not a value to switch on**: it is the driver's
+own wording, and a future controller may reword it. What is stable is the address
+suffix (`@0xNN`) and the fact of `none`. An older controller that does not know
+the command answers `ERR unknown key` — that means *"this controller cannot say"*,
+not *"there is no depth sensor"*; show nothing rather than showing `none`.
+
+The same facts are stated once at boot on the controller's console — `depth:
+LPS28DFW @0x5D ready, 1016.7 hPa`, or `depth: ** … identified, no sane pressure
+within 3 s` — and never again, which is why a client that connects after boot has
+to ask. A client that can see both may compare them: they name the same chip or
+the firmware is lying to one of them.
+
+```
 HIST,<cell>,<window_s>,<windows>,<bin_width_centi>,<horizon_age_s>,<samples>,<bin0>,...,<bin37>
 ```
 one line per cell (3 lines). 38 bins of 0.05 bar covering 0.00–1.90 bar
@@ -682,6 +715,14 @@ dive and was rewritten afterwards.
    `dive locked` means waiting for a surface when the value was simply invalid.
 5. The controller console heartbeat (`HB st=...`) is a debug line on the USB
    serial console, **not** part of this protocol — do not parse it from UART2.
+6. **A command added later is refused, not ignored, by an older controller**:
+   `GET <unknown>` answers `ERR unknown key`, and an unknown verb answers
+   `ERR unknown command`. Both mean *"this controller cannot say"*, which is not
+   the same fact as a state the controller reports as nothing (`DS,0,0,0,0,none`
+   is "no depth source"; `ERR unknown key` is "no answer available"). A client
+   that conflates them shows a diver "no sensor" on a machine that has one. A
+   new query must therefore answer something on every build that has it, and
+   never disappear behind a compile switch.
 
 ## 8. Known current limits (truthful as of this revision)
 
@@ -763,7 +804,15 @@ dive and was rewritten afterwards.
   the warm-up refusal that used to appear only on the USB console — is on the
   wire as `CALAIR,` and as an `E,<t>,7,<code>` row (§3). Rule that survives:
   never infer an effect from `OK`. Prove it with a read-back of the state the
-  command was supposed to change (`GET CALAIR`, `GET TIME`, `GET SP2`, …).
+  command was supposed to change (`GET CALAIR`, `GET TIME`, `GET SP2`, `GET DS`, …).
+* **`GET DS` says where the depth came from, not that it is accurate.** It answers
+  which chip holds the slot, whether the control path is using it, and how stale
+  its last reading is — the three things a depth number cannot show about itself.
+  It does not correct the number. There is still **no surface tare**: `CAL DEPTH`
+  is refused (no consumer on the board), so the absolute depth on `T,` and in a dive
+  file carries whatever offset the sensor and the assumed surface pressure leave
+  behind — measured at **about 0.04 m** on the 2026-11-24 bench, with the checks
+  here therefore running a ±0.5 m tolerance rather than a centimetre one.
 * Event ids 7, 8, 11, 12, 13, 14 are reserved in the log format and **not
   published** (§4 table). Do not build notifications on them.
 * `PULSE` works during a dive as well as at the surface — it is a diver

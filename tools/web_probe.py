@@ -24,7 +24,12 @@ What it verifies, and what each part is for:
            ends unless the marker count equals the answer's line count - and for
            the over-long case that the marker says `dropped`.
   EQUALITY each command sent twice, BACK TO BACK, once over the WebSocket and
-           once on UART2. Eight must be byte-identical (one command path, two
+           once on UART2. Twelve must be byte-identical (one command path, two
+           transports: the project's central claim); `GET DS` is compared with its
+           `age_s` field excepted (seconds since the sensor's last good read, and
+           the two sends are ~0.4 s apart); the over-long case is compared on its
+           refusal only, because UART2 additionally dispatches the leftover tail as
+           its own line - docs/HANDSET_PROTOCOL.md says why. (one command path, two
            transports: the project's central claim); the over-long case is
            compared on its refusal only, because UART2 additionally dispatches
            the leftover tail as its own line - docs/HANDSET_PROTOCOL.md says why.
@@ -90,6 +95,24 @@ MATRIX = [
     ("GET SCHEMA", "ranges the page will enforce", "identical"),
     ("GET *", "every setting", "identical"),
     ("GET FAULT", "fuse/duty picture", "identical"),
+    # Which chip owns depth. Compared with one field excepted, and the exception
+    # is stated rather than waved at: `age_s` is seconds since that chip's last
+    # good read, and the two sends are ~0.4 s apart, so THAT field may legitimately
+    # differ. The name, the address and the three flags must be the same bytes on
+    # both transports — there is one command path, and a web bridge that answered
+    # depth provenance out of its own copy is exactly what this catches.
+    ("GET DS", "which chip owns depth, and whether it is being used",
+     "identical-except-age"),
+    # Calibration honesty. `CAL O2` and `CAL DEPTH` are in the grammar but have no
+    # consumer on the board, so they must be REFUSED — and refused the same way on
+    # both transports, or a handset has a calibration the phone does not (and vice
+    # versa). `GET CALAIR` is the verdict of the one calibration that does run:
+    # code 0 (nothing asked since this power-up) is deterministic here because this
+    # probe never asks for one, so the two transports have to agree byte for byte.
+    ("CAL DEPTH", "depth tare refused: nothing consumes it", "identical"),
+    ("CAL O2", "O2 calibration refused: no sequencer on the board", "identical"),
+    ("CAL O2 CONFIRM", "no phantom two-step arm to confirm", "identical"),
+    ("GET CALAIR", "the air calibration's real verdict", "identical"),
     # Calibration honesty. `CAL O2` and `CAL DEPTH` are in the grammar but have no
     # consumer on the board, so they must be REFUSED — and refused the same way on
     # both transports, or a handset has a calibration the phone does not (and vice
@@ -545,6 +568,21 @@ def compare_transports(host, port, cmds, checks, settle=1.5):
             if mode == "identical":
                 same = web == uart and bool(web)
                 detail = f"web {web[:2]} | uart {uart[:2]} | marker {marker}"
+            elif mode == "identical-except-age":
+                def scrub(lines):
+                    out = []
+                    for l in lines:
+                        f = l.split(",")
+                        # isdigit() here is a check, not a convenience: an answer
+                        # whose age field is not a number is not a DS, answer.
+                        if len(f) >= 6 and f[0] == "DS" and f[4].isdigit():
+                            f[4] = "<age>"
+                        out.append(",".join(f))
+                    return out
+                got = [l for l in web if l.startswith("DS,")]
+                same = scrub(web) == scrub(uart) and bool(got)
+                detail = (f"web {web[:2]} | uart {uart[:2]} | marker {marker} — "
+                          f"age field excepted (the sends are ~0.4 s apart)")
             else:
                 same = False
                 detail = f"unknown comparison mode {mode!r} in the check table"

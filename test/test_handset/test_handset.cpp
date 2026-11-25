@@ -19,7 +19,7 @@ Link link;
 struct Captured {
     int telemetry = 0, deco = 0, events = 0, ok = 0, err = 0;
     int settings = 0, schema = 0, pre = 0, cells = 0, proof = 0, fault = 0;
-    int logList = 0, diveHeader = 0, clock = 0, calAir = 0, raw = 0, linkDown = 0, linkUp = 0;
+    int logList = 0, diveHeader = 0, clock = 0, calAir = 0, depthSrc = 0, raw = 0, linkDown = 0, linkUp = 0;
     Telemetry t{};
     Deco d{};
     Event e{};
@@ -33,6 +33,7 @@ struct Captured {
     DiveHeader dh{};
     Clock ck{};
     CalAir ca{};
+    DepthSource ds{};
     char okNote[64] = {0}, errReason[64] = {0}, rawLine[1200] = {0};
 };
 Captured cap;
@@ -53,6 +54,7 @@ void hLog(const LogEntry& l, void*) { cap.le = l; cap.logList++; }
 void hDive(const DiveHeader& h, void*) { cap.dh = h; cap.diveHeader++; }
 void hClock(const Clock& c, void*) { cap.ck = c; cap.clock++; }
 void hCalAir(const CalAir& c, void*) { cap.ca = c; cap.calAir++; }
+void hDepthSource(const DepthSource& d, void*) { cap.ds = d; cap.depthSrc++; }
 void hRaw(const char* l, void*) { std::strncpy(cap.rawLine, l, 1199); cap.raw++; }
 void hDown(void*) { cap.linkDown++; }
 void hUp(void*) { cap.linkUp++; }
@@ -70,6 +72,7 @@ void reset() {
     h.onPre = hPre; h.onCells = hCells; h.onProof = hProof; h.onFault = hFault;
     h.onLogList = hLog; h.onDiveHeader = hDive; h.onClock = hClock;
     h.onCalAir = hCalAir; h.onLine = hRaw;
+    h.onDepthSource = hDepthSource;
     h.onLinkDown = hDown; h.onLinkUp = hUp;
     link.begin(writer, nullptr, h);
     sent[0] = 0;
@@ -468,6 +471,81 @@ void test_link_health_timeouts() {
     TEST_ASSERT_EQUAL_INT(2, cap.linkUp);
 }
 
+void test_depth_source_line_and_wording() {
+    // Which chip is producing the metres, and whether the controller is using it.
+    // The parse is not the interesting part; the two things that go wrong are (a)
+    // the line falling through to onLine because dispatch did not claim it, and
+    // (b) a client reading `locked` and concluding the depth is live.
+    link.feedText("DS,1,1,1,4,LPS28DFW @0x5D\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, cap.depthSrc, "DS, line never reached onDepthSource");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, cap.raw,
+                                  "DS, fell through to onLine: dispatch does not claim it");
+    TEST_ASSERT_TRUE(cap.ds.locked); TEST_ASSERT_TRUE(cap.ds.used); TEST_ASSERT_TRUE(cap.ds.healthy);
+    TEST_ASSERT_EQUAL_UINT32(4u, cap.ds.ageS);
+    TEST_ASSERT_EQUAL_STRING("LPS28DFW @0x5D", cap.ds.identity);
+
+    // The field a handset must act on: locked but not used means the metres on
+    // `T,` are held, not measured. Same name, same slot, different meaning.
+    link.feedText("DS,1,0,1,37,MS5837-30BA @0x76\n");
+    TEST_ASSERT_TRUE(cap.ds.locked);
+    TEST_ASSERT_FALSE_MESSAGE(cap.ds.used, "a held depth read as a live one");
+    TEST_ASSERT_EQUAL_UINT32(37u, cap.ds.ageS);
+
+    // No source is a complete answer, not a parse failure.
+    link.feedText("DS,0,0,0,0,none\n");
+    TEST_ASSERT_FALSE(cap.ds.locked);
+    TEST_ASSERT_EQUAL_STRING("none", cap.ds.identity);
+
+    // Append-only: a controller that grows the line on the right still parses,
+    // because identity is the last field and never holds a comma.
+    const int appendedBefore = cap.depthSrc;
+    link.feedText("DS,1,1,1,0,LPS28DFW @0x5D,99\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(appendedBefore + 1, cap.depthSrc,
+                                  "a DS, line with a field appended on the right was refused");
+    TEST_ASSERT_EQUAL_STRING("LPS28DFW @0x5D", cap.ds.identity);
+
+    // A truncated line is refused, not guessed: "1,1,1" with no age and no name
+    // would otherwise become a source with an empty name and an age of 0.
+    const int before = cap.depthSrc, rawBefore = cap.raw;
+    link.feedText("DS,1,1,1\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(before, cap.depthSrc, "a truncated DS, line was accepted");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(rawBefore + 1, cap.raw,
+                                  "a rejected DS, line should reach onLine, not vanish");
+
+    // An empty identity field still means "none" rather than a blank on a display.
+    link.feedText("DS,1,1,1,0,\n");
+    TEST_ASSERT_EQUAL_STRING("none", cap.ds.identity);
+
+    // A longer name than the client's field is truncated, not run over.
+    link.feedText("DS,1,1,1,0,CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(31, static_cast<int>(std::strlen(cap.ds.identity)),
+                                  "an over-long identity was not truncated into the client's field");
+
+    // The wording, because "1,0,1" is not something a diver reads.
+    DepthSource d{};
+    char txt[96];
+    d.locked = d.used = d.healthy = true; d.ageS = 0;
+    std::snprintf(d.identity, sizeof(d.identity), "LPS28DFW @0x5D");
+    TEST_ASSERT_GREATER_THAN_INT(0, depthSourceText(d, txt, sizeof(txt)));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "LPS28DFW @0x5D"), txt);
+
+    d.used = false; d.ageS = 12;
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(depthSourceText(d, txt, sizeof(txt)) ? txt : "", "HELD"),
+                                 "a held depth is not described as held");
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(txt, "12 s"), txt);
+
+    d.locked = false;
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(depthSourceText(d, txt, sizeof(txt)) ? txt : "",
+                                             "no depth sensor"), txt);
+
+    // Too small a buffer: empty string, zero length. A half sentence on an OLED
+    // ("depth HELD: no reading fr") is worse than nothing.
+    char tiny[8];
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, depthSourceText(d, tiny, sizeof(tiny)),
+                                  "depthSourceText wrote a partial sentence");
+    TEST_ASSERT_EQUAL_CHAR('\0', tiny[0]);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_parse_T_line);
@@ -486,5 +564,6 @@ int main() {
     RUN_TEST(test_line_assembly_crlf_and_overflow);
     RUN_TEST(test_command_builders_exact_strings);
     RUN_TEST(test_link_health_timeouts);
+    RUN_TEST(test_depth_source_line_and_wording);
     return UNITY_END();
 }

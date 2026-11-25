@@ -9,6 +9,8 @@
 #include "control/alarms.h"
 #include "util/numfmt.h"           // scaled(): the payload digits must match the GET answer
 
+#include <cstdio>              // snprintf for the depth-source identity copy (bounded)
+
 namespace bridge {
 
 logfmt::DiveMeta DiveTotals::toMeta() const {
@@ -157,6 +159,40 @@ void publishCalAirRefused(CalAir& out, uint8_t code, uint32_t warmupLeftS,
     out.atMs = nowMs;
     out.code = code;
     if (!ring.push({tSec, logfmt::EVT_CAL_AIR, code})) ring.noteDropped();
+}
+
+
+// See telemetry_bridge.h for why these rules are a function rather than five
+// assignments at the SensorTask call site: main.cpp is not compiled for the host
+// build, so a rule that lives there is a rule no test can see.
+void publishDepthSource(DepthSource& out, bool locked, bool used, bool healthy,
+                        uint32_t lastGoodMs, const char* identity) {
+    // Nothing means nothing: an unlocked slot has no source to be used, healthy
+    // or 300 s silent, and no name. Forcing all five together is what lets a
+    // client read `DS,0,0,0,0,none` as a complete statement instead of wondering
+    // which fields are meaningful this cycle.
+    if (!locked) {
+        used = false;
+        healthy = false;
+        lastGoodMs = 0;
+        identity = "none";
+    }
+    // No write order here can make five fields atomic (see the struct's note), so
+    // this is best-effort coherence for anyone reading the struct directly, and
+    // the authoritative guard is in the reply: `GET DS` prints a name only when
+    // `locked` vouches for it.
+    //
+    // The name goes through snprintf with the destination's own size, so a driver
+    // that ever hands out something longer is truncated rather than overrunning
+    // the array, and the array is always terminated for the reply's %s. A null
+    // here is a driver bug, and "none" is the honest answer to a driver bug: the
+    // alternative is a blank field a reader fills in himself.
+    out.locked = locked;
+    out.used = used;
+    out.healthy = healthy;
+    out.lastGoodMs = lastGoodMs;
+    std::snprintf(out.identity, sizeof(out.identity), "%s",
+                  identity ? identity : "none");
 }
 
 } // namespace bridge

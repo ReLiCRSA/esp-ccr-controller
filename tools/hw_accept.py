@@ -176,6 +176,11 @@ PROTOCOL_CHECKS = [
     ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server"),
     ("GET HIST", r"^(HIST,|ERR no histogram)", "histogram answer, or the truth"),
     ("GET FAULT", r"^FAULT,", "fuse/stuck-open/duty on request"),
+    # Which chip owns depth, and whether the control path is using it (2026-11-25).
+    # The matrix only asks for the SHAPE; the meaning is graded against the boot
+    # announce in grade_depth_source below, because `1,1,1,0,...` says nothing until
+    # you know which chip the console named at boot and whether "in use" is true.
+    ("GET DS", r"^DS,\d,\d,\d,\d+,", "depth source answers on request"),
     ("AUTO", r"^ERR predive required", "AUTO lockout on a cold boot"),
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
@@ -1106,6 +1111,172 @@ def selftest_density_lock():
                            f"no failure matching {want!r}; failures seen: {failed}"))
     return checks
 
+
+DS_LINE = re.compile(r"^DS,(\d),(\d),(\d),(\d+),(.*)$")
+
+
+def grade_depth_source(lines, pairs, expect_depth):
+    """`GET DS` on the wire, against what the console said at boot.
+
+    Two transports, one fact. The console announce (`depth: LPS28DFW @0x5D ready,
+    1016.7 hPa`) is the boot decision, printed once, before any client is
+    listening; `DS,` is that decision plus its live state, asked seconds later. A
+    build that published the arbiter's choice into one and something else into the
+    other — the second driver fitted, a stale name, a snapshot that never got
+    filled in — is caught by the two not agreeing, which no single-transport check
+    can see.
+
+    `used` is graded too, and it is the field a diver's safety depends on: a locked,
+    identified, healthy sensor that has stopped producing readings leaves the depth
+    on `T,` HELD, and the `T,` row looks identical either way.
+    """
+    checks = []
+    reply = next((r for c, r in pairs if c == "GET DS"), None)
+    if not reply:
+        return [("the depth-source leg ran (`GET DS` answered)", False,
+                 "no reply to `GET DS` — an older controller answers `ERR unknown key`, "
+                 "which means 'this controller cannot say', not 'there is no sensor'")]
+
+    line = next((l for l in reply if DS_LINE.match(l)), None)
+    if line is None:
+        return [("`GET DS` answered a well-formed `DS,` line", False,
+                 f"`GET DS` answered {reply} — want "
+                 f"`DS,<locked>,<used>,<healthy>,<age_s>,<identity>`")]
+    m = DS_LINE.match(line)
+    locked, used, healthy = (m.group(1) == "1", m.group(2) == "1", m.group(3) == "1")
+    age, who_addr = int(m.group(4)), m.group(5).strip()
+
+    ready = next((DEPTH_READY.search(l) for l in lines if DEPTH_READY.search(l)), None)
+    nodata = next((DEPTH_NODATA.search(l) for l in lines if DEPTH_NODATA.search(l)), None)
+    announce = None
+    if ready or nodata:
+        g = (ready or nodata).group
+        announce = f"{g('who').strip()} @{g('addr')}"
+
+    checks.append(("`GET DS` names a source, or says none",
+                   who_addr != "" and "," not in who_addr,
+                   f"identity field is {who_addr!r} — the field is free text and must "
+                   f"never contain a comma, because it is the last field on the line"))
+
+    if announce is None:
+        # Nothing claimed depth at boot. Then the wire must not either, and the
+        # honest answer is the whole-zero one with the name "none".
+        checks.append(("no depth sensor at boot: the wire says none too",
+                       not locked and who_addr == "none",
+                       f"announce said nothing, `DS,` says {locked=}, {who_addr!r} — a "
+                       f"name with no announce behind it is a sensor nobody identified"))
+        if expect_depth and not locked:
+            checks.append(("a bench asked for depth: something must own the slot",
+                           False, "--expect-depth was given, but no source owns depth "
+                                  "and no announce named one either"))
+        return checks
+
+    # The cross-transport claim, and the one this leg exists for.
+    checks.append(("the wire names the chip the console named at boot",
+                   who_addr == announce,
+                   f"console announced {announce!r}, `GET DS` answers {who_addr!r} — "
+                   f"one of these is not the sensor the depth is coming from"))
+    name, _, addr = who_addr.rpartition("@")
+    checks.append(("and that chip is one the identity gates accept",
+                   addr in DEPTH_IDENTS.get(name.strip(), set()),
+                   f"{who_addr!r}, accepted {DEPTH_IDENTS} — a near-relative part "
+                   f"(an LPS22HB, say) must never be handed the depth slot"))
+    checks.append(("a source owns the depth slot", locked,
+                   f"`{line}` — the console announced {announce!r} at boot, so the "
+                   f"slot is awarded until the next power cycle"))
+    checks.append(("the control path is USING it (the depth on `T,` is measured, not held)",
+                   used,
+                   f"`{line}` — locked but not used means the controller has stopped "
+                   f"taking depth from a sensor that still holds the slot, and every "
+                   f"`T,` row still prints a plausible depth. This is the field a "
+                   f"handset must look at, and the reason `GET DS` exists"))
+    if used:
+        checks.append(("a source in use has read recently", age <= 5,
+                       f"`{line}` — claimed in use, last good read {age} s ago. The "
+                       f"firmware's own staleness gate is far tighter than this, so "
+                       f"the two fields contradict each other"))
+    checks.append(("and its driver reports clean transactions", healthy,
+                   f"`{line}` — identified at boot, and by now its transaction stream "
+                   f"is in backoff"))
+    return checks
+
+
+def selftest_depth_source():
+    """The depth-source grader, proven on lying captures.
+
+    The honest capture is this bench: an LPS28DFW on the XSA-strapped breakout
+    (hence 0x5D, not the default 0x5C), identified at boot, reading. The lies are
+    the ways the two transports come apart: the wire naming a different chip than
+    the console, a near-relative part getting the slot, a sensor that holds the
+    slot while nobody is reading it, an answer that contradicts itself, and a
+    leg that never ran at all.
+    """
+    honest_pairs = [("GET DS", ["DS,1,1,1,0,LPS28DFW @0x5D"])]
+
+    def pairs_with(ds):
+        return [("GET DS", [ds])]
+
+    cases = [
+        # name, boot lines, pairs, expected failing check (None = clean)
+        ("an honest bench: console and wire name the same chip",
+         DEPTH_BOOT_OK, honest_pairs, None),
+        ("the wire names a different address than the console probed",
+         DEPTH_BOOT_OK, pairs_with("DS,1,1,1,0,LPS28DFW @0x5C"),
+         "names the chip the console named"),
+        ("a near-relative part is handed the depth slot",
+         DEPTH_BOOT_OK, pairs_with("DS,1,1,1,0,LPS22HB @0x5C"),
+         "identity gates accept"),
+        ("the snapshot was never filled in: locked, and no name",
+         DEPTH_BOOT_OK, pairs_with("DS,1,0,0,0,none"), "names the chip the console named"),
+        ("locked and identified but NOT used: the depth on `T,` is held",
+         DEPTH_BOOT_OK, pairs_with("DS,1,0,1,12,LPS28DFW @0x5D"),
+         "is USING it"),
+        ("an answer that contradicts itself: in use, silent for 15 minutes",
+         DEPTH_BOOT_OK, pairs_with("DS,1,1,1,900,LPS28DFW @0x5D"),
+         "read recently"),
+        ("no source owns depth, though the console named one",
+         DEPTH_BOOT_OK, pairs_with("DS,0,0,0,0,none"), "a source owns the depth slot"),
+        ("a truncated line is not an answer",
+         DEPTH_BOOT_OK, pairs_with("DS,1,1,1"), "well-formed"),
+        ("an identity field carrying a comma would shift every field after it",
+         # The field-count check catches it first, which is the honest result: a
+         # comma in the last field is caught as a malformed line rather than as a
+         # comma inside a name, and either way the answer is refused.
+         DEPTH_BOOT_OK, pairs_with("DS,1,1,1,0,LPS28DFW @0x5D,x"),
+         "names a source, or says none"),
+        ("older firmware that has no such command (`ERR unknown key`)",
+         DEPTH_BOOT_OK, [("GET DS", ["ERR unknown key"])], "answered a well-formed"),
+    ]
+    checks = []
+    for name, boot, pr, want in cases:
+        got = grade_depth_source(boot, pr, True)
+        failed = [c[0] for c in got if not c[1]]
+        if want is None:
+            why = "; ".join(c[0] for c in got if c[1])
+            checks.append((f"depth source: {name}", bool(got) and not failed,
+                           f"expected no failures, saw: {failed}. Graded: {why}"))
+        else:
+            checks.append((f"depth source: {name}", any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
+
+    # The leg never ran: no reply at all. A grader that returns [] here would make
+    # "not tested" indistinguishable from "passed".
+    checks.append(("depth source: `GET DS` got no reply at all",
+                   any(not ok_ for _, ok_, _ in grade_depth_source(DEPTH_BOOT_OK, [], True)),
+                   "a missing leg must report itself as a failure"))
+
+    # A bench with no depth sensor fitted: silence is the honest answer, on both
+    # transports, and must not be graded as a fault.
+    no_sensor = [("GET DS", ["DS,0,0,0,0,none"])]
+    checks.append(("depth source: no sensor fitted, both transports say none",
+                   all(ok_ for _, ok_, _ in grade_depth_source(DEPTH_BOOT_OK[:1], no_sensor, False)),
+                   str(grade_depth_source(DEPTH_BOOT_OK[:1], no_sensor, False))))
+    # ... but a name on the wire with nothing behind it is a fabricated source.
+    checks.append(("depth source: a name with no announce behind it",
+                   any(not ok_ for _, ok_, _ in grade_depth_source(
+                       DEPTH_BOOT_OK[:1], pairs_with("DS,1,1,1,0,LPS28DFW @0x5D"), False)),
+                   "an identity nobody announced at boot was accepted"))
+    return checks
 
 def grade_dive_file(drows, want, wire=()):
     """Grade one exported dive against itself, and against the settings it claims.
@@ -2293,6 +2464,7 @@ def main() -> int:
         # No board, no ports: this section is about the grader, not the machine.
         fails = 0
         for name, ok_, detail in [*selftest_depth(), *selftest_scale(),
+                                  *selftest_depth_source(),
                                   *selftest_density_lock(),
                                   *selftest_value_caps(),
                                   *selftest_dive_file(),
@@ -2416,6 +2588,16 @@ def main() -> int:
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}"
                   + ("" if ok else f": {detail}"))
             failures += 0 if ok else 1
+
+        # One sensor, two views again — this time about WHICH sensor. The console
+        # announce is the boot decision, printed once; `GET DS` is that decision
+        # plus its live state, seconds later. They must name the same chip, and
+        # `used` must be true on a bench whose sensor is reading.
+        print("\n--- depth source: the console's chip and the wire's chip are one chip ---")
+        for name, ok_, detail in grade_depth_source(lines, proto_pairs, args.expect_depth):
+            print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
+                  + ("" if ok_ else f": {detail}"))
+            failures += 0 if ok_ else 1
 
         print("\n--- value caps: an unwritable value is refused, not shortened ---")
         for name, ok, detail in grade_value_caps(proto_pairs):

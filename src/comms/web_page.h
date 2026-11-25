@@ -624,7 +624,14 @@ function showDive(slot){
     var snaps=[],meta=null,evts=[];
     txt.split("\n").forEach(function(l){
       var f=l.split(",");
-      if(f[0]==="S"&&f.length>14) snaps.push({t:+f[1],d:+f[2],p:+f[3],sp:+f[8],al:+f[9]});
+      // v1 grammar (divelog.cpp snapshotCsvLine): f[1] t_s, f[2] depth_m,
+      // f[3] voted, f[4-6] cells, f[7] SETPOINT, f[8] ALARMS(hex, the log
+      // view: alarms.h), f[9] CNS. The indices were once sp:f[8] al:f[9] -
+      // one column right, reading the alarm word as a setpoint and CNS as
+      // an alarm. Nothing consumes these two fields today (the chart draws
+      // t/d/p only), which is why the slip was harmless - and why the
+      // grammar now sits here, where the next reader cannot repeat it.
+      if(f[0]==="S"&&f.length>14) snaps.push({t:+f[1],d:+f[2],p:+f[3],sp:+f[7],al:+f[8]});
       if(f[0]==="M") meta=f;
       // The verdict rows. The chart says where the diver went; only these
       // say what the machine decided on the way: which alarm edges fired,

@@ -268,6 +268,20 @@ def grade_page(page: str):
                    none_case.group(0) if none_case else
                    "zero rows renders as nothing: silence where a reader needs "
                    "'the file held no verdicts', not an absence to be guessed"))
+
+    # ---- S, column indices (2026-11-27) -------------------------------------
+    # The dive parse once read sp:f[8] al:f[9] — one column right of the v1
+    # grammar (divelog.cpp snapshotCsvLine: f[7] SETPOINT, f[8] ALARMS, f[9]
+    # CNS): the alarm word as a setpoint, CNS as an alarm. Nothing consumed
+    # those fields, which is exactly why the slip survived; the day someone
+    # draws alarms on the chart, they would draw CNS percent. Pinned here so
+    # a drifting index reddens a check instead of a chart.
+    cols = re.search(r'sp:\+f\[7\],al:\+f\[8\]', page)
+    checks.append(("dive view reads S, setpoint/alarm at the v1 column indices",
+                   bool(cols), cols.group(0) if cols else
+                   "the S, parse's setpoint/alarm indices do not match the v1 "
+                   "grammar (sp=f[7], alarms=f[8]): an alarm word drawn as a "
+                   "setpoint, or CNS drawn as an alarm"))
     return checks
 
 
@@ -302,6 +316,9 @@ def selftest_page():
         ("verdict-free dive renders silence instead of the fact",
          '"no verdict rows in this dive"', '""',
          "a verdict-free dive says so out loud"),
+        ("dive sp/al read one column right — the historical slip restored",
+         'sp:+f[7],al:+f[8]', 'sp:+f[8],al:+f[9]',
+         "dive view reads S, setpoint/alarm at the v1 column indices"),
     ]
     for label, needle, lie, expect_red in LIES:
         if needle not in page:

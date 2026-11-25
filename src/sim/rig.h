@@ -4,9 +4,9 @@
 // runs. The rig adds only (a) the virtual clock, (b) the valve fault path and
 // (c) the running ppO2 envelope the scenarios assert on.
 //
-// Fault injection goes through the world (cell faults, stuck solenoid,
-// flushes), never through the control chain: every detection has to earn its
-// alarm the way it would in the water.
+// Fault injection goes through the world (cell faults, stuck solenoid, flushes,
+// the shared depth bus), never through the control chain: every detection has to
+// earn its alarm the way it would in the water.
 // ============================================================================
 #pragma once
 

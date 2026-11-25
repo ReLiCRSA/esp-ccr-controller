@@ -16,9 +16,18 @@
 // Sensitivity was measured, not assumed: dropping the per-cell high veto,
 // moving the high alarm to the wall value, un-binding the CellProof verdict from
 // the vote, or removing the vote's fallback when a ban empties it each makes
-// this suite fail. What it cannot reach: the staleness gate, the depth filter
-// and the stuck-open hysteresis (the gas model never makes a sample stale or
-// dither) — test_loop, test_depth and test_injector own those.
+// this suite fail. What it still cannot reach: the ADC staleness gate and the
+// stuck-open hysteresis (the gas model never makes a CELL sample stale or
+// dither) — test_loop, test_depth and test_injector own those. What it can reach
+// since 2026-11-25: the depth leg. sim::World::DepthFault stops the bus that
+// feeds the depth filter, so test_depth_bus_dies_and_returns_mid_dive owns the
+// frozen setpoint band and "an unmeasured depth never becomes a published
+// depth" end to end, through the real gas model. One limit worth stating: the
+// sim's dead bus holds its last sample the way the real driver does, so a chain
+// that ignores the validity flag is not caught by the depth asserts alone (the
+// numbers are the same either way) — the dive therefore checks its own premise,
+// and test_depth owns the filter's hold-last-good rule against a moving input.
+// The sim's depth is also noise-free, so spike rejection stays test_depth's.
 //
 // The diver model is deliberately simple and fallible: it takes a human moment
 // to notice an alarm, it ACKs, and it closes the manual inhibit when the
@@ -63,8 +72,11 @@ char g_msg[300];  // why a dive failed, including its number
 // ---------------------------------------------------------------------------
 // Fault plan: a fault must be NOTICED in time and its consequence must follow
 // ---------------------------------------------------------------------------
+// F_DEPTH_BUS is last (appended): fault kinds are named in BENCH.md evidence,
+// so the existing order is not renumberable.
 enum FaultKind : uint8_t { F_NONE, F_DEAD, F_SATURATE, F_STUCK_LOW, F_STUCK_HIGH,
-                           F_SLOW, F_VALVE, F_FLUSH, F_TWIN_LIE, F_TWIN_DRIFT };
+                           F_SLOW, F_VALVE, F_FLUSH, F_TWIN_LIE, F_TWIN_DRIFT,
+                           F_DEPTH_BUS };
 
 const char* faultName(FaultKind k) {
     switch (k) {
@@ -77,6 +89,7 @@ const char* faultName(FaultKind k) {
         case F_FLUSH: return "diluent flush";
         case F_TWIN_LIE: return "two cells agreeing low";
         case F_TWIN_DRIFT: return "two cells drifting low together";
+        case F_DEPTH_BUS: return "depth bus dead (both chips, one Wire1)";
         default: return "none";
     }
 }
@@ -264,9 +277,28 @@ void injectFault(Rig& rig, Fault& f) {
             // testing the model, not the firmware).
             w.changeO2Bar(-std::min(0.70f, rig.world().ppo2True() - 0.15f));
             break;
+        case F_DEPTH_BUS:
+            // Both depth channels at once — the shared-Wire1 failure. Only the
+            // measurement dies: the world keeps its real depth and keeps
+            // burning SAC at the real ambient pressure, and the rig keeps
+            // feeding the last reading the bus delivered with the not-believed
+            // flag set (sim/rig.cpp). That gap is what is under test.
+            w.depthFault = DepthFault::BUS_DEAD;
+            break;
         default: break;
     }
     f.injected = true;
+}
+
+// On-window faults: the measurement comes back. A depth bus that stays dead for
+// the whole dive only tests half of the rule — the other half is that the chain
+// resumes BELIEVING samples once they are real again, instead of latching into
+// "depth is a number we keep" (test_depth_bus_dies_and_returns_mid_dive).
+void clearFault(Rig& rig, const Fault& f) {
+    switch (f.kind) {
+        case F_DEPTH_BUS: rig.world().depthFault = DepthFault::NONE; break;
+        default: break;  // cell lies and a stuck valve are not self-clearing
+    }
 }
 
 // Did the machine see this fault? Detection has to come from the chain itself;
@@ -733,6 +765,291 @@ void runDive(int id) {
     if (n == 0) FAIL("dive %d: CSV export overflowed (%d rows)", id, nRec);
 }
 
+// ---------------------------------------------------------------------------
+// The depth bus dies mid-dive and comes back (findings C1 + C2, end to end)
+//
+// Why this dive exists: this suite's own header used to admit it could not
+// reach the depth filter, because the world had no way to stop MEASURING depth.
+// sim::World::DepthFault::BUS_DEAD is that way, and it is the failure the
+// hardware actually has — MS5837 and LPS28DFW share one I2C port
+// (include/config/pins.h), so a wet harness takes both depth channels out
+// together, which is exactly the "both failed" state sensors/depth_manager.h
+// budgets for. Physics does NOT follow the fault: the loop keeps burning SAC at
+// the real ambient pressure while the controller is blind about where it is.
+//
+// The window deliberately straddles an ASCENT, and that is the load-bearing
+// choice. A dead bus keeps its driver's last pressure (Ms5837::pressureBar_ is
+// written only on a good conversion — src/sensors/ms5837.cpp:146 — and no fault
+// or reset path clears it, so g_depthM holds too), so with the diver sitting
+// still, a chain that BELIEVES the frozen sample and a chain that HOLDS it see
+// the same number and no assert can tell them apart. With the diver climbing,
+// the two separate: the honest band would step down as the rig rises and the
+// chain's must not. The dive therefore checks its own premise (the rig really
+// moved while blind) before it claims anything about the hold — a scenario that
+// silently stops testing its premise is how a regression comes back green.
+//
+// Why a named scenario and not another pool draw: pool[] is indexed by the
+// per-dive RNG, so adding a kind re-rolls all fifty seeded dives — and those
+// dive numbers are cited as evidence in PLAN.md, BENCH.md and in code comments
+// ("the 50-dive soak, dive 4"). Re-rolling them is a decision for the
+// maintainer, not a side effect of adding a fault. F_DEPTH_BUS is wired into
+// the soak's fault vocabulary here (injectFault / clearFault / faultName /
+// detection grading) so that when the decision is made it is one line in pool[].
+//
+// Graded on, every control cycle through the window:
+//   * the chain's depth stays a HELD measurement (within 0.5 m of last-good)
+//     while the rig itself climbs ~13 m under it — never a surface the machine
+//     invented. This is the exact value main.cpp turns into maxDepthCm and the
+//     30 s grid row's depthCm, so "no fabricated 0 m reaches the dive file" is
+//     asserted at its source;
+//   * the setpoint never steps down a rung, let alone to the surface rung, even
+//     though the rig's true depth says it should. Note which direction the hold
+//     leaves the loop in: a deep setpoint above a shallower reality, i.e. richer
+//     than the honest plan. That is inside the toxicity fences, which is why the
+//     per-cell high veto and the 2.20 bar envelope are asserted here too;
+//   * the injector keeps regulating to the held band;
+//   * BIT_SENSOR_STALE is visible the whole window (announced within its
+//     deadline, by the suite's own detection-grading idiom);
+//   * BIT_SENSOR_FAIL never appears: the cells are honest throughout, and a
+//     chain that reported a lost vote here would be conflating "depth
+//     unmeasured" with "no ppO2 measurement", which is the C2 boundary;
+//   * after the bus returns, the chain resumes believing samples within the
+//     filter's own settle bound, and the band is free to move again at the end
+//     of the dive (the freeze is a held input, not a latched mode).
+// Mirrored from runDive's invariants: setpoint escape, the low-loop rule with
+// its sensor-honest escape hatch, the 0.12/2.20 bar hard envelope, the per-cell
+// high veto, and the latched-valve rule. Deliberately not mirrored: the
+// high-unalarmed pair, which grades cell-LIE detection — a fault this dive does
+// not inject, and asserting it here would be asserting an unrelated path.
+// Witnessed, not asserted: the deco engine does not integrate while the bus is
+// blind (loop.cpp step 8), so the CNS figure printed below stands still for the
+// window. Whether it SHOULD keep decomputing off a held depth is a question this
+// change raises for the maintainer; the dive records it rather than settling it.
+// ---------------------------------------------------------------------------
+void runDepthBusDive() {
+    const int id = 9001;                // the scenario's own number, never a soak dive
+    constexpr float kBottomM = 32.0f;   // the SP3 band: 1.00 bar, deep enough to matter
+    constexpr float kRiseToM = 12.0f;   // the honest band up there is SP2 0.70, not 1.00
+    constexpr float kFaultAtS = 420.0f;  // opens ~7 s before the climb starts, past CellProof
+    constexpr float kWindowS = 90.0f;   // 900 control ticks: long enough to matter
+    // Band floor, not equality: CellProof's upward override (1.10) is not a walk
+    // and must not fail this. Downward is: 0.70 is one rung lost and 0.40 is the
+    // surface, which is the C1 failure.
+    constexpr float kSpFloorBar = 0.999f;
+    // The loop is held near 1.0 bar by a setpoint the rig's real depth no longer
+    // supports, so it still falls toward it and still owes pulses: around 20 m it
+    // burns 1.2 l/min x 3.0 bar ~= 3.6 l-atm/min out of 8 l, about 0.45 bar/min,
+    // so a pulse is owed every ~4 s — roughly 20 in this window. Ten is the
+    // "injection clearly still running" bar; a setpoint that walked to 0.40 bar
+    // would have injected almost none, because the loop already sits at 1.0.
+    constexpr int kMinPulsesInWindow = 10;
+    // The premise of the whole dive: the rig must actually have moved under the
+    // held reading (see the comment above). 5 m is 34 s of climb at 0.15 m/s and
+    // well past the 0.5 m the chain is allowed to hold within.
+    constexpr float kPremiseRiseM = 5.0f;
+    const float trackAfterS = kFaultAtS + kWindowS + 3.0f;  // filter bound is ~0.9 s
+    constexpr float kTrackTolM = 1.2f;  // 9 ticks of settle + 0.15 m/s of real climb
+
+    RigOpts o = soakOpts();
+    Rig rig(o);
+    prediveHealthy(rig);
+    if (!rig.predivePassed()) FAIL("dive %d: pre-dive failed on a rig with no fitted faults", id);
+    if (!rig.requestAuto(true)) FAIL("dive %d: AUTO refused after a passed pre-dive", id);
+
+    rig.startDive();
+    rig.markEnvelope();
+
+    // Bottom, then a climb whose middle is inside the blind window: two
+    // waypoints, driven by the soak's own ceiling-aware, rate-limited diver.
+    Diver dv;
+    dv.depthM[0] = kBottomM;
+    dv.holdS[0] = 300.0f;
+    dv.depthM[1] = kRiseToM;
+    dv.holdS[1] = 300.0f;
+    dv.nWp = 2;
+    dv.holdLeft = dv.holdS[0];
+
+    Fault f;
+    f.kind = F_DEPTH_BUS;
+    f.atS = kFaultAtS;
+    f.detectMask = (uint16_t)(1u << alarms::BIT_SENSOR_STALE);
+    f.detectDeadlineS = 1.0f;  // one tick: the bus health flag is not something to infer
+    const float clearAtS = f.atS + kWindowS;
+
+    const float dtS = Rig::kTickMs / 1000.0f;
+    const float ackDelayS = 8.0f;  // a human moment to notice and ACK
+    bool inWindow = false, windowClosed = false, trackChecked = false;
+    float heldDepthM = 0.0f, minSp = 9.0f, minChainM = 999.0f, maxRiseM = 0.0f;
+    uint32_t pulsesAtFault = 0, pulsesInWindow = 0;
+    bool staleMissing = false, sensorFailSeen = false;
+    float lowUnalarmedS = 0.0f, alarmSinceS = -1.0f;
+    uint16_t alarmUnion = 0;
+    bool finished = false;
+    float tS = 0.0f;
+
+    for (; tS < 2400.0f && !finished; tS += dtS) {
+        // ---- open, then close, the window --------------------------------
+        if (!f.injected && tS >= f.atS) {
+            injectFault(rig, f);
+            inWindow = true;
+            heldDepthM = rig.loop().depthSmoothedM();
+            pulsesAtFault = rig.pulseCount();
+            if (heldDepthM < kBottomM - 1.0f)
+                FAIL("dive %d: the chain reads %.1f m at the bottom before the fault (true "
+                     "%.1f m) — the scenario is measuring the wrong thing",
+                     id, heldDepthM, dv.depth);
+        }
+        if (inWindow && tS >= clearAtS) {
+            clearFault(rig, f);
+            inWindow = false;
+            windowClosed = true;
+            pulsesInWindow = rig.pulseCount() - pulsesAtFault;
+            // The premise, checked at the moment it could still have been met:
+            // if the rig never moved under the held reading, believing and
+            // holding are the same number and this dive proves nothing.
+            if (maxRiseM < kPremiseRiseM)
+                FAIL("dive %d: the rig moved only %.1f m while the bus was blind (held %.1f "
+                     "m, true %.1f m) — this dive cannot tell a held depth from a believed "
+                     "one; move the window (profile changed?)",
+                     id, maxRiseM, heldDepthM, dv.depth);
+        }
+
+        if (dv.step(dtS, rig.deco(), tS)) { finished = true; break; }
+        rig.world().setDepthM(dv.depth);
+        rig.tick();
+
+        const uint16_t bits = rig.alarmBits();
+        const uint16_t seen = visibleAlarms(rig);
+        alarmUnion |= bits;
+        if (f.injected && f.detectSeenS < 0.0f && faultSignalSeen(rig, f, f.detectMask))
+            f.detectSeenS = tS;
+
+        const float sp = rig.spTarget();
+        const float chainM = rig.loop().depthSmoothedM();
+        const float pTrue = rig.world().ppo2True();
+
+        // Setpoint escape: the suite-wide bound first, whatever the depth leg does.
+        if (sp < 0.39f || sp > 1.31f)
+            FAIL("dive %d: setpoint escaped to %.2f bar at t=%.0fs depth=%.1fm",
+                 id, sp, tS, dv.depth);
+
+        if (inWindow) {
+            // A held measurement, not an invented surface. chainM is what
+            // main.cpp feeds maxDepthCm and the 30 s grid row: if it were 0 m
+            // here, the dive file would say the diver was on the surface.
+            if (chainM < heldDepthM - 0.5f)
+                FAIL("dive %d: depth readout fell to %.1f m with the bus blind (last good "
+                     "%.1f m, true depth %.1f m) at t=%.0fs — an unmeasured depth is "
+                     "being believed", id, chainM, heldDepthM, dv.depth, tS);
+            if (chainM < minChainM) minChainM = chainM;
+            if (sp < minSp) minSp = sp;
+            if (sp < kSpFloorBar)
+                FAIL("dive %d: dead depth bus walked the setpoint to %.2f bar at t=%.0fs "
+                     "(held band 1.00, last good depth %.1f m, true %.1f m): the surface "
+                     "rung was chased", id, sp, tS, heldDepthM, dv.depth);
+            if (!(seen & (1u << alarms::BIT_SENSOR_STALE))) staleMissing = true;
+            if (seen & (1u << alarms::BIT_SENSOR_FAIL)) sensorFailSeen = true;
+            if (rig.vote().mode == voting::Mode::FAILED)
+                FAIL("dive %d: the vote failed on a dive whose only fault was depth "
+                     "(t=%.0fs alarms=0x%03x)", id, tS, alarmUnion);
+            // The premise, watched from the diving side: the rig is climbing out
+            // of the band the chain is holding. If this never happens, the
+            // window is not straddling a depth change and the assert above is
+            // not doing the job it looks like it does.
+            if (heldDepthM - dv.depth > maxRiseM) maxRiseM = heldDepthM - dv.depth;
+        }
+
+        // Post-recovery: the chain must be back on the world's depth within the
+        // filter's own settle bound (5 medians + 4 boxcar = 9 ticks), plus the
+        // ground the climb covers in the 3 s since the window closed. A hold
+        // that outlives the fault is a depth frozen forever.
+        if (windowClosed && !trackChecked && tS >= trackAfterS) {
+            trackChecked = true;
+            if (std::fabs(chainM - rig.world().depthM()) > kTrackTolM)
+                FAIL("dive %d: with the bus back the chain still reads %.1f m while the rig "
+                     "is at %.1f m — hold-last-good outlived the fault",
+                     id, chainM, rig.world().depthM());
+        }
+
+        // ---- the suite-wide safety invariants, through the window ---------
+        // The low-loop rule carries the sensor-honest escape hatch: it exists for
+        // a machine that is shouting it cannot be trusted. A depth fault must not
+        // NEED it — the loop stays regulated on the held band — so the assert is
+        // here to prove the window is inert, and it is the second net if a setpoint
+        // walk ever gets far enough to starve the loop (the setpoint assert above
+        // fires first).
+        if (pTrue < 0.18f) {
+            lowUnalarmedS += dtS;
+            const bool sensorHonest = seen & ((1u << alarms::BIT_CELL_DRIFT) |
+                                              (1u << alarms::BIT_SENSOR_FAIL) |
+                                              (1u << alarms::BIT_SENSOR_STALE));
+            if (lowUnalarmedS > 3.0f &&
+                !(seen & ((1u << alarms::BIT_LOW_PPO2) | (1u << alarms::BIT_HYPOXIA))) &&
+                !sensorHonest)
+                FAIL("dive %d: loop at %.2f bar for %.1f s with no low/hypoxia alarm and "
+                     "no sensor warning (t=%.0fs depth=%.1fm alarms=0x%03x)",
+                     id, pTrue, lowUnalarmedS, tS, dv.depth, alarmUnion);
+        } else lowUnalarmedS = 0.0f;
+        if (pTrue < 0.12f && dv.depth > 3.0f)
+            FAIL("dive %d: loop fell to %.2f bar at %.1f m (t=%.0fs alarms=0x%03x)",
+                 id, pTrue, tS, dv.depth, alarmUnion);
+        if (pTrue > 2.20f)
+            FAIL("dive %d: loop reached %.2f bar (toxic) at t=%.0fs depth=%.1fm alarms=0x%03x",
+                 id, pTrue, tS, dv.depth, alarmUnion);
+        float maxCell = 0.0f;
+        for (int c = 0; c < 3; c++)
+            if (rig.cellStatus((uint8_t)c).last > maxCell) maxCell = rig.cellStatus((uint8_t)c).last;
+        if (maxCell >= kHighWall && rig.injOut().pulseStarted)
+            FAIL("dive %d: pulse started while a cell read %.2f bar (wall %.2f) at t=%.0fs "
+                 "vote=%.2f alarms=0x%03x", id, maxCell, kHighWall, tS, rig.vote().votedPpo2,
+                 alarmUnion);
+        if (rig.injOut().stuckOpenLatched && rig.loop().solenoid())
+            FAIL("dive %d: valve still commanded while latched stuck-open (t=%.0fs)", id, tS);
+
+        // ---- the simulated diver -----------------------------------------
+        if (bits && alarmSinceS < 0.0f) alarmSinceS = tS;
+        if (!bits) alarmSinceS = -1.0f;
+        if (alarmSinceS >= 0.0f && tS - alarmSinceS >= ackDelayS) {
+            rig.ackAlarms();
+            alarmSinceS = -1.0f;
+        }
+    }
+    rig.endDive();
+
+    // ---- grading ----------------------------------------------------------
+    if (!f.injected) FAIL("dive %d: the depth-bus fault was never injected", id);
+    if (!windowClosed) FAIL("dive %d: the depth-bus window never closed (t=%.0fs)", id, tS);
+    if (!finished) FAIL("dive %d: the dive had not finished by t=%.0fs", id, tS);
+    if (f.detectSeenS < 0.0f)
+        FAIL("dive %d: a dead depth bus raised no sensor alarm at all (alarms=0x%03x)",
+             id, alarmUnion);
+    if (f.detectSeenS - f.atS > f.detectDeadlineS)
+        FAIL("dive %d: the dead depth bus took %.0fs to announce (deadline %.0fs)",
+             id, f.detectSeenS - f.atS, f.detectDeadlineS);
+    if (staleMissing)
+        FAIL("dive %d: part of the blind window ran with no sensor alarm on the wire "
+             "(alarms=0x%03x)", id, alarmUnion);
+    if (sensorFailSeen)
+        FAIL("dive %d: honest cells reported as a lost vote: depth staleness conflated "
+             "with no-vote (alarms=0x%03x)", id, alarmUnion);
+    if (pulsesInWindow < kMinPulsesInWindow)
+        FAIL("dive %d: only %u pulses in the %u s blind window (lowest setpoint %.2f bar): "
+             "the injector stopped regulating to the held band",
+             id, (unsigned)pulsesInWindow, (unsigned)kWindowS, minSp);
+    if (minChainM < 20.0f)
+        FAIL("dive %d: the chain published %.1f m while blind at %.0f m — a fabricated "
+             "surface reached the dive-file inputs", id, minChainM, kBottomM);
+    if (!trackChecked) FAIL("dive %d: the dive ended before the post-recovery check ran", id);
+    if (std::fabs(rig.spTarget() - 0.40f) > 0.001f)
+        FAIL("dive %d: home at the surface and the setpoint is still %.2f bar — the depth "
+             "freeze latched instead of tracking the recovered bus", id, rig.spTarget());
+
+    std::printf("dive %d  depth-bus  %5.0f m  window %3.0f s  held %4.1f m  blind rise %4.1f m  "
+                "min chain %4.1f m  min sp %.2f  pulses %3u  CNS %3.0f%%  alarms 0x%03x\n",
+                id, kBottomM, kWindowS, heldDepthM, maxRiseM, minChainM, minSp,
+                (unsigned)pulsesInWindow, rig.cnsPct(), alarmUnion);
+}
+
 }  // namespace
 
 // Batched so one bad dive names itself without losing the rest of the soak.
@@ -741,11 +1058,16 @@ void test_soak_dives_14_25() { for (int i = 14; i <= 25; i++) runDive(i); }
 void test_soak_dives_26_38() { for (int i = 26; i <= 38; i++) runDive(i); }
 void test_soak_dives_39_50() { for (int i = 39; i <= 50; i++) runDive(i); }
 
+// The depth leg, on a named dive rather than a seeded draw: see the comment at
+// runDepthBusDive for why the pool is left alone.
+void test_depth_bus_dies_and_returns_mid_dive() { runDepthBusDive(); }
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_soak_dives_01_13);
     RUN_TEST(test_soak_dives_14_25);
     RUN_TEST(test_soak_dives_26_38);
     RUN_TEST(test_soak_dives_39_50);
+    RUN_TEST(test_depth_bus_dies_and_returns_mid_dive);
     return UNITY_END();
 }

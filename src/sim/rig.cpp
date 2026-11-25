@@ -26,8 +26,15 @@ void Rig::tick() {
     ctrl::SensorData sd;
     for (int i = 0; i < 3; i++)
         sd.cells[i] = world_.cellValue(static_cast<uint8_t>(i), kTickS);
-    sd.depthM = world_.depthM();
-    sd.pressureValid = true;  // the sim's pressure bus never fails; see test_pressure
+    // The depth leg of the world can fail now (World::DepthFault), and the way it
+    // fails is the way the driver fails on the board: the last measured sample
+    // keeps being delivered and the health flag goes false. Not 0.0f — that
+    // substitution IS the C1 bug, and SensorData.depthM in control/loop.h now
+    // says it is forbidden. The physics never follows the fault: the world stays
+    // as deep as the profile says (and keeps burning SAC at that pressure),
+    // which is the whole point of injecting it.
+    sd.depthM = world_.depthReadingM();
+    sd.pressureValid = world_.depthValid();
     sd.cellsFresh = true;
     sd.vbat = vbat_;
 

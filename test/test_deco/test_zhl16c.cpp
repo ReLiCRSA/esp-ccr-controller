@@ -1,4 +1,6 @@
-// Unit tests for ZH-L16C CCR deco math: behavior + invariants. The
+// Unit tests for ZH-L16C CCR deco math: behavior + invariants, including the
+// CNS/tissue split the control chain now runs under a depth fault (the two
+// halves are separately gated, so they are separately tested). The
 // published-table cross-validation lives in test_published.cpp (same suite:
 // done 2026-11-23 vs the Buhlmann air tables and the paliers implementation;
 // the pre-fix bands here were re-banded where the corrected M-form moved
@@ -144,6 +146,91 @@ void test_cns_clock_matches_noaa_16() {
     TEST_ASSERT_FLOAT_WITHIN(2.0, 100.0, f.cnsPct());
 }
 
+// ---------------------------------------------------------------------------
+// The two halves of integration are separable, and the split is exact.
+//
+// Why this exists: the control chain runs them under different conditions now.
+// CNS counts oxygen exposure whenever the CELL vote is trustworthy; tissues
+// count ambient pressure whenever the DEPTH leg is — which during a depth-bus
+// fault means the held last-good pressure. If either half kept its own idea of
+// elapsed time (a stored timestamp, a leftover dt), a window in which only one
+// of them ran would make the other lose time or count it twice. These three
+// tests are the witness that neither half can: step() is the wrapper, the halves
+// are additive by construction, and the published-table suite above keeps
+// passing through the wrapper unchanged.
+// ---------------------------------------------------------------------------
+void test_step_cns_only_clocks_time_without_touching_tissues() {
+    Zhl16Ccr d(baseCfg());
+    holdAt(d, 30.0f, 1.3f, 10.0f);  // a real dive first: tissues loaded, CNS running
+
+    double before[Zhl16Ccr::NCOMP];
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) before[i] = d.tissueBar(i);
+    const double cns0 = d.cnsPct();
+
+    // 10 min of ppO2 with no ambient pressure argument at all — this is the
+    // shape of a depth-bus fault: the cells are a measurement, the depth is not.
+    for (int k = 0; k < 10; k++) d.stepCns(60.0, 1.3);
+
+    // NOAA 1.30 row: 180 min => 100/180 %/min => 5.56 % over 10 min.
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.01, cns0 + 100.0 * 10.0 / 180.0, d.cnsPct(),
+                                     "stepCns did not accrue the ppO2 exposure it was given");
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i)
+        TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-9, before[i], d.tissueBar(i),
+                                         "stepCns moved a tissue compartment");
+}
+
+void test_step_tissues_only_loads_tissues_without_clocking_cns() {
+    Zhl16Ccr d(baseCfg());
+    holdAt(d, 30.0f, 1.3f, 10.0f);
+    const double cns0 = d.cnsPct();
+    const double fast0 = d.tissueBar(0);
+    const double p = d.depthToBar(30.0);
+
+    for (int k = 0; k < 10; k++) d.stepTissues(60.0, p, 1.3);
+
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-9, cns0, d.cnsPct(), "stepTissues moved the CNS clock");
+    // Haldane closed form on the 5 min compartment: 10 min at constant ppN2
+    // closes 1 - 2^-2 = 75 % of the gap. Also the witness that the tissue half
+    // really did integrate the 10 minutes it was handed.
+    const double ppN2 = p - 0.0627 - 1.3;
+    const double expected = fast0 + (ppN2 - fast0) * (1.0 - std::pow(2.0, -10.0 / 5.0));
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.005, expected, d.tissueBar(0),
+                                     "stepTissues did not integrate the time it was given");
+    TEST_ASSERT_TRUE(d.tissueBar(0) > fast0);
+}
+
+void test_step_wrapper_equals_the_two_halves_no_time_lost_or_double_counted() {
+    const double p = Zhl16Ccr(baseCfg()).depthToBar(30.0);
+
+    // Reference: 30 min through the wrapper, one call.
+    Zhl16Ccr a(baseCfg());
+    a.step(30.0 * 60.0, p, 1.3);
+
+    // Same 30 min, but delivered as halves one minute at a time.
+    Zhl16Ccr b(baseCfg());
+    for (int k = 0; k < 30; k++) {
+        b.stepCns(60.0, 1.3);
+        b.stepTissues(60.0, p, 1.3);
+    }
+    TEST_ASSERT_FLOAT_WITHIN(1e-6, a.cnsPct(), b.cnsPct());
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i)
+        TEST_ASSERT_FLOAT_WITHIN(1e-6, a.tissueBar(i), b.tissueBar(i));
+
+    // And the fault shape: 10 min healthy, 10 min where only CNS ran (depth
+    // lost), 10 min healthy again. The CNS clock must not care that a half sat
+    // out — same 30 min of ppO2, same total — while the tissues, which missed
+    // those 10 min, must be behind the reference. That is the pair of assertions
+    // that fails if either half skips dt or counts it twice.
+    Zhl16Ccr c(baseCfg());
+    c.step(10.0 * 60.0, p, 1.3);
+    c.stepCns(10.0 * 60.0, 1.3);
+    c.step(10.0 * 60.0, p, 1.3);
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-6, a.cnsPct(), c.cnsPct(),
+                                     "a CNS-only window changed the oxygen clock total");
+    TEST_ASSERT_TRUE_MESSAGE(c.tissueBar(0) < a.tissueBar(0),
+                             "tissues counted time they were never handed");
+}
+
 void test_pco2_inclusion_is_conservative() {
     Config cNo = baseCfg();
     Config cWith = baseCfg();
@@ -163,6 +250,9 @@ int main() {
     RUN_TEST(test_schedule_deep_dive_has_ordered_stops_ending_at_3m);
     RUN_TEST(test_schedule_short_dive_shallow_stops_only);
     RUN_TEST(test_cns_clock_matches_noaa_16);
+    RUN_TEST(test_step_cns_only_clocks_time_without_touching_tissues);
+    RUN_TEST(test_step_tissues_only_loads_tissues_without_clocking_cns);
+    RUN_TEST(test_step_wrapper_equals_the_two_halves_no_time_lost_or_double_counted);
     RUN_TEST(test_pco2_inclusion_is_conservative);
     RUN_TEST(test_pub_air_table_schedules);
     RUN_TEST(test_pub_ndl_structure);

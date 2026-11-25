@@ -274,10 +274,61 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     alarmRes_ = alarmMgr_.update(ai);
 
     // ---- 8. decompression + CNS (the diver's real exposure) ----------------
-    // The deco converts depth with its own surface pressure and water density,
-    // so depth and absolute pressure stay consistent inside one module.
-    if (diveActive && in.pressureValid)
-        deco_.step(dt / 1000.0, deco_.depthToBar(std::max(0.0f, depthSmooth_)), vote_.votedPpo2);
+    // The deco engine integrates two things from two sensors, and they fail
+    // independently, so the two halves are gated separately (deco::Zhl16Ccr
+    // step/stepCns/stepTissues — verified: cnsLimitMin() has no ambient or
+    // depth term anywhere, and neither half keeps state about time, so running
+    // one half without the other cannot skip or double-count dt). Depth is
+    // still converted inside the deco module, with its own surface pressure and
+    // water density, so depth and absolute pressure stay on one ruler.
+    //
+    // CNS: ppO2 x time, from the OXYGEN CELLS — a different sensor on a
+    // different bus from depth. So it advances whenever the chain has a ppO2
+    // worth integrating, which is the same trust rule the injector is held to
+    // in step 6: haveVote_ && in.cellsFresh. A dead depth bus must not stop the
+    // oxygen clock — this used to freeze it, which under-records in the
+    // direction that hurts: 300 blind seconds at a 1.30 bar setpoint is around
+    // 2.8 % CNS the diver was never told about (the NOAA 1.30 row: 180 min), and
+    // CNS is what the CNS alarm and the dive file's cnsPct column are built on.
+    // Residual, stated rather than hidden: with NO vote there is nothing to
+    // integrate, so CNS freezes there. That is the one remaining CNS
+    // under-record window, and it is the window in which alarms.cpp already
+    // raises BIT_SENSOR_FAIL (vote FAILED with cells seen) — the diver is being
+    // told the machine cannot see the loop at all, which is also the moment
+    // they stop trusting its deco picture.
+    if (diveActive && haveVote_ && in.cellsFresh)
+        deco_.stepCns(dt / 1000.0, vote_.votedPpo2);
+
+    // Tissues: ambient pressure x time, and during a depth fault the pressure
+    // available is the one depthSmooth_ last MEASURED (held, not believed —
+    // finding C1). Stepping on the held depth is the choice that is wrong in
+    // the safe direction, both ways it can be wrong:
+    //   * Freezing used to be the behavior, and it under-records in exactly the
+    //     fault response the manual asks for: a diver who loses depth and setpoint
+    //     climbs on the instruments they still have. That off-gassing happened,
+    //     and a frozen model forgets the debt (or the recovery from it) the
+    //     diver just paid — the schedule and NDL shown after recovery would be
+    //     computed from tissues that are not the diver's.
+    //   * Holding last-good while the diver ASCENDS over-states the ambient
+    //     pressure, so it over-counts uptake and the ceiling it demands is
+    //     deeper than the truth needs. Over-recording debt is the fenced
+    //     direction: a deeper ceiling can only ever ask for more deco, and the
+    //     setpoint is frozen anyway (step 5), so the machine is not being walked
+    //     anywhere on the held number.
+    //   * The one case that under-records is a diver who descends DEEPER than
+    //     the last known depth while blind and alarmed: uptake is counted at a
+    //     shallower pressure than reality. Bounded — the window ends when the
+    //     bus returns or the dive is aborted, BIT_SENSOR_STALE is on the display
+    //     saying the depth shown is not measured, and injection is regulating to
+    //     a frozen band rather than following the diver down. No phantom depth
+    //     excursion is invented to paper over it: the model does not get to be
+    //     cleverer than the sensor that went away.
+    if (diveActive)
+        deco_.stepTissues(dt / 1000.0, deco_.depthToBar(std::max(0.0f, depthSmooth_)),
+                          vote_.votedPpo2);
+    // (With no vote, votedPpo2 is 0.0f, so ppN2 is computed HIGHER and the
+    // tissues load more than they would on a real ppO2 — unchanged from before
+    // this split, and the conservative side of "no measurement".)
 
     // ---- 9. fill the report ------------------------------------------------
     st.solenoid = solenoid_;

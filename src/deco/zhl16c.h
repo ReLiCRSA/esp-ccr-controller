@@ -80,9 +80,30 @@ public:
 
     void reset();  // tissues equilibrated to surface air (0.21)
 
-    // Integrate one real-time step. pAmbBar = measured absolute pressure,
-    // ppO2Bar = VOTED loop ppO2. Internally subdivided (<=10 s substeps).
+    // Integrate one real-time step: both halves, tissues AND the CNS clock.
+    // pAmbBar = measured absolute pressure, ppO2Bar = VOTED loop ppO2.
+    // Internally subdivided (<=10 s substeps). This is the wrapper: it forwards
+    // the SAME dt to each half, and neither half keeps any state about time
+    // (no timestamp, no leftover accumulator — see stepCns/stepTissues), so
+    // calling the wrapper cannot double-count or skip time that the two halves
+    // called separately would have seen.
     void step(double dtSec, double pAmbBar, double ppO2Bar);
+
+    /// The CNS clock alone. Its entire input is ppO2 — the NOAA table is a
+    /// function of ppO2 and time only, with no ambient or depth term anywhere
+    /// (cnsLimitMin below) — because ppO2 comes from the oxygen cells, a
+    /// different sensor on a different bus from depth. So a controller that has
+    /// lost the depth leg can still count oxygen exposure honestly, and one
+    /// that has lost the CELLS cannot (there is nothing to integrate).
+    /// Accumulates on real time, not on substeps, exactly as step() always did.
+    void stepCns(double dtSec, double ppO2Bar);
+
+    /// The 16 tissue compartments alone, at a given absolute ambient pressure.
+    /// CNS untouched. Inert take-up needs both pressure and ppO2
+    /// (ppN2 = Pamb - pH2O - pCO2 - ppO2), so this half is the one that dies
+    /// with the depth measurement — and the caller decides what pressure to
+    /// hand it when that measurement is a held one.
+    void stepTissues(double dtSec, double pAmbBar, double ppO2Bar);
 
     // Ceiling: tolerated ambient pressure across all compartments.
     double ceilingBar() const;

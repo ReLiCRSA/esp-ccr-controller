@@ -68,16 +68,29 @@ double Zhl16Ccr::depthToBar(double depthM) const {
     return depthscale::ambientBarAtDepthM(depthM, cfg_.pSurfaceBar, cfg_.waterDensity);
 }
 
+// The two halves of integration, deliberately separable. Neither one keeps any
+// state about time: step() never stored a timestamp or carried a leftover dt,
+// the CNS term uses the caller's dt once and the tissue loop subdivides a copy
+// of it. So step() == stepCns() + stepTissues() for the same dt, by
+// construction — and a caller that runs only one half for a while cannot make
+// the other half double-count or lose time when it comes back.
 void Zhl16Ccr::step(double dtSec, double pAmbBar, double ppO2Bar) {
+    stepCns(dtSec, ppO2Bar);
+    stepTissues(dtSec, pAmbBar, ppO2Bar);
+}
+
+void Zhl16Ccr::stepCns(double dtSec, double ppO2Bar) {
+    if (dtSec <= 0.0) return;
+    // CNS clock accumulates on real time regardless of substep size. ppO2 is its
+    // only input: no ambient pressure, no depth term anywhere in cnsLimitMin.
+    const double lim = cnsLimitMin(ppO2Bar);
+    cnsPct_ += 100.0 * (dtSec / 60.0) / lim;
+    cnsPct_ = std::min(cnsPct_, 999.0);
+}
+
+void Zhl16Ccr::stepTissues(double dtSec, double pAmbBar, double ppO2Bar) {
     if (dtSec <= 0.0) return;
     const double ppN2 = std::max(0.0, pAmbBar - cfg_.ph2oBar - cfg_.pco2Bar - ppO2Bar);
-
-    // CNS clock accumulates on real time regardless of substep size.
-    if (dtSec > 0.0) {
-        const double lim = cnsLimitMin(ppO2Bar);
-        cnsPct_ += 100.0 * (dtSec / 60.0) / lim;
-        cnsPct_ = std::min(cnsPct_, 999.0);
-    }
 
     // Subdivide for stability when the caller uses coarse steps.
     while (dtSec > 0.0) {

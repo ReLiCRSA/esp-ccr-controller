@@ -813,18 +813,40 @@ void runDive(int id) {
 //   * BIT_SENSOR_FAIL never appears: the cells are honest throughout, and a
 //     chain that reported a lost vote here would be conflating "depth
 //     unmeasured" with "no ppO2 measurement", which is the C2 boundary;
+//   * the exposure picture keeps integrating (follow-up #1): the CNS clock
+//     accrues through the window — ppO2 comes from the cells, not the depth bus
+//     — and the tissue model keeps counting the held depth. Direction is
+//     asserted against a TWIN: a second rig, same options, same diver, same true
+//     depth at every tick, but an honest bus. Up to the moment the fault opens
+//     the two are deterministically identical (same dive, same world noise
+//     seed), so whatever separates them at the window's end IS the fault. It
+//     must separate in the conservative direction: the blind rig's tissues are
+//     the loaded ones and the ceiling it shows is the deeper one, because it
+//     kept integrating the last measured depth while the real diver climbed out
+//     of it. Freezing (the old behavior) sat between the two and quietly
+//     forgot both the loading and the off-gas the diver actually did. The
+//     witness bundles the held setpoint's effect on ppN2 as well — it asserts
+//     the direction, not a decomposition of it; test_loop's
+//     test_blind_depth_window_still_clocks_cns_and_loads_tissues is the one
+//     that pins the magnitudes;
 //   * after the bus returns, the chain resumes believing samples within the
 //     filter's own settle bound, and the band is free to move again at the end
-//     of the dive (the freeze is a held input, not a latched mode).
+//     of the dive (the freeze is a held input, not a latched mode);
+//   * and the window is identifiable in the dive file afterwards, with no wire
+//     or format change: every 30 s grid row that overlaps it carries
+//     BIT_SENSOR_STALE in alarmBits (main.cpp ORs in whatever was active since
+//     the previous row) and its ceiling/decoTotal/NDL columns — written from the
+//     same deco picture the window just integrated — actually moved. A blind
+//     window that integrated nothing would leave rows that look healthy and
+//     unchanged, which is how an under-recorded deco debt hides.
 // Mirrored from runDive's invariants: setpoint escape, the low-loop rule with
 // its sensor-honest escape hatch, the 0.12/2.20 bar hard envelope, the per-cell
 // high veto, and the latched-valve rule. Deliberately not mirrored: the
 // high-unalarmed pair, which grades cell-LIE detection — a fault this dive does
 // not inject, and asserting it here would be asserting an unrelated path.
-// Witnessed, not asserted: the deco engine does not integrate while the bus is
-// blind (loop.cpp step 8), so the CNS figure printed below stands still for the
-// window. Whether it SHOULD keep decomputing off a held depth is a question this
-// change raises for the maintainer; the dive records it rather than settling it.
+// The deco engine no longer freezes while the bus is blind: both halves advance
+// through the window (loop.cpp step 8), which is what the CNS and twin asserts
+// below are watching.
 // ---------------------------------------------------------------------------
 void runDepthBusDive() {
     const int id = 9001;                // the scenario's own number, never a soak dive
@@ -859,6 +881,24 @@ void runDepthBusDive() {
     rig.startDive();
     rig.markEnvelope();
 
+    // The twin: same options, same diver, the same true depth at every tick, but
+    // an honest depth bus. Until the fault opens the two are deterministically
+    // the same dive, so the difference between them at the window's end is the
+    // fault and nothing else — which is how the exposure asserts below can
+    // assert a DIRECTION (the blind rig must be the conservative one) without
+    // hard-coding a deco number that a GF or band change would move. The diver
+    // follows the FAULTED rig's ceiling (that is what a diver looking at this
+    // machine's display would do), which also keeps both rigs at the same true
+    // depth, so the tissue comparison is apples to apples. The twin is a
+    // reference, not a subject: the suite's safety invariants are graded on the
+    // faulted rig, and the twin's behavior is the healthy-dive path the other
+    // fifty dives already grade.
+    Rig twin(o);
+    prediveHealthy(twin);
+    if (!twin.predivePassed()) FAIL("dive %d: the twin's pre-dive failed", id);
+    if (!twin.requestAuto(true)) FAIL("dive %d: the twin refused AUTO", id);
+    twin.startDive();
+
     // Bottom, then a climb whose middle is inside the blind window: two
     // waypoints, driven by the soak's own ceiling-aware, rate-limited diver.
     Diver dv;
@@ -876,10 +916,27 @@ void runDepthBusDive() {
     f.detectDeadlineS = 1.0f;  // one tick: the bus health flag is not something to infer
     const float clearAtS = f.atS + kWindowS;
 
+    // The CNS the window is owed: the loop is regulated to the held 1.00 bar
+    // band throughout, so the NOAA 1.00 row (300 min) sets the rate —
+    // 100 x 1.5 min / 300 = 0.5 %, and the CellProof override can push it a bit
+    // higher. Anything near zero is the frozen clock this follow-up removed.
+    constexpr float kMinCnsGainPct = 0.25f;
+
     const float dtS = Rig::kTickMs / 1000.0f;
     const float ackDelayS = 8.0f;  // a human moment to notice and ACK
     bool inWindow = false, windowClosed = false, trackChecked = false;
     float heldDepthM = 0.0f, minSp = 9.0f, minChainM = 999.0f, maxRiseM = 0.0f;
+    float cnsAtOpen = 0.0f, cnsGainInWindow = 0.0f;
+    double fastTissueOpen = 0.0, twinFastTissueOpen = 0.0;
+    double fastTissueClose = 0.0, twinFastTissueClose = 0.0;
+    double ceilAtClose = 0.0, twinCeilClose = 0.0;
+    // The 30 s dive-file row, tracked the way the firmware writes it.
+    float rowClockS = 0.0f, rowDecoOpen = 0.0f, rowDecoClose = 0.0f;
+    float rowNdlOpen = 0.0f, rowNdlClose = 0.0f;
+    float rowCeilLastBlind = 0.0f, ceilAtWindowOpen = 0.0f;
+    uint16_t rowAlarm = 0, rowAlarmVis = 0;
+    bool rowStaleMissing = false;
+    int rowsBlind = 0, blindCyclesInRow = 0, rowsBlindRawStale = 0;
     uint32_t pulsesAtFault = 0, pulsesInWindow = 0;
     bool staleMissing = false, sensorFailSeen = false;
     float lowUnalarmedS = 0.0f, alarmSinceS = -1.0f;
@@ -898,6 +955,22 @@ void runDepthBusDive() {
                 FAIL("dive %d: the chain reads %.1f m at the bottom before the fault (true "
                      "%.1f m) — the scenario is measuring the wrong thing",
                      id, heldDepthM, dv.depth);
+            // The twins must still be the same dive at this instant: if they are
+            // not, the comparison at the window's end proves nothing.
+            if (std::fabs(rig.deco().tissueBar(0) - twin.deco().tissueBar(0)) > 0.02)
+                FAIL("dive %d: twin (%.2f bar) and faulted rig (%.2f bar) had different tissues "
+                     "before the fault was injected — the comparison below is not a control",
+                     id, twin.deco().tissueBar(0), rig.deco().tissueBar(0));
+            cnsAtOpen = rig.cnsPct();
+            fastTissueOpen = rig.deco().tissueBar(0);
+            twinFastTissueOpen = twin.deco().tissueBar(0);
+            // The deco columns of the next dive-file row, computed the way
+            // main.cpp computes them: from the depth the CHAIN believes (the
+            // held one during the window), not the world's true one.
+            const double heldBar = rig.deco().depthToBar(rig.loop().depthSmoothedM());
+            rowDecoOpen = (float)rig.deco().schedule(heldBar).totalTimeMin;
+            rowNdlOpen = (float)rig.deco().ndlMinutes(heldBar, rig.vote().votedPpo2);
+            ceilAtWindowOpen = (float)rig.deco().ceilingM();
         }
         if (inWindow && tS >= clearAtS) {
             clearFault(rig, f);
@@ -912,11 +985,56 @@ void runDepthBusDive() {
                      "m, true %.1f m) — this dive cannot tell a held depth from a believed "
                      "one; move the window (profile changed?)",
                      id, maxRiseM, heldDepthM, dv.depth);
+
+            // ---- the exposure picture, at the moment the window closes ----
+            // CNS: ppO2 is a cell measurement, so the oxygen clock must have run
+            // the whole window. The old chain froze it here (exactly 0 gained).
+            cnsGainInWindow = rig.cnsPct() - cnsAtOpen;
+            if (cnsGainInWindow < kMinCnsGainPct)
+                FAIL("dive %d: the blind %0.0f s window gained %.2f %% CNS at a held %.2f bar "
+                     "setpoint (the NOAA 1.00 row owes ~0.5 %%): ppO2 exposure stopped being "
+                     "counted because the DEPTH bus died",
+                     id, kWindowS, cnsGainInWindow, minSp);
+            // Tissues: the model keeps integrating the held last-good depth, so
+            // its fast compartment is still loading toward 32 m while the real
+            // diver has climbed ~12 m out of that band. The honest twin, same
+            // dive, same diver, is off-gassing instead. The blind rig must be
+            // the deeper one — over-recording debt asks for MORE deco, which is
+            // the fenced direction; forgetting it asks for less.
+            fastTissueClose = rig.deco().tissueBar(0);
+            twinFastTissueClose = twin.deco().tissueBar(0);
+            const double fastDelta = fastTissueClose - fastTissueOpen;
+            const double twinFastDelta = twinFastTissueClose - twinFastTissueOpen;
+            if (fastDelta + 0.1 < twinFastDelta)
+                FAIL("dive %d: across the blind window the faulted rig's fast compartment moved "
+                     "%+.3f bar against the honest twin's %+.3f — the held-depth integration "
+                     "under-recorded the diver's debt (last measured depth %.1f m, true %.1f m)",
+                     id, fastDelta, twinFastDelta, heldDepthM, dv.depth);
+            // And the same in the number the diver is shown: the ceiling this
+            // machine demands must not be shallower than the honest one's.
+            ceilAtClose = rig.deco().ceilingM();
+            twinCeilClose = twin.deco().ceilingM();
+            const double heldBarClose = rig.deco().depthToBar(rig.loop().depthSmoothedM());
+            rowDecoClose = (float)rig.deco().schedule(heldBarClose).totalTimeMin;
+            rowNdlClose = (float)rig.deco().ndlMinutes(heldBarClose, rig.vote().votedPpo2);
+            if (ceilAtClose + 0.25 < twinCeilClose)
+                FAIL("dive %d: the blind rig shows a %.1f m ceiling against the twin's %.1f m "
+                     "— the window's debt never reached the deco picture the diver reads",
+                     id, ceilAtClose, twinCeilClose);
+            if (fastTissueClose <= fastTissueOpen)
+                FAIL("dive %d: no tissue moved during the %0.0f s blind window (fast compartment "
+                     "%.2f -> %.2f bar): deco integration froze with the depth bus",
+                     id, kWindowS, fastTissueOpen, fastTissueClose);
         }
 
         if (dv.step(dtS, rig.deco(), tS)) { finished = true; break; }
         rig.world().setDepthM(dv.depth);
         rig.tick();
+        // The twin rides the same diver and the same true depth, with an honest
+        // bus: its world burns SAC at the same ambient pressure and its chain
+        // believes every sample it is given.
+        twin.world().setDepthM(dv.depth);
+        twin.tick();
 
         const uint16_t bits = rig.alarmBits();
         const uint16_t seen = visibleAlarms(rig);
@@ -1013,8 +1131,42 @@ void runDepthBusDive() {
             rig.ackAlarms();
             alarmSinceS = -1.0f;
         }
+
+        // ---- the 30 s dive-file row, filled the way main.cpp fills it ------
+        // Item 6 of the follow-up: now that the tissues integrate through a blind
+        // window, the window has to be identifiable in the file afterwards — and
+        // the existing row format already does that with no wire or format
+        // change. alarmBits carries whatever was active since the previous row,
+        // so a row that overlaps the window must carry BIT_SENSOR_STALE, and the
+        // ceiling/NDL/decoTotal columns are written from the deco picture this
+        // window just moved. Checked on the row boundary, which is exactly where
+        // the firmware writes the row.
+        rowAlarm |= bits;
+        rowAlarmVis |= seen;
+        if (inWindow) blindCyclesInRow++;
+        if (tS >= rowClockS) {
+            // Only a row that was blind for most of its 30 s says anything: a row
+            // clipped by one cycle at the edge of the window would be graded on a
+            // cycle whose alarm had barely had time to arrive.
+            // Grade a row only when it was blind for most of its 30 s AND the row
+            // boundary itself fell inside the window: a boundary at or after the
+            // recovery lets the first healthy cycles move the numbers and hides a
+            // window in which nothing integrated at all.
+            if (blindCyclesInRow >= 150 && inWindow) {
+                rowsBlind++;
+                if (!(rowAlarmVis & (uint16_t)(1u << alarms::BIT_SENSOR_STALE)))
+                    rowStaleMissing = true;
+                if (rowAlarm & (uint16_t)(1u << alarms::BIT_SENSOR_STALE)) rowsBlindRawStale++;
+                rowCeilLastBlind = (float)rig.deco().ceilingM();
+            }
+            rowClockS += 30.0f;
+            rowAlarm = 0;
+            rowAlarmVis = 0;
+            blindCyclesInRow = 0;
+        }
     }
     rig.endDive();
+    twin.endDive();
 
     // ---- grading ----------------------------------------------------------
     if (!f.injected) FAIL("dive %d: the depth-bus fault was never injected", id);
@@ -1040,14 +1192,53 @@ void runDepthBusDive() {
         FAIL("dive %d: the chain published %.1f m while blind at %.0f m — a fabricated "
              "surface reached the dive-file inputs", id, minChainM, kBottomM);
     if (!trackChecked) FAIL("dive %d: the dive ended before the post-recovery check ran", id);
+    // The window must be identifiable post-dive, with no format change: two 30 s
+    // rows of a 90 s window are wholly inside it (their boundaries fall between
+    // the open and the close), every one of them has to carry the sensor alarm,
+    // and the deco columns written next to it have to have moved.
+    if (rowsBlind < 2)
+        FAIL("dive %d: only %d dive-file rows sat wholly inside the %0.0f s window — the profile "
+             "moved on, the witness below proves nothing", id, rowsBlind, kWindowS);
+    if (rowStaleMissing)
+        FAIL("dive %d: a dive-file row that overlapped the blind window carried no sensor alarm "
+             "even counting an ACKed-but-still-active one — the held-depth deco figures written "
+             "next to it would be unreadable afterwards", id);
+    // Witness, deliberately NOT a failure. main.cpp writes sn.alarmBits =
+    // st.alarms.bits, and alarms.cpp drops an ACKed-but-still-active CRITICAL
+    // condition out of that set (it travels in ackSuppressed, for the handset,
+    // until the condition recovers). So a diver who has ACKed the stale-depth
+    // alarm loses the STALE marker from the file's rows while the bus stays
+    // dead — the deco columns still identify the window, but the marker does
+    // not. Reported so the gap is on the record: closing it changes what is
+    // written into an existing field, which is the maintainer's call, not a
+    // side effect of this change.
+    if (rowsBlindRawStale < rowsBlind)
+        std::printf("dive %d  NOTE  %d/%d blind dive-file rows lost BIT_SENSOR_STALE from "
+                    "alarmBits after an ACK (it survives only in ackSuppressed, for the "
+                    "handset)\n",
+                    id, rowsBlind - rowsBlindRawStale, rowsBlind);
+    if (!(rowDecoClose > rowDecoOpen || rowNdlClose < rowNdlOpen))
+        FAIL("dive %d: across the blind window the deco columns of the dive file did not move "
+             "(total %.1f -> %.1f min, NDL %.1f -> %.1f min): the window left no trace the "
+             "held-depth integration could be seen in", id, rowDecoOpen, rowDecoClose, rowNdlOpen,
+             rowNdlClose);
+    if (rowCeilLastBlind <= ceilAtWindowOpen)
+        FAIL("dive %d: the ceiling column written into the dive file was flat across the blind "
+             "window (%.2f m when it opened, %.2f m on the last blind row): the integration that "
+             "ran on the held depth left nothing a post-dive reader could see",
+             id, ceilAtWindowOpen, rowCeilLastBlind);
     if (std::fabs(rig.spTarget() - 0.40f) > 0.001f)
         FAIL("dive %d: home at the surface and the setpoint is still %.2f bar — the depth "
              "freeze latched instead of tracking the recovered bus", id, rig.spTarget());
 
     std::printf("dive %d  depth-bus  %5.0f m  window %3.0f s  held %4.1f m  blind rise %4.1f m  "
-                "min chain %4.1f m  min sp %.2f  pulses %3u  CNS %3.0f%%  alarms 0x%03x\n",
+                "min chain %4.1f m  min sp %.2f  pulses %3u  CNS %4.1f%% (+%2.1f in window, twin "
+                "%4.1f%%)  fast tissue %4.2f vs twin %4.2f  ceil %4.1f vs twin %4.1f m  rows %d "
+                "(deco %.1f->%.1f min, NDL %.0f->%.0f)  alarms 0x%03x\n",
                 id, kBottomM, kWindowS, heldDepthM, maxRiseM, minChainM, minSp,
-                (unsigned)pulsesInWindow, rig.cnsPct(), alarmUnion);
+                (unsigned)pulsesInWindow, rig.cnsPct(), cnsGainInWindow, twin.cnsPct(),
+                fastTissueClose, twinFastTissueClose, ceilAtClose, twinCeilClose, rowsBlind,
+                rowDecoOpen, rowDecoClose, rowNdlOpen, rowNdlClose, alarmUnion);
 }
 
 }  // namespace

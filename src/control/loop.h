@@ -59,6 +59,15 @@ struct SensorData {
     /// bus actually measured (or anything at all) and set pressureValid false;
     /// depthfilter.h explains why hold-last-good is the survivable direction.
     float depthM = 0.0f;
+    /// When pressureValid is false the chain does five separate things (each one
+    /// measured by test_loop / test_divesoak): the depth filter holds the last
+    /// sample, the setpoint band freezes with it, pre-dive's "am I on the
+    /// surface?" answers FAIL, BIT_SENSOR_STALE goes up, and the tissue model
+    /// keeps integrating the HELD depth (loop.cpp step 8). What does NOT stop is
+    /// the CNS clock: ppO2 comes from the cells, on another bus, and it advances
+    /// whenever there is a trustworthy vote — which is also the only case where
+    /// it does stop (no vote, or a vote built from stale samples: nothing to
+    /// integrate).
     bool pressureValid = true;            // pressure bus healthy: depthM believed
     bool cellsFresh = true;               // ADC readings are not stale
     float vbat = 12.0f;

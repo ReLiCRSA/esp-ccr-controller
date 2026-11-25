@@ -2,12 +2,15 @@
 // test_loop — behaviour that only exists in the assembled chain: what happens
 // between the modules (sensor staleness gating the valve, the output fuse, the
 // pre-dive lockout, a spiked depth sample vs the setpoint bands, a dead depth
-// bus vs the depth readout and the setpoint rung, and what the pre-dive makes
-// of a rig that cannot measure depth at all).
+// bus vs the depth readout and the setpoint rung, a dead depth bus vs the deco
+// and CNS clocks, and what the pre-dive makes of a rig that cannot measure
+// depth at all).
 // The fault scenarios in test_sim cover the same ground physically; these pin
 // the interface contracts the firmware ControlTask depends on.
 // ============================================================================
 #include <unity.h>
+
+#include <cmath>
 
 #include "control/loop.h"
 
@@ -264,6 +267,167 @@ void test_dead_depth_bus_holds_depth_and_setpoint() {
                                      "the band stayed frozen after the bus recovered");
 }
 
+// ---------------------------------------------------------------------------
+// Follow-up #1: the depth bus dies, and the diver's exposure must not die with
+// it. CNS comes from the oxygen cells (a different sensor, a different bus);
+// tissue loading comes from ambient pressure, and during a depth fault the only
+// pressure available is the held last-good one. Two rigs, identical feeds, one
+// honest depth and one blind for 300 s: their CNS clocks must stay together,
+// and the blind one's tissues must still be loading. The old chain froze both.
+void test_blind_depth_window_still_clocks_cns_and_loads_tissues() {
+    Config c = benchCfg();
+    c.cellproof.enabled = false;  // the depth leg only; the proof is test_cellproof's
+    Loop blind(c), healthy(c);
+    uint32_t nb = 0, nh = 0;
+    blind.setAutoMode(true);
+    healthy.setAutoMode(true);
+    blind.startDive(nb);
+    healthy.startDive(nh);
+    // 32 m on the SP3 band, loop at 1.30 bar: no injection (the loop is above
+    // the setpoint) and CNS accruing at the NOAA deep row, ~0.5 %/min.
+    feed(blind, nb, 1.30f, 32.0f, 10.0f);
+    feed(healthy, nh, 1.30f, 32.0f, 10.0f);
+    TEST_ASSERT_TRUE_MESSAGE(blind.haveVote(), "no vote on a rig with three honest cells");
+    TEST_ASSERT_FLOAT_WITHIN(1e-6, blind.cnsPct(), healthy.cnsPct());
+
+    const double cnsBlind0 = blind.cnsPct();
+    const double cnsHealthy0 = healthy.cnsPct();
+    const double fast0 = blind.deco().tissueBar(0);
+    const double slow0 = blind.deco().tissueBar(15);
+    const double ceilM0 = blind.deco().ceilingM();
+    const double ndl0 = blind.deco().ndlMinutes(blind.deco().depthToBar(32.0f), 1.3f);
+
+    // 300 s (3000 control cycles) with the depth leg dead, fed the 0.0 m that
+    // main.cpp used to fabricate for it, while the cells stay a measurement.
+    for (int i = 0; i < 3000; i++) {
+        SensorData sd;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 1.30f;
+        sd.depthM = 0.0f;
+        sd.cellsFresh = true;
+        sd.vbat = 12.4f;
+        sd.pressureValid = false;
+        nb += Loop::kTickMs;
+        blind.cycle(sd, nb);
+        sd.pressureValid = true;
+        sd.depthM = 32.0f;
+        nh += Loop::kTickMs;
+        healthy.cycle(sd, nh);
+    }
+
+    // 1. The oxygen clock does not depend on the depth leg. Same ppO2, same
+    // dt, so the two rigs must have clocked the same exposure — and it must be
+    // real exposure (2.8-3.3 % over 5 min at 1.30 bar, depending on which NOAA
+    // row the float lands on), not the frozen 0 the old gate produced.
+    const double gainBlind = blind.cnsPct() - cnsBlind0;
+    const double gainHealthy = healthy.cnsPct() - cnsHealthy0;
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(
+        1.0f, gainBlind,
+        "a dead depth bus stopped the CNS clock: ppO2 exposure stopped being counted");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(
+        0.01, gainHealthy, gainBlind,
+        "CNS depended on the depth leg: the blind rig clocked different exposure for the same ppO2");
+
+    // 2. Tissues keep integrating, on the held depth. The fast compartment
+    // (5 min half-time) must have closed most of the way toward the 32 m ppN2;
+    // even the 630 min compartment has to have moved.
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(
+        fast0 + 0.8f, blind.deco().tissueBar(0),
+        "tissues froze during a depth fault: the window's gas loading was never integrated");
+    TEST_ASSERT_TRUE(blind.deco().tissueBar(15) > slow0);
+
+    // 3. And the debt reaches the consumers the diver reads. Across this window
+    // the demanded ceiling goes from "no stop" to a stop, and the NDL drops
+    // (measured on this exact profile: 0 m -> 1.8 m, and 8.2 -> 3.0 min).
+    // main.cpp writes exactly these two numbers (plus the schedule) into every
+    // 30 s grid row, so a window whose loading was forgotten would show up in
+    // the dive file as a shallower ceiling and a longer NDL than the diver had.
+    const double ceilM1 = blind.deco().ceilingM();
+    const double ndl1 = blind.deco().ndlMinutes(blind.deco().depthToBar(32.0f), 1.3);
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(
+        ceilM0 + 0.5f, ceilM1, "the window's loading never reached the ceiling the diver is shown");
+    TEST_ASSERT_TRUE_MESSAGE(ndl1 + 1.0 < ndl0,
+                             "the window's loading never reached the NDL the diver is shown");
+}
+
+// The residual, named in the test so nobody has to rediscover it: with no
+// trustworthy ppO2 there is nothing to integrate, so the CNS clock stops — and
+// "trustworthy" means the same thing it means to the injector: a vote, from
+// samples that are actually new. All three fitted cells unplug at once (a
+// harness letting go) on top of a dead depth bus, and then the cells come back
+// but the ADC stalls. The alarm layer covers both windows — this asserts the
+// pairing, so the under-record can never exist without the shout that says so.
+void test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alarm() {
+    Config c = benchCfg();
+    c.cellproof.enabled = false;
+    Loop loop(c);
+    loop.setAutoMode(true);
+    uint32_t now = 0;
+    loop.startDive(now);
+    feed(loop, now, 1.30f, 32.0f, 10.0f);
+    const double cns0 = loop.cnsPct();
+    const double fast0 = loop.deco().tissueBar(0);
+    TEST_ASSERT_GREATER_THAN_FLOAT(0.0f, cns0);  // the clock was running
+
+    Config noCells = c;
+    noCells.presentMask = 0;  // every fitted cell unplugged: no believable sample
+    loop.setConfig(noCells);
+    bool staleSeen = false;
+    for (int i = 0; i < 3000; i++) {
+        SensorData sd;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 1.30f;
+        sd.depthM = 0.0f;
+        sd.cellsFresh = true;
+        sd.vbat = 12.4f;
+        sd.pressureValid = false;
+        now += Loop::kTickMs;
+        const State st = loop.cycle(sd, now);
+        if (st.alarms.bits & (1u << alarms::BIT_SENSOR_STALE)) staleSeen = true;
+    }
+
+    TEST_ASSERT_FALSE_MESSAGE(loop.haveVote(), "a rig with no fitted cell produced a vote");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(
+        1e-6, cns0, loop.cnsPct(),
+        "CNS accrued oxygen exposure with no ppO2 measurement to integrate: the no-vote "
+        "freeze is deliberate (the documented residual, covered by the sensor alarm)");
+    // The tissues still integrate the held depth: ppO2 only shifts ppN2, and a
+    // zero-vote ppO2 makes that HIGHER — the conservative direction.
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(fast0 + 0.8f, loop.deco().tissueBar(0),
+                                           "tissues froze when the cells were lost too");
+    TEST_ASSERT_TRUE_MESSAGE(staleSeen,
+                             "a window with no depth and no ppO2 raised no sensor alarm");
+
+    // The other half of the same trust rule: a VOTE built from frozen samples is
+    // not a measurement either (the injector is held to the identical rule), so
+    // the oxygen clock stops for a stalled ADC as well. Cells back fitted, then
+    // 300 s of readings that never update, depth bus still dead.
+    loop.setConfig(c);
+    const double cnsNoVoteEnd = loop.cnsPct();
+    const double fastBeforeStaleLeg = loop.deco().tissueBar(0);
+    for (int i = 0; i < 3000; i++) {
+        SensorData sd;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 1.30f;
+        sd.depthM = 0.0f;
+        sd.cellsFresh = false;  // the ADC stalled: same number, not a new one
+        sd.vbat = 12.4f;
+        sd.pressureValid = false;
+        now += Loop::kTickMs;
+        loop.cycle(sd, now);
+    }
+    TEST_ASSERT_TRUE_MESSAGE(loop.haveVote(), "the vote did not come back with the cells fitted");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(
+        1e-6, cnsNoVoteEnd, loop.cnsPct(),
+        "CNS accrued exposure from frozen cell readings: a stale ppO2 is not a measurement");
+    // The depth half is unaffected by the cell stall: it keeps integrating the
+    // held depth, which is the whole point of gating the two halves separately.
+    // Direction here is deliberately not pinned — the no-vote leg above left the
+    // tissues loaded toward a ppN2 computed with ppO2 = 0, so with the vote back
+    // the compartment is entitled to come back down. What must not happen is
+    // that nothing moves at all.
+    TEST_ASSERT_TRUE_MESSAGE(std::fabs(loop.deco().tissueBar(0) - fastBeforeStaleLeg) > 0.1,
+                             "tissues stopped integrating when the cells went stale: the depth "
+                             "half is independent of the cell half");
+}
+
 // Review H3, at the chain level (the sequencer's own rule is test_predive's):
 // a rig whose depth bus never worked must not walk away from the pre-dive with
 // a PASS. A dead bus used to be handed the 0.0 m that means "on the surface",
@@ -291,6 +455,8 @@ int main() {
     RUN_TEST(test_unresponsive_cell_fails_the_cell_test);
     RUN_TEST(test_depth_spike_does_not_move_the_setpoint);
     RUN_TEST(test_dead_depth_bus_holds_depth_and_setpoint);
+    RUN_TEST(test_blind_depth_window_still_clocks_cns_and_loads_tissues);
+    RUN_TEST(test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alarm);
     RUN_TEST(test_pre_dive_refuses_a_dead_depth_bus);
     return UNITY_END();
 }

@@ -30,8 +30,8 @@ tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
                                  --cal-air --predive --dive-persist    # 170 checks
 tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio graders, no board: 107 cases
-tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 71 checks
-tools/.../python tools/web_probe.py --selftest  # dive-identity + cross-transport scrub graders, no board: 20 cases
+tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 75 checks
+tools/.../python tools/web_probe.py --selftest  # dive-identity + cross-transport scrub + page-radio graders, no board: 28 cases
 ```
 
 Two radio-policy legs are opt-in on top of the run above: `--wifi-idle

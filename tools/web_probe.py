@@ -201,6 +201,87 @@ def grade_surface_body(body):
     return checks
 
 
+def grade_page(page: str):
+    """The radio-policy surface checks (2026-11-26). Graded on page TEXT, so
+    selftest_page can lie at each one without a board.
+
+    "Can I connect, and if not why" is a surface question, so the answer has
+    to be on a surface client. The failure modes are not the same: asking, and
+    being able to say. A page that never asks cannot show the state at all.
+    """
+    checks = []
+    ask = re.search(r'"GET WIFI"', page)
+    checks.append(("page asks for the radio policy", bool(ask),
+                   ask.group(0) if ask else
+                   "no GET WIFI anywhere: the page cannot say why its own AP vanished"))
+    # Asking is not enough — the countdown and the hold cause have to be turned
+    # into words, or the row shows `WIFI,0,3,0,0` to someone who needs "down:
+    # depth". Same rule as CALAIR's verdict code.
+    reads = re.search(r'WIFI\[[1234]\]', page)
+    checks.append(("page reads the radio state and has wording for it", bool(reads),
+                   reads.group(0) if reads else
+                   "the WIFI line is fetched and never parsed: numbers where a "
+                   "diver needs a reason"))
+    # The idle countdown must NOT be advertised unconditionally: with any
+    # station associated the router rewinds the window every tick, so a page
+    # showing "sleeps in 10:00" to a connected reader is showing a timer that
+    # can never fire. The gate is `stations == 0`.
+    gated = re.search(r'!st\s*&&\s*idle\s*>\s*0', page)
+    checks.append(("idle countdown shown only while no station is associated", bool(gated),
+                   gated.group(0) if gated else
+                   "the countdown is not gated on stations==0: it would promise a "
+                   "sleep that any connected client cancels"))
+    # And the reason must be a word, not a held_by number — the console prints
+    # "radio down (depth)", the page must not print "radio down (3)". Both
+    # halves: a word list nobody renders is as mute as a renderer with no words.
+    words = re.search(r'HOLD\s*=\s*\[[^\]]*depth', page)
+    use = re.search(r'HOLD\[hold\]', page)
+    checks.append(("radio hold reason is a word on the page, as on the console",
+                   bool(words) and bool(use),
+                   (words.group(0)[:48] if words else "") + (" ... HOLD[hold]" if use else ""),
+                   ))
+    if not (words and use):
+        checks[-1] = (checks[-1][0], False,
+                      "held_by is rendered as a number (or the word list is never "
+                      "used): the bench log and the phone would describe the same "
+                      "state differently")
+    return checks
+
+
+def selftest_page():
+    """Each case below is the repo's OWN page with one lie applied. A case
+    that does not redden exactly its check means that check is decoration.
+    """
+    gen = Path(__file__).resolve().parent.parent / "data" / "index.html"
+    page = gen.read_text(encoding="utf-8")
+    honest = [(n, ok, d) for n, ok, d in grade_page(page)]
+    cases = []
+    for n, ok, d in honest:
+        cases.append((f"honest page: {n}", ok, d))
+    LIES = [
+        ("page never asks for the radio policy (GET WIFI poll deleted)",
+         'send("GET WIFI")', 'send("GET T")', "page asks for the radio policy"),
+        ("radio row renders the raw numbers, no fields read",
+         'var on=+WIFI[1],hold=+WIFI[2],idle=+WIFI[3],st=+WIFI[4];',
+         'var on=0,hold=0,idle=0,st=0;', "page reads the radio state and has wording for it"),
+        ("countdown promised to a connected reader (stations gate removed)",
+         'if(!st&&idle>0)', 'if(idle>0)',
+         "idle countdown shown only while no station is associated"),
+        ("hold reason rendered as a number (words deleted)",
+         '"down &#183; "+(HOLD[hold]||"reason "+hold)', '"down "+hold',
+         "radio hold reason is a word on the page, as on the console"),
+    ]
+    for label, needle, lie, expect_red in LIES:
+        if needle not in page:
+            cases.append((label, False, f"mutation not applicable: {needle!r} not in page"))
+            continue
+        reds = [(n, ok) for n, ok, _ in grade_page(page.replace(needle, lie, 1)) if not ok]
+        want = {expect_red}
+        got = {n for n, _ in reds}
+        cases.append((label, got == want, f"red: {sorted(got)} — wanted exactly {sorted(want)}"))
+    return cases
+
+
 def http_probe(host, out):
     """Status line for each URL that matters. Returns the list of (url, ok, detail)."""
     import urllib.error
@@ -326,6 +407,10 @@ def http_probe(host, out):
                    renders.group(0) if renders else
                    "the CALAIR status field is never read: the page would show a "
                    "number, or nothing, where a diver needs words"))
+
+    # The radio-policy page checks live in grade_page (host-gradable:
+    # selftest_page lies at each one in turn against the repo's own page).
+    checks.extend(grade_page(page))
 
     # The surface log is web-only by decision, so the page is the only way to read
     # it: a controller that records verdicts nobody can retrieve has not recorded
@@ -1136,7 +1221,8 @@ def main() -> int:
 
     if args.selftest:
         fails = 0
-        for name, ok_, detail in [*selftest_identity(), *selftest_scrub()]:
+        for name, ok_, detail in [*selftest_identity(), *selftest_scrub(),
+                                  *selftest_page()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
                   + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1
@@ -1150,8 +1236,14 @@ def main() -> int:
     # Bytes, not characters: the page is UTF-8 and carries multi-byte characters
     # (ppO₂, →), so `len(page)` on the decoded text reads 25 642 as 25 640 and the
     # line below contradicts the byte-identity check two lines later.
-    print(f"  page size {len(got['/'])} bytes, "
-          f"{page.count(chr(10))} lines")
+    # And if '/' never came back at all (board mid-reboot is the usual cause),
+    # say NOTHING here — the check list below already carries the fetch failure
+    # as a FAIL line; crashing the summary with a KeyError hides that line and
+    # turns a reportable condition into a traceback (seen 2026-11-26, probing a
+    # board that was still coming up after its flash).
+    if "/" in got:
+        print(f"  page size {len(got['/'])} bytes, "
+              f"{page.count(chr(10))} lines")
     for name, ok, detail in checks:
         print(f"  [{mark(ok)}] {name}: {detail}")
 

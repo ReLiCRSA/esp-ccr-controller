@@ -106,6 +106,7 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
     <div class="row"><span class="k">CNS O&#8322;</span><span class="n" id="cns">-</span></div>
     <div class="row"><span class="k">battery</span><span class="n" id="bat">-</span></div>
     <div class="row"><span class="k">injection</span><span class="n" id="inj">-</span></div>
+    <div class="row"><span class="k">radio</span><span class="n" id="radio">-</span></div>
   </div>
 </section>
 <section id="v-check">
@@ -171,7 +172,7 @@ canvas{width:100%;height:180px;background:#0e141b;border:1px solid var(--line);b
 "use strict";
 var $=function(id){return document.getElementById(id)};
 var view="status", sock=null, outq=[], busy=null, lastRx=0, bootMs=0, tries=0;
-var T=null, D=null, CELLS=null, PROOF=null, PRE=null, FAULT=null, CALAIR=null;
+var T=null, D=null, CELLS=null, PROOF=null, PRE=null, FAULT=null, CALAIR=null, WIFI=null;
 var SCHEMA=[], VALS={}, diveActive=false;
 
 function toast(msg,kind){
@@ -288,6 +289,7 @@ function connect(){
     else if(f[0]==="PRE") { PRE=f; check(); }
     else if(f[0]==="CALAIR") { CALAIR=f; check(); }
     else if(f[0]==="FAULT") { FAULT=f; state(); }
+    else if(f[0]==="WIFI") { WIFI=f; state(); }
     else if(f[0]==="E") {
       var id=+f[2], val=+f[3];
       toast(eventName(id,val),(id===1||id===10||id===11)?"bad":"ok"); }
@@ -354,6 +356,26 @@ function state(){
     var duty=+FAULT[3];
     $("inj").textContent=(FAULT[1]==="1"?"STUCK OPEN ":"")+(FAULT[2]==="1"?"FUSE TRIPPED ":"")+
       "duty "+duty.toFixed(1)+"%";
+  }
+  // Radio policy (WIFI,on,held_by,idle_left_s,stations — §4). Two rules here:
+  // words match the console's transition line, so the same state reads the
+  // same way in a bench log and on the phone; and the idle countdown is shown
+  // ONLY while no station is associated, because `stations>0` rewinds the
+  // window every tick — advertising "sleeps in 10:00" to a connected reader
+  // would be a timer that can never fire.
+  if(WIFI){
+    var on=+WIFI[1],hold=+WIFI[2],idle=+WIFI[3],st=+WIFI[4];
+    var HOLD=["","diver's WIFI OFF","dive in progress","depth","idle: no station"];
+    var txt;
+    if(on){
+      txt="up &#183; "+st+(st===1?" station":" stations");
+      if(!st&&idle>0) txt="sleeps in "+Math.floor(idle/60)+":"+
+        ("0"+(idle%60)).slice(-2)+" &#183; no station";
+      else if(!st&&!(+((VALS["WIFI_IDLE_MIN"]||"0").split(".")[0])))
+        txt+=" &#183; idle timer off";
+    }
+    else txt="down &#183; "+(HOLD[hold]||"reason "+hold);
+    $("radio").innerHTML=txt;
   }
   var cls="clean";
   if(bits&((1<<0)|(1<<1)|(1<<6)|(1<<7))) cls="alarm"; else if(bits) cls="warn";
@@ -642,6 +664,9 @@ setInterval(function(){
 setInterval(function(){ if(sock&&sock.readyState===1) send("GET T"); },2000);
 setInterval(function(){ if(sock&&sock.readyState===1&&(view==="status"||view==="check")) send("GET D"); },2400);
 setInterval(function(){ if(sock&&sock.readyState===1&&view==="check"){ send("GET PRE"); send("GET CELLS"); send("GET PROOF"); send("GET FAULT"); send("GET CALAIR"); } },2400);
+// The radio row: the page cannot show the policy, it can only ask for it —
+// GET WIFI is the same line the handset and hw_accept's grade_wifi read.
+setInterval(function(){ if(sock&&sock.readyState===1&&view==="status") send("GET WIFI"); },2400);
 setInterval(function(){ if(sock&&sock.readyState===1&&view==="hist") refreshHist(); },4000);
 connect();
 </script>

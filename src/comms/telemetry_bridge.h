@@ -26,6 +26,11 @@ struct Telemetry {
     volatile float depthM = 0.0f;
     volatile float vbat = 0.0f;
     volatile uint16_t alarmBits = 0;
+    /// The dive-file view (alarms::Result::logBits): the alarm conditions that
+    /// were TRUE, including a CRITICAL the diver has ACKed into silence. Only the
+    /// snapshot writers read this; every wire consumer reads alarmBits, because an
+    /// ACK has to silence the wire.
+    volatile uint16_t alarmLogBits = 0;
     volatile uint8_t voteMode = 0;
     volatile uint32_t pulses = 0;
     volatile uint16_t pulsesWindow = 0;   // pulses in the last T, interval

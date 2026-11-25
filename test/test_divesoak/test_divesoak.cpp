@@ -124,15 +124,13 @@ RigOpts soakOpts() {
     return o;
 }
 
-// An ACK silences a continuous alarm, but the mask keeps reporting it as
-// suppressed-and-active. "Visible" means either: the diver was told.
-uint16_t visibleAlarms(const Rig& rig) {
-    uint16_t v = rig.alarmBits();
-    const alarms::Result& r = rig.alarmRes();
-    for (int b = 0; b < alarms::BIT_COUNT; b++)
-        if (r.ackSuppressed[b]) v |= (uint16_t)(1u << b);
-    return v;
-}
+// Did the machine know about this condition, whatever volume it was reporting it
+// at? This is the chain's own LOG view (alarms::Result::logBits): the live word
+// plus a CRITICAL the diver has ACKed into silence. The suite used to rebuild that
+// set by hand out of ackSuppressed because the firmware had no word for it; now
+// that the firmware has one, the suite reads it — one vocabulary, and the hand-
+// built version could not drift away from what the dive file gets.
+uint16_t knownAlarms(const Rig& rig) { return rig.alarmLogBits(); }
 
 // ---------------------------------------------------------------------------
 // Dive profile: waypoints, then home under the machine's own ceiling. The
@@ -306,7 +304,7 @@ void clearFault(Rig& rig, const Fault& f) {
 // alarm, because that is what the diver is told about.
 bool faultSignalSeen(const Rig& rig, const Fault& f, uint16_t mask) {
     if (mask == 0) return true;
-    if (visibleAlarms(rig) & mask) return true;
+    if (knownAlarms(rig) & mask) return true;
     if ((mask & (1u << alarms::BIT_CELL_DRIFT)) &&
         !(rig.vote().activeMask & (1u << f.ch))) return true;
     return false;
@@ -492,7 +490,7 @@ void runDive(int id) {
         rig.tick();
 
         const uint16_t bits = rig.alarmBits();
-        const uint16_t seen = visibleAlarms(rig);
+        const uint16_t seen = knownAlarms(rig);
         const alarms::Result& ar = rig.alarmRes();
         alarmUnion |= bits;
         const float pTrue = rig.world().ppo2True();
@@ -626,7 +624,12 @@ void runDive(int id) {
         }
 
         // ---- dive file ----------------------------------------------------
-        snapAlarm |= bits;
+        // The row carries the chain's LOG view, which is what main.cpp writes
+        // (sn.alarmBits = st.alarms.logBits): ORed across the row here because the
+        // rig samples once per tick and wants "anything true in this window", the
+        // stricter of the two. Never the live word: an ACK would delete a fact the
+        // row is being read for.
+        snapAlarm |= rig.alarmLogBits();
         if (tS >= snapClock && nSnap < kMaxSnaps) {
             snapClock = tS + 10.0f;
             logfmt::Snapshot& s = snaps[nSnap++];
@@ -833,12 +836,18 @@ void runDive(int id) {
 //     filter's own settle bound, and the band is free to move again at the end
 //     of the dive (the freeze is a held input, not a latched mode);
 //   * and the window is identifiable in the dive file afterwards, with no wire
-//     or format change: every 30 s grid row that overlaps it carries
-//     BIT_SENSOR_STALE in alarmBits (main.cpp ORs in whatever was active since
-//     the previous row) and its ceiling/decoTotal/NDL columns — written from the
-//     same deco picture the window just integrated — actually moved. A blind
-//     window that integrated nothing would leave rows that look healthy and
-//     unchanged, which is how an under-recorded deco debt hides.
+//     or format change: every 30 s grid row wholly inside it carries
+//     BIT_SENSOR_STALE in alarmBits (main.cpp writes the row from the LOG view,
+//     alarms::Result::logBits) and its ceiling/decoTotal/NDL columns — written
+//     from the same deco picture the window just integrated — actually moved. A
+//     blind window that integrated nothing would leave rows that look healthy and
+//     unchanged, which is how an under-recorded deco debt hides. The diver ACKs
+//     the alarm 8 s into the window, so this grades the two vocabularies against
+//     each other at the same instant: the LIVE word must lose BIT_SENSOR_STALE to
+//     the ACK (the handset went quiet — otherwise the marker assert proves
+//     nothing, because nothing separates the views) while the file's rows keep it,
+//     and the log view must stop claiming it once the bus recovers (a fact about
+//     now, not a latch). That split is finding #5.
 // Mirrored from runDive's invariants: setpoint escape, the low-loop rule with
 // its sensor-honest escape hatch, the 0.12/2.20 bar hard envelope, the per-cell
 // high veto, and the latched-valve rule. Deliberately not mirrored: the
@@ -934,9 +943,15 @@ void runDepthBusDive() {
     float rowClockS = 0.0f, rowDecoOpen = 0.0f, rowDecoClose = 0.0f;
     float rowNdlOpen = 0.0f, rowNdlClose = 0.0f;
     float rowCeilLastBlind = 0.0f, ceilAtWindowOpen = 0.0f;
-    uint16_t rowAlarm = 0, rowAlarmVis = 0;
-    bool rowStaleMissing = false;
-    int rowsBlind = 0, blindCyclesInRow = 0, rowsBlindRawStale = 0;
+    int rowsBlind = 0, blindCyclesInRow = 0, rowsBlindMarker = 0;
+    // The live-vs-log split, witnessed cycle by cycle. `ackSilencedCycles` counts
+    // the cycles where the diver's ACK had taken BIT_SENSOR_STALE off the live
+    // word while the log view still carried it: the ACK working (live) and the
+    // dive file not forgetting (log) at the same instant. `logStaleAfterRecovery`
+    // catches the opposite error — a log view that outlives the condition it
+    // reports, which would make it a latch rather than a fact.
+    int ackSilencedCycles = 0;
+    bool logStaleAfterRecovery = false;
     uint32_t pulsesAtFault = 0, pulsesInWindow = 0;
     bool staleMissing = false, sensorFailSeen = false;
     float lowUnalarmedS = 0.0f, alarmSinceS = -1.0f;
@@ -1037,10 +1052,24 @@ void runDepthBusDive() {
         twin.tick();
 
         const uint16_t bits = rig.alarmBits();
-        const uint16_t seen = visibleAlarms(rig);
+        const uint16_t seen = knownAlarms(rig);
         alarmUnion |= bits;
         if (f.injected && f.detectSeenS < 0.0f && faultSignalSeen(rig, f, f.detectMask))
             f.detectSeenS = tS;
+
+        // ---- the live/log split, at one instant ----------------------------
+        // The simulated diver ACKs (below), so during a long blind window there
+        // are cycles where the live word no longer carries BIT_SENSOR_STALE — the
+        // ACK did its job, the handset went quiet — while the view the dive file
+        // is written from still does. Both halves of that sentence have to be
+        // witnessed, or a change to either view passes unnoticed.
+        if (inWindow && !(bits & (1u << alarms::BIT_SENSOR_STALE)) &&
+            (seen & (1u << alarms::BIT_SENSOR_STALE)))
+            ackSilencedCycles++;
+        // And the log view is a fact, not a latch: once the depth bus is back and
+        // the condition has genuinely recovered, it must stop claiming STALE too.
+        if (windowClosed && tS >= clearAtS + 5.0f && (seen & (1u << alarms::BIT_SENSOR_STALE)))
+            logStaleAfterRecovery = true;
 
         const float sp = rig.spTarget();
         const float chainM = rig.loop().depthSmoothedM();
@@ -1133,16 +1162,13 @@ void runDepthBusDive() {
         }
 
         // ---- the 30 s dive-file row, filled the way main.cpp fills it ------
-        // Item 6 of the follow-up: now that the tissues integrate through a blind
-        // window, the window has to be identifiable in the file afterwards — and
-        // the existing row format already does that with no wire or format
-        // change. alarmBits carries whatever was active since the previous row,
-        // so a row that overlaps the window must carry BIT_SENSOR_STALE, and the
-        // ceiling/NDL/decoTotal columns are written from the deco picture this
-        // window just moved. Checked on the row boundary, which is exactly where
-        // the firmware writes the row.
-        rowAlarm |= bits;
-        rowAlarmVis |= seen;
+        // The row's alarmBits is written from the LOG view at the row's own instant
+        // (main.cpp: sn.alarmBits = st.alarms.logBits), so a row wholly inside this
+        // window must carry BIT_SENSOR_STALE even though the diver ACKed the alarm
+        // 8 s into it. That instant is read directly, not an OR across the row:
+        // main.cpp writes one value per row, and an OR would let a row inherit a
+        // marker from cycles before the ACK and hide a file that goes blind to the
+        // condition the moment the diver asks for quiet.
         if (inWindow) blindCyclesInRow++;
         if (tS >= rowClockS) {
             // Only a row that was blind for most of its 30 s says anything: a row
@@ -1154,14 +1180,11 @@ void runDepthBusDive() {
             // window in which nothing integrated at all.
             if (blindCyclesInRow >= 150 && inWindow) {
                 rowsBlind++;
-                if (!(rowAlarmVis & (uint16_t)(1u << alarms::BIT_SENSOR_STALE)))
-                    rowStaleMissing = true;
-                if (rowAlarm & (uint16_t)(1u << alarms::BIT_SENSOR_STALE)) rowsBlindRawStale++;
+                if (rig.alarmLogBits() & (uint16_t)(1u << alarms::BIT_SENSOR_STALE))
+                    rowsBlindMarker++;
                 rowCeilLastBlind = (float)rig.deco().ceilingM();
             }
             rowClockS += 30.0f;
-            rowAlarm = 0;
-            rowAlarmVis = 0;
             blindCyclesInRow = 0;
         }
     }
@@ -1179,8 +1202,8 @@ void runDepthBusDive() {
         FAIL("dive %d: the dead depth bus took %.0fs to announce (deadline %.0fs)",
              id, f.detectSeenS - f.atS, f.detectDeadlineS);
     if (staleMissing)
-        FAIL("dive %d: part of the blind window ran with no sensor alarm on the wire "
-             "(alarms=0x%03x)", id, alarmUnion);
+        FAIL("dive %d: part of the blind window ran with no sensor alarm known to the chain — "
+             "the view the dive file is written from (alarms=0x%03x)", id, alarmUnion);
     if (sensorFailSeen)
         FAIL("dive %d: honest cells reported as a lost vote: depth staleness conflated "
              "with no-vote (alarms=0x%03x)", id, alarmUnion);
@@ -1194,29 +1217,42 @@ void runDepthBusDive() {
     if (!trackChecked) FAIL("dive %d: the dive ended before the post-recovery check ran", id);
     // The window must be identifiable post-dive, with no format change: two 30 s
     // rows of a 90 s window are wholly inside it (their boundaries fall between
-    // the open and the close), every one of them has to carry the sensor alarm,
-    // and the deco columns written next to it have to have moved.
+    // the open and the close), every one of them has to carry the sensor alarm in
+    // the view the file is written from — across the ACK — and the deco columns
+    // written beside it have to have moved.
     if (rowsBlind < 2)
         FAIL("dive %d: only %d dive-file rows sat wholly inside the %0.0f s window — the profile "
              "moved on, the witness below proves nothing", id, rowsBlind, kWindowS);
-    if (rowStaleMissing)
-        FAIL("dive %d: a dive-file row that overlapped the blind window carried no sensor alarm "
-             "even counting an ACKed-but-still-active one — the held-depth deco figures written "
-             "next to it would be unreadable afterwards", id);
-    // Witness, deliberately NOT a failure. main.cpp writes sn.alarmBits =
-    // st.alarms.bits, and alarms.cpp drops an ACKed-but-still-active CRITICAL
-    // condition out of that set (it travels in ackSuppressed, for the handset,
-    // until the condition recovers). So a diver who has ACKed the stale-depth
-    // alarm loses the STALE marker from the file's rows while the bus stays
-    // dead — the deco columns still identify the window, but the marker does
-    // not. Reported so the gap is on the record: closing it changes what is
-    // written into an existing field, which is the maintainer's call, not a
-    // side effect of this change.
-    if (rowsBlindRawStale < rowsBlind)
-        std::printf("dive %d  NOTE  %d/%d blind dive-file rows lost BIT_SENSOR_STALE from "
-                    "alarmBits after an ACK (it survives only in ackSuppressed, for the "
-                    "handset)\n",
-                    id, rowsBlind - rowsBlindRawStale, rowsBlind);
+    // ---- finding #5, now a requirement ------------------------------------
+    // Every dive-file row wholly inside the window must carry BIT_SENSOR_STALE,
+    // even though the diver ACKed the alarm 8 s into the window. This used to be a
+    // NOTE, because the firmware wrote the LIVE word into the file and had no log
+    // view to write instead: an ACK deleted the marker from the very rows whose
+    // ceiling/NDL were computed with no depth measurement. Now the file carries
+    // alarms::Result::logBits, so losing the marker is a defect, not a footnote.
+    // The row's own instant is what is read, because that is what main.cpp writes.
+    // It is deliberately NOT "was STALE live somewhere in the row": the ACK
+    // silences the live word 8 s in, so no later row could pass that, and whether
+    // the chain announced the fault at all is graded separately, above.
+    if (rowsBlindMarker != rowsBlind)
+        FAIL("dive %d: %d/%d dive-file rows wholly inside the blind window would be written "
+             "without BIT_SENSOR_STALE — the diver's ACK deleted a fact about the instrument "
+             "state (the file is written from logBits, not the live word)",
+             id, rowsBlind - rowsBlindMarker, rowsBlind);
+    // The other side of the same instant: the ACK has to have actually silenced the
+    // LIVE word, or the assert above is not distinguishing two views at all — it
+    // would pass on a build where ACK silences nothing. This is the half that keeps
+    // the handset's `ACK` meaningful, so it is graded as hard as the marker.
+    if (ackSilencedCycles == 0)
+        FAIL("dive %d: across %d blind rows the diver's ACK never took BIT_SENSOR_STALE off "
+             "the live word — nothing here separates the live view from the log view, so the "
+             "marker assert above proves nothing (alarms=0x%03x)", id, rowsBlind, alarmUnion);
+    // And the log view reports conditions, it does not latch them: once the bus is
+    // back the marker has to stop, or the file would claim blindness that ended.
+    if (logStaleAfterRecovery)
+        FAIL("dive %d: 5 s after the depth bus recovered, the dive-file view still claimed "
+             "BIT_SENSOR_STALE — the log view is a fact about now, not a latch that "
+             "outlives its condition", id);
     if (!(rowDecoClose > rowDecoOpen || rowNdlClose < rowNdlOpen))
         FAIL("dive %d: across the blind window the deco columns of the dive file did not move "
              "(total %.1f -> %.1f min, NDL %.1f -> %.1f min): the window left no trace the "
@@ -1239,6 +1275,13 @@ void runDepthBusDive() {
                 (unsigned)pulsesInWindow, rig.cnsPct(), cnsGainInWindow, twin.cnsPct(),
                 fastTissueClose, twinFastTissueClose, ceilAtClose, twinCeilClose, rowsBlind,
                 rowDecoOpen, rowDecoClose, rowNdlOpen, rowNdlClose, alarmUnion);
+    // The vocabulary split, on the record beside the numbers it protects. The
+    // alarms column above is the LIVE union (0x080 for this dive, STALE included,
+    // because the alarm is raised before the ACK and after recovery); what this
+    // line says is that the ACK cost the file nothing.
+    std::printf("dive %d  alarm-view  %d/%d blind dive-file rows keep BIT_SENSOR_STALE across "
+                "the ACK  (live word silent for %d cycles, log view clear after recovery)\n",
+                id, rowsBlindMarker, rowsBlind, ackSilencedCycles);
 }
 
 }  // namespace

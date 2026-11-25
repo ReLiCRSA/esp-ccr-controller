@@ -23,6 +23,18 @@ void Manager::evaluate(uint8_t bit, bool condition, Level level, Result& res) {
     }
     res.ackSuppressed[bit] = suppressed_[bit] && rawActive;
 
+    // The log view: the FACT, whether or not the diver has an ACK holding it
+    // quiet. For every bit that is not suppressed this is the same set as
+    // `reported`, so the two views only ever differ on a CONTINUOUS CRITICAL the
+    // diver silenced (ack() sets suppressed_ for nothing else) — and a WARNING can
+    // never appear here beyond `bits` either, for the same reason.
+    //
+    // The rule that keeps this from becoming noise: an EVENT latch (kLatchAck) is
+    // not re-marked after its ACK, because ack() releases that latch instead of
+    // suppressing it, so `rawActive` drops with the ACK and the log view stops
+    // claiming it. What stands is a condition that is still standing.
+    if (rawActive) res.logBits |= (1u << bit);
+
     if (reported != prevReported) res.edges[res.edgeCount++] = {bit, reported};
 
     active_[bit] = reported; // what the world saw last cycle (edge tracking)

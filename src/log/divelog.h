@@ -90,6 +90,10 @@ struct Snapshot {
     // bits 0..7 inline and borrows bits 3..4 of `flags` for 8..9. The struct
     // keeps the full mask and unpack clears the borrowed bits out of `flags`,
     // so a hypoxia or CNS row in a dive file is never silently lost.
+    // What goes in it is the LOG view (alarms::Result::logBits): the conditions
+    // that were TRUE at this instant, including a critical the diver has ACKed
+    // into silence. Not the live `T,` FLAGS word — an ACK must stay able to
+    // silence the handset without editing the record afterwards.
     uint16_t alarmBits;
     uint8_t cnsPct;      // capped 255
     int16_t ceilingCm;

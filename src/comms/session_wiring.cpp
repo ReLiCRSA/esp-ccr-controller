@@ -159,7 +159,12 @@ void hookAppendSnap(void*) {
         s.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.cellBar[i], 3));
     s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.setpointBar, 3));
     s.mode = g_bridgeTel.diveActive ? (g_bridgeTel.autoMode ? 1 : 2) : 0;
-    s.alarmBits = g_bridgeTel.alarmBits;
+    // Same view as the 30 s grid row (main.cpp): the dive file records what was
+    // true, so a snapshot taken at the very edge where the diver ACKed an alarm
+    // still says the condition was standing. That edge is exactly when the live
+    // word goes quiet, and it is exactly when a row written from the live word
+    // used to lose the marker (finding #5).
+    s.alarmBits = g_bridgeTel.alarmLogBits;
     s.cnsPct = g_bridgeTotals.cnsPeakPct;
     s.pulses = (uint16_t)g_bridgeTel.pulsesWindow;
     s.battX1000 = static_cast<uint16_t>(numfmt::scaled(g_bridgeTel.vbat, 3));

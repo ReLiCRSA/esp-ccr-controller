@@ -1,14 +1,35 @@
 // ============================================================================
 // alarms.h — one authority for conditions, severities and edges.
 //
-// The alarm bitmask IS the telemetry FLAGS field and drives the ERR LED;
-// raised/cleared edges feed E, lines and dive-log events, so the handset,
-// web and dive file can never disagree about what happened when.
-//
 // Critical alarms LATCH: they persist until the condition recovers or the
 // diver ACKs (ACK suppresses the audible/LED state for that id until the
 // condition clears once and re-arms — diver outranks the machine, but the
 // event log never forgets).
+//
+// TWO VOCABULARIES, and what separates them is the diver's silence, not the fact:
+//
+//   bits     — the alarm as the DIVER experiences it: raised, silenced by an ACK,
+//              cleared. This is the `T,` FLAGS word, the ERR LED, the toasts and
+//              the raised/cleared `E,` edges. An ACK may turn it off, and that is
+//              correct: the diver outranks the machine.
+//   logBits  — the alarm as a FACT about the instrument state at this instant:
+//              raised, and STILL raised while an ACK is silencing it. This is what
+//              the dive file's alarmBits column carries, because "the diver asked
+//              for quiet" says nothing about the sensor that went away, and a
+//              reader of a dive an hour later must not be able to lose that.
+//
+// Before logBits existed the dive file borrowed the live view, so an ACK in the
+// middle of a blind depth bus erased the marker from the rows beside the very
+// numbers that were computed without a depth measurement (finding #5, dive 9001).
+// Raising the marker there would have meant raising it on the handset too, which
+// is the one thing an ACK exists to forbid — hence two views, one word each.
+//
+// Event-latch ids (kLatchAck — today only HYPOXIA) are deliberately NOT carried on
+// the log side after an ACK. ACK CONSUMES such a latch: a one-shot verdict the
+// diver has heard is not a standing condition, so there is nothing left that is
+// true, and the rising edge already wrote its own `E,` row. Re-marking every
+// later dive-file row with a consumed event would turn one decision into
+// hundreds of rows.
 // ============================================================================
 #pragma once
 
@@ -62,7 +83,14 @@ struct Inputs {
 struct Edge { uint8_t id; bool raised; };
 
 struct Result {
-    uint16_t bits = 0;             // active alarms (latch-applied)
+    uint16_t bits = 0;             // active alarms (latch-applied) — the LIVE view
+    /// The LOG view: what `bits` says, plus every condition that is active while
+    /// an ACK is silencing it. Read it where the question is "what was the machine
+    /// like" (the dive file's alarmBits column); never where the question is "what
+    /// is the diver being told" (T, FLAGS, the LED, toasts, E, edges) — those keep
+    /// `bits`, because an ACK that changed nothing on the console would be a
+    /// machine that cannot be silenced.
+    uint16_t logBits = 0;
     bool ackSuppressed[BIT_COUNT]; // latch masks (for UI display)
     Edge edges[BIT_COUNT];
     uint8_t edgeCount = 0;

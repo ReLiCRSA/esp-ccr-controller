@@ -3,8 +3,10 @@
 // between the modules (sensor staleness gating the valve, the output fuse, the
 // pre-dive lockout, a spiked depth sample vs the setpoint bands, a dead depth
 // bus vs the depth readout and the setpoint rung, a dead depth bus vs the deco
-// and CNS clocks, and what the pre-dive makes of a rig that cannot measure
-// depth at all).
+// and CNS clocks, and what the pre-dive makes of a rig that cannot measure depth
+// at all — or of one whose depth bus hiccups for two seconds in the middle of
+// the depth check), and what an ACK leaves in the dive file's alarm word after it
+// silenced the one the diver hears.
 // The fault scenarios in test_sim cover the same ground physically; these pin
 // the interface contracts the firmware ControlTask depends on.
 // ============================================================================
@@ -349,6 +351,48 @@ void test_blind_depth_window_still_clocks_cns_and_loads_tissues() {
                              "the window's loading never reached the NDL the diver is shown");
 }
 
+// The chain-level half of the vocabulary split (alarms.h): ControlTask writes the
+// dive file's alarmBits from loop.alarmLogBits() and the handset's `T,` FLAGS from
+// loop.alarmBits(). One dead depth bus and one ACK has to separate them — silence
+// on the wire, marker in the file — and both have to let go when the bus answers
+// again. Dive 9001 in the soak grades the same split over a whole dive with a
+// climbing diver and 30 s rows; this pins the interface contract in one place, with
+// the alarm ids visible.
+void test_an_ack_silences_a_dead_depth_bus_on_the_wire_but_not_in_the_log() {
+    Config c = benchCfg();
+    c.cellproof.enabled = false;  // the depth leg only
+    Loop loop(c);
+    loop.setAutoMode(true);
+    uint32_t now = 0;
+    feed(loop, now, 1.30f, 32.0f, 10.0f);
+    TEST_ASSERT_EQUAL_UINT16(0u, loop.alarmBits());
+
+    // The bus stops answering. Both views say so: nothing has been silenced yet,
+    // so the two words are the same word.
+    feed(loop, now, 1.30f, 32.0f, 4.0f, /*fresh=*/true, /*pressureValid=*/false);
+    TEST_ASSERT_TRUE_MESSAGE(loop.alarmBits() & (1u << alarms::BIT_SENSOR_STALE),
+                             "a depth bus that stopped answering never raised STALE");
+    TEST_ASSERT_TRUE(loop.alarmLogBits() & (1u << alarms::BIT_SENSOR_STALE));
+
+    // The diver ACKs. Both halves of the split are requirements, not a preference:
+    // the live word must go quiet or the handset's ACK button does nothing, and the
+    // log view must keep the marker or the dive file stops marking the rows that
+    // were written from a held depth (finding #5).
+    loop.ackAlarms();
+    feed(loop, now, 1.30f, 32.0f, 1.0f, /*fresh=*/true, /*pressureValid=*/false);
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(0u, loop.alarmBits() & (1u << alarms::BIT_SENSOR_STALE),
+                                     "ACK did not silence the depth alarm the diver hears");
+    TEST_ASSERT_TRUE_MESSAGE(loop.alarmLogBits() & (1u << alarms::BIT_SENSOR_STALE),
+                             "the dive-file view lost BIT_SENSOR_STALE to an ACK");
+
+    // The bus answers again and both views let go: the log view reports conditions,
+    // it does not latch them, so the file cannot keep claiming blindness that ended.
+    feed(loop, now, 1.30f, 32.0f, 2.0f);
+    TEST_ASSERT_EQUAL_UINT16(0u, loop.alarmBits() & (1u << alarms::BIT_SENSOR_STALE));
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(0u, loop.alarmLogBits() & (1u << alarms::BIT_SENSOR_STALE),
+                                     "the log view kept claiming a depth fault that had ended");
+}
+
 // The residual, named in the test so nobody has to rediscover it: with no
 // trustworthy ppO2 there is nothing to integrate, so the CNS clock stops — and
 // "trustworthy" means the same thing it means to the injector: a vote, from
@@ -531,6 +575,7 @@ int main() {
     RUN_TEST(test_depth_spike_does_not_move_the_setpoint);
     RUN_TEST(test_dead_depth_bus_holds_depth_and_setpoint);
     RUN_TEST(test_blind_depth_window_still_clocks_cns_and_loads_tissues);
+    RUN_TEST(test_an_ack_silences_a_dead_depth_bus_on_the_wire_but_not_in_the_log);
     RUN_TEST(test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alarm);
     RUN_TEST(test_pre_dive_refuses_a_dead_depth_bus);
     RUN_TEST(test_pre_dive_rides_through_a_short_depth_bus_dropout);

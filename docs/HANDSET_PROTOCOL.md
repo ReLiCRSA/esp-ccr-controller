@@ -585,6 +585,15 @@ E,<t_s>,<id>,<value>
 M,<duration_s>,<max_depth_cm>,<min_ppo2>,<max_ppo2>,<pulses>,<cns_peak_pct>,<snapshots>,<events>,<gf_low>,<gf_high>,<sp1>,<sp2>,<sp3>,<sp4>
 ```
 
+`0x<alarm16>` is the controller's 10-bit alarm word **as a fact about that instant,
+not as the diver was hearing it**: a critical condition the diver has ACKed into
+silence still appears here for as long as it is active, because "the diver asked for
+quiet" says nothing about the sensor that stopped answering. The live word in
+`T,` FLAGS (§2) does drop it on an ACK, and that is deliberate — two vocabularies,
+defined in `src/control/alarms.h` — so an ACK shows up in the export as one
+`E,<t>,2,<bit>` clear row with the marker still standing on the samples on both
+sides of it.
+
 The `S,` and `M,` rows carry the `row_format` version in the `DIVE,` line, and
 columns are **append-only**: field 1 is always the tag, fields 2-15 of an `S,`
 row are always the v1 set in the v1 order and units, and new information only

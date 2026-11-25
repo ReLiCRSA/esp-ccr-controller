@@ -192,7 +192,15 @@ public:
     /// evidence (the handset and web pages show why the count dropped).
     uint8_t proofExclusion() const { return voting_.proofExclusion(); }
     const alarms::Result& alarms() const { return alarmRes_; }
+    /// The LIVE alarm word — what the diver is being screamed at right now, ACK
+    /// silences included. This is what `T,` FLAGS, the LED and the router answer
+    /// with, and it must keep honouring an ACK.
     uint16_t alarmBits() const { return alarmRes_.bits; }
+    /// The LOG view (alarms::Result::logBits): what was true, ACK silences
+    /// ignored. This is what goes into the dive file's alarmBits column — see the
+    /// header of alarms.h for why the two views exist and what an ACK does and
+    /// does not erase.
+    uint16_t alarmLogBits() const { return alarmRes_.logBits; }
     const cellproof::Output& cellproof() const { return cpOut_; }
     const inj::Output& injector() const { return injOut_; }
     bool outputFuseTripped() const { return injector_.outputFuseTripped(); }

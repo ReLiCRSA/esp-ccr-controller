@@ -71,6 +71,10 @@ public:
     const voting::CellStatus& cellStatus(uint8_t ch) const { return loop_.cell(ch); }
     const alarms::Result& alarmRes() const { return loop_.alarms(); }
     uint16_t alarmBits() const { return loop_.alarmBits(); }
+    /// The dive-file view: the condition that was TRUE, ACK silences ignored.
+    /// `alarmBits()`/`alarmOn()` stay the live word — they are what the handset
+    /// and the soak's "was the diver told" grading read.
+    uint16_t alarmLogBits() const { return loop_.alarmLogBits(); }
     bool alarmOn(uint8_t bit) const { return loop_.alarmBits() & (1u << bit); }
     cellproof::State cpState() const { return loop_.cellproof().state; }
     uint8_t cpUnprovenMask() const { return loop_.cellproof().unprovenHighMask; }

@@ -510,6 +510,12 @@ static void controlTask(void*) {
         g_bridgeTel.depthM = st.depthSmoothedM;
         g_bridgeTel.vbat = sd.vbat;
         g_bridgeTel.alarmBits = st.alarms.bits;
+        // The log view, published beside the live one so the event-driven snapshot
+        // (which the command task writes from bridge scalars, never from the live
+        // chain) files the same fact the 30 s grid row does. Nothing on the wire
+        // reads this: `T,` FLAGS and the router answers stay on alarmBits, because
+        // an ACK has to silence those.
+        g_bridgeTel.alarmLogBits = st.alarms.logBits;
         g_bridgeTel.voteMode = static_cast<uint8_t>(st.vote.mode);
         g_bridgeTel.pulses = g_loop->pulseCount();
         g_bridgeTel.solenoid = st.solenoid;
@@ -599,9 +605,12 @@ static void controlTask(void*) {
             // bus is invalid (loop.h), so nothing recorded here can be the
             // fabricated 0 m the old main.cpp used to hand over: maxDepthCm is
             // a maximum, so a held depth can only repeat what was already
-            // measured, and the grid row below carries sn.alarmBits — which has
-            // BIT_SENSOR_STALE set for exactly those rows. A held depth in the
-            // dive file is a depth marked as held.
+            // measured. And the grid row below carries sn.alarmBits = the LOG
+            // view, which marks BIT_SENSOR_STALE for exactly those rows even
+            // after the diver ACKed the alarm (alarms.h: bits is what the diver
+            // was told, logBits is what was true). That is now a guarantee, not
+            // a claim that quietly lapsed the moment someone pressed ACK: a held
+            // depth in the dive file is a depth marked as held.
             g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
             const int32_t dCm = static_cast<int32_t>(numfmt::scaled(st.depthSmoothedM, 2));
             if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;
@@ -652,7 +661,12 @@ static void controlTask(void*) {
                     sn.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(sd.cells[i], 3));
                 sn.setpointX1000 = static_cast<int16_t>(numfmt::scaled(st.setpointBar, 3));
                 sn.mode = st.autoMode ? 1 : 2;
-                sn.alarmBits = st.alarms.bits;
+                // The fact, not the volume: the log view. An ACK silences the
+                // handset and the LED (they read alarmBits) and must not also
+                // delete the marker that says these rows were written with no
+                // depth measurement. test_divesoak's dive 9001 grades both sides
+                // of that split.
+                sn.alarmBits = st.alarms.logBits;
                 sn.cnsPct = g_bridgeTotals.cnsPeakPct;
                 // Was `* 100.0` — a DOUBLE literal, which promotes the float and
                 // pushes more products just below the integer: this bench's measured

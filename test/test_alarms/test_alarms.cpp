@@ -219,6 +219,135 @@ void test_a_collapsing_loop_is_still_hypoxia_with_no_vote() {
     TEST_ASSERT_TRUE(r.anyCritical);
 }
 
+// ---- the two vocabularies (alarms.h) --------------------------------------
+// `bits` is what the diver is being told; `logBits` is what is true. They are the
+// same set except while an ACK is silencing a CONTINUOUS CRITICAL, and the dive
+// file is written from logBits while the handset, the LED and the E, edges are
+// driven by bits. This is the case that pins the semantics themselves; dive 9001
+// in the soak grades the consequence in a real dive.
+void test_the_log_view_keeps_what_an_ack_silences_from_the_live_one() {
+    Manager m{Config{}};
+    Inputs in = base();
+    in.sensorStale = true;  // the depth bus has stopped answering
+
+    const Result up = m.update(in);
+    TEST_ASSERT_TRUE_MESSAGE(up.bits & (1u << alarms::BIT_SENSOR_STALE),
+                             "a dead depth bus raised nothing the diver could hear");
+    TEST_ASSERT_TRUE_MESSAGE(up.logBits & (1u << alarms::BIT_SENSOR_STALE),
+                             "the log view was already missing a condition the chain knew");
+    TEST_ASSERT_FALSE(up.ackSuppressed[alarms::BIT_SENSOR_STALE]);
+
+    m.ack();
+    const Result quiet = m.update(in);
+    // The diver's side of the split: the console goes quiet.
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(0u, quiet.bits,
+                                     "ACK did not silence the live word — the machine "
+                                     "cannot be acknowledged");
+    // The file's side: the condition is still standing, so the marker stays.
+    TEST_ASSERT_TRUE_MESSAGE(quiet.logBits & (1u << alarms::BIT_SENSOR_STALE),
+                             "ACK deleted a fact about the instrument state — the dive file "
+                             "would stop marking rows written with no depth measurement");
+    TEST_ASSERT_TRUE(quiet.ackSuppressed[alarms::BIT_SENSOR_STALE]);
+    TEST_ASSERT_TRUE_MESSAGE((quiet.logBits & quiet.bits) == quiet.bits,
+                             "logBits is not a superset of bits");
+    // The silence itself is the one edge this cycle owes: `E,<t>,2,7` (alarm
+    // cleared, bit 7) tells a live reader the diver acknowledged. Unchanged by the
+    // log view, which has no edges of its own — E, rows stay the live vocabulary.
+    TEST_ASSERT_EQUAL_UINT8(1, quiet.edgeCount);
+
+    // No edge spam: the suppressed condition is neither re-raised nor re-cleared
+    // every cycle, or the E, rows would repeat while the diver sits in silence.
+    for (int i = 0; i < 3; i++) {
+        const Result same = m.update(in);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, same.edgeCount,
+                                        "an ACK-suppressed condition emitted an edge while "
+                                        "nothing changed");
+        TEST_ASSERT_EQUAL_UINT16(0u, same.bits);
+        TEST_ASSERT_TRUE(same.logBits & (1u << alarms::BIT_SENSOR_STALE));
+    }
+
+    // Recovery clears BOTH views, and re-arms: logBits reports conditions, it does
+    // not latch them, so a file that keeps claiming blindness after the bus came
+    // back would be lying in the other direction.
+    in.sensorStale = false;
+    const Result back = m.update(in);
+    TEST_ASSERT_EQUAL_UINT16(0u, back.bits);
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(0u, back.logBits,
+                                     "the log view outlived the condition it reports");
+    // No edge here either: the live word already went quiet at the ACK, and that
+    // was the news. The log view going quiet writes no row of its own — a reader
+    // of the E, stream sees one clear, not two.
+    TEST_ASSERT_EQUAL_UINT8(0, back.edgeCount);
+
+    in.sensorStale = true;
+    const Result again = m.update(in);
+    TEST_ASSERT_TRUE(again.bits & (1u << alarms::BIT_SENSOR_STALE));
+    TEST_ASSERT_TRUE(again.logBits & (1u << alarms::BIT_SENSOR_STALE));
+}
+
+// The two views can only differ where ack() can suppress, and ack() only suppresses
+// CRITICAL ids. So a WARNING is the same word in both vocabularies, before and
+// after an ACK — pinning that here keeps a future change to ack() from quietly
+// splitting a warning across the two views and making the dive file disagree with
+// the handset about something the diver was never asked to acknowledge.
+void test_a_warning_is_the_same_in_both_views_across_an_ack() {
+    Manager m{Config{}};
+    Inputs in = base();
+    in.vbat = 3.0f;  // BATTERY is WARNING
+
+    const Result up = m.update(in);
+    TEST_ASSERT_TRUE(up.bits & (1u << alarms::BIT_BATTERY));
+    TEST_ASSERT_TRUE(up.logBits & (1u << alarms::BIT_BATTERY));
+
+    m.ack();
+    const Result after = m.update(in);
+    TEST_ASSERT_TRUE_MESSAGE(after.bits & (1u << alarms::BIT_BATTERY),
+                             "an ACK silenced a WARNING on the live word");
+    TEST_ASSERT_TRUE(after.logBits & (1u << alarms::BIT_BATTERY));
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(after.bits, after.logBits,
+                                     "bits and logBits diverged on a warning — they have no "
+                                     "reason to, and a reader would have to guess which "
+                                     "column the file holds");
+    TEST_ASSERT_FALSE(after.ackSuppressed[alarms::BIT_BATTERY]);
+}
+
+// The exception, and the reason logBits is not simply `rawActive_` ORed forever:
+// an EVENT latch (kLatchAck — today only HYPOXIA) is CONSUMED by the ACK rather
+// than suppressed. A one-shot verdict the diver has heard is not a standing
+// condition, so the log view lets it go with the live one; the rising edge already
+// wrote its own E, row, and re-marking every later dive-file row with a consumed
+// event would turn one decision into hundreds of rows.
+void test_an_ack_consumes_an_event_latch_and_both_views_let_it_go() {
+    Manager m{Config{}};
+    Inputs in = base();
+    in.haveVote = false;
+    in.vote.mode = voting::Mode::FAILED;
+    in.vote.cellsSeen = true;
+    in.vote.hypoxiaSuspect = true;
+
+    const Result up = m.update(in);
+    TEST_ASSERT_TRUE(up.bits & (1u << alarms::BIT_HYPOXIA));
+    TEST_ASSERT_TRUE(up.logBits & (1u << alarms::BIT_HYPOXIA));
+
+    in.vote.hypoxiaSuspect = false;  // the event is over; the latch is what remains
+    const Result latched = m.update(in);
+    TEST_ASSERT_TRUE(latched.bits & (1u << alarms::BIT_HYPOXIA));
+    TEST_ASSERT_TRUE(latched.logBits & (1u << alarms::BIT_HYPOXIA));
+
+    m.ack();
+    const Result after = m.update(in);
+    TEST_ASSERT_FALSE_MESSAGE(after.bits & (1u << alarms::BIT_HYPOXIA),
+                              "ACK left a consumed hypoxia event on the live word");
+    TEST_ASSERT_FALSE_MESSAGE(after.logBits & (1u << alarms::BIT_HYPOXIA),
+                              "the log view re-marked a one-shot event the diver had already "
+                              "acknowledged — every later dive-file row would claim it");
+    // The continuous condition from the same cycle keeps its marker: what the
+    // consume rule applies to is latches, not facts.
+    TEST_ASSERT_EQUAL_UINT16(0u, after.bits & (1u << alarms::BIT_SENSOR_FAIL));
+    TEST_ASSERT_TRUE_MESSAGE(after.logBits & (1u << alarms::BIT_SENSOR_FAIL),
+                             "the continuous condition lost its log marker beside the latch");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_low_ppo2_edge_pair_and_critical_level);
@@ -231,5 +360,8 @@ int main() {
     RUN_TEST(test_no_vote_before_the_first_sample_is_not_a_fault);
     RUN_TEST(test_sensor_fail_ack_silences_until_the_vote_returns);
     RUN_TEST(test_a_collapsing_loop_is_still_hypoxia_with_no_vote);
+    RUN_TEST(test_the_log_view_keeps_what_an_ack_silences_from_the_live_one);
+    RUN_TEST(test_a_warning_is_the_same_in_both_views_across_an_ack);
+    RUN_TEST(test_an_ack_consumes_an_event_latch_and_both_views_let_it_go);
     return UNITY_END();
 }

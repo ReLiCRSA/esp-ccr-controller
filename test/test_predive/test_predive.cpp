@@ -1,5 +1,7 @@
 #include <unity.h>
 
+#include <limits>
+
 #include "control/predive.h"
 
 using predive::Config;
@@ -113,6 +115,80 @@ void test_restart_after_failure() {
     TEST_ASSERT_FALSE(s.failed());
 }
 
+// Finding C1 / review H3: a dead depth bus used to reach this step as the
+// 0.0 m somebody fabricated for "unknown", and 0.0 m is exactly what the step
+// wants to see — so the rig was certified "on the surface" by the failure of
+// its own depth sensor. The step must answer the prior question first: is
+// there a depth at all?
+void test_dead_depth_bus_fails_the_depth_step() {
+    Config c; c.warmupMs = 0;
+    Sequencer s{c};
+    Inputs in = airGood();
+    uint32_t t = 0;
+    s.start(t);
+    // The exact firmware shape of the fault: depthM is the surface (because it
+    // was invented), and the bus is not believed.
+    in.depthM = 0.0f;
+    in.depthValid = false;
+    runUntil(s, in, Step::S_DEPTH, t);
+    TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
+    s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(), "the DEPTH step passed with no depth sensor");
+    TEST_ASSERT_FALSE_MESSAGE(s.allPassed(), "pre-dive PREPASS with a dead depth bus");
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s.status(Step::S_DEPTH));
+}
+
+// A bus that is alive but telling nonsense is refused too — the validity flag
+// is not a licence for any number the driver happens to be holding. A sane but
+// off-surface depth WAITS (the diver can still surface, and the existing depth
+// gate test pins that); only "there is no measurement" is a verdict.
+void test_invalid_and_wild_depth_both_refused() {
+    Config c; c.warmupMs = 0;
+    Sequencer s{c};
+    Inputs in = airGood();
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_DEPTH, t);
+    TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
+
+    in.depthM = 400.0f;  // believed, but no sane rig is there: still waits
+    for (int i = 0; i < 5; ++i) s.update(in, t += 100);
+    TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
+    TEST_ASSERT_FALSE(s.failed());
+
+    in.depthM = std::numeric_limits<float>::quiet_NaN();  // the comparison refuses it
+    for (int i = 0; i < 5; ++i) s.update(in, t += 100);
+    TEST_ASSERT_EQUAL_UINT8(Step::S_DEPTH, s.current());
+    TEST_ASSERT_FALSE(s.failed());
+
+    // and a held sample behind an invalid flag fails, whatever number it holds
+    Sequencer s2{c};
+    Inputs in2 = airGood();
+    in2.depthM = 0.05f;
+    in2.depthValid = false;
+    t = 0;
+    s2.start(t);
+    runUntil(s2, in2, Step::S_DEPTH, t);
+    s2.update(in2, t += 100);
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s2.status(Step::S_DEPTH));
+    TEST_ASSERT_TRUE(s2.failed());
+}
+
+// A bus that recovers is not a fault the diver has to restart for: while the
+// sample is believed and sane the step still passes on its own.
+void test_depth_step_recovers_with_the_bus() {
+    Config c; c.warmupMs = 0;
+    Sequencer s{c};
+    Inputs in = airGood();
+    uint32_t t = 0;
+    s.start(t);
+    in.depthValid = true;
+    in.depthM = 0.05f;
+    runUntil(s, in, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE(s.allPassed());
+    TEST_ASSERT_EQUAL_UINT8(Status::PASS, s.status(Step::S_DEPTH));
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_full_pass_sequence);
@@ -120,5 +196,8 @@ int main() {
     RUN_TEST(test_solenoid_failure_aborts);
     RUN_TEST(test_low_battery_fails_depth_gate_blocks);
     RUN_TEST(test_restart_after_failure);
+    RUN_TEST(test_dead_depth_bus_fails_the_depth_step);
+    RUN_TEST(test_invalid_and_wild_depth_both_refused);
+    RUN_TEST(test_depth_step_recovers_with_the_bus);
     return UNITY_END();
 }

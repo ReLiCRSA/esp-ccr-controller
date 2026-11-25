@@ -1,7 +1,9 @@
 // ============================================================================
 // test_loop — behaviour that only exists in the assembled chain: what happens
 // between the modules (sensor staleness gating the valve, the output fuse, the
-// pre-dive lockout, a spiked depth sample vs the setpoint bands).
+// pre-dive lockout, a spiked depth sample vs the setpoint bands, a dead depth
+// bus vs the depth readout and the setpoint rung, and what the pre-dive makes
+// of a rig that cannot measure depth at all).
 // The fault scenarios in test_sim cover the same ground physically; these pin
 // the interface contracts the firmware ControlTask depends on.
 // ============================================================================
@@ -27,13 +29,13 @@ Config benchCfg() {
 
 // Feeds the loop a fixed cell level / depth for `seconds`.
 void feed(Loop& loop, uint32_t& now, float bar, float depth, float seconds,
-          bool fresh = true) {
+          bool fresh = true, bool pressureValid = true) {
     const uint32_t n = static_cast<uint32_t>(seconds * 1000.0f / Loop::kTickMs);
     for (uint32_t i = 0; i < n; i++) {
         SensorData sd;
         for (int ch = 0; ch < 3; ch++) sd.cells[ch] = bar;
         sd.depthM = depth;
-        sd.pressureValid = true;
+        sd.pressureValid = pressureValid;
         sd.cellsFresh = fresh;
         sd.vbat = 12.4f;
         now += Loop::kTickMs;
@@ -56,7 +58,7 @@ struct Plant {
 
     explicit Plant(Loop& l) : loop(l) {}
 
-    void tick(uint32_t& now, float depth, bool fresh = true) {
+    void tick(uint32_t& now, float depth, bool fresh = true, bool pressureValid = true) {
         const uint32_t p = loop.pulseCount();
         for (int ch = 0; ch < 3; ch++) {
             if (pulses < p && !(deafMask & (1u << ch))) bar[ch] += perPulse * (p - pulses);
@@ -68,16 +70,17 @@ struct Plant {
         SensorData sd;
         for (int ch = 0; ch < 3; ch++) sd.cells[ch] = bar[ch];
         sd.depthM = depth;
-        sd.pressureValid = true;
+        sd.pressureValid = pressureValid;
         sd.cellsFresh = fresh;
         sd.vbat = 12.4f;
         now += Loop::kTickMs;
         loop.cycle(sd, now);
     }
 
-    void run(uint32_t& now, float depth, float seconds, bool fresh = true) {
+    void run(uint32_t& now, float depth, float seconds, bool fresh = true,
+             bool pressureValid = true) {
         const uint32_t n = static_cast<uint32_t>(seconds * 1000.0f / Loop::kTickMs);
-        for (uint32_t i = 0; i < n; i++) tick(now, depth, fresh);
+        for (uint32_t i = 0; i < n; i++) tick(now, depth, fresh, pressureValid);
     }
 };
 
@@ -194,6 +197,92 @@ void test_depth_spike_does_not_move_the_setpoint() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Finding C1: a depth bus that dies mid-dive makes the depth UNKNOWN. Unknown
+// must not become 0 m anywhere in the chain — the two chips share one I2C port,
+// so this is a single failure, and it used to arrive at the setpoint engine as
+// "the diver is on the surface".
+// ---------------------------------------------------------------------------
+void test_dead_depth_bus_holds_depth_and_setpoint() {
+    Config c = benchCfg();
+    c.cellproof.enabled = false;  // depth leg only; the proof is test_cellproof's
+    Loop loop(c);
+    loop.setAutoMode(true);
+    uint32_t now = 0;
+
+    // A dive already in progress at 32 m: the SP3 band (1.00 bar), with the
+    // loop a tenth below it so the valve has something to do.
+    loop.startDive(now);
+    feed(loop, now, 0.90f, 32.0f, 5.0f);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 32.0f, loop.depthSmoothedM());
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.00f, loop.setpointBar());
+    const uint32_t pulsesBefore = loop.pulseCount();
+    TEST_ASSERT_GREATER_THAN_UINT32(0u, pulsesBefore);
+
+    // 60 s of dead bus — fed the exact 0.0 m main.cpp used to fabricate for it.
+    float minSp = 9.0f, minDepth = 999.0f;
+    bool staleSeen = false;
+    for (int i = 0; i < 600; i++) {
+        SensorData sd;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 0.90f;
+        sd.depthM = 0.0f;
+        sd.pressureValid = false;
+        sd.cellsFresh = true;
+        sd.vbat = 12.4f;
+        now += Loop::kTickMs;
+        const State st = loop.cycle(sd, now);
+        if (st.setpointBar < minSp) minSp = st.setpointBar;
+        if (st.depthSmoothedM < minDepth) minDepth = st.depthSmoothedM;
+        if (st.alarms.bits & (1u << alarms::BIT_SENSOR_STALE)) staleSeen = true;
+    }
+
+    // The readout never approaches the surface: 32 m held, not 0 m believed.
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(20.0f, minDepth,
+                                           "a dead depth bus drove the depth readout to 0 m");
+    // The band is frozen by the frozen input — no separate inhibit latch, and
+    // nothing walked it towards the surface rung (0.40 bar).
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001f, 1.00f, minSp,
+                                     "an invalid depth moved the setpoint band");
+    // What the diver is owed on the wire: no new protocol bit, BIT_SENSOR_STALE
+    // is the existing one that says the number on the display is held.
+    TEST_ASSERT_TRUE_MESSAGE(staleSeen, "a dead depth bus raised no sensor alarm");
+    // And the injector, documented by the count: it keeps regulating to the
+    // held band, because the cells are still a measurement even when the depth
+    // is not. This is the assertion that separates a held setpoint from the C1
+    // walk — a loop sitting at 0.90 bar is far ABOVE the 0.40 bar surface rung,
+    // so a setpoint that reached it would have injected nothing at all.
+    TEST_ASSERT_GREATER_THAN_UINT32_MESSAGE(pulsesBefore, loop.pulseCount(),
+                                            "injection stopped regulating to the held band");
+
+    // Recovery: believed samples resume, the stale alarm clears, and the band
+    // is free to move again — the freeze is a held input, not a latched mode.
+    feed(loop, now, 0.90f, 32.0f, 2.0f);
+    TEST_ASSERT_FALSE(loop.alarmBits() & (1u << alarms::BIT_SENSOR_STALE));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.00f, loop.setpointBar());
+    feed(loop, now, 0.90f, 1.0f, 5.0f);
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001f, 0.40f, loop.setpointBar(),
+                                     "the band stayed frozen after the bus recovered");
+}
+
+// Review H3, at the chain level (the sequencer's own rule is test_predive's):
+// a rig whose depth bus never worked must not walk away from the pre-dive with
+// a PASS. A dead bus used to be handed the 0.0 m that means "on the surface",
+// which is the one answer that makes the depth step happy.
+void test_pre_dive_refuses_a_dead_depth_bus() {
+    Loop loop(benchCfg());
+    Plant plant(loop);
+    uint32_t now = 0;
+    loop.prediveStart(now);
+    plant.run(now, 0.0f, 15.0f, /*fresh=*/true, /*pressureValid=*/false);
+
+    TEST_ASSERT_TRUE_MESSAGE(loop.prediveFailed(), "pre-dive passed with no depth sensor");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(predive::FAIL, loop.prediveStatus(predive::S_DEPTH),
+                                    "the DEPTH step did not fail on a dead bus");
+    TEST_ASSERT_FALSE(loop.predivePassed());
+    TEST_ASSERT_FALSE_MESSAGE(loop.requestAuto(true),
+                              "AUTO granted to a rig that cannot measure depth");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_stale_sensors_stop_injection);
@@ -201,5 +290,7 @@ int main() {
     RUN_TEST(test_auto_refused_until_pre_dive_passes);
     RUN_TEST(test_unresponsive_cell_fails_the_cell_test);
     RUN_TEST(test_depth_spike_does_not_move_the_setpoint);
+    RUN_TEST(test_dead_depth_bus_holds_depth_and_setpoint);
+    RUN_TEST(test_pre_dive_refuses_a_dead_depth_bus);
     return UNITY_END();
 }

@@ -414,7 +414,16 @@ static void controlTask(void*) {
         ctrl::SensorData sd;
         for (int i = 0; i < 3; i++)
             sd.cells[i] = g_cellCal[i].apply(static_cast<float>(g_ads.raw(i)));
-        sd.depthM = g_depthValid ? g_depthM : 0.0f;
+        // The last depth the bus actually measured, believed or not — and
+        // NOT 0.0f standing in for "unknown". 0 m is a reading (the surface):
+        // it wins the depth filter's median, the setpoint engine walks to the
+        // 0.40 bar surface rung, and the handset reads 0.0 m while the diver is
+        // at depth. g_depthM is only ever written from a sane conversion in
+        // SensorTask, and the staleness watchdog clears the flag rather than
+        // the number, so this already IS the last good sample; pressureValid is
+        // what tells the chain to hold instead of believe. See loop.h
+        // SensorData.depthM and depthfilter.h.
+        sd.depthM = g_depthM;
         sd.pressureValid = g_depthValid;
         sd.cellsFresh = !g_ads.anyStale(now);
         sd.vbat = g_battery.volts();
@@ -560,6 +569,14 @@ static void controlTask(void*) {
 
         if (st.diveActive) {
             // running totals for the dive meta (max/min/total only: cheap)
+            //
+            // st.depthSmoothedM is the chain's held depth while the pressure
+            // bus is invalid (loop.h), so nothing recorded here can be the
+            // fabricated 0 m the old main.cpp used to hand over: maxDepthCm is
+            // a maximum, so a held depth can only repeat what was already
+            // measured, and the grid row below carries sn.alarmBits — which has
+            // BIT_SENSOR_STALE set for exactly those rows. A held depth in the
+            // dive file is a depth marked as held.
             g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
             const int32_t dCm = static_cast<int32_t>(numfmt::scaled(st.depthSmoothedM, 2));
             if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;

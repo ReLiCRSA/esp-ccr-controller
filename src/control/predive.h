@@ -32,6 +32,14 @@ struct Inputs {
     float depthM = 0.0f;
     float vbat = 12.0f;
     uint32_t nowMs = 0;
+    // Optional (last on purpose — structs here are aggregate-initialised in
+    // tests and firmware, and inserting a field in the middle would silently
+    // re-map every positional initialiser). Is `depthM` a measurement? The
+    // firmware feeds the pressure bus's own health flag. Default true keeps
+    // every existing caller's meaning; what it must never be is "guessed from
+    // depthM", because a dead bus used to be handed to the DEPTH step as 0.0 m
+    // and PASSed it: "no sensor" and "on the surface" arrived as one number.
+    bool depthValid = true;
 };
 
 class Sequencer {

@@ -19,7 +19,14 @@ float medianF(const float* v, int n) {
 void Engine::setPresentMask(uint8_t mask) {
     present_ = mask & 0x7;
     for (uint8_t i = 0; i < NCELL; ++i) {
-        if (!(present_ & (1u << i))) st_[i] = CellStatus{};
+        if (!(present_ & (1u << i))) {
+            st_[i] = CellStatus{};
+            // Its history goes with it, including "this cell once answered":
+            // Result::cellsSeen means "any FITTED cell has data", and a cell
+            // the bench uninstalled must not keep that claim alive for a vote
+            // it no longer takes part in.
+            seen_[i] = false;
+        }
     }
 }
 
@@ -61,6 +68,12 @@ Result Engine::update(const float ppo2[NCELL], uint32_t dtMs) {
         if (collapsing) collapsingAny = true;
         else collapsingAll = false;
     }
+
+    // Does the engine have any believable cell data at all yet — including this
+    // call's? Reported rather than inferred by the caller: the difference
+    // between "never sampled" and "stopped being believed" is a fact this layer
+    // owns, and it is the difference between a boot-time alarm and a real one.
+    res.cellsSeen = seen_[0] || seen_[1] || seen_[2];
 
     if (collapsingAny && collapsingAll && activeCandidates >= 1) {
         // ALL still-trusted cells fell together: the loop really dropped

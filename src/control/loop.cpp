@@ -112,9 +112,31 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     // Median then boxcar: bands and CellProof switch on absolute thresholds,
     // so one spiked pressure sample must not move the setpoint (and a bare EMA
     // would asymptote towards a threshold without ever crossing it).
-    depthSmooth_ = depthF_.update(in.depthM);
-    depthRate_ = std::fabs(depthSmooth_ - depthPrev_) / (dt / 1000.0f);
-    depthPrev_ = depthSmooth_;
+    //
+    // And a sample the driver did not measure is not a sample: the bus health
+    // flag goes to the filter, which skips it and keeps the last depth it
+    // actually believed. Until 2026-11-26 main.cpp turned "no reading" into
+    // 0.0 m here, the windows converged on it in half a second, and step 5
+    // walked the setpoint to the 0.40 bar surface rung while the diver was at
+    // depth — one failure mode, because both depth chips share Wire1
+    // (include/config/pins.h) and depth_manager.h budgets for exactly that.
+    // depthfilter.h carries the reasoning for hold-last-good.
+    depthSmooth_ = depthF_.update(in.depthM, in.pressureValid);
+    if (in.pressureValid) {
+        depthRate_ = std::fabs(depthSmooth_ - depthPrev_) / (dt / 1000.0f);
+        depthPrev_ = depthSmooth_;
+    }
+    // While the bus is invalid the rate is UNKNOWN, and the last measured rate
+    // is held rather than replaced by 0. Zero is not "unknown": it is a claim
+    // that the diver is stationary, and depthRate_'s only consumer is the
+    // injector's stuck-open gate, which may only judge a ppO2 rise on windows
+    // where depth is PROVABLY steady. A frozen filtered depth is precisely a
+    // window where steadiness cannot be proved, so fabricating 0 would let the
+    // gate latch a stuck-open valve on physics it never measured — and a false
+    // STUCK_OPEN latch stops injection until the diver clears it, which is the
+    // failure that starves a loop at depth. Holding the last real rate gets
+    // this wrong in the harmless direction: a stuck-open suspicion is deferred,
+    // never invented.
     const bool depthStable = depthRate_ < 0.02f;  // <1.2 m/min: stuck-open gate
 
     // ---- 2. voting ---------------------------------------------------------
@@ -127,6 +149,11 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
         for (int i = 0; i < 3; i++) pi.cells[i] = cellBar_[i];
         pi.presentMask = cfg_.presentMask;
         pi.depthM = in.depthM;
+        // The step asks "is the rig on the surface", which is only answerable
+        // with a measurement: a dead depth bus used to arrive here as the 0.0 m
+        // main.cpp fabricated for it, and "no sensor" was rewarded with a PASS
+        // (review H3 — closed as part of C1).
+        pi.depthValid = in.pressureValid;
         pi.vbat = in.vbat;
         pi.nowMs = nowMs;
         predive_.update(pi, nowMs);
@@ -162,6 +189,18 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     cpOut_ = cpEng_.update(ci);
 
     // ---- 5. setpoint selection (+ CellProof override/clamp) ----------------
+    // Fed the smoothed depth, and that is the whole C1 inhibit — there is no
+    // separate "depth invalid" latch here, deliberately. The band engine moves
+    // only when the number it is given crosses a boundary, so while the bus is
+    // invalid and depthSmooth_ holds, the band is frozen wherever the last real
+    // sample left it and the setpoint cannot chase a surface the machine did
+    // not measure. Verified end to end: sp::Engine::update() takes depth and
+    // nothing else (setpoints.cpp), and its only input is depthSmooth_.
+    // What the diver sees: the setpoint stays at the deep band while the depth
+    // readout sits still, next to BIT_SENSOR_STALE saying the number is held.
+    // Holding rich is the side with walls under it (HIGH alarm 1.40, injector
+    // highWall 1.45 / cutoff 1.60, the duty cap); holding toward the surface
+    // has none, which is why freezing is the direction this chain takes.
     spEng_.setClamp(cpOut_.clampActive ? cpCfg_.okMaxSpBar : 0.0f);
     const sp::Result sp = spEng_.update(depthSmooth_);
     spTarget_ = sp.value;

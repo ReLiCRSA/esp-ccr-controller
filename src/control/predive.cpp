@@ -77,7 +77,18 @@ void Sequencer::update(const Inputs& in, uint32_t nowMs) {
             break;
 
         case S_DEPTH:
-            if (std::fabs(in.depthM) <= cfg_.depthMaxM) advance(S_DEPTH);
+            // Two questions, in this order: is there a depth at all, and is it
+            // the surface. Only the second one is allowed to wait — a rig that
+            // is off the surface can still surface, so the step holds until it
+            // does. A bus that cannot answer is not patience, it is a fault,
+            // and it FAILS loudly: a step left RUNNING forever is a pre-dive
+            // that never returns a verdict, and the surface log would carry
+            // nothing about it. (Review H3: with 0.0 m fabricated for a dead
+            // bus, this step rewarded the fault with a PASS.)
+            // NaN and out-of-band values are excluded by the comparison itself,
+            // so no extra arithmetic is needed to distrust a wild sample.
+            if (!in.depthValid) fail(S_DEPTH);
+            else if (std::fabs(in.depthM) <= cfg_.depthMaxM) advance(S_DEPTH);
             break;
 
         case S_BATTERY:

@@ -46,7 +46,12 @@ struct Inputs {
     bool spClamped = false;
     bool stuckOpen = false;
     voting::Result vote{};
-    bool haveVote = false;      // false before first sample
+    // false when the vote failed (Mode::FAILED) — which includes the
+    // pre-first-sample window. It says "there is no ppO2 number this tick"; it
+    // does NOT say why, and the two reasons are not interchangeable: see the
+    // SENSOR_FAIL / HYPOXIA evaluation in update(), which lives outside the
+    // haveVote gate precisely because a missing vote is their subject.
+    bool haveVote = false;
     // Optional (last on purpose — see inj::Input): highest reading any fitted
     // cell reports, even one excluded from the vote. Two poisoned cells can
     // agree on 0.50 bar in a loop that is really at 1.6; the honest third must
@@ -99,6 +104,11 @@ private:
     // Event-type criticals arrive as one-shot conditions: they latch until
     // the diver ACKs (continuous alarms instead self-clear on recovery and
     // ACK only silences while the condition persists).
+    //
+    // SENSOR_FAIL is deliberately NOT an event latch: "the machine cannot see
+    // its loop" is a continuous condition, and the diver is owed the moment it
+    // stops being true — the bit goes away with the vote, and a re-fault
+    // re-alarms from scratch.
     static constexpr bool kLatchAck[BIT_COUNT] = {
         false, false, false, false, false, false, false, false, false, true,
     };

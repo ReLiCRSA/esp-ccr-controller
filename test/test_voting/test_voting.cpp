@@ -158,6 +158,40 @@ void test_health_scores_degrade_for_bad_cells() {
     TEST_ASSERT_TRUE(e.cell(0).health >= 90);
 }
 
+// Result::cellsSeen is what lets the alarm layer tell "the machine has never
+// sampled" from "it can no longer see the loop": Mode::FAILED is the report in
+// both cases, and only one of them is a fault the diver has to hear about
+// (alarms.cpp, finding C2). Pinned here, at the layer that owns the fact.
+void test_cells_seen_distinguishes_boot_from_a_lost_vote() {
+    Engine e{Config{}};
+    feedRet(e, 9.0f, 9.0f, 9.0f);  // every reading out of the plausible band
+    TEST_ASSERT_EQUAL_UINT8(Mode::FAILED, last.mode);
+    TEST_ASSERT_FALSE_MESSAGE(last.cellsSeen, "boot claimed cell data it never had");
+
+    feedRet(e, 0.40f, 9.0f, 9.0f);  // one believable answer lands
+    TEST_ASSERT_TRUE(last.cellsSeen);
+    TEST_ASSERT_EQUAL_UINT8(Mode::SINGLE, last.mode);
+
+    e.setProofExclusion(0b001);  // and the proof bans the only witness: FAILED again
+    feedRet(e, 0.40f, 9.0f, 9.0f);
+    TEST_ASSERT_EQUAL_UINT8(Mode::FAILED, last.mode);
+    TEST_ASSERT_TRUE_MESSAGE(last.cellsSeen,
+                             "a lost vote is indistinguishable from a boot");
+}
+
+// The claim is about FITTED cells: one the bench uninstalled takes its history
+// with it, and must not keep "we have data" alive for a vote it left.
+void test_unfitting_a_cell_forgets_its_history() {
+    Engine e{Config{}};
+    feedRet(e, 0.40f, 9.0f, 9.0f);  // only cell 0 has ever answered
+    TEST_ASSERT_TRUE(last.cellsSeen);
+    e.setPresentMask(0b110);  // cell 0 comes off the rig
+    feedRet(e, 9.0f, 9.0f, 9.0f);
+    TEST_ASSERT_EQUAL_UINT8(Mode::FAILED, last.mode);
+    TEST_ASSERT_FALSE_MESSAGE(last.cellsSeen,
+                              "an uninstalled cell kept the data claim alive");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_median_of_three_rejects_outlier_after_window);
@@ -170,5 +204,7 @@ int main() {
     RUN_TEST(test_health_scores_degrade_for_bad_cells);
     RUN_TEST(test_proof_exclusion_outranks_drift_hysteresis);
     RUN_TEST(test_ban_that_empties_the_vote_falls_back_to_a_drifted_cell);
+    RUN_TEST(test_cells_seen_distinguishes_boot_from_a_lost_vote);
+    RUN_TEST(test_unfitting_a_cell_forgets_its_history);
     return UNITY_END();
 }

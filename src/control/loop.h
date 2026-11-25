@@ -47,8 +47,19 @@ struct Config {
 /// ADC/pressure tasks; the simulator from its world. Nothing else may differ.
 struct SensorData {
     float cells[3] = {0.0f, 0.0f, 0.0f};  // calibrated ppO2 per channel, bar
-    float depthM = 0.0f;                  // raw depth, metres
-    bool pressureValid = true;            // pressure bus healthy
+    /// Raw depth in metres. MEANINGLESS when pressureValid is false: the
+    /// drivers then hold their last sample, and the chain's filter holds it
+    /// right back, so whatever is in this field is never believed.
+    ///
+    /// A caller must NOT substitute 0.0f for "not measured". 0 m is not a
+    /// placeholder, it is a reading — the surface — and it wins the median: the
+    /// setpoint engine follows it to the 0.40 bar surface rung while the diver
+    /// is at depth, and the handset reads 0.0 m. That substitution was in
+    /// main.cpp until 2026-11-26 and it is finding C1. Pass the last depth the
+    /// bus actually measured (or anything at all) and set pressureValid false;
+    /// depthfilter.h explains why hold-last-good is the survivable direction.
+    float depthM = 0.0f;
+    bool pressureValid = true;            // pressure bus healthy: depthM believed
     bool cellsFresh = true;               // ADC readings are not stale
     float vbat = 12.0f;
 };
@@ -60,6 +71,11 @@ struct State {
     bool diveActive = false;
     float votedBar = 0.0f;
     float setpointBar = 0.0f;
+    /// Filtered depth. While the pressure bus is invalid this is the LAST depth
+    /// the bus measured, not the current one: consumers (handset display, dive
+    /// log grid, max-depth total, deco ceiling) may print it, but must not
+    /// present it as a fresh measurement — BIT_SENSOR_STALE in the same report
+    /// is what says it is held.
     float depthSmoothedM = 0.0f;
     bool haveVote = false;
     bool injectionInhibited = false;

@@ -41,6 +41,14 @@ struct Result {
     bool hypoxiaSuspect = false; // all active cells collapsing together
     bool disagreement = false;   // any cell currently excluded/failing
     uint8_t activeMask = 0;      // cells currently in the vote
+    // Has any fitted cell produced a plausible sample yet? It is false only in
+    // the window before the first ADC reading lands, or with no cells fitted —
+    // which is exactly the distinction the alarm layer needs, because Mode::
+    // FAILED means "the machine cannot see the loop" in both of its readings:
+    // a controller that has not sampled yet (boot: no fault to raise) and one
+    // whose cells have all stopped being believable (a fault that must be
+    // shouted). See alarms.cpp.
+    bool cellsSeen = false;
 };
 
 struct CellStatus {

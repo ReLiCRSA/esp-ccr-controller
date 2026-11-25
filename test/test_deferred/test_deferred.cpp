@@ -6,7 +6,7 @@
 // The split (loop.h): gates (dive active, auto, cell test) flip synchronously,
 // because dive-locked refusals and telemetry mode ask for them the same
 // millisecond the button was pressed; chain work (config re-tune, dive-state
-// reset, sequencer start, ack latch, valve pulses) is queued and applied at
+// reset, sequencer start, ack latch) is queued and applied at
 // the top of the next cycle() — on the control thread. The handset is the
 // in-water transport (the web is off during a dive), so "lands within one
 // 100 ms tick" is a lifeline property, and it is asserted here, not assumed.
@@ -125,32 +125,66 @@ void test_a_posted_predive_starts_on_the_next_tick() {
     TEST_ASSERT_EQUAL_UINT8(predive::RUNNING, loop.prediveStatus(predive::S_WARMUP));
 }
 
-// The handset `PULSE` is a bench lifeline, and this case pins two things the
-// old code got wrong at once: a posted pulse must not be cancelled by the
-// "withdraw the stopped test's leftovers" rule (it is not a leftover), and
-// the queue cap survives coalescing. A PULSE that replies OK and never fires
-// is worse than one that ERRs.
-void test_a_posted_pulse_fires_within_one_tick_and_stays_capped() {
+// The pulse test is now the ONLY producer of test pulses (`PULSE` retired
+// 2026-11-26, HANDSET_PROTOCOL.md §8), and this case keeps the property the
+// old `PULSE` regression taught the hard way: a pulse that a live test asked
+// for must reach the valve — the "withdraw the stopped test's leftovers"
+// cancel must not eat it between request and delivery — and a test that
+// finished must leave nothing behind in the injector. `TEST CELLS` is the
+// smallest live producer: no dive, no pre-dive chain, same engine, same
+// cancel edge. A pulse that was asked for and silently never fired used to be
+// worse than a refusal; now a whole pulse class of silent no-ops is gone, and
+// this pins that the surviving class still lands.
+void test_a_pulsing_test_gets_every_pulse_and_leaves_no_leftovers() {
     Config cfg = benchCfg();
     Loop loop{cfg};
     uint32_t now = 0;
     tick(loop, now, 2);
     TEST_ASSERT_EQUAL_UINT32(0, loop.pulseCount());
 
-    loop.postTestPulses(1);
-    tick(loop, now, 1);
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1, loop.pulseCount(),
-                                     "posted PULSE never reached the valve (or was cancelled)");
+    loop.requestCellTest();
+    // 200 ticks = 20 s of simulated time: BASELINE (6 samples), the three
+    // requested pulses, the 8 s verdict hold (cells sit at 0.55 and never
+    // rise, so the test must finish on schedule, not on success), RECOVER,
+    // DONE. Exactly `cfg.pulseTest.pulses` may leave the valve in all of it:
+    // short by one and a live request was cancelled; over and a leftover
+    // outlived the test.
+    tick(loop, now, 200);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(cfg.pulseTest.pulses, loop.pulseCount(),
+                                     "the pulse test did not get exactly the pulses it asked for");
+    TEST_ASSERT_FALSE_MESSAGE(loop.cellTestRequested(),
+                              "the standalone cell test never closed its gate");
 
-    loop.postTestPulses(8);
-    loop.postTestPulses(8);
-    loop.postTestPulses(8);  // three asks coalesce at the injector's own cap
-    // 50 s of ticks: the rolling duty cap (10 % by default) throttles delivery
-    // deliberately, so this waits the queue out instead of fighting it.
-    tick(loop, now, 500);
-    const uint32_t added = loop.pulseCount() - 1;
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(8, added,
-                                     "coalesced pulse requests did not land exactly at the cap");
+    // And once it is over, the valve stays quiet: three 300 ms pulses use
+    // 900 ms of the 1000 ms duty budget, so the window still has room — a
+    // leftover would fire within these ticks, not hide under the cap.
+    const uint32_t settled = loop.pulseCount();
+    tick(loop, now, 100);
+    TEST_ASSERT_EQUAL_UINT32(settled, loop.pulseCount());
+
+    // The cancel half of the rule needs a run where the engine gives up while
+    // a queued pulse has NOT yet reached the valve — the fast run above never
+    // throttles, so no leftover can form there. 10 s min-gap (counted from the
+    // END of the previous pulse) puts the train at ~0 / +10.3 / +21.2 s: the
+    // 20 s verdict timeout lands with 2 of 3 delivered and ONE still queued.
+    // That one belongs to a finished test — the edge-triggered cancel must
+    // withdraw it, and the count must then never move. If the cancel ever
+    // stops cancelling, the third pulse arrives at ~21.2 s, inside the tail
+    // below, and the count moves. This is what makes `cancelTestPulse` itself,
+    // not just the pulses, a tested rule.
+    Config slow = benchCfg();
+    slow.inj.minGapMs = 10000;
+    Loop slowLoop{slow};
+    uint32_t snow = 0;
+    tick(slowLoop, snow, 2);
+    slowLoop.requestCellTest();
+    tick(slowLoop, snow, 210);   // baseline + pulses + the 20 s verdict + DONE
+    const uint32_t throttled = slowLoop.pulseCount();
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(2, throttled,
+        "throttled run should deliver exactly 2 of 3 before the verdict");
+    tick(slowLoop, snow, 150);   // 15 more s: a surviving leftover would land
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(throttled, slowLoop.pulseCount(),
+        "a leftover outlived its pulse test — the cancel edge stopped cancelling");
 }
 
 // AUTO is a gate, checked against the sequencer's own state where it lives:
@@ -214,7 +248,6 @@ void test_two_threads_never_split_the_chain() {
             c.sp.sp[1] = (c.sp.sp[1] < 1.0f) ? 1.50f : 0.70f;
             loop.postConfig(c);
             loop.postAckAlarms();
-            loop.postTestPulses(1);
             loop.postPredive(t++);
             loop.postCpOverride();
             loop.postStartDive(t);
@@ -250,7 +283,7 @@ int main() {
     RUN_TEST(test_the_dive_gate_is_now_and_a_second_start_cannot_wipe_the_dive);
     RUN_TEST(test_a_queued_config_decides_the_same_tick_it_lands);
     RUN_TEST(test_a_posted_predive_starts_on_the_next_tick);
-    RUN_TEST(test_a_posted_pulse_fires_within_one_tick_and_stays_capped);
+    RUN_TEST(test_a_pulsing_test_gets_every_pulse_and_leaves_no_leftovers);
     RUN_TEST(test_the_auto_gate_and_the_lockout_stay_synchronous);
     RUN_TEST(test_two_threads_never_split_the_chain);
     return UNITY_END();

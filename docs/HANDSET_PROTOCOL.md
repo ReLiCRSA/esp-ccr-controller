@@ -166,7 +166,6 @@ Refusals are honest `ERR` lines — a handset should display them, not hide them
 | `MANUAL` | `OK MANUAL` | always accepted |
 | `ACK` | `OK` / `OK SAFE RESTART` | acknowledge/silence current alarms. The diver outranks the machine: the condition persists and keeps alarming if it persists, but the latch/silence is honoured. In **SAFE mode** it means something else and bigger — see "SAFE mode" below. |
 | `CHECK` | `OK CHECK` / `ERR dive active` | run the pre-dive sequence |
-| `PULSE` | `OK` | request one test injection pulse (posted to the control task; it is a real pulse, subject to the injector's own duty/stuck-open rules) |
 | `TEST CELLS` | `OK TEST CELLS` / `ERR test running` | start the cell pulse test; watch it via `GET CELLS` |
 | `DECO` | `D,` line (no OK) | ask for the deco picture now |
 | `CELLPROOF OVERRIDE` | `OK CLAMP LIFTED` / `ERR no clamp active` | lift the setpoint clamp imposed by a failed cell proof |
@@ -904,9 +903,15 @@ dive and was rewritten afterwards.
   here therefore running a ±0.5 m tolerance rather than a centimetre one.
 * Event ids 7, 8, 11, 12, 13, 14 are reserved in the log format and **not
   published** (§4 table). Do not build notifications on them.
-* `PULSE` works during a dive as well as at the surface — it is a diver
-  command with a physical effect, so a handset should keep it off an
-  unguarded button.
+* `PULSE` is **retired** (2026-11-26). A handset has no manual injection path:
+  adding diluent by hand is an analog act — a physical bypass of the loop, not
+  a button — and anything the handset triggers mechanically must come from a
+  clear decision the firmware itself made (the pre-dive solenoid step, `TEST
+  CELLS`, closed-loop control under AUTO). Older controllers accepted `PULSE`
+  mid-dive; current firmware does not parse the word, so it answers
+  `ERR unknown command`, truthfully — the controller has no manual pulse path
+  at all. A handset must not offer the button; if one was built against the
+  older line, delete it rather than working around the refusal.
 
 ## 9. Building a handset
 

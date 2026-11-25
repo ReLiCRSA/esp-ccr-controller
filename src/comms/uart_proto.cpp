@@ -111,7 +111,12 @@ bool parseCommand(const char* line, Command& out, const char** err) {
     if (std::strcmp(verb, "AUTO") == 0) { out.kind = Kind::AUTO; return true; }
     if (std::strcmp(verb, "MANUAL") == 0) { out.kind = Kind::MANUAL; return true; }
     if (std::strcmp(verb, "ACK") == 0) { out.kind = Kind::ACK; return true; }
-    if (std::strcmp(verb, "PULSE") == 0) { out.kind = Kind::PULSE; return true; }
+    // `PULSE` retired 2026-11-26: there is no manual injection path from the
+    // handset, so the verb is not parsed at all and falls through to
+    // `ERR unknown command`. Deliberately not kept as a parse-and-refuse case
+    // (compare the CAL family below, which stays parseable because those
+    // calibrations have consumers waiting): a manual valve command is a
+    // decision the project has made against, not a feature awaiting a consumer.
     if (std::strcmp(verb, "DECO") == 0) { out.kind = Kind::DECO; return true; }
 
     if (std::strcmp(verb, "CAL") == 0) {

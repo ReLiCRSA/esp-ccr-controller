@@ -720,11 +720,6 @@ void CommandRouter::exec(const char* line, Response& r) {
             else replyErr(r, "no clamp active");
             break;
 
-        case Kind::PULSE:
-            loop_.postTestPulses(1);
-            replyOk(r);
-            break;
-
         case Kind::DECO:
             replyInPlace(r, proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()),
                                               r.text, sizeof(r.text)));

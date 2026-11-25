@@ -106,7 +106,7 @@ public:
     //     dive-locked refusals, telemetry mode and "one test at a time" ask
     //     for them the same millisecond the diver pressed the button;
     //   * the CHAIN WORK (engine re-tune, tissue/proof reset, sequencer start,
-    //     ack latch, valve pulses) is queued and applied at the top of the
+    //     ack latch) is queued and applied at the top of the
     //     next cycle(), so the chain is never mutated mid-decision on the
     //     other core. One control tick (100 ms) is the worst-case latency —
     //     the handset is the in-water transport, so that bound is a lifeline
@@ -117,7 +117,10 @@ public:
     void postAckAlarms();
     void postPredive(uint32_t nowMs);
     void postCpOverride();
-    void postTestPulses(uint8_t n = 1);
+    // (postTestPulses retired 2026-11-26 with the `PULSE` verb: see
+    // docs/HANDSET_PROTOCOL.md §8. Test pulses now have exactly one producer —
+    // the pre-dive solenoid step and `TEST CELLS`, both relayed by
+    // drivePulseTest — and no diver-facing command can queue a valve pulse.)
 
     // ---- diver commands ------------------------------------------------------
     // requestAuto/requestCellTest flip GATES and are safe from any thread;
@@ -138,10 +141,6 @@ public:
     bool clampActive() const { return cpEng_.state() == cellproof::State::FAIL; }
     void clearStuckOpen() { injector_.clearStuckOpen(); }  // control thread
     void prediveStart(uint32_t nowMs) { predive_.start(nowMs); }  // control thread
-    /// Bench / handset `PULSE`: one valve pulse outside AUTO. The high wall,
-    /// cutoff latch, duty cap and output fuse all still apply — a bench command
-    /// is not a bypass. Control-thread form; the command path posts it.
-    void requestTestPulse() { injector_.requestTestPulse(); }
     /// Bench / handset `TEST CELLS`: run the cell responsiveness test now,
     /// outside the pre-dive sequence. Same engine, same walls. The request is
     /// just a gate flip — the test itself always runs inside cycle().
@@ -231,7 +230,6 @@ private:
              predive = false, cpOverride = false;
         Config cfgVal;
         uint32_t prediveStamp = 0;
-        uint8_t pulses = 0;
     };
     std::mutex reqMux_;
     Pending pending_;

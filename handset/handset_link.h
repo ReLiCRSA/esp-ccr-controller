@@ -690,7 +690,9 @@ public:
     bool setAuto()             { return send("AUTO"); }
     bool setManual()           { return send("MANUAL"); }
     bool ack()                 { return send("ACK"); }
-    bool pulse()               { return send("PULSE"); }
+    // `pulse()` was retired 2026-11-26 with the `PULSE` verb: the controller
+    // has no handset-originated injection path (HANDSET_PROTOCOL.md §8). The
+    // method is gone from the library so a new handset cannot grow the button.
     bool deco()                { return send("DECO"); }
     // CAL AIR: the reply is a receipt, not a verdict. Read the outcome with
     // getCalAir(), or watch the live `E,<t>,7,<code>` event.

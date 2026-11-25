@@ -16,8 +16,16 @@ reboots" from a log that begins with one.
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
 pio test -e native            # host gate, currently 278 cases
+tools/port_id.py --listen 4   # name the ports before trusting any of the below:
+                                 # two identical CP2102s swap under the USB stack, and a
+                                 # swapped pair makes every check below lie (see C2-g)
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
-pio run -e esp32 -t upload    # only once the soak has ended
+pio run -e esp32 -t upload --upload-port /dev/ttyUSB0   # explicit or never: two
+                                 # identical CP2102s exist, auto-select CAN flash the
+                                 # controller image into the bridge (it did, 2026-11-26:
+                                 # acceptance then "died on I2C" while it was reading a
+                                 # controller-flashed spare's console as the handset
+                                 # port). tools/port_id.py settles which is which.
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
                                  --cal-air --predive --dive-persist    # 170 checks
@@ -1075,6 +1083,47 @@ page's first two hundred bytes, not that the response is a document. It now
 requires a doctype and an `<html` tag inside 4 KiB, and was tried against an
 empty body, a plain-text error, a stripped doctype, a missing `<html`, and HTTP
 500, failing all five.
+
+## C2-g — the bench was talking to the wrong board (2026-11-26)
+
+A PULSE-retirement build flashed with `pio run -e esp32 -t upload` — no port
+named — then `hw_accept` failed 81 checks and the console flooded with
+`requestFrom(): i2cWriteReadNonStop returned Error -1`. It read as a hardware
+fault, and the first two readings were both wrong:
+
+* It was **not the PULSE diff**: the same command re-run against the committed
+  build failed identically (80, one fewer because that image has one fewer
+  check). Reproducible means real — but reproducible against *two* images
+  points at the bench, not the firmware.
+* It was **not the I2C bus**: `HB st=…` lines are console-only
+  (`main.cpp:291`), and the handset-phase reads were full of them. A check
+  that asks the handset port and gets console text is reading the wrong port,
+  whatever the numbers in that text say.
+
+What had actually happened: `platformio.ini` pins no `upload_port`, and the
+bench has **two identical CP2102 modules whose `by-id` strings are
+indistinguishable** — `/dev/serial/by-id` resolves to one entry for both, so
+it cannot be used to name a port either. esptool auto-selected, and the
+controller image went into the **spare**, overwriting the `bridge_esp32`
+sketch that *is* the handset link. The `i2cWriteReadNonStop` flood was that
+spare running controller firmware with no cell front-end and no depth sensor
+wired to it — an honest error from an honest bus, on a board that was never
+meant to be a controller.
+
+Fix: re-flash the bridge to the spare (`pio run -d handset/bridge_esp32 -t
+upload --upload-port /dev/ttyUSB1`), then the controller
+(`pio run -e esp32 -t upload --upload-port /dev/ttyUSB0`). Acceptance returned
+**171 checks, 0 failures** on the first run after that, with `stk=1040
+u2stk=3088` — the same stack margin the pre-change board reported, which is
+the confirmation that the flash landed where it was meant to.
+
+The witness that costs almost nothing: **name the ports at the top of every
+flash session** (`tools/port_id.py --listen 4`, passive — it opens DTR/RTS low
+so it resets nothing), and **name `--upload-port` on every upload**. Both are
+in the C2 block above now. The rule about the two identical CP2102s had been
+recorded before (M5b, §16) and was still not in the command list an operator
+copy-pastes, which is how it got stepped over again: a rule in prose is not a
+guard in a runbook.
 
 ## C3-a — depth sensor: LPS28DFW on its own bus (decided 2026-11-23)
 

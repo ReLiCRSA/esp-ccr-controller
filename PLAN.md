@@ -183,7 +183,9 @@ lie at depth. CellProof catches exactly this:
   Deterministic, no windup — right behavior for a CCR. Low ppO₂ increases
   aggressiveness but never bypasses the high wall.
 - Bench: solenoid GPIO also drives a monitoring LED (same net) so injection is
-  visible. `PULSE` handset command = single manual test pulse.
+  visible. Test pulses come only from the engines — the pre-dive solenoid step
+  and `TEST CELLS`; there is no handset manual-pulse command (`PULSE` was
+  retired 2026-11-26, §16).
 
 ## 6. Deco engine — ZHL-16C + GF
 
@@ -253,7 +255,7 @@ OK / ERR <why>   command replies
 **Uplink commands**:
 `GET *|<key>` · `SET <key>=<val>` · `CHECK` · `AUTO` · `MANUAL` · `ACK` ·
 `CAL AIR` · `CAL O2` / `CAL O2 CONFIRM` · `CAL DEPTH` · `TEST CELLS` ·
-`CELLPROOF OVERRIDE` · `PULSE` · `DECO` (one-shot `D,` line) ·
+`CELLPROOF OVERRIDE` · `DECO` (one-shot `D,` line) ·
 `DIVE START|END` · `LOG LIST` · `LOG EXPORT <n>` · `WIFI ON|OFF`.
 
 Display keys (resolved **after** the registry, so a real key like `D1` or
@@ -546,7 +548,12 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
 | — | per-cell histogram: `ctrl::cellhist` accumulator + `GET HIST` + Cells tab | done `1b8c807`, page tabs working since `70049fa` |
 | M4a | **ZHL-16C published cross-validation**: 25 schedule entries + NDL transitions from the published Buhlmann air tables (Deco_Package PDF) and GF100/80 cross-impl anchors from repied/paliers `src/gf.ts` run as a node oracle; fixed the M-value form (was `a + b·P`, deco inflated 2–3× — Subsurface/paliers both use `a + P/b`), the NDL definition (direct-ascent feasibility), the NOAA CNS rows (0.8→450, 0.7→570), and one inverted test assertion. Decision logged in §6: per-tissue GF interpolation kept | done `73e004d` (tag `m4-deco-validated`) |
 | M5a | **handset client package** (so a handset can be built by someone else, against a stated contract rather than by reading firmware): `docs/HANDSET_PROTOCOL.md` v1 — framing, cadence, every command/reply/refusal string, every downlink line format, the append-only evolution rules and the honest limits (§8: `SET` value truncated to 23 chars, `LOG EXPORT n` slot mapping, 32-deep `E,` ring); `handset/handset_link.h` — header-only C++17 client, transport-agnostic (UART2 and `/ws` carry the same lines), zero-allocation callback handlers, link-health watchdog (3 s silence = alarm); `handset/example_esp32_handset/` — reference handset firmware (wiring, buttons, buzzer classes, link-loss alarm); `handset/README.md`; `test/test_handset/` — 10 conformance cases feeding the library the firmware's own wire literals | done `acfada8` — **183/183 native**, both esp32 builds clean. The protocol contract is now verified against real firmware on real wires: the C2 matrix runs over the bench bridge on 16/17 (48 checks), and `web_probe.py` proves the same lines over `/ws`. Never yet flashed: the example handset board itself. **Caught up 2026-11-24** with the clock batch (`7f98a2c`), which had reached the spec and the firmware but not the package: `timeSet`/`getTime`/`onClock` + `Clock`, `LogEntry::seq` (the fourth `L,` field; a legacy three-field line still parses, `seq 0` = unknown order), `DiveHeader::rowFormat`/`iso` (`clock-unset` passes through verbatim), `timeSet`'s epoch window enforced client-side too — mirroring `wallclock::sane`, refusing **without sending** — a README section on being the time source, and the example firmware now carries the clock state on its main line (`** NO CLOCK: dives undated **`) and can set it from its own console. 14 conformance cases, fed literals **captured off the bench link** (`TIME,1795518150,1,509`, `L,7,1795517641,27`, `L,6,0,26` — an undated dive, `DIVE,10,1795516836,3,3,2026-11-24T10:40:36Z`) rather than literals typed from the spec's grammar; four library mutations (drop the `TIME,` dispatch, drop `L,`'s fourth field, drop the dated `DIVE,` fields, drop the epoch gate) turned five cases red, each with the matching reason. The bench bridge runs this same library as a live observer: reflashed with it, the C2 short gate stayed green (53 checks, 0 failures). **Level again 2026-11-24** with the calibration batch, in one commit as 16 now requires: `CalAir` + `parseCalAir` + `onCalAir` + `getCalAir()` + `calAirText()` (words for a code, because a diver reads words), the `CALAIR,` dispatch, and the refusal documented on the builders that stay in the grammar; the example handset shows `** CELLS NOT CALIBRATED: <why> **` on its main line and re-asks until the calibration is actually done; the tap prints the verdict. 16 conformance cases, the new ones fed literals captured off the bench (`CALAIR,0,0,0,0,0,0,0,0`, `CALAIR,3,1,0,0,0,0,0,97`, `CALAIR,1,0,3,0,0,0,0,0`, `CALAIR,2,2,12,21,1514,1519,1528,0`, `E,18,7,3`, `E,129,7,2`), including the append-only cases (a short `CALAIR,2` still parses; an unknown code 9 is "a verdict with no name", never a parse failure). Three library mutations — no `CALAIR,` dispatch, all nine fields mandatory, `warmup_left_s` ignored — each turned the matching case red |
-| M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `-DBRIDGE_TAP=1` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image | done `233ad2c`, **and the bench link is live**: the bridge is flashed and the C2 refusal matrix has been run over it many times (48 checks, 0 failures), with the client library on the bridge side watching the same stream. Two facts the wiring taught, both now in 16 and `BENCH.md`: opening the bridge's serial port resets it and its boot banner lands in the controller's line buffer, where un-terminated bytes are glued onto the next command, so `hw_accept.py` and `web_probe.py` send a newline first and discard what it draws; and both CP2102s report the same `/dev/serial/by-id`, so an upload must name `--upload-port`. `tools/port_id.py` (`--loopback` jumper test, boot-time UART2 self-test in the tap build) stays as the bisect path if the link ever goes silent again |
+| M5b | **handset link on the bench without an adapter**: `handset/bridge_esp32` — a spare classic ESP32 as the USB-UART (its own bridge chip for the PC, UART2 16/17 for the controller), a byte-for-byte pipe that also runs the client library as a passive observer (link/traffic LEDs = the library's verdict, not a guess), plus `-DBRIDGE_TAP=1` for a handset-side console. Bench sketches are now their own mini-projects (`pio run -d handset/<name>`), so a handset build can never produce a controller image | done `233ad2c`, **and the bench link is live**: the bridge is flashed and the C2 refusal matrix has been run over it many times (48 checks, 0 failures), with the client library on the bridge side watching the same stream. Two facts the wiring taught, both now in 16 and `BENCH.md`: opening the bridge's serial port resets it and its boot banner lands in the controller's line buffer, where un-terminated bytes are glued onto the next command, so `hw_accept.py` and `web_probe.py` send a newline first and discard what it draws; and both CP2102s report the same `/dev/serial/by-id`, so an upload must name
+`--upload-port` — a rule that sat in prose and not in the copy-paste runbook,
+and got stepped over on 2026-11-26 with the confusion C2-g in `BENCH.md`
+records; the port naming is now part of the C2 command list itself.
+`tools/port_id.py` (`--loopback` jumper test, boot-time UART2 self-test in
+the tap build) stays as the bisect path if the link ever goes silent again |
 
 ## 16. Design watch-outs (recorded decisions)
 
@@ -2091,12 +2098,71 @@ C2 row's open clause, in C3, and in the recorded-but-unfixed items of 16.
   thumb): scripted, graded, lying-capture-proven — and the ledger says *host-proved*
   until a squeeze says otherwise.
 
+- **`PULSE` is dead: the handset has no manual injection path (2026-11-26).**
+  The decision came from the diver side, not from a bug: adding diluent by hand
+  is an **analog** act — physical, a bypass of the loop, done by hand in the
+  real sense — and anything the handset triggers mechanically must come from a
+  clear decision the firmware itself made: the pre-dive solenoid step, `TEST
+  CELLS`, closed-loop control under AUTO. A manual-pulse button is neither, and
+  it was *protocol*: a spec §3 line, and a §8 note telling handsets `PULSE`
+  works mid-dive and to "keep it off an unguarded button." That second half was
+  the spec admitting it managed a hazard instead of refusing one. So the verb is
+  gone, not disarmed: it no longer **parses**, and the answer is
+  `ERR unknown command` — the controller saying truthfully that it has no
+  manual pulse path. That deliberately differs from the CAL family, which keeps
+  parsing and refuses `ERR not implemented`: those calibrations have real
+  consumers waiting; this has none, by decision. `Kind::PULSE` is removed from
+  the enum rather than left as a stub — an enum value nothing refuses is an
+  enum value something eventually re-wires. `Loop::postTestPulses`,
+  `Pending::pulses` and the dead `Loop::requestTestPulse` wrapper are gone; the
+  injector's `testPending_` mechanism **stays**, because the sequencer that
+  uses it is exactly the kind of decision the handset is allowed to trigger.
+  `pulse()` is deleted from the reference client so a new handset cannot grow
+  the button, and because the older firmware answered `PULSE` **mid-dive**, the
+  bench pin sits in the dive half of the hw_accept matrix: a handset built
+  against the old spec meets the refusal at the exact moment it used to be able
+  to open the valve.
+
+  Regression coverage moved rather than vanished. `test_deferred`'s pulse case
+  pinned plumbing that no longer exists, but the regression inside it — *the
+  leftover-cancel rule must not eat a pulse between request and valve* — now
+  has only the engine's own pulses as producers, and the rewritten case drives
+  a standalone `TEST CELLS` to pin it: exactly the 3 pulses the test asks for
+  reach the valve, and the valve stays quiet after the test ends (three 300 ms
+  pulses spend 900 ms of the 1000 ms duty budget, so a leftover would fire
+  inside the next ticks, not hide under the cap). The edge-triggered cancel in
+  `loop.cpp` keeps its comment — and the same reason.
+
+  The ledger lesson, which this project has now paid for twice: **a verb's own
+  `OK` is never a witness.** This firmware once had a `PULSE` that replied `OK`
+  and never fired the valve (the unconditional-cancel bug, recorded above), with
+  the host suite green — only the injector's delivered-pulse counter told the
+  truth. Hence the retirement pins a refusal, and the surviving pulse path is
+  pinned by a delivery count, never by the reply of the thing that asked. The
+  cancel rule got its own leg too: a second throttled run (10 s min-gap) leaves
+  the engine's verdict landing with one pulse still queued, so a `cancelTestPulse`
+  that stopped cancelling is a red test, not a comment. Mutation battery for the
+  package: re-armed verb reddens the parser and the router, unconditional cancel
+  reddens the fast leg (the original bug, `Expected 3 Was 0`), removed cancel
+  reddens the throttled leg — three mutations, three reds, on their own cases.
+
+  Bench after flashing (and after C2-g in BENCH.md: an unnamed `upload` had put
+  the image into the spare, which fakes an I2C catastrophe — read that entry
+  before trusting any bench mystery): `hw_accept.py` **171 checks 0 failures**
+  on the controller itself, the new row witnessed mid-dive — `PULSE` answered
+  `ERR unknown command` exactly where the old protocol opened the valve — idle
+  leg, web, depth, dive-persist all green, `stk=1040 u2stk=3088` unchanged from
+  the radio-policy board, `web_probe` **71 / 0** and selftests **107 + 20**,
+  native **278**.
+
 - **Queued next, none of it waiting on hardware** (2026-11-24, after the
   calibration batch; the surface log is now done, the rest still is not):
   the small known lies: ~~WiFi idle auto-off~~ (an open
-  M5 criterion — **closed by the radio-policy entry above**, 2026-11-26); a
-  `PULSE` button on the page (the command exists, the page has
-  AUTO/MANUAL/ACK). The depth-source item that used to open this list closed as
+  M5 criterion — **closed by the radio-policy entry above**, 2026-11-26); ~~a
+  `PULSE` button on the page~~ — **closed by retiring the verb instead**, same
+  decision as the entry above: the page and the handset both get no manual
+  injection at all, so the queue item that wanted the button is void. The
+  page's command set stays AUTO/MANUAL/ACK. The depth-source item that used to open this list closed as
   `GET DS` — the entry above records why a query and not an appended field.
   Added by the dive-file batch: the page's dive view **ignores `E,` rows** — it
   renders the chart from `S,` and one hint line from `M,`, so the verdicts are in

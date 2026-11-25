@@ -24,7 +24,13 @@ void test_simple_verbs() {
     TEST_ASSERT_EQUAL_UINT8(Kind::CHECK, parsed("CHECK").kind);
     TEST_ASSERT_EQUAL_UINT8(Kind::AUTO, parsed("AUTO").kind);
     TEST_ASSERT_EQUAL_UINT8(Kind::ACK, parsed("ACK\r\n").kind);   // CRLF tolerated
-    TEST_ASSERT_EQUAL_UINT8(Kind::PULSE, parsed("PULSE ").kind);  // trailing space
+    TEST_ASSERT_EQUAL_UINT8(Kind::DECO, parsed("DECO ").kind);    // trailing space
+    // `PULSE` was retired 2026-11-26 (HANDSET_PROTOCOL.md §8). Pinned here at
+    // the parser: the word must reach UNKNOWN, not a Kind that a future case
+    // could re-arm. This is where a handset built against the old spec learns
+    // the truth — via `ERR unknown command`, never a silent OK.
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)Kind::UNKNOWN, (uint8_t)parsed("PULSE", false).kind);
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)Kind::UNKNOWN, (uint8_t)parsed("PULSE ", false).kind);
 }
 
 void test_get_and_set() {

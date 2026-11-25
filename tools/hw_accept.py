@@ -261,6 +261,12 @@ PROTOCOL_CHECKS = [
      "mid-dive: radio down, reason dive, countdown parked, no stations"),
     ("CAL AIR", r"^ERR cal locked in dive", "calibration never under a diver"),
     ("FROBNICATE", r"^ERR unknown command", "unknown commands do nothing"),
+    # `PULSE` retired 2026-11-26 (HANDSET_PROTOCOL.md §8): no handset-originated
+    # injection, and the older protocol this replaces let the verb work MID-DIVE.
+    # So the pin is placed in the dive half, where the old firmware answered OK:
+    # a handset built against the old line learns the truth at the parse level,
+    # at the moment it used to be able to fire the valve.
+    ("PULSE", r"^ERR unknown command", "the retired manual-pulse verb stays dead mid-dive"),
     (OVERLONG, r"^ERR line too long", "line buffer cannot be flooded"),
     # dwell covers the re-arm: loopTask applies it within its poll interval and
     # softAP + captive DNS + server start are all inside that one console line.

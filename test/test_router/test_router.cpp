@@ -548,7 +548,7 @@ void test_time_set_is_range_checked_and_delegated() {
     TEST_ASSERT_TRUE(has(r, "ERR safe mode"));
 }
 
-void test_log_and_pulse_and_calibration_commands_delegations() {
+void test_log_and_calibration_commands_delegations() {
     Bench b;
     CommandRouter::Response r;
         b.run("LOG LIST", r);
@@ -557,10 +557,15 @@ void test_log_and_pulse_and_calibration_commands_delegations() {
     TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_LOG_EXPORT);
     TEST_ASSERT_EQUAL_UINT16(3, b.router.logExportIndex());
 
-    // PULSE is a bench command, not a bypass: it asks the injector, which
-    // still owns wall/cutoff/duty/fuse. Reply is a plain OK.
+    // `PULSE` retired 2026-11-26 (HANDSET_PROTOCOL.md §8): no handset-originated
+    // manual injection. Pinned at the router so a regression that quietly
+    // re-arms any pulse path — parse table, Kind, or a new case — is a red
+    // test, not a quiet feature. It must be the parse-level refusal (unknown
+    // command), not a runtime refusal that leaves the verb wired: and no
+    // action bit may ride along, so the transport provably did nothing.
     b.run("PULSE", r);
-    TEST_ASSERT_TRUE(has(r, "OK"));
+    TEST_ASSERT_TRUE(has(r, "ERR unknown command"));
+    TEST_ASSERT_EQUAL_UINT32(CommandRouter::ACT_NONE, r.actions);
 
     // CAL AIR is the one calibration with a consumer on the board, so it is
     // accepted (and its verdict reaches the wire: see test_uartlink).
@@ -1108,7 +1113,7 @@ int main() {
     RUN_TEST(test_testcells_runs_on_the_bench_and_reports_masks);
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);
     RUN_TEST(test_set_actually_moves_the_live_chain);
-    RUN_TEST(test_log_and_pulse_and_calibration_commands_delegations);
+    RUN_TEST(test_log_and_calibration_commands_delegations);
     RUN_TEST(test_unimplemented_calibrations_are_refused_not_acked);
     RUN_TEST(test_get_calair_reports_the_verdict_not_the_request);
     RUN_TEST(test_time_set_is_range_checked_and_delegated);

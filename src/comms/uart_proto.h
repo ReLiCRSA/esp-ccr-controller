@@ -8,7 +8,7 @@
 //            OK | ERR <reason>                   (command replies)
 // Uplink:    GET [*|KEY] | SET KEY=VAL | CHECK | AUTO | MANUAL | ACK |
 //            CAL AIR | CAL O2 | CAL O2 CONFIRM | CAL DEPTH | TEST CELLS |
-//            CELLPROOF OVERRIDE | PULSE | DECO | DIVE START|END |
+//            CELLPROOF OVERRIDE | DECO | DIVE START|END |
 //            LOG LIST | LOG EXPORT n | WIFI ON|OFF | TIME SET <epoch>
 // There is no RTC on the board and no NTP through an AP with no uplink, so wall
 // time is handed to the controller by a client at the surface. It is a command,
@@ -44,7 +44,12 @@ constexpr int MAX_STOPS = 8;
 
 enum class Kind : uint8_t {
     GET, SET, CHECK, AUTO, MANUAL, ACK, CAL, TESTCELLS, CELLPROOF_OVERRIDE,
-    PULSE, DECO, DIVE_START, DIVE_END, LOG_LIST, LOG_EXPORT, WIFI, TIME_SET,
+    // `PULSE` was retired 2026-11-26 (docs/HANDSET_PROTOCOL.md §8): the verb
+    // no longer parses, so it answers `ERR unknown command`. Its enumerator is
+    // gone rather than left as a stub — a manual valve command on the handset
+    // is a decision this project has made against, and an enum value that
+    // nothing refuses is a value something eventually wires up again.
+    DECO, DIVE_START, DIVE_END, LOG_LIST, LOG_EXPORT, WIFI, TIME_SET,
     UNKNOWN,
 };
 

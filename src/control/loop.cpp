@@ -88,7 +88,6 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
         if (p.predive) predive_.start(p.prediveStamp ? p.prediveStamp : nowMs);
         if (p.cpOverride) cpEng_.override();
         if (p.ack) alarmMgr_.ack();
-        if (p.pulses) injector_.requestTestPulse(p.pulses);
         if (p.end) cpEng_.diveEnded();
     }
 
@@ -141,8 +140,10 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     // purpose: the unconditional cancel also ate the handset's standalone
     // `PULSE` (queued between cycles, withdrawn before the valve ever saw it —
     // a command that silently did nothing). Only pulses belonging to a pulse
-    // test that just STOPPED are withdrawn; the diver's own pulse is never a
-    // leftover.
+    // test that just STOPPED are withdrawn. (`PULSE` itself was retired
+    // 2026-11-26, HANDSET_PROTOCOL.md §8 — but the edge-trigger stays: the
+    // pre-dive step's queued pulse crosses the same boundary the old command
+    // died on, and this is what keeps it alive between request and valve.)
     {
         const bool pulsing = pulseTest_.state() == cal::TestState::PULSING;
         if (wasPulsing_ && !pulsing) injector_.cancelTestPulse();
@@ -312,12 +313,6 @@ void Loop::postPredive(uint32_t nowMs) {
 void Loop::postCpOverride() {
     std::lock_guard<std::mutex> g(reqMux_);
     pending_.cpOverride = true;
-}
-
-void Loop::postTestPulses(uint8_t n) {
-    std::lock_guard<std::mutex> g(reqMux_);
-    const unsigned sum = pending_.pulses + n;
-    pending_.pulses = static_cast<uint8_t>(sum > 8 ? 8 : sum);  // injector's own cap
 }
 
 bool Loop::requestAuto(bool on) {

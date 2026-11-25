@@ -4,7 +4,9 @@
 #include <cstring>
 #include <string>
 
+#include "deco/zhl16c.h"
 #include "log/divelog.h"
+#include "log/rowfill.h"
 #include "util/numfmt.h"
 
 using namespace logfmt;
@@ -898,6 +900,271 @@ void test_a_row_holds_the_digits_the_wire_gave_for_the_same_sample() {
                              "a truncating cast is back: 20.30 m stored 2029 cm again");
 }
 
+// ---- the shared row fill (src/log/rowfill.h) -------------------------------
+// These cases are the point of the refactor. Until now the conversions that turn
+// the chain's floats into the integers a dive file holds lived in main.cpp and
+// session_wiring.cpp, neither of which the native env compiles, so the only thing
+// grading them was the soak's hand-written copy of them. Everything below runs the
+// function the firmware calls.
+
+namespace {
+
+logfmt::RowInputs benchRow() {
+    logfmt::RowInputs ri{};
+    ri.nowMs = 1500000u;
+    ri.diveStartMs = 0u;
+    ri.smoothedDepthM = 20.30f;
+    ri.haveVote = true;
+    ri.votedBar = 0.55f;
+    ri.cellBar[0] = 0.549f; ri.cellBar[1] = 0.55f; ri.cellBar[2] = 0.551f;
+    ri.setpointBar = 0.70f;
+    ri.diveActive = true;
+    ri.autoMode = true;
+    ri.alarmLogBits = 0x0010;
+    ri.cnsPeakPct = 13;
+    ri.vbat = 11.90f;
+    ri.pulsesNow = 1000;
+    ri.pulsesPrev = 940;
+    return ri;
+}
+
+deco::Zhl16Ccr loadedEngine() {
+    deco::Config dc;               // the shipped defaults: GF 30/85, sea, CCR
+    deco::Zhl16Ccr eng(dc);
+    eng.reset();
+    // 20 min at 40 m on a 1.30 bar setpoint: deep enough that the ceiling, the
+    // NDL and the schedule are all unambiguously non-zero afterwards.
+    for (int i = 0; i < 120; i++) eng.step(10.0, eng.depthToBar(40.0), 1.30);
+    return eng;
+}
+
+}  // namespace
+
+// The defect this whole module guards against, at the exact inputs that caught it
+// on the bench: a truncating cast or a `* 100.0` double product lands one count
+// under the integer the renderer prints, and the dive file stops being comparable
+// with what the handset was answered.
+void test_the_fill_stores_the_count_the_renderer_prints() {
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.smoothedDepthM = 11.15f;    // 11.15f is 11.1499996...: `* 100.0` gives 1114
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_INT32_MESSAGE(1115, s.depthCm,
+                                    "11.15 m stored as something other than 1115 cm — a "
+                                    "hand-rolled product is back in the row fill");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(550, s.votedX1000,
+                                    "0.55 bar stored as something other than 550 (0.55f is "
+                                    "0.54999999...)");
+    TEST_ASSERT_EQUAL_INT16(549, s.cellX1000[0]);
+    TEST_ASSERT_EQUAL_INT16(551, s.cellX1000[2]);
+    TEST_ASSERT_EQUAL_INT16(700, s.setpointX1000);
+    TEST_ASSERT_EQUAL_UINT16(11900, s.battX1000);
+    // Whole seconds since dive start: the row's clock is a millisecond difference
+    // divided, not a float the caller rounded.
+    TEST_ASSERT_EQUAL_UINT32(1500, s.tSec);
+
+    logfmt::Snapshot s2{};
+    logfmt::RowInputs ri2 = benchRow();
+    ri2.diveStartMs = 245000u;     // a dive that started mid-uptime
+    logfmt::fillSnapshot(s2, ri2);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1255, s2.tSec,
+                                     "tSec is not the dive-relative second");
+    TEST_ASSERT_EQUAL_INT32(2030, s2.depthCm);   // 20.30 m, the old 2029 bug
+}
+
+// End to end through the row writer: the number the fill stored is the number a
+// diver reads in the CSV, which is the only agreement that matters.
+void test_the_fill_stores_the_digits_the_wire_prints() {
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.smoothedDepthM = 20.30f;
+    logfmt::fillSnapshot(s, ri);
+    char line[256];
+    const size_t n = logfmt::snapshotCsvLine(line, sizeof(line), s);
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(40, static_cast<int>(n), "the row formatter wrote nothing");
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, ",20.30,0.550,0.549,0.550,0.551,0.700,"),
+                                 (std::string("a filled row does not print the numbers the "
+                                              "handset was answered; row was: ") + line).c_str());
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, "0x0010"),
+                                 (std::string("the alarm word is not the one the fill was "
+                                              "given; row was: ") + line).c_str());
+    TEST_ASSERT_NULL_MESSAGE(std::strstr(line, ",20.29,"),
+                             "a truncating conversion is back: 20.30 m stored 2029 cm again");
+}
+
+// The deco columns are measured at the depth the CHAIN believed — the same value
+// the row's depth column carries — and the absence of a vote is recorded in the
+// ndl sentinel, not by zeroing the last measurement.
+void test_the_deco_columns_are_measured_at_the_chains_depth() {
+    deco::Zhl16Ccr eng = loadedEngine();
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.smoothedDepthM = 40.0f;     // the chain's held depth; the diver may be elsewhere
+    ri.votedBar = 1.30f;
+    ri.deco = &eng;
+    logfmt::fillSnapshot(s, ri);
+
+    TEST_ASSERT_TRUE_MESSAGE(s.ceilingCm > 0, "20 min at 40 m demanded no ceiling: the engine "
+                                              "never reached the row");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(static_cast<int16_t>(numfmt::scaled(eng.ceilingM(), 2)),
+                                    s.ceilingCm,
+                                    "ceiling_cm is not numfmt::scaled(ceilingM(), 2): the row "
+                                    "and the row writer disagree by a rounding");
+    TEST_ASSERT_TRUE_MESSAGE(s.decoTotalMin > 0, "the schedule never reached the row");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(static_cast<int16_t>(eng.ndlMinutes(eng.depthToBar(40.0), 1.30)),
+                                    s.ndlMin,
+                                    "ndl is not ndlMinutes(depthToBar(the row's own depth))");
+    // The `ceiling_m` column a v1 parser reads is the integer metres of that same
+    // centimetre value — never a second, differently rounded measurement.
+    char line[256];
+    logfmt::snapshotCsvLine(line, sizeof(line), s);
+    char want[32];
+    std::snprintf(want, sizeof(want), ",%d,%d,%d,", static_cast<int>(s.ceilingCm) / 100,
+                  static_cast<int>(s.ndlMin), static_cast<int>(s.decoTotalMin));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, want),
+                                 (std::string("the row does not print ceiling_m/ndl/deco from "
+                                              "the values the fill stored; want '") + want +
+                                  "' in: " + line).c_str());
+    std::snprintf(want, sizeof(want), ",%d\n", static_cast<int>(s.ceilingCm));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, want),
+                                 (std::string("the appended ceiling_cm is not the value the "
+                                              "fill stored: ") + line).c_str());
+
+    // No vote: the NDL column says "nothing to total" (the same 480 the engine
+    // saturates at), while the vote the chain last made stays in its column.
+    logfmt::Snapshot q{};
+    logfmt::RowInputs qi = ri;
+    qi.haveVote = false;
+    logfmt::fillSnapshot(q, qi);
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, q.ndlMin,
+                                    "a row with no vote does not carry the 480 sentinel — an "
+                                    "unanswerable NDL and an unlimited one are now the same "
+                                    "number");
+    TEST_ASSERT_EQUAL_INT16(1300, q.votedX1000);
+    TEST_ASSERT_EQUAL_INT16(s.ceilingCm, q.ceilingCm);   // the ceiling is not a voted quantity
+}
+
+// The event-driven row's documented shape: no deco picture, so those three columns
+// are zero. Pinned, because it is a difference a reader can be misled by and
+// because "fixing" it must be a decision about a documented column, not an accident.
+void test_a_row_with_no_deco_picture_leaves_the_deco_columns_zero() {
+    deco::Zhl16Ccr eng = loadedEngine();
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.deco = nullptr;
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_INT16(0, s.ceilingCm);
+    TEST_ASSERT_EQUAL_INT16(0, s.ndlMin);
+    TEST_ASSERT_EQUAL_INT16(0, s.decoTotalMin);
+    // Everything else is still filled: an event row is a measurement row, not a
+    // stub. (A ceiling of 0 here reads as "no stop demanded", which is what needs
+    // deciding before these columns are wired.)
+    TEST_ASSERT_EQUAL_INT32(2030, s.depthCm);
+    TEST_ASSERT_EQUAL_UINT16(0x0010, s.alarmBits);
+    TEST_ASSERT_TRUE_MESSAGE(eng.ceilingM() > 0.0,
+                             "the engine in this case demands no stop, so the zeros below "
+                             "would prove nothing");
+}
+
+// The pulses column is a difference of two absolute counters, widened in uint32
+// and truncated into the uint16 the record holds — the behaviour the firmware has
+// always had, now named where a reader can see it.
+void test_the_pulses_column_is_a_window_delta() {
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.pulsesNow = 5000; ri.pulsesPrev = 4940;
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_UINT16(60, s.pulses);
+
+    logfmt::Snapshot w{};
+    logfmt::RowInputs wi = benchRow();
+    wi.pulsesNow = 65536u + 7u;    // 21+ min of continuous pulsing: wraps, as it always did
+    wi.pulsesPrev = 0u;
+    logfmt::fillSnapshot(w, wi);
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(7, w.pulses,
+                                     "the pulse window no longer truncates where it always "
+                                     "did — a silent change to an existing column");
+
+    logfmt::Snapshot z{};
+    logfmt::RowInputs zi = benchRow();
+    zi.pulsesNow = 0u; zi.pulsesPrev = 0u;   // the event row has no window of its own
+    logfmt::fillSnapshot(z, zi);
+    TEST_ASSERT_EQUAL_UINT16(0, z.pulses);
+}
+
+// mode is the dive state, not the autopilot flag: a row that lands outside a dive
+// (an event drained after DIVE END) is neither auto nor manual.
+void test_mode_is_the_dive_state_not_just_the_autopilot() {
+    logfmt::Snapshot a{};
+    logfmt::RowInputs ai = benchRow();
+    ai.diveActive = true; ai.autoMode = true;
+    logfmt::fillSnapshot(a, ai);
+    TEST_ASSERT_EQUAL_UINT8(1, a.mode);
+
+    logfmt::Snapshot m{};
+    logfmt::RowInputs mi = benchRow();
+    mi.diveActive = true; mi.autoMode = false;
+    logfmt::fillSnapshot(m, mi);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(2, m.mode,
+                                    "a manual dive row is not mode 2 — the soak and the web "
+                                    "page both read this column as the dive state");
+
+    logfmt::Snapshot o{};
+    logfmt::RowInputs oi = benchRow();
+    oi.diveActive = false; oi.autoMode = true;
+    logfmt::fillSnapshot(o, oi);
+    TEST_ASSERT_EQUAL_UINT8(0, o.mode);
+}
+
+// The alarm column is the LOG view, and the record still carries bits 8..9
+// through the borrowed flag bits (finding #5: an ACK must not be able to delete
+// a marker from a row that was written while the condition stood).
+void test_the_row_carries_the_log_alarm_view_whole() {
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.alarmLogBits = 0x0180;      // BIT_SENSOR_STALE plus BIT_CNS_HIGH: the top half borrows
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_UINT16(0x0180, s.alarmBits);
+
+    uint8_t bytes[logfmt::SNAPSHOT_SIZE];
+    logfmt::packSnapshot(s, bytes);
+    logfmt::Snapshot back{};
+    TEST_ASSERT_TRUE(logfmt::unpackSnapshot(bytes, back));
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(0x0180, back.alarmBits,
+                                     "the row's alarm marker lost a bit on the way to flash");
+}
+
+// CNS is the dive's running peak, passthrough: a row and the `M,` summary beside
+// it must be the same number, so the fill may not round or clamp it again.
+void test_the_cns_column_is_the_dive_peak_untouched() {
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.cnsPeakPct = 13;
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_UINT8(13, s.cnsPct);
+    ri.cnsPeakPct = 254;           // DiveTotals' clamp, not the row's
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_UINT8(254, s.cnsPct);
+}
+
+// Two columns of the row format have never had a writer. Keeping them unwritable
+// from RowInputs is deliberate: giving `temp_c` or `flags` a value is a format
+// decision, and a half-wired sensor arriving by accident would put a number a
+// reader trusts into a byte nothing has ever defined.
+void test_temp_and_flags_stay_unwritten_until_somebody_owns_them() {
+    logfmt::Snapshot s{};
+    s.tempC = 0; s.flags = 0;
+    logfmt::RowInputs ri = benchRow();
+    ri.smoothedDepthM = -3.0f;     // nothing here reaches those two columns
+    logfmt::fillSnapshot(s, ri);
+    TEST_ASSERT_EQUAL_INT32(-300, s.depthCm);   // a signed depth still scales
+    TEST_ASSERT_EQUAL_INT8_MESSAGE(0, s.tempC,
+                                   "temp_c gained a value with no sensor behind it");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0, s.flags,
+                                    "the flags byte gained a value: it duplicates what the "
+                                    "E, rows already say, and nothing defined it");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_snapshot_roundtrip_and_size);
@@ -932,5 +1199,14 @@ int main() {
     RUN_TEST(test_surface_counts_refuse_what_they_cannot_hold);
     RUN_TEST(test_surface_capacity_keeps_the_newest_and_never_renumbers);
     RUN_TEST(test_a_row_holds_the_digits_the_wire_gave_for_the_same_sample);
+    RUN_TEST(test_the_fill_stores_the_count_the_renderer_prints);
+    RUN_TEST(test_the_fill_stores_the_digits_the_wire_prints);
+    RUN_TEST(test_the_deco_columns_are_measured_at_the_chains_depth);
+    RUN_TEST(test_a_row_with_no_deco_picture_leaves_the_deco_columns_zero);
+    RUN_TEST(test_the_pulses_column_is_a_window_delta);
+    RUN_TEST(test_mode_is_the_dive_state_not_just_the_autopilot);
+    RUN_TEST(test_the_row_carries_the_log_alarm_view_whole);
+    RUN_TEST(test_the_cns_column_is_the_dive_peak_untouched);
+    RUN_TEST(test_temp_and_flags_stay_unwritten_until_somebody_owns_them);
     return UNITY_END();
 }

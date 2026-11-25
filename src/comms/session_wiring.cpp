@@ -29,8 +29,8 @@
 #include "comms/web_server.h"
 #include "config/defaults.h"
 #include "log/dive_store.h"
+#include "log/rowfill.h"      // the one snapshot-row fill (grid row and event row)
 #include "log/surface_store.h"
-#include "util/numfmt.h"          // scaled(): one rounding rule for stored values
 
 // The chain, the registry and the bridge belong to main.cpp; the session must
 // drive the very same objects the sensors and the HUD use.
@@ -145,29 +145,41 @@ bool hookSetClock(uint32_t epoch, void*) {
 /// happened is worth a row of its own, not just a 30 s grid row nearby.
 void hookAppendSnap(void*) {
     if (!g_loop || !g_logMtx) return;
+    // Built from the published bridge scalars, never from the live chain: the
+    // control task owns that object. That is the ONLY difference between this row
+    // and the 30 s grid row — where the numbers are read from, not what they are
+    // converted into — so both rows go through the same fill (src/log/rowfill.h)
+    // and the two kinds of row cannot drift apart in scaling, mode, alarm view or
+    // the pulses delta.
+    logfmt::RowInputs ri{};
+    ri.nowMs = millis();
+    ri.diveStartMs = g_diveStartMs;
+    ri.smoothedDepthM = g_bridgeTel.depthM;
+    ri.haveVote = g_bridgeTel.haveVote;
+    ri.votedBar = g_bridgeTel.votedBar;
+    for (int i = 0; i < 3; i++) ri.cellBar[i] = g_bridgeTel.cellBar[i];
+    ri.setpointBar = g_bridgeTel.setpointBar;
+    ri.diveActive = g_bridgeTel.diveActive;  // an edge drained after DIVE END is
+                                            // neither auto nor manual: mode 0
+    ri.autoMode = g_bridgeTel.autoMode;
+    // Same view as the grid row: the dive file records what was true, so a
+    // snapshot taken at the very edge where the diver ACKed an alarm still says
+    // the condition was standing. That edge is exactly when the live word goes
+    // quiet, and it is exactly when a row written from the live word used to lose
+    // the marker (finding #5).
+    ri.alarmLogBits = g_bridgeTel.alarmLogBits;
+    ri.cnsPeakPct = g_bridgeTotals.cnsPeakPct;
+    ri.vbat = g_bridgeTel.vbat;
+    // No window of its own, so 0 — which is what these rows have always recorded:
+    // `Telemetry::pulsesWindow` is declared and read but written nowhere, so the
+    // pulses column of every event row has always been 0. Fixing that means
+    // publishing a real per-event window, which moves a byte on an existing
+    // column: a decision, not a side effect of this refactor.
+    ri.pulsesNow = 0;
+    ri.pulsesPrev = 0;
+    // And no deco picture, as before the refactor (rowfill.h: RowInputs::deco).
     logfmt::Snapshot s{};
-    // Built from the published bridge scalars, never from the live chain:
-    // the control task owns that object.
-    // Every stored number here goes through numfmt::scaled, with the same decimal
-    // count it is printed with. A bare cast truncates toward zero and the product
-    // of a decimal and 100/1000 can land just under the integer it should be, so
-    // the dive file was one count away from the wire it has to match (2026-11-24).
-    s.tSec = (millis() - g_diveStartMs) / 1000;
-    s.depthCm = static_cast<int32_t>(numfmt::scaled(g_bridgeTel.depthM, 2));
-    s.votedX1000 = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.votedBar, 3));
-    for (int i = 0; i < 3; i++)
-        s.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.cellBar[i], 3));
-    s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(g_bridgeTel.setpointBar, 3));
-    s.mode = g_bridgeTel.diveActive ? (g_bridgeTel.autoMode ? 1 : 2) : 0;
-    // Same view as the 30 s grid row (main.cpp): the dive file records what was
-    // true, so a snapshot taken at the very edge where the diver ACKed an alarm
-    // still says the condition was standing. That edge is exactly when the live
-    // word goes quiet, and it is exactly when a row written from the live word
-    // used to lose the marker (finding #5).
-    s.alarmBits = g_bridgeTel.alarmLogBits;
-    s.cnsPct = g_bridgeTotals.cnsPeakPct;
-    s.pulses = (uint16_t)g_bridgeTel.pulsesWindow;
-    s.battX1000 = static_cast<uint16_t>(numfmt::scaled(g_bridgeTel.vbat, 3));
+    logfmt::fillSnapshot(s, ri);
 
     xSemaphoreTake(g_logMtx, portMAX_DELAY);
     if (g_diveStore.recording()) g_diveStore.append(s);

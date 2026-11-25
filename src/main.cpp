@@ -45,6 +45,7 @@
 #include "control/cellhist.h"
 #include "comms/uart2_task.h"
 #include "comms/web_server.h"
+#include "log/rowfill.h"
 #include "hud.h"
 
 // ---------------------------------------------------------------------------
@@ -605,12 +606,14 @@ static void controlTask(void*) {
             // bus is invalid (loop.h), so nothing recorded here can be the
             // fabricated 0 m the old main.cpp used to hand over: maxDepthCm is
             // a maximum, so a held depth can only repeat what was already
-            // measured. And the grid row below carries sn.alarmBits = the LOG
-            // view, which marks BIT_SENSOR_STALE for exactly those rows even
-            // after the diver ACKed the alarm (alarms.h: bits is what the diver
-            // was told, logBits is what was true). That is now a guarantee, not
-            // a claim that quietly lapsed the moment someone pressed ACK: a held
-            // depth in the dive file is a depth marked as held.
+            // measured. And the grid row below carries the LOG alarm view
+            // (RowInputs::alarmLogBits, written by logfmt::fillSnapshot), which
+            // marks BIT_SENSOR_STALE for exactly those rows even after the diver
+            // ACKed the alarm (alarms.h: bits is what the diver was told, logBits
+            // is what was true). That is a guarantee, not a claim that quietly
+            // lapsed the moment someone pressed ACK — and dive 9001 grades it
+            // through the same fill this block calls: a held depth in the dive
+            // file is a depth marked as held.
             g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
             const int32_t dCm = static_cast<int32_t>(numfmt::scaled(st.depthSmoothedM, 2));
             if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;
@@ -651,35 +654,35 @@ static void controlTask(void*) {
             // 30 s snapshot grid (PLAN 10). Event-driven snapshots are taken
             // by the command task alongside each E, line; ControlTask only
             // ever appends the grid row, keeping file ownership single-owner.
+            //
+            // The row itself is filled by logfmt::fillSnapshot (src/log/rowfill.h):
+            // every conversion below is an input mapping, and the arithmetic that
+            // decides what a diver's download says is compiled for the host tests
+            // and graded there. This block used to hand-roll it, in a file the
+            // native env does not even build, with the soak as the only "test" of
+            // it — a mirror that cannot catch a drift in its original.
             if (comms::diveLogRecording() && now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
                 lastSnapMs = now;
-                logfmt::Snapshot sn{};
-                sn.tSec = (now - diveStartMs) / 1000u;
-                sn.depthCm = dCm;
-                sn.votedX1000 = (int16_t)v;
-                for (int i = 0; i < 3; i++)
-                    sn.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(sd.cells[i], 3));
-                sn.setpointX1000 = static_cast<int16_t>(numfmt::scaled(st.setpointBar, 3));
-                sn.mode = st.autoMode ? 1 : 2;
-                // The fact, not the volume: the log view. An ACK silences the
-                // handset and the LED (they read alarmBits) and must not also
-                // delete the marker that says these rows were written with no
-                // depth measurement. test_divesoak's dive 9001 grades both sides
-                // of that split.
-                sn.alarmBits = st.alarms.logBits;
-                sn.cnsPct = g_bridgeTotals.cnsPeakPct;
-                // Was `* 100.0` — a DOUBLE literal, which promotes the float and
-                // pushes more products just below the integer: this bench's measured
-                // ceiling of 11.15 m stored 1114 cm, 11.14 m in the file.
-                sn.ceilingCm = static_cast<int16_t>(numfmt::scaled(g_loop->deco().ceilingM(), 2));
-                sn.ndlMin = st.haveVote ? (int16_t)g_loop->deco().ndlMinutes(
-                    g_loop->deco().depthToBar(st.depthSmoothedM), st.votedBar) : 480;
-                sn.decoTotalMin = (int16_t)g_loop->deco().schedule(
-                    g_loop->deco().depthToBar(st.depthSmoothedM)).totalTimeMin;
+                logfmt::RowInputs ri{};
+                ri.nowMs = now;
+                ri.diveStartMs = diveStartMs;
+                ri.smoothedDepthM = st.depthSmoothedM;
+                ri.haveVote = st.haveVote;
+                ri.votedBar = st.votedBar;
+                for (int i = 0; i < 3; i++) ri.cellBar[i] = sd.cells[i];
+                ri.setpointBar = st.setpointBar;
+                ri.diveActive = true;  // the enclosing block is inside a dive
+                ri.autoMode = st.autoMode;
+                ri.alarmLogBits = st.alarms.logBits;
+                ri.cnsPeakPct = g_bridgeTotals.cnsPeakPct;
+                ri.vbat = sd.vbat;
                 const uint32_t p = g_loop->pulseCount();
-                sn.pulses = (uint16_t)(p - lastPulseBase);
+                ri.pulsesNow = p;
+                ri.pulsesPrev = lastPulseBase;
                 lastPulseBase = p;
-                sn.battX1000 = static_cast<uint16_t>(numfmt::scaled(sd.vbat, 3));
+                ri.deco = &g_loop->deco();
+                logfmt::Snapshot sn{};
+                logfmt::fillSnapshot(sn, ri);
                 comms::diveLogAppendGrid(sn);
             }
         }

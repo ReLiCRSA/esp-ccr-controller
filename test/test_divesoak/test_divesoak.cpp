@@ -40,6 +40,7 @@
 #include <cstring>
 
 #include "log/divelog.h"
+#include "log/rowfill.h"      // the firmware's own row fill: the soak calls it, it does not mirror it
 #include "util/numfmt.h"       // the rig must store values the way the firmware does
 #include "sim/rig.h"
 
@@ -624,38 +625,48 @@ void runDive(int id) {
         }
 
         // ---- dive file ----------------------------------------------------
-        // The row carries the chain's LOG view, which is what main.cpp writes
-        // (sn.alarmBits = st.alarms.logBits): ORed across the row here because the
+        // The row carries the chain's LOG view, which is what the fill writes
+        // (logfmt::RowInputs::alarmLogBits): ORed across the row here because the
         // rig samples once per tick and wants "anything true in this window", the
         // stricter of the two. Never the live word: an ACK would delete a fact the
         // row is being read for.
         snapAlarm |= rig.alarmLogBits();
         if (tS >= snapClock && nSnap < kMaxSnaps) {
             snapClock = tS + 10.0f;
-            logfmt::Snapshot& s = snaps[nSnap++];
-            s.tSec = (uint32_t)tS;
-            // numfmt::scaled, not a cast: until 2026-11-24 the rig mirrored the
-            // firmware's truncating casts line for line, which is precisely why the
-            // soak suite could not see the defect. A rig that re-implements the code
-            // under test witnesses nothing.
-            s.depthCm = static_cast<int32_t>(numfmt::scaled(dv.depth, 2));
-            s.votedX1000 = static_cast<int16_t>(numfmt::scaled(rig.vote().votedPpo2, 3));
+            // Not a mirror any more: the rig calls the firmware's own fill
+            // (src/log/rowfill.h), the one main.cpp calls. Until now the soak
+            // re-typed those conversions — and re-typed them differently, reading
+            // the DIVER's depth (dv.depth) and the world's true ambient for the
+            // deco columns where the firmware reads the chain's held depth. In a
+            // dive with an honest depth bus the two agree closely enough to hide
+            // the difference; in a blind one it is the whole point, and a soak row
+            // built from the diver's depth could never have caught a firmware that
+            // wrote the diver's depth.
+            logfmt::RowInputs ri{};
+            ri.nowMs = static_cast<uint32_t>(tS * 1000.0f);  // dive-relative
+            ri.diveStartMs = 0;
+            ri.smoothedDepthM = rig.loop().depthSmoothedM();
+            ri.haveVote = rig.loop().haveVote();
+            ri.votedBar = rig.vote().votedPpo2;
             for (int c = 0; c < 3; c++)
-                s.cellX1000[c] = static_cast<int16_t>(numfmt::scaled(rig.cellStatus((uint8_t)c).last, 3));
-            s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(sp, 3));
-            s.mode = rig.autoMode() ? 1 : 0;
-            s.alarmBits = snapAlarm;  // anything active since the previous row
-            s.cnsPct = (uint8_t)(rig.cnsPct() > 255.0 ? 255.0 : rig.cnsPct());
-            s.ceilingCm = static_cast<int16_t>(numfmt::scaled(rig.deco().ceilingM(), 2));
-            const int ndl = (int)rig.deco().ndlMinutes(rig.world().pAmbBar(),
-                                                       rig.vote().votedPpo2);
-            s.ndlMin = (int16_t)(ndl > 480 ? 480 : (ndl < 0 ? 0 : ndl));
-            s.decoTotalMin = (int16_t)rig.deco().schedule(rig.world().pAmbBar()).totalTimeMin;
-            s.pulses = (uint16_t)(rig.pulseCount() - pulsesLastSnap);
+                ri.cellBar[c] = rig.cellStatus(static_cast<uint8_t>(c)).last;
+            ri.setpointBar = sp;
+            ri.diveActive = true;
+            ri.autoMode = rig.autoMode();
+            // The row spans 10 s of simulated time and the rig samples every
+            // 100 ms, so the alarm field is ORed across the window: the stricter
+            // of the two readings of "what was true at this row". The firmware
+            // writes one instant. Never the live word: an ACK would delete a fact
+            // the row is being read for.
+            ri.alarmLogBits = snapAlarm;
+            const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
+            ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
+            ri.vbat = 12.4f;
+            ri.pulsesNow = rig.pulseCount();
+            ri.pulsesPrev = pulsesLastSnap;
+            ri.deco = &rig.loop().deco();
+            logfmt::fillSnapshot(snaps[nSnap++], ri);
             pulsesLastSnap = rig.pulseCount();
-            s.battX1000 = 12400;
-            s.tempC = 24;
-            s.flags = (uint8_t)((rig.cpClampActive() ? 1 : 0) | ((uint8_t)rig.vote().mode << 1));
             snapAlarm = 0;
         }
         for (uint8_t e = 0; e < ar.edgeCount && nEv < kMaxEvents; e++)
@@ -837,17 +848,17 @@ void runDive(int id) {
 //     of the dive (the freeze is a held input, not a latched mode);
 //   * and the window is identifiable in the dive file afterwards, with no wire
 //     or format change: every 30 s grid row wholly inside it carries
-//     BIT_SENSOR_STALE in alarmBits (main.cpp writes the row from the LOG view,
-//     alarms::Result::logBits) and its ceiling/decoTotal/NDL columns — written
-//     from the same deco picture the window just integrated — actually moved. A
-//     blind window that integrated nothing would leave rows that look healthy and
-//     unchanged, which is how an under-recorded deco debt hides. The diver ACKs
-//     the alarm 8 s into the window, so this grades the two vocabularies against
-//     each other at the same instant: the LIVE word must lose BIT_SENSOR_STALE to
-//     the ACK (the handset went quiet — otherwise the marker assert proves
-//     nothing, because nothing separates the views) while the file's rows keep it,
-//     and the log view must stop claiming it once the bus recovers (a fact about
-//     now, not a latch). That split is finding #5.
+//     BIT_SENSOR_STALE in alarmBits and its ceiling/NDL/decoTotal columns — the
+//     same deco picture the window just integrated — moved. Since 2026-11-25 the
+//     row is not re-typed here: the scenario calls logfmt::fillSnapshot
+//     (src/log/rowfill.h), the fill main.cpp calls, with the values main.cpp maps,
+//     so what these asserts grade are the bytes a diver would download. That also
+//     makes the row the right place to grade the vocabulary split: the diver ACKs
+//     the alarm 8 s into the window, so the LIVE word must lose BIT_SENSOR_STALE
+//     to the ACK (the handset went quiet — otherwise the marker assert proves
+//     nothing, because nothing separates the views) while the row keeps it, and
+//     the log view must stop claiming it once the bus recovers (a fact about now,
+//     not a latch). That split is finding #5.
 // Mirrored from runDive's invariants: setpoint escape, the low-loop rule with
 // its sensor-honest escape hatch, the 0.12/2.20 bar hard envelope, the per-cell
 // high veto, and the latched-valve rule. Deliberately not mirrored: the
@@ -939,7 +950,14 @@ void runDepthBusDive() {
     double fastTissueOpen = 0.0, twinFastTissueOpen = 0.0;
     double fastTissueClose = 0.0, twinFastTissueClose = 0.0;
     double ceilAtClose = 0.0, twinCeilClose = 0.0;
-    // The 30 s dive-file row, tracked the way the firmware writes it.
+    // The 30 s dive-file row, built by the firmware's own fill every 30 s of the
+    // dive: `row` is the row as written, `rowHonest` the last one before the bus
+    // went blind, `rowBlind` the last wholly-blind one. All three are logfmt
+    // records, so the asserts below grade bytes a diver would download rather than
+    // a paraphrase of them.
+    logfmt::Snapshot row{}, rowHonest{}, rowBlind{};
+    uint32_t rowPulseBase = 0;
+    float rowTrueDepthM = 0.0f;
     float rowClockS = 0.0f, rowDecoOpen = 0.0f, rowDecoClose = 0.0f;
     float rowNdlOpen = 0.0f, rowNdlClose = 0.0f;
     float rowCeilLastBlind = 0.0f, ceilAtWindowOpen = 0.0f;
@@ -1161,16 +1179,41 @@ void runDepthBusDive() {
             alarmSinceS = -1.0f;
         }
 
-        // ---- the 30 s dive-file row, filled the way main.cpp fills it ------
-        // The row's alarmBits is written from the LOG view at the row's own instant
-        // (main.cpp: sn.alarmBits = st.alarms.logBits), so a row wholly inside this
-        // window must carry BIT_SENSOR_STALE even though the diver ACKed the alarm
-        // 8 s into it. That instant is read directly, not an OR across the row:
-        // main.cpp writes one value per row, and an OR would let a row inherit a
-        // marker from cycles before the ACK and hide a file that goes blind to the
-        // condition the moment the diver asks for quiet.
+        // ---- the 30 s dive-file row, built by the firmware's own fill -------
+        // logfmt::fillSnapshot (src/log/rowfill.h) is what main.cpp calls, with
+        // the same values main.cpp maps. There is no hand-written row in this
+        // scenario any more: what the asserts below grade is the record the
+        // controller would have written, conversions and all.
         if (inWindow) blindCyclesInRow++;
         if (tS >= rowClockS) {
+            logfmt::RowInputs ri{};
+            ri.nowMs = static_cast<uint32_t>(tS * 1000.0f);  // dive-relative
+            ri.diveStartMs = 0;
+            ri.smoothedDepthM = rig.loop().depthSmoothedM();
+            ri.haveVote = rig.loop().haveVote();
+            ri.votedBar = rig.vote().votedPpo2;
+            for (int c = 0; c < 3; c++)
+                ri.cellBar[c] = rig.cellStatus(static_cast<uint8_t>(c)).last;
+            ri.setpointBar = rig.spTarget();
+            ri.diveActive = true;
+            ri.autoMode = rig.autoMode();
+            // One instant, exactly like the firmware's grid row: the marker has to
+            // survive the ACK at the moment the row is written, not merely have
+            // been true somewhere in the 30 s before it.
+            ri.alarmLogBits = rig.alarmLogBits();
+            const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
+            ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
+            ri.vbat = 12.4f;
+            ri.pulsesNow = rig.pulseCount();
+            ri.pulsesPrev = rowPulseBase;
+            ri.deco = &rig.loop().deco();
+            logfmt::fillSnapshot(row, ri);
+            rowPulseBase = ri.pulsesNow;
+
+            // The last row written before the bus went blind: the baseline the
+            // blind rows are compared with, produced by the same fill.
+            if (!inWindow && !windowClosed) rowHonest = row;
+
             // Only a row that was blind for most of its 30 s says anything: a row
             // clipped by one cycle at the edge of the window would be graded on a
             // cycle whose alarm had barely had time to arrive.
@@ -1180,7 +1223,9 @@ void runDepthBusDive() {
             // window in which nothing integrated at all.
             if (blindCyclesInRow >= 150 && inWindow) {
                 rowsBlind++;
-                if (rig.alarmLogBits() & (uint16_t)(1u << alarms::BIT_SENSOR_STALE))
+                rowBlind = row;
+                rowTrueDepthM = dv.depth;  // where the diver actually was at THIS row
+                if (row.alarmBits & (uint16_t)(1u << alarms::BIT_SENSOR_STALE))
                     rowsBlindMarker++;
                 rowCeilLastBlind = (float)rig.deco().ceilingM();
             }
@@ -1220,6 +1265,57 @@ void runDepthBusDive() {
     // the open and the close), every one of them has to carry the sensor alarm in
     // the view the file is written from — across the ACK — and the deco columns
     // written beside it have to have moved.
+    // ---- the row as a record, not as a paraphrase -------------------------
+    // Everything above grades the chain's state; this block grades the BYTES a
+    // diver would download, produced by the same fill main.cpp calls. A fill that
+    // wrote the diver's depth, or measured the deco columns at it, passes every
+    // chain-level assert in this scenario and still lies in the file.
+    // (1) The depth column is the chain's HELD depth, and by this row the diver is
+    // well over 2 m shallower than the number written beside the marker.
+    if (rowBlind.depthCm < static_cast<int32_t>(numfmt::scaled(rowTrueDepthM, 2)) + 200)
+        FAIL("dive %d: the blind dive-file row stored %.2f m while the diver was at %.1f m — "
+             "the row carries the diver's depth, not the chain's held one, so the STALE marker "
+             "beside it describes a depth the file never used",
+             id, rowBlind.depthCm / 100.0f, rowTrueDepthM);
+    // (2) The window's gas loading reached the record's ceiling. Measured on this
+    // exact profile: 3.30 m before the bus died, 5.07 m in the blind row.
+    if (rowBlind.ceilingCm <= rowHonest.ceilingCm)
+        FAIL("dive %d: the ceiling in the blind row is %d cm against %d cm in the last honest "
+             "row — the deco picture written into the file forgot the loading the window "
+             "integrated (or was measured at a depth the controller never believed)",
+             id, rowBlind.ceilingCm, rowHonest.ceilingCm);
+    // (3,4) Direction, not magnitude: a blind window at a held depth can only add
+    // debt. If either column moved the other way, the row was totalled somewhere
+    // other than the held depth.
+    if (rowBlind.decoTotalMin < rowHonest.decoTotalMin)
+        FAIL("dive %d: decoTotal in the blind row is %d min against %d min in the last honest "
+             "row: a window that kept integrating the held depth cannot owe LESS than the "
+             "honest row before it", id, rowBlind.decoTotalMin, rowHonest.decoTotalMin);
+    if (rowBlind.ndlMin > rowHonest.ndlMin)
+        FAIL("dive %d: NDL in the blind row is %d min against %d min in the last honest row: "
+             "the file says the diver gained time while the chain was integrating a held "
+             "depth", id, rowBlind.ndlMin, rowHonest.ndlMin);
+    // (5) The row's pulse delta is a window difference of two absolute counters,
+    // and the chain injected throughout the blind window (the setpoint stayed at
+    // the held band): a row that records none has lost the delta.
+    if (rowBlind.pulses == 0)
+        FAIL("dive %d: the blind row records 0 injection pulses although the chain pulsed "
+             "through the window (21 in the window) — the row's pulse window is not a delta "
+             "of the counters", id);
+    // (6) The columns are the numbers a held 32 m dive owes — measured on this
+    // exact profile, 11 min of deco and 0 min of NDL in the blind row, beside 10
+    // and 1 in the honest row before the fault. The direction asserts above cannot
+    // see a fill that totals EVERY row at a depth the controller never believed
+    // (both rows shift together); this band can, because it is an absolute claim
+    // about the depth the row was written at.
+    if (rowBlind.decoTotalMin < 6 || rowBlind.decoTotalMin > 25)
+        FAIL("dive %d: the blind row states %d min of deco for a dive the chain was holding at "
+             "32 m — the row's deco picture was totalled at some other depth",
+             id, rowBlind.decoTotalMin);
+    if (rowBlind.ndlMin > 10)
+        FAIL("dive %d: the blind row states %d min of NDL at the depth the chain believed, on a "
+             "dive that had sat at 32 m for seven minutes — the row's NDL was measured somewhere "
+             "the controller was not", id, rowBlind.ndlMin);
     if (rowsBlind < 2)
         FAIL("dive %d: only %d dive-file rows sat wholly inside the %0.0f s window — the profile "
              "moved on, the witness below proves nothing", id, rowsBlind, kWindowS);

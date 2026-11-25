@@ -320,7 +320,14 @@ void test_stored_values_go_through_the_helper() {
     // host-compiled, so a scan is the only way the native suite can see them, and
     // a scan that shrugs when a file will not open is decoration: a missing file
     // fails loudly.
-    const char* kUsers[] = {"src/main.cpp", "src/comms/session_wiring.cpp",
+    //
+    // 2026-11-25: session_wiring.cpp left this list when its row fill moved into
+    // src/log/rowfill.cpp. It no longer stores a scaled value at all — it maps raw
+    // scalars onto logfmt::RowInputs — and the file that now does the storing is
+    // host-compiled and executed by test_logfmt, so the scan is now the weaker of
+    // two checks over that one file. It stays scanned because the rule is about
+    // the NEXT field someone adds, wherever they add it.
+    const char* kUsers[] = {"src/main.cpp", "src/log/rowfill.cpp",
                             "src/comms/telemetry_bridge.cpp", "src/control/cellhist.cpp"};
     int calls = 0;
     for (const char* path : kUsers) {

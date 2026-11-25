@@ -273,6 +273,12 @@ grader has lying captures in `hw_accept.py --selftest`):
   build cannot pass — then up within `WIFI_ON_HOLD_S`+15 s and no sooner than the
   hold allows, console line included. If the cue goes unmet the leg FAILS with
   "operator cue not met": opt-in means un-run is a report, not a silent skip.
+  Two bench truths from its first witness runs (2026-11-26): opening the console
+  port does NOT reset the controller here (the boot banner never appeared, run
+  after run — the port-pulse reset is the handset *bridge*, not the CP2102
+  console), and the leg pre-checks `GET WIFI` and aborts if the radio is already
+  down: a down→up latch cannot be witnessed from a state that is already down,
+  and an abort costs no squeeze.
 
 The mid-dive reason column is graded in the ordinary matrix too: `GET WIFI`
 mid-dive must be exactly `WIFI,0,2,0,0` — the refusal `ERR wifi locked in dive`

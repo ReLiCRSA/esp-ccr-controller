@@ -2397,6 +2397,27 @@ def _ask(ser, log, cmd, window=2.0):
     return out
 
 
+def _ask_depth(ser, log, window=2.0):
+    """GET T on the handset link, returning the T, lines themselves.
+
+    `_ask` drops the unsolicited `T,`/`D,` stream — right for command
+    answers, fatal for reading depth: the first bench run of --wifi-depth
+    (2026-11-26) found the depth polls parsing everything EXCEPT depth, and
+    passing the squeeze half off an unrelated event row's timestamp. No host
+    selftest could catch that: they grade the scorer on captured caps, and
+    this poller only ever ran here, against a real thumb.
+    """
+    ser.write(b"GET T\r\n")
+    ser.flush()
+    out, end = [], time.time() + window
+    while time.time() < end:
+        l = ser.readline().decode(errors="replace").strip()
+        if l.startswith("T,"):
+            log.append(f"[{time.time() - T_ORIGIN:7.2f}s] << {l}")
+            out.append(l)
+    return out
+
+
 def run_wifi_depth(port, baud, watch, settle=1.5, squeeze_wait=90.0, log=None):
     """The DEPTH half of the radio policy, on the real sensor.
 
@@ -2433,7 +2454,7 @@ def run_wifi_depth(port, baud, watch, settle=1.5, squeeze_wait=90.0, log=None):
         print(f"\n  >>> SQUEEZE the thumb pressure sensor past {offD} m now <<<")
         t0, maxd, t_deep = time.time(), None, None
         while time.time() - t0 < squeeze_wait:
-            for l in _ask(ser, log, "GET T"):
+            for l in _ask_depth(ser, log):
                 try:
                     d = float(l.split(",")[1])
                 except (ValueError, IndexError):
@@ -2461,7 +2482,7 @@ def run_wifi_depth(port, baud, watch, settle=1.5, squeeze_wait=90.0, log=None):
         print("  >>> RELEASE the squeeze now <<<")
         t0, t_shallow = time.time(), None
         while time.time() - t0 < squeeze_wait:
-            for l in _ask(ser, log, "GET T"):
+            for l in _ask_depth(ser, log):
                 try:
                     d = float(l.split(",")[1])
                 except (ValueError, IndexError):

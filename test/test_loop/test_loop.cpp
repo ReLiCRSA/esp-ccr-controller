@@ -33,13 +33,37 @@ Config benchCfg() {
     return c;
 }
 
+// Live-channel dither for fixture feeds: ±1 ADC count (0.21/1490 per count) in
+// a non-repeating pattern. The voting layer's frozen-reading detector condemns
+// a channel whose reading never moves across its 20 s window, so a fixture that
+// feeds a bit-identical value for 30 s is not a calm rig, it is an injected
+// frozen-channel fault. Real cells wobble 4..7 counts p-p (bench, 2026-11-26);
+// this is quieter than the bench on purpose — it only has to stay above the
+// 2-count epsilon the detector uses — and it is far inside every tolerance
+// these tests assert on.
+float liveCell(float bar, uint32_t i, int ch) {
+    const uint32_t h = (i * 2654435761u) >> 30;  // 0..3, non-repeating phase
+    return bar + static_cast<float>(static_cast<int>((h + static_cast<uint32_t>(ch)) % 4u)) * 0.00021f - 0.00032f;
+}
+
 // Feeds the loop a fixed cell level / depth for `seconds`.
+//
+// The cell feeds carry a small ADC-count wobble, and that is not decoration:
+// the voting layer's frozen-reading detector condemns a channel whose reading
+// never moves (bench: a live front end dithers 4..7 counts p-p forever, a
+// frozen one does not), so a fixture that feeds a bit-identical value for more
+// than the 20 s window IS injecting the frozen-channel fault. A live chain is
+// the normal state these tests want; a test that wants a frozen channel asks
+// for it on purpose. Amplitude = ±3 counts at the factory slope
+// (0.21/1490), matching the sim's bench-matched dither and well inside every
+// tolerance below.
 void feed(Loop& loop, uint32_t& now, float bar, float depth, float seconds,
           bool fresh = true, bool pressureValid = true) {
     const uint32_t n = static_cast<uint32_t>(seconds * 1000.0f / Loop::kTickMs);
     for (uint32_t i = 0; i < n; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = bar;
+        for (int ch = 0; ch < 3; ch++)
+            sd.cells[ch] = liveCell(bar, i, ch);
         sd.depthM = depth;
         sd.pressureValid = pressureValid;
         sd.cellsFresh = fresh;
@@ -74,7 +98,8 @@ struct Plant {
         pulses = p;
 
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = bar[ch];
+        for (int ch = 0; ch < 3; ch++)
+            sd.cells[ch] = liveCell(bar[ch], pulses + static_cast<uint32_t>(ch), ch);
         sd.depthM = depth;
         sd.pressureValid = pressureValid;
         sd.cellsFresh = fresh;
@@ -122,7 +147,7 @@ void test_output_fuse_cuts_a_valve_that_will_not_close() {
     uint32_t now = 0;
     for (int i = 0; i < 40; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 0.30f;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(0.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.pressureValid = true;
         sd.cellsFresh = true;
@@ -191,7 +216,7 @@ void test_depth_spike_does_not_move_the_setpoint() {
     // Three samples, the middle one deep enough to reach the SP3 band (30 m).
     for (int i = 0; i < 3; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 0.70f;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(0.70f, static_cast<uint32_t>(i), ch);
         sd.depthM = (i == 1) ? 45.0f : 25.0f;
         sd.pressureValid = true;
         sd.cellsFresh = true;
@@ -230,7 +255,7 @@ void test_dead_depth_bus_holds_depth_and_setpoint() {
     bool staleSeen = false;
     for (int i = 0; i < 600; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 0.90f;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(0.90f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.pressureValid = false;
         sd.cellsFresh = true;
@@ -304,7 +329,7 @@ void test_blind_depth_window_still_clocks_cns_and_loads_tissues() {
     // main.cpp used to fabricate for it, while the cells stay a measurement.
     for (int i = 0; i < 3000; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 1.30f;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(1.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.cellsFresh = true;
         sd.vbat = 12.4f;
@@ -419,7 +444,7 @@ void test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alar
     bool staleSeen = false;
     for (int i = 0; i < 3000; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 1.30f;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(1.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.cellsFresh = true;
         sd.vbat = 12.4f;
@@ -450,7 +475,7 @@ void test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alar
     const double fastBeforeStaleLeg = loop.deco().tissueBar(0);
     for (int i = 0; i < 3000; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 1.30f;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(1.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.cellsFresh = false;  // the ADC stalled: same number, not a new one
         sd.vbat = 12.4f;

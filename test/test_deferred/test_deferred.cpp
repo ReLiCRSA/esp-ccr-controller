@@ -22,6 +22,20 @@
 #include <cmath>
 #include <thread>
 
+// Live-channel dither for fixture feeds: ±1 ADC count (0.21/1490 per count) in
+// a non-repeating pattern. The voting layer's frozen-reading detector condemns
+// a channel whose reading never moves across its 20 s window, so a fixture that
+// feeds a bit-identical value for 30 s is not a calm rig, it is an injected
+// frozen-channel fault. Real cells wobble 4..7 counts p-p (bench, 2026-11-26);
+// this is quieter than the bench on purpose — it only has to stay above the
+// 2-count epsilon the detector uses — and it is far inside every tolerance
+// these tests assert on.
+float liveCell(float bar, uint32_t i, int ch) {
+    const uint32_t h = (i * 2654435761u) >> 30;  // 0..3, non-repeating phase
+    return bar + static_cast<float>(static_cast<int>((h + static_cast<uint32_t>(ch)) % 4u)) * 0.00021f - 0.00032f;
+}
+
+
 #include "control/loop.h"
 
 using namespace ctrl;
@@ -42,7 +56,7 @@ void tick(Loop& loop, uint32_t& now, uint32_t n = 1, float depth = 0.0f,
           float cell = 0.55f) {
     for (uint32_t i = 0; i < n; i++) {
         SensorData sd;
-        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = cell;
+        for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(cell, i, ch);
         sd.depthM = depth;
         sd.vbat = 12.4f;
         now += Loop::kTickMs;
@@ -231,7 +245,7 @@ void test_two_threads_never_split_the_chain() {
         uint32_t now = 0;
         while (!stop.load()) {
             SensorData sd;
-            for (int ch = 0; ch < 3; ch++) sd.cells[ch] = 0.55f;
+            for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(0.55f, cycles.load(), ch);
             sd.depthM = 5.0f;
             sd.vbat = 12.2f;
             now += 1;  // faster than the board's 100 ms: more edges per second

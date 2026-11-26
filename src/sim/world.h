@@ -54,6 +54,15 @@ struct CellModel {
     CellFault fault = CellFault::NONE;
     float satCapBar = 0.80f;        // for SATURATE
     float stuckValue = 0.21f;       // for STUCK_AT
+    // A frozen RAW channel: the reading stops changing at all, dither included.
+    // This is physically what a shorted input or a wet connector that latched the
+    // multiplexer does — and it is the ONLY thing the voting layer's frozen-reading
+    // detector can see, because that detector's evidence is that a live front end
+    // dithers by a few ADC counts forever (bench, 2026-11-26) and a frozen one does
+    // not. STUCK_AT alone is NOT frozen: it pins the electrochemical target and
+    // keeps the ADC wobble — that models a poisoned cell, not a dead channel, and
+    // it is deliberately left alone because the 50-dive pool uses it that way.
+    bool noDither = false;
     float state = 0.21f;            // filtered internal
 };
 

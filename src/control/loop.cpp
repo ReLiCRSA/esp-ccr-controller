@@ -146,6 +146,18 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     const bool depthStable = depthRate_ < 0.02f;  // <1.2 m/min: stuck-open gate
 
     // ---- 2. voting ---------------------------------------------------------
+    // Two facts the voting layer cannot see for itself, told to it here because
+    // this is where they live:
+    //   * whether the samples are FRESH. A dead ADC channel must be reported
+    //     SENSOR_STALE by the sensor layer (age/ageMs), not misattributed to the
+    //     cells by the frozen-reading detector below — a channel that stopped
+    //     delivering is a different fault from a channel delivering the same
+    //     number, and only the first one is invisible to `age`.
+    //   * how many O2 pulses the valve has actually fired. The engine scores
+    //     each cell's responsiveness against that: movement in a cell that
+    //     nobody dosed is not evidence about the cell.
+    voting_.setSampleSourceLive(in.cellsFresh);
+    voting_.notePulses(injector_.pulsesTotal());
     vote_ = voting_.update(cellBar_, dt);
     haveVote_ = vote_.mode != voting::Mode::FAILED;
 

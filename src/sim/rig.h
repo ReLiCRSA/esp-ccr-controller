@@ -86,6 +86,10 @@ public:
     const ctrl::State& state() const { return lastState_; }
     const voting::Result& vote() const { return loop_.vote(); }
     const voting::CellStatus& cellStatus(uint8_t ch) const { return loop_.cell(ch); }
+    /// Why a cell is currently excluded (voting::Engine::BarReason): the
+    /// detector's evidence, visible to scenarios that grade WHY the machine
+    /// stopped believing a channel, not just that it did.
+    uint8_t cellBarReason(uint8_t ch) const { return loop_.barReason(ch); }
     const alarms::Result& alarmRes() const { return loop_.alarms(); }
     uint16_t alarmBits() const { return loop_.alarmBits(); }
     /// The dive-file view: the condition that was TRUE, ACK silences ignored.

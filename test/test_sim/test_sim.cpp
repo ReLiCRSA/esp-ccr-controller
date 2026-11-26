@@ -195,12 +195,24 @@ void test_two_lying_cells_veto() {
     descend(rig, 25.0f);
     TEST_ASSERT_LESS_THAN_FLOAT_MESSAGE(0.75f, rig.spTarget(), "expected the 0.70 band at 25 m");
 
-    // Two cells frozen at 0.55 / 0.60 while the loop really is at 0.70: the
+    // Two cells LYING LOW at 0.55 / 0.60 while the loop really is at 0.70: the
     // median can never exceed 0.60 so demand never stops, and because the
     // honest cell is now the odd one out the drift rule is just as likely to
     // exclude IT. Cell 2 is all that stands between this loop and toxicity.
+    //
+    // The lie must CREEP, not step (tauS 120 s toward the stuck value). A step
+    // this large is past the dropout slope, so the dropout gate itself catches
+    // the pair within a cycle, the honest cell keeps the vote, the loop never
+    // climbs, and the test grades the dropout gate instead of the veto. A creep
+    // stays under dropoutRateBarS (0.045 bar/s at fault time vs the 0.15 gate)
+    // and under the stuck detector's notice (the reading keeps moving, and the
+    // dither keeps wobbling), so what is really on trial here is the veto: the
+    // lying pair holds the vote lean, the loop climbs, and only the honest
+    // cell's raw reading reaches the wall.
+    rig.world().cells[0].tauS = 120.0f;
     rig.world().cells[0].fault = CellFault::STUCK_AT;
     rig.world().cells[0].stuckValue = 0.55f;
+    rig.world().cells[1].tauS = 120.0f;
     rig.world().cells[1].fault = CellFault::STUCK_AT;
     rig.world().cells[1].stuckValue = 0.60f;
 

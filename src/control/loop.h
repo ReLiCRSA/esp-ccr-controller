@@ -212,6 +212,10 @@ public:
     // ---- telemetry readers -------------------------------------------------
     const voting::Result& vote() const { return vote_; }
     const voting::CellStatus& cell(uint8_t ch) const { return voting_.cell(ch); }
+    /// Detector evidence for scenarios/telemetry: WHY a cell is out
+    /// (voting::Engine::BarReason). Read-only; the exclusion vocabulary itself
+    /// stays inside the voting layer.
+    uint8_t barReason(uint8_t ch) const { return voting_.barReason(ch); }
     /// Diagnostics: which cells are currently barred from the vote on CellProof
     /// evidence (the handset and web pages show why the count dropped).
     uint8_t proofExclusion() const { return voting_.proofExclusion(); }

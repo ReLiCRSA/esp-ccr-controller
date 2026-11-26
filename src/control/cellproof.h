@@ -51,8 +51,10 @@ struct Config {
     // A cell proves itself by TRACKING the loop, not by sitting at a number.
     // Over the run window each cell must move by at least this much (the
     // proof's setpoint change makes the loop move in one direction or the
-    // other) — the sim's own cell noise is ±0.0025 bar, so 0.05 is ten times
-    // the noise floor and a fifth of the drift bar. Without this, a cell frozen
+    // other) — the sim's own cell noise is the bench-matched dither, ±3 ADS
+    // counts (~0.0004 bar, sim/world.cpp carries the derivation), so 0.05 is
+    // more than an order of magnitude above the noise floor and a fifth of
+    // the drift bar. Without this, a cell frozen
     // at 1.20 bar "proves" itself by being above minPass in a loop at 1.20.
     float trackMinBar = 0.05f;
 };

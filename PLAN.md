@@ -613,7 +613,12 @@ the tap build) stays as the bisect path if the link ever goes silent again |
   1.40 < `inj::highWallBar` 1.45 < `inj::cutoffBar` 1.60). With the alarm at the
   wall value the wall silently caps enrichment: the loop parks at 1.45 and the
   diver is never told why the setpoint is not being met. Found by the 50-dive
-  soak (dive 26/42); moving the alarm back to 1.60 makes that suite fail.
+  soak (dive 26/42); moving the alarm back to 1.60 makes that suite fail —
+  re-verified 2026-11-26 on the bench-matched sim noise (`d0b60cf`), where the
+  failure now reads with numbers: `dive 26: loop at 1.59 bar for 3.1 s, a cell
+  read 1.59, and the high alarm stayed off`, dive 42 the same at 1.59/1.60 —
+  and the mutation also reddens dives 4/14's low-drift detection asserts, a
+  wider blast than this entry had been claiming.
 - **Dive-file records are fixed-stride and each carries its own CRC16**. The v1
   codec wrote **34 bytes into a 32-byte record** — appended back to back, every
   snapshot silently corrupted its neighbour. `SNAPSHOT_SIZE` is 36 (34 B of
@@ -631,12 +636,17 @@ the tap build) stays as the bisect path if the link ever goes silent again |
   plausible garbage.
 - **A cell proof is only worth what it changes.** Four separate gaps, all found
   by the soak (dive 4: vote 0.82 bar, real loop 0.12 bar at 27 m — the loop was
-  being *starved*, not over-enriched):
+  being *starved*, not over-enriched. The numbers are as-found at `bda1825`,
+  under that era's sim noise; today's dive 4 never reaches that floor — its
+  witness reads `ppO2 0.24-1.48` — because the four gaps are closed. The
+  record stands for the discovery, not for current bytes):
   * the verdict is **per cell**, and every *fitted* cell is judged including one
     the voting layer dropped (requiring the vote to reach the proof level first
     lets a lying pair hide the honest cell);
   * a cell proves itself by **tracking** the demand change, not by sitting at a
-    plausible number (`trackMinBar` 0.05, 10× the sim's cell noise) — a cell
+    plausible number (`trackMinBar` 0.05 — ten times the sim's cell noise when
+    written, over fifty times since the dither was corrected to bench-matched
+    ±3 counts on 2026-11-26) — a cell
     frozen at 1.20 bar would otherwise "prove" itself in a loop at 1.20;
   * a PASS **re-arms** when a rejected cell is persistently off the vote in
     either direction (gap 0.10 = 2× drift bar, cooldown 300 s, 3 attempts per
@@ -2281,3 +2291,77 @@ the tap build) stays as the bisect path if the link ever goes silent again |
   finding, a check that witnesses a different site than the one that broke.
   Gates: probe **78 checks 0 failures** with the dive cycle, `--selftest`
   **37 cases**, hw_accept **171 / 0**, native **278**, `stk=1040 u2stk=3088`.
+
+- **The sim's cell noise now matches the board, and the witness baseline is
+  re-cited with it (2026-11-26, `d0b60cf`).** The sim's healthy cells dithered
+  ±18 ADC counts — five times the board. The bench HB line (which prints
+  `g_ads.raw()` directly) showed three healthy cells AT REST IN AIR wobbling
+  4..7 counts peak-to-peak, and after the frozen-reading detector that
+  amplitude stopped being cosmetic: a live channel dithering a few counts every
+  sample is the ONLY thing separating it from a channel whose reading froze, so
+  a sim five times noisier than the board flatters the detector. Corrected to
+  ±3 quantized counts (`sim/world.cpp` carries the arithmetic: PGA=16, LSB
+  7.8125 uV, 0.21/1490 = 1.41e-4 bar/count), and the seeded pool re-ran: **23
+  of the 54 witness lines that existed then moved — 22 of the 50 seeded dives,
+  plus the 9002 `ppO2-view` line — and dive 9003's pair was added, for the
+  current baseline of 56 lines.** Attribution by control run, not assertion:
+  old voting engine + new sim reproduces exactly those 23 moves, and the
+  engine-attribution diff between control run and final run is additions-only.
+  The moved fields, old → new:
+
+  | dive | move |
+  |---|---|
+  | 2  | snaps 248→247, ppO2 top 1.44→1.43 |
+  | 4  | snaps 491→492, ev 7→5, pulses 1083→1084, ppO2 top 1.47→1.48 |
+  | 5  | ppO2 top 1.03→1.07 |
+  | 7  | ev 7→5, pulses 176→177, ppO2 top 1.52→1.51 |
+  | 8  | ev 11→9 |
+  | 9  | ev 7→5, pulses 750→757 |
+  | 11 | ev 15→11 |
+  | 12 | snaps 177→178 |
+  | 13 | pulses 601→600 |
+  | 14 | snaps 187→188, pulses 446→443, ppO2 top 1.47→1.48 |
+  | 16 | ppO2 top 1.07→1.08 |
+  | 18 | snaps 471→472, ev 7→3, pulses 1030→1032 |
+  | 19 | ev 4→2, alarms 0x204→0x200 |
+  | 20 | snaps 250→251 |
+  | 23 | snaps 306→307, ppO2 top 1.30→1.31 |
+  | 25 | ev 7→3, ppO2 top 1.07→1.08 |
+  | 26 | pulses 77→79, ppO2 top 1.70→1.60 |
+  | 27 | ev 6→4, ppO2 top 1.61→1.63 |
+  | 35 | snaps 175→176, ppO2 top 1.08→1.07 |
+  | 46 | ppO2 top 1.03→1.07 |
+  | 47 | ev 7→3, pulses 497→498 |
+  | 50 | snaps 456→457, ev 7→5, pulses 1015→1017, ppO2 top 1.47→1.48 |
+  | 9002 | rows hold 0.989→0.990 |
+
+  Why each kind of move is acceptable: snaps and pulses shift by 1..7 because
+  the 30 s grid and the injection schedule sample different noise on the same
+  dive; `ev` (alarm-edge count) DROPS on eleven dives because the old noise
+  crossed alarm thresholds on blips the bench does not produce — and the alarm
+  union itself moved on exactly one dive of the fifty: dive 19 `0x204→0x200`,
+  where the phantom `BIT_CELL_DRIFT` was one of those blips and the dive's own
+  fact, diluent-flush `BIT_HYPOXIA`, stands with its asserts untouched. Dive
+  26's true-loop top 1.70→1.60 is the largest single move: the stuck-open
+  runaway now gets caught ~0.1 bar earlier, because the HIGH alarm lands on a
+  different sample — the same rule, less twitch. The 9002 held-ppO2 quote went
+  0.989→0.990 because the last believable vote is itself a median of dithered
+  cells; the `be772aa` commit message citing 0.989 is history text, not a byte
+  to chase. What did NOT move: 28 seeded lines byte-identical, the 9001 pair,
+  the 9002 `wet-connector` line — and every assert the suite runs on a moved
+  dive (detection delays, the 0.12/2.20 bar envelope, alarm pairing, the held
+  windows) is the same assert, unchanged. Two claims that cite specific dives
+  were re-verified against this baseline before accepting it: the wall/alarm
+  entry above (dives 26/42 still redden the suite, now reading 1.59/1.60), and
+  the `bda1825` dive-4 starvation quote, kept as the as-found record and
+  annotated as such. The stale noise multipliers that the old ±18-count sim
+  justified were re-cited with it: `cellproof.h`'s comment still said
+  "±0.0025 bar... ten times" — the fix `d0b60cf`'s message claimed for that
+  comment had in fact not landed, and now it says what the sim does (±3
+  counts); this section's `trackMinBar` ratio moved from ten to over fifty.
+  Baseline gates: native **333**, the 56 lines byte-identical run-to-run, and
+  `d0b60cf` bench-accepted on the board at **140 checks 0 failures**
+  (`--cal-air --predive --expect-depth --expect-web`: surface records 138/139
+  joined console↔wire, `DS,1,1,1,0,LPS28DFW @0x5D`, `stk=1120 u2stk=3088`);
+  the bench HB dither that set the epsilon, c0=1534..1541, is the same
+  4..7-count wobble the sim now writes.

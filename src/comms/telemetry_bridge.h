@@ -15,6 +15,7 @@
 
 #include "control/calibration.h"
 #include "control/loop.h"
+#include "deco/view.h"
 #include "log/divelog.h"
 
 namespace bridge {
@@ -46,6 +47,12 @@ struct Telemetry {
     volatile uint8_t unprovenMask = 0;
     volatile float solDutyPct = 0.0f;
     volatile uint32_t diveStartMs = 0;
+    /// The decompression picture, published by ControlTask through a seqlock
+    /// (deco/view.h): the event-driven dive row and every `D,` answer read
+    /// this copy, never the engine. One writer; readers get one consistent
+    /// generation or retry. This slot replaced the cross-task live walk that
+    /// reviews N1/N8 named (rowfill.h carries the ownership vocabulary).
+    deco::ViewSlot view;
 };
 
 struct Event {
@@ -187,9 +194,12 @@ struct PublisherState {
 };
 
 // Publish the chain's changes since last cycle as protocol events. One call
-// per ControlTask cycle; cheap when nothing changed.
-void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
-                   PublisherState& ps);
+// per ControlTask cycle; cheap when nothing changed. Returns how many rows
+// were pushed: ControlTask uses a nonzero count as the trigger to republish
+// the deco plan, so an event-driven snapshot row reads a picture computed
+// for the edge it records — not one from the last 30 s grid (N1's freshness).
+int publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
+                  PublisherState& ps);
 
 // Records an air-calibration step where the clients can see it, and puts the
 // TERMINAL verdicts on the event ring as `E,<t>,7,<code>`. Running is not an

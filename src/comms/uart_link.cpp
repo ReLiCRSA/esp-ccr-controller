@@ -116,9 +116,14 @@ void UartLink::emitT(Sink sink, void* ctx) {
 
 void UartLink::emitD(Sink sink, void* ctx) {
     // This one runs unprompted twice a second on the uart2 task, 24/7 — the
-    // 1024-byte temporary here was part of the same overflow budget.
-    const size_t n = proto::formatDeco(
-        CommandRouter::decoInfoOf(loop_, tel_.haveVote), lineBuf_, sizeof(lineBuf_));
+    // 1024-byte temporary here was part of the same overflow budget. From the
+    // published deco generation (deco/view.h): this task never touches the
+    // engine ControlTask integrates. If nothing is published (SAFE boot: no
+    // control task), the line is not printed at all — no stale plan on a wire.
+    deco::View pic{};
+    if (!deco::viewSnapshot(tel_.view, pic)) return;
+    const size_t n = proto::formatDeco(CommandRouter::decoInfoOf(pic),
+                                       lineBuf_, sizeof(lineBuf_));
     emit(sink, ctx, lineBuf_, n);
     if (n) linesOut_++;
 }

@@ -264,6 +264,11 @@ static void sensorTask(void*) {
 // the moment the bench can read the margin.
 uint32_t g_worstCycleMs = 0;
 
+// The deco picture ControlTask computes and publishes every cycle
+// (deco/view.h). One writer: controlTask. Readers take seqlock snapshots of
+// the bridge slot (g_bridgeTel.view), never this object and never deco_.
+deco::View g_decoView;
+
 // ---------------------------------------------------------------------------
 // HudTask — core 1. Owns LED patterns and the periodic serial status line
 // (the status line keeps printing even if the sensor path is in trouble —
@@ -753,6 +758,24 @@ static void controlTask(void*) {
         g_bridgeTel.unprovenMask = st.cellproof.unprovenHighMask;
         g_bridgeTel.solDutyPct = g_loop->solDutyPct(now);
 
+        // ---- deco picture publication (reviews N1/N8/N5) ------------------
+        // ControlTask owns deco_ (rowfill.h says who else may, which is no
+        // one). Every cycle refreshes the CHEAP scalars — one ceiling solve
+        // and the bounded NDL binary search, host worst case <=17 us — and
+        // publishes the picture through the bridge's seqlock slot. The
+        // schedule() plan is recomputed where the plan actually moved: the
+        // 30 s grid, any E, event edge, the dive-start edge, and any
+        // continuity seeding (below). The event dive row and every `D,`
+        // answer then read the generation published for THEIR instant, and
+        // the two agree by construction.
+        {
+            const double pAmb = g_loop->deco().depthToBar(st.depthSmoothedM);
+            deco::viewScalars(g_decoView, g_loop->deco(), pAmb,
+                              st.haveVote, st.shownPpo2);
+            deco::publishView(g_bridgeTel.view, g_decoView);
+        }
+        bool decoPlanDirty = false;
+
         // Dive edges, in the chain's own clock: publisher bookkeeping, totals
         // and the snapshot grid all restart with the dive (the handset/web
         // command task opens and closes the actual file).
@@ -771,6 +794,10 @@ static void controlTask(void*) {
             // the bench-visible re-entry that says the machine has been looked
             // at. SAFE boot re-arms it too (fresh boot, fresh object).
             g_solFuse.clear();
+            // The dive may have been SEEDED: H1 continuity can move tissue
+            // loads discontinuously at this instant, so the published deco
+            // picture is stale the moment the dive starts.
+            decoPlanDirty = true;
         }
         // ---- dive continuity (H1): three edges, and every one of them is a copy
         //   dive start  -> the verdict: what seeded this dive, in words on the
@@ -788,6 +815,7 @@ static void controlTask(void*) {
             contStarts = contStartsNow;
             contSnapMs = now;   // the grid belongs to the dive, not to boot
             continuityAnnounceStart();
+            decoPlanDirty = true;  // the seed just moved the tissues
         }
         if (st.diveActive) {
             if (now - contSnapMs >= CONTINUITY_SNAPSHOT_MS) {
@@ -800,6 +828,10 @@ static void controlTask(void*) {
         if (!st.diveActive && (int32_t)(now - contRefreshAt) >= 0) {
             contRefreshAt = now + CONTINUITY_SEED_REFRESH_MS;
             comms::continuityRefreshSeed(*g_loop, comms::clockEpoch());
+            // The seed refresh can replace the loads it was seeded from; at
+            // the surface the plan recompute it forces is the cheap end of
+            // the cost curve (schedule() work scales with measured depth).
+            decoPlanDirty = true;
         }
 
         prevDive = st.diveActive;
@@ -807,7 +839,21 @@ static void controlTask(void*) {
         // Protocol events from the chain's transitions (alarm edges, mode,
         // cellproof, vote membership): the handset E, lines and the dive
         // log's event rows both come from this one publication.
-        bridge::publishEvents(st, (now - diveStartMs) / 1000u, g_bridgeEvents, pub);
+        //
+        // N1's freshness rule lives here: an edge means the machine just
+        // decided something, and the event-driven snapshot rows that follow
+        // must carry the deco plan OF THAT INSTANT, not one from the last
+        // 30 s grid. So every cycle that publishes an edge also republishes
+        // the plan — coalesced (one recompute per cycle however many edges
+        // fired: an alarm storm costs one schedule(), and that is the same
+        // per-cycle bound the H2 budget test pins).
+        if (bridge::publishEvents(st, (now - diveStartMs) / 1000u, g_bridgeEvents, pub) > 0)
+            decoPlanDirty = true;
+        if (decoPlanDirty) {
+            deco::viewPlan(g_decoView, g_loop->deco(),
+                           g_loop->deco().depthToBar(st.depthSmoothedM));
+            deco::publishView(g_bridgeTel.view, g_decoView);
+        }
 
         // A pre-dive PASS or FAIL becomes a surface record on its rising edge.
         // Edges, not levels: the check runs once and its verdict stands until
@@ -951,6 +997,13 @@ static void controlTask(void*) {
                               static_cast<unsigned>(landedSurf.id));
             if (now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
                 lastSnapMs = now;
+                // The grid row is filled from the plan computed HERE, now:
+                // one viewPlan() per grid tick feeds both the row and the
+                // published picture, so the file's grid row and the `D,`
+                // answer beside it are the same generation by construction.
+                deco::viewPlan(g_decoView, g_loop->deco(),
+                               g_loop->deco().depthToBar(st.depthSmoothedM));
+                deco::publishView(g_bridgeTel.view, g_decoView);
                 // The row's ppO2 column is the SHOWN number, which the chain holds
                 // across a failed vote (loop.cpp step 2b), so the dive file says
                 // what the diver was shown at this instant — and the alarm word
@@ -975,7 +1028,13 @@ static void controlTask(void*) {
                 ri.pulsesNow = p;
                 ri.pulsesPrev = lastPulseBase;
                 lastPulseBase = p;
-                ri.deco = &g_loop->deco();
+                // The deco picture and the flags byte, from this instant's
+                // State — the same generation the row's depth/ppO2 columns
+                // describe (rowfill.h owns the vocabulary; N1/N3).
+                ri.hasDecoPicture = true;
+                ri.deco = g_decoView;
+                ri.voteMode = static_cast<uint8_t>(st.vote.mode);
+                ri.spClamped = st.cellproof.state == cellproof::State::FAIL;
                 logfmt::Snapshot sn{};
                 logfmt::fillSnapshot(sn, ri);
                 comms::diveLogPostGrid(sn);

@@ -26,9 +26,12 @@
 // ============================================================================
 #include <unity.h>
 
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <string>
+#include <thread>
 
 #include "deco/zhl16c.h"
 #include "log/rowfill.h"
@@ -56,16 +59,17 @@ deco::Zhl16Ccr loadedEngine(double depthM, double bottomMin, double ppO2) {
 // Worst fill time in us; when outBest is given, also reports the BEST (fastest)
 // of the runs — best-case timing is the stable complexity measure, worst-case
 // is what a loaded CI box's scheduler noise moves around.
+// The cost that matters for the ControlTask budget is the PUBLISHER:
+// deco::viewFull (scalars + schedule), the exact call main.cpp runs at the
+// 30 s grid and at every event edge. Since 2026-11-28 (N1/N8) the row fill
+// itself copies published ints and does no deco math at all — the engine
+// work left the fill, it did not leave the task.
 double worstFillUs(deco::Zhl16Ccr& z, double depthM, double* outBest = nullptr) {
-    logfmt::RowInputs ri{};
-    ri.nowMs = 0; ri.diveStartMs = 0; ri.smoothedDepthM = depthM;
-    ri.haveVote = true; ri.shownPpo2 = 1.30f; ri.setpointBar = 1.2f;
-    ri.diveActive = true; ri.autoMode = true; ri.deco = &z;
     double worst = 0.0, best = 1e18;
     for (int r = 0; r < 20; ++r) {
-        logfmt::Snapshot sn{};
+        deco::View v{};
         const auto t0 = std::chrono::steady_clock::now();
-        logfmt::fillSnapshot(sn, ri);
+        deco::viewFull(v, z, z.depthToBar(depthM), true, 1.30);
         const auto t1 = std::chrono::steady_clock::now();
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
         if (us > worst) worst = us;
@@ -80,7 +84,7 @@ void test_worst_case_row_fill_fits_the_control_budget() {
     // 250 mbar; ~148 m of sea water. Loaded at that depth, held 60 min.
     deco::Zhl16Ccr z = loadedEngine(148.0, 60.0, 1.30);
     const double us = worstFillUs(z, 148.0);
-    printf("  controlplane: worst-case fill (148 m, capped holds) = %.0f us on host\n", us);
+    printf("  controlplane: worst-case deco publish viewFull (148 m, capped holds) = %.0f us on host\n", us);
     // Budget: 25 ms — a ~50x factor over the measured host number (the native
     // env builds -O0; the ESP32 pays its soft-double factor separately, and
     // HB `worst=` measures that on real metal). The number is deliberately
@@ -88,9 +92,10 @@ void test_worst_case_row_fill_fits_the_control_budget() {
     // loops, per-cycle recomputation, a new simulation dimension — not to
     // pin microseconds. Any jump of two orders of magnitude reddens it.
     TEST_ASSERT_LESS_THAN_FLOAT_MESSAGE(25000.0, us,
-        "worst-case ControlTask row fill blew the pinned budget: the deco "
-        "recompute is due-driven (30 s grid) and quadratic-in-depth by design; "
-        "this number growing means that shape changed");
+        "worst-case ControlTask deco publication blew the pinned budget: the "
+        "recompute is due-driven (30 s grid + event edges, per the publisher "
+        "in main.cpp) and quadratic-in-depth by design; this number growing "
+        "means that shape changed");
 }
 
 void test_fill_cost_grows_with_depth_not_worse_than_quadratic() {
@@ -111,12 +116,12 @@ void test_fill_cost_grows_with_depth_not_worse_than_quadratic() {
     deco::Zhl16Ccr deep = loadedEngine(90.0, 90.0, 1.30);
     const double a = worstFillUs(shallow, 45.0, &sa);
     const double b = worstFillUs(deep, 90.0, &sb);
-    printf("  controlplane: fill 45 m = %.0f us best / %.0f us worst, "
+    printf("  controlplane: publish 45 m = %.0f us best / %.0f us worst, "
            "90 m = %.0f us best / %.0f us worst, best-ratio %.2f (quadratic => ~4)\n",
            sa, a, sb, b, sa > 0 ? sb / sa : 0.0);
     TEST_ASSERT_TRUE_MESSAGE(sa > 0.0, "the shallow case measured no time at all: timer broken");
     TEST_ASSERT_LESS_THAN_FLOAT_MESSAGE(sa * 6.0, sb,
-        "row-fill cost grew faster than the documented quadratic-in-depth shape");
+        "deco publish cost grew faster than the documented quadratic-in-depth shape");
 }
 
 void test_capped_schedule_reports_itself() {
@@ -291,6 +296,97 @@ void test_continuous_on_spans_pile_up_across_rewrites() {
 }
 
 // ---------------------------------------------------------------------------
+// (3b) The published picture: cycle-grade scalar cost, no torn generations,
+// and the staleness bound that makes the 30 s grid honest for the PLAN half.
+// ---------------------------------------------------------------------------
+void test_the_per_cycle_scalar_publish_is_cycle_grade() {
+    // The cheap half the publisher runs EVERY 100 ms control cycle: one
+    // ceiling solve + the bounded NDL binary search. It must stay two orders
+    // of magnitude under the cycle itself, or the cadence decision (scalars
+    // per cycle, schedule() due-driven) is a lie. Measured: tens of
+    // microseconds even at the deepest legal load.
+    deco::Zhl16Ccr z = loadedEngine(148.0, 60.0, 1.30);
+    double worst = 0.0;
+    for (int r = 0; r < 50; ++r) {
+        deco::View v{};
+        const auto t0 = std::chrono::steady_clock::now();
+        deco::viewScalars(v, z, z.depthToBar(148.0), true, 1.30);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        if (us > worst) worst = us;
+    }
+    printf("  controlplane: worst-case viewScalars (148 m) = %.0f us on host\n", worst);
+    TEST_ASSERT_LESS_THAN_FLOAT_MESSAGE(1000.0, worst,
+        "the per-cycle scalar publish (ceiling + NDL) outgrew its cycle grade: "
+        "the publisher cadence in main.cpp depends on this half staying cheap");
+}
+
+void test_the_seqlock_publishes_generations_never_torn_pairs() {
+    // Writer and reader on different threads — the exact shape of ControlTask
+    // publishing and the uart2 task answering `D,`. Every generation is
+    // internally consistent by construction (here: ceilingCm == ndl*10 and
+    // stopDepthCm[0] == ndl*100); a torn read would break the invariant
+    // across fields. Before this module, the reader walked the live engine
+    // and no invariant across two reads was assertable at all.
+    deco::ViewSlot slot;
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        for (int i = 1; i <= 2000; ++i) {
+            deco::View v{};
+            v.ndlMin = static_cast<int16_t>(i % 300);  // keeps *100 inside int16
+            v.ceilingCm = static_cast<int16_t>(v.ndlMin * 10);
+            v.stopDepthCm[0] = static_cast<int16_t>(v.ndlMin * 100);
+            v.stopCount = 1;
+            deco::publishView(slot, v);
+        }
+        done = true;
+    });
+    int seen = 0;
+    while (!done) {
+        deco::View v{};
+        if (!deco::viewSnapshot(slot, v)) continue;
+        ++seen;
+        TEST_ASSERT_EQUAL_INT_MESSAGE(static_cast<int>(v.ceilingCm),
+                                      v.ndlMin * 10, "torn generation: ceiling from one write, NDL from another");
+        TEST_ASSERT_EQUAL_INT_MESSAGE(static_cast<int>(v.stopDepthCm[0]),
+                                      v.ndlMin * 100, "torn generation: stop depth from another write");
+    }
+    writer.join();
+    TEST_ASSERT_TRUE_MESSAGE(seen > 0, "the reader never got a generation: the slot is dead");
+    printf("  controlplane: seqlock reader took %d generations, none torn\n", seen);
+}
+
+void test_the_30s_plan_window_drift_is_small_and_its_direction_is_named() {
+    // The honesty bound for the plan half between grids (quiet dive, no
+    // edges): what 30 s of on-gassing at depth actually moves. Measured at
+    // 45 m after a 60 min bottom — the direction is the part that must be
+    // named: staying at depth makes the obligation WORSE, so a stale plan
+    // UNDER-states it (permissive), and a stale NDL OVER-states the time
+    // left (permissive). The bound below is what makes "<= 30 s old" a
+    // number instead of a hope; it is also what the 30 s dive-file grid has
+    // always implied for the file's own plan resolution.
+    deco::Zhl16Ccr z = loadedEngine(45.0, 60.0, 1.30);
+    const double pAmb = z.depthToBar(45.0);
+    deco::View a{}, b{};
+    deco::viewFull(a, z, pAmb, true, 1.30);
+    for (int s = 0; s < 30; ++s) z.stepTissues(1.0, pAmb, 1.30);
+    deco::viewFull(b, z, pAmb, true, 1.30);
+    const int dCeilCm = std::abs(static_cast<int>(b.ceilingCm) - static_cast<int>(a.ceilingCm));
+    const int dTotalMin = static_cast<int>(b.decoTotalX10 - a.decoTotalX10) / 10;
+    printf("  controlplane: 30 s at 45 m after 60 min: ceiling moved %d cm, "
+           "deco total %+d min, NDL %d -> %d\n", dCeilCm, dTotalMin,
+           (int)a.ndlMin, (int)b.ndlMin);
+    TEST_ASSERT_TRUE_MESSAGE(dCeilCm <= 150,
+        "30 s of tissue drift moved the ceiling by metres: the plan staleness "
+        "bound between grids is no longer a fact a reader can rely on");
+    TEST_ASSERT_TRUE_MESSAGE(dTotalMin <= 3,
+        "30 s of tissue drift moved the deco total beyond its stated bound");
+    TEST_ASSERT_TRUE_MESSAGE(b.ndlMin <= a.ndlMin,
+        "staying at depth did not shorten the NDL: the staleness direction "
+        "this design names (stale NDL reads permissive) no longer holds");
+}
+
+// ---------------------------------------------------------------------------
 // (4) Source scan: no portMAX_DELAY anywhere on ControlTask's call graph.
 // ---------------------------------------------------------------------------
 std::string readFile(const char* path) {
@@ -407,6 +503,77 @@ void test_control_task_store_entry_points_are_bounded() {
     }
 }
 
+void test_no_consumer_walks_the_live_engine_anymore() {
+    // N8's structural closure as a build-time rule, not prose: the fill, the
+    // router and the handset link must contain no deco COMPUTATION and no
+    // engine access. If RowInputs::deco ever becomes a pointer again, or a
+    // schedule()/ndlMinutes() call creeps back into a command-task file,
+    // this reddens. (main.cpp is exempt by ownership: ControlTask owns deco_;
+    // the N8 vocabulary in rowfill.h says exactly who may touch it.)
+    const std::string rf = stripComments(readFile("src/log/rowfill.h"));
+    const std::string rfc = stripComments(readFile("src/log/rowfill.cpp"));
+    TEST_ASSERT_TRUE_MESSAGE(!rf.empty() && !rfc.empty(), "cannot read rowfill sources");
+    for (const char* banned : {"schedule(", "ndlMinutes(", "Zhl16Ccr*"}) {
+        TEST_ASSERT_TRUE_MESSAGE(rf.find(banned) == std::string::npos,
+                                 (std::string("rowfill.h references ") + banned +
+                                  ": the fill must consume the published deco::View, "
+                                  "never the engine or its arithmetic").c_str());
+        TEST_ASSERT_TRUE_MESSAGE(rfc.find(banned) == std::string::npos,
+                                 (std::string("rowfill.cpp calls ") + banned +
+                                  ": no deco computation may live in the row fill").c_str());
+    }
+    const std::string cr = readFile("src/comms/cmd_router.cpp");
+    const std::string body = stripComments(
+        functionBody(cr, "proto::DecoInfo CommandRouter::decoInfoOf("));
+    TEST_ASSERT_TRUE_MESSAGE(!body.empty(),
+                             "decoInfoOf not found by the scan: renamed? the scan must keep seeing it");
+    for (const char* banned : {"schedule(", "ndlMinutes(", ".deco()"}) {
+        TEST_ASSERT_TRUE_MESSAGE(body.find(banned) == std::string::npos,
+                                 (std::string("decoInfoOf contains ") + banned +
+                                  ": the `D,` answer must come from the published picture "
+                                  "(deco/view.h), not from the live engine").c_str());
+    }
+    const std::string ul = readFile("src/comms/uart_link.cpp");
+    const std::string ed = stripComments(functionBody(ul, "void UartLink::emitD(Sink sink, void* ctx) {"));
+    TEST_ASSERT_TRUE_MESSAGE(!ed.empty(), "emitD not found by the scan");
+    TEST_ASSERT_TRUE_MESSAGE(ed.find("deco::viewSnapshot") != std::string::npos,
+                             "the uart2 `D,` stream no longer reads the published generation — "
+                             "what is it answering from?");
+
+    // The freshness rule itself (main.cpp is not compiled for host tests, so
+    // the scan is the only net): the publisher must exist, an event edge must
+    // republish the plan, and BOTH row fills must hand over the picture.
+    const std::string m = readFile("src/main.cpp");
+    const std::string mc = stripComments(m);
+    TEST_ASSERT_TRUE_MESSAGE(mc.find("deco::viewScalars") != std::string::npos &&
+                             mc.find("deco::publishView") != std::string::npos,
+                             "ControlTask no longer publishes the deco picture: "
+                             "every `D,` answer and every event row is reading from what?");
+    const size_t pe = mc.find("bridge::publishEvents");
+    TEST_ASSERT_TRUE_MESSAGE(pe != std::string::npos &&
+                             mc.find("> 0", pe) != std::string::npos &&
+                             mc.find("> 0", pe) < mc.find(";", pe) + 1,
+                             "an event edge no longer triggers the plan republish: the "
+                             "event row would carry the plan of the last 30 s grid, which "
+                             "is the freshness decision this batch made (N1)");
+    TEST_ASSERT_TRUE_MESSAGE(mc.find("decoPlanDirty") != std::string::npos &&
+                             mc.find("deco::viewPlan") != std::string::npos,
+                             "the due-driven plan recompute is gone from the publisher");
+    // One fill site per kind of row: the grid row (main.cpp, control task)
+    // and the event row (session_wiring.cpp, command task). A fill that stops
+    // asking for the picture silently zeroes the deco columns again (N1).
+    size_t picsGrid = 0;
+    for (size_t at = 0; (at = mc.find("hasDecoPicture", at)) != std::string::npos; at += 5) ++picsGrid;
+    const std::string sw = stripComments(readFile("src/comms/session_wiring.cpp"));
+    size_t picsEv = 0;
+    for (size_t at = 0; (at = sw.find("hasDecoPicture", at)) != std::string::npos; at += 5) ++picsEv;
+    TEST_ASSERT_TRUE_MESSAGE(picsGrid == 1 && picsEv == 1,
+                             "both dive-row fills (grid in main.cpp + event in "
+                             "session_wiring.cpp) must take the published picture");
+    TEST_ASSERT_TRUE_MESSAGE(sw.find("deco::viewSnapshot") != std::string::npos,
+                             "the event row no longer reads the published generation");
+}
+
 void test_the_supervisor_holds_the_fuse_half_it_promise() {
     // The fuse's third layer (the one that runs when ControlTask never does)
     // must stay wired where it is: the supervisor evaluates shouldCut and
@@ -473,6 +640,10 @@ int main() {
     RUN_TEST(test_fuse_condition_never_references_cycle);
     RUN_TEST(test_latched_fuse_refuses_reassertion_at_the_write_site);
     RUN_TEST(test_continuous_on_spans_pile_up_across_rewrites);
+    RUN_TEST(test_the_per_cycle_scalar_publish_is_cycle_grade);
+    RUN_TEST(test_the_seqlock_publishes_generations_never_torn_pairs);
+    RUN_TEST(test_the_30s_plan_window_drift_is_small_and_its_direction_is_named);
+    RUN_TEST(test_no_consumer_walks_the_live_engine_anymore);
     RUN_TEST(test_control_task_body_has_no_unbounded_waits_and_no_legacy_appends);
     RUN_TEST(test_control_task_store_entry_points_are_bounded);
     RUN_TEST(test_the_supervisor_holds_the_fuse_half_it_promise);

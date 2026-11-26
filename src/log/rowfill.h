@@ -25,9 +25,9 @@
 // conversion is the scaling that logfmt's own CSV writer prints with (a stored
 // number and its digits must agree — the class of bug that made the dive file one
 // count away from the wire until 2026-11-24), and the only thing it borrows from
-// the control side is a read-only pointer to the deco engine's numbers. The
-// dependency points one way: nothing in src/control includes src/log, and
-// src/deco includes neither, so this adds no cycle.
+// the control side is the published deco picture — a value struct (src/deco/view.h),
+// never the engine. The dependency points one way: nothing in src/control
+// includes src/log, and src/deco includes neither, so this adds no cycle.
 //
 // What deliberately stays with the caller:
 //   * the dive META totals (max/min/peak/GF/setpoint ladder) — a dive-long
@@ -35,40 +35,32 @@
 //   * where the row's numbers come from (the live chain for the grid row, the
 //     published bridge scalars for the event row). Which snapshot of the machine
 //     a row is allowed to read is a task-ownership question, and this module must
-//     not have an opinion about it;
-//   * whether the row carries a deco picture at all — see RowInputs::deco.
+//     not have an opinion about it.
 //
-// N8 — WHO OWNS DECO STATE, stated once, here, because three files used to
-// hint at it in prose and the type (a bare const pointer) enforces nothing:
+// N8 — WHO OWNS DECO STATE, stated once, here (this vocabulary closed the
+// structural half of review N8 on 2026-11-28; reviews N1/N3 landed with it):
 //   * ctrl::Loop::deco_ is OWNED BY ControlTask. Only the control thread ever
 //     advances it (step/stepTissues/stepCns), re-tunes it (setConfig, queued
-//     through the A5e deferred-apply path) or computes dive-file deco columns
-//     from it (the 30 s grid row: fillSnapshot with a non-null deco pointer
-//     happens at exactly one call site, on the control task).
-//   * Every OTHER reader is a stale-read-by-construction: the bridge scalars
-//     are copied once per control cycle; the event-driven snapshot row passes
-//     deco = nullptr precisely so it can never compute deco columns from a
-//     half-updated engine on the command task.
-//   * The one concurrent LIVE reader that remains is the handset/web answer
-//     builder (CommandRouter::decoInfoOf: ceilingM/ndlMinutes/schedule on the
-//     command task while ControlTask integrates). It is a benign torn read —
-//     doubles are aligned word loads on the ESP32, and the worst outcome is a
-//     D, schedule off by at most one control step of tissue movement (~100 ms
-//     of physiology) — but it is tolerated, not endorsed. The structural fix
-//     is a ControlTask-published deco SNAPSHOT (picture struct) that the
-//     command task reads instead of the engine; that is deliberately NOT in
-//     this batch: it moves the diver-visible NDL/plan freshness model and
-//     belongs with the D, line's contract, not with a control-plane stall
-//     fix. H2 kept the heavy deco math ON ControlTask (bounded: see the
-//     cost-shape comment in zhl16c schedule()) precisely because the
-//     alternative — computing it on another task — would turn this prose
-//     into a real race on the engine's live state.
+//     through the A5e deferred-apply path) or COMPUTES anything from it: the
+//     derived picture is produced by deco::viewScalars/viewPlan on the control
+//     task and published as a plain-value deco::View through a seqlock slot
+//     (src/deco/view.h).
+//   * Every other reader — the 30 s grid row, the event-driven row, the
+//     handset/web `D,` answer builder — reads that PUBLISHED COPY, never the
+//     engine. The event row and `D,` therefore agree by construction: they
+//     read the same generation, and what the file says a moment was, the
+//     diver was or is being shown the same numbers.
+//   * RowInputs::deco used to be a const pointer to the live engine, and the
+//     safety of every reader was prose ("a benign torn read... tolerated, not
+//     endorsed"). The prose is gone because the type is gone: a value struct
+//     cannot alias an engine another task is integrating. There is no longer
+//     a legal call path from the command or uart2 task into deco_.
 // ============================================================================
 #pragma once
 
 #include <cstdint>
 
-#include "deco/zhl16c.h"
+#include "deco/view.h"
 #include "log/divelog.h"
 
 namespace logfmt {
@@ -99,8 +91,9 @@ struct RowInputs {
     /// row of a sensor-failure window recorded a hard 0.00 ppO2: finding N2). It
     /// is now what the code does, and it is marked rather than naked: the row's
     /// alarm word carries BIT_SENSOR_FAIL / BIT_SENSOR_STALE for exactly those
-    /// cycles (the LOG view, so an ACK cannot delete it) and `ndl` carries the 480
-    /// sentinel for "no vote, nothing to total". Before the first vote ever the
+    /// cycles (the LOG view, so an ACK cannot delete it) and `ndl` carries the
+    /// unknown sentinel (deco::kNDL_UNKNOWN, -1) for "no vote, nothing to total".
+    /// Before the first vote ever the
     /// column still says 0, because there is no history to hold — and
     /// BIT_SENSOR_STALE is up from the first cycle for the same reason.
     /// The deliberate asymmetry with the dive META next to these rows: min_ppo2/
@@ -137,20 +130,35 @@ struct RowInputs {
     uint32_t pulsesPrev = 0;
 
     // ---- the deco picture -----------------------------------------------
-    // Null when the row carries no deco picture. Today that is the event-driven
-    // row (session_wiring.cpp): it has always left ceiling/NDL/deco at zero, so
-    // its `ceiling_m` column reads "no stop" whether or not a stop was demanded
-    // at the instant the machine decided. Filling those three columns changes
-    // bytes on an existing, documented column, so it is a maintainer decision and
-    // not a side effect of moving the code — the option is therefore explicit
-    // here rather than quietly starting to write what no event row ever had.
-    const deco::Zhl16Ccr* deco = nullptr;
+    // A PUBLISHED VALUE, never the engine (N8, 2026-11-28): whoever fills a
+    // row hands over the deco::View that ControlTask published — the grid row
+    // takes the generation computed for this very cycle, the event row takes
+    // the seqlock snapshot the `D,` line is answering from. hasDecoPicture is
+    // false only in the boot window before the first control cycle published
+    // one: those rows keep zeroed deco columns, and they are the ONLY rows a
+    // zero plan column can belong to now. Before this change, every event row
+    // ever written left ceiling/NDL/deco at zero, so its `ceiling_m` column
+    // read "no stop" whether or not a stop was demanded at the instant the
+    // machine decided (finding N1 — the zeros are what this replaces).
+    bool hasDecoPicture = false;
+    deco::View deco{};
+
+    // ---- the flags byte (N3, 2026-11-28) ---------------------------------
+    // Documented in divelog.h since v2, written by nobody until now: every
+    // dive file ever exported said "OK 3-cell, not clamped", including the
+    // dives that ran on two cells and under the proof clamp. Both sources are
+    // the same vocabulary the wire and the held-ppO2 rule already use:
+    // voting::Mode (0 ok, 1 2cell, 2 single, 3 fail — a row written while the
+    // chain HELD a ppO2 across a failed vote says FAILED, not OK) and the
+    // CellProof clamp being up at the instant of the row.
+    uint8_t voteMode = 0;
+    bool spClamped = false;
 };
 
-/// Fills the row. Fields the firmware has never written (tempC, flags) get no
-/// entry in RowInputs at all, so a caller cannot smuggle a value into a column
-/// whose meaning the format has not agreed to; they keep whatever the Snapshot
-/// held when it came in, which for `Snapshot{}` is zero.
+/// Fills the row. Fields the firmware has never written (tempC) get no entry
+/// in RowInputs at all, so a caller cannot smuggle a value into a column whose
+/// meaning the format has not agreed to; they keep whatever the Snapshot held
+/// when it came in, which for `Snapshot{}` is zero.
 void fillSnapshot(Snapshot& s, const RowInputs& in);
 
 }  // namespace logfmt

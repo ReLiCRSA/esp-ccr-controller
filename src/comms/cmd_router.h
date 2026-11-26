@@ -224,7 +224,17 @@ public:
 
     /// Deco picture as the protocol wants it (shared by `DECO`, `GET D` and
     /// the periodic D, line in the UART task).
-    static proto::DecoInfo decoInfoOf(const ctrl::Loop& loop, bool hasVote);
+    /// The published deco picture slot (deco/view.h). Wired by Session::begin
+    /// from the bridge it is built over; DECO/GET D answer from the published
+    /// generation, never from the live engine (review N8: the cross-task walk
+    /// that used to happen here is what the seqlock slot replaced). When no
+    /// slot is wired the answer is ERR: a missing publication is a wiring bug,
+    /// and it must say so rather than fabricate a plan.
+    void setDecoView(const deco::ViewSlot* v) { decoView_ = v; }
+
+    /// Builds a `D,` answer from a PUBLISHED picture (same numbers the event
+    /// dive row carries at that instant — N1's agreement is by construction).
+    static proto::DecoInfo decoInfoOf(const deco::View& v);
 
 private:
     void replyOk(Response& r, const char* note = nullptr);
@@ -265,6 +275,7 @@ private:
     uint32_t shallowSinceMs_ = 0;  // 0 = not shallow; the WIFI_ON_HOLD_S timer
     uint32_t idleSinceMs_ = 0;     // 0 = not counting; start of the idle window
     const wallclock::State* clock_ = nullptr;
+    const deco::ViewSlot* decoView_ = nullptr;
     uint32_t clockEpoch_ = 0;
     const cellhist::Hist* hist_ = nullptr;
     const bridge::CalAir* calAir_ = nullptr;

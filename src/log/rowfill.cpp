@@ -23,7 +23,10 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
     // The row's ppO2 is the number the diver was shown, and the chain holds that
     // across a failed vote (RowInputs::shownPpo2 — the contract, and the finding
     // it closes, are both in rowfill.h). The absence of a vote is not recorded by
-    // zeroing this column: it is recorded in the alarm word and in `ndl` = 480.
+    // zeroing this column: it is recorded in the alarm word, in the flags byte's
+    // voting-mode bits, and in `ndl` = deco::kNDL_UNKNOWN (-1, "no number" — the
+    // same value `D,` answers, and now the same value everywhere; 480 means the
+    // engine's own "unlimited" and nothing else).
     s.votedX1000 = static_cast<int16_t>(numfmt::scaled(in.shownPpo2, 3));
     for (int i = 0; i < 3; i++)
         s.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(in.cellBar[i], 3));
@@ -33,38 +36,39 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
     s.alarmBits = in.alarmLogBits;  // the LOG view — see RowInputs
     s.cnsPct = in.cnsPeakPct;
 
-    if (in.deco) {
-        // Measured at the chain's own depth, which is what the engine integrated
-        // and what the row's depth column carries. Grading it at the diver's
-        // true depth instead would write a ceiling the controller never showed
-        // the diver — and in a blind window it would write the honest number
-        // beside a held depth, which is the disagreement this module forbids.
-        const double pAmbBar = in.deco->depthToBar(in.smoothedDepthM);
-        // `* 100.0` (a double literal) was the old bug: it promotes the float and
-        // pushes more products just under the integer, so this bench's measured
-        // 11.15 m ceiling stored 1114 cm. The exact centimetres live in this
-        // column; the `ceiling_m` column stays integer metres for v1 parsers and
-        // is derived from it in the row writer.
-        s.ceilingCm = static_cast<int16_t>(numfmt::scaled(in.deco->ceilingM(), 2));
-        // 480 is the "no vote, nothing to total" sentinel, and it is the same
-        // sentinel ndlMinutes() saturates at, so an unlimited NDL and an
-        // unanswerable one cannot be confused with a real stop budget. The gate
-        // also keeps a HELD ppO2 out of the NDL arithmetic: the number that is
-        // allowed to reduce a diver's NDL has to be a measurement.
-        s.ndlMin = in.haveVote
-                       ? static_cast<int16_t>(in.deco->ndlMinutes(pAmbBar, in.shownPpo2))
-                       : 480;
-        s.decoTotalMin = static_cast<int16_t>(in.deco->schedule(pAmbBar).totalTimeMin);
+    if (in.hasDecoPicture) {
+        // Copied from the PUBLISHED picture (deco/view.h), computed by
+        // ControlTask for this instant — the fill performs no deco arithmetic
+        // and holds no engine. That is not an optimisation, it is the shape
+        // of the N8 fix: a command task used to run the engine's NDL search
+        // and its full ascent schedule right here, against a live engine,
+        // reading tissue states that never existed at one instant. The
+        // published generation is what the diver was shown (the `D,` line
+        // answers from the same slot), and the ceiling still describes the
+        // chain's own depth, because the engine the picture was computed from
+        // is the one that integrated the depth this row's depth column carries.
+        s.ceilingCm = in.deco.ceilingCm;
+        s.ndlMin = in.deco.ndlMin;  // sentinels: kNDL_UNKNOWN / kNDL_UNLIMITED
+        // Integer minutes, as this column has always been: divide the stored
+        // x10 — never re-round, so the column and `D,`'s decimal agree by
+        // construction (both derive from one scaled store).
+        s.decoTotalMin = static_cast<int16_t>(in.deco.decoTotalX10 / 10);
     }
 
     s.pulses = static_cast<uint16_t>(in.pulsesNow - in.pulsesPrev);
     s.battX1000 = static_cast<uint16_t>(numfmt::scaled(in.vbat, 3));
-    // s.tempC and s.flags are not written here and RowInputs has no field for
-    // them. Both columns are in the row format and nothing in the firmware has
-    // ever filled them: they read 0 in every dive file ever exported. Pinning
-    // that in test_logfmt keeps a half-wired sensor (a temperature nobody reads,
-    // a voting-mode byte that duplicates the `E,` rows) from arriving by
-    // accident; giving them meaning is a format decision, not a refactor.
+    // The documented flags byte (divelog.h): b0 = the setpoint clamp up,
+    // b1..2 = the voting mode the row was written under (voting::Mode).
+    // Until 2026-11-28 nothing wrote this column and every dive file said
+    // "OK 3-cell, not clamped" (finding N3). The alarm word beside it marks
+    // the same condition from its side; the two must agree, and both come
+    // from the same instant's State.
+    s.flags = static_cast<uint8_t>((in.spClamped ? 1u : 0u) |
+                                   ((in.voteMode & 3u) << 1));
+    // s.tempC is not written here and RowInputs has no field for it: the
+    // column reads 0 in every dive file ever exported, and pinning that in
+    // test_logfmt keeps a half-wired sensor (a temperature nobody reads) from
+    // arriving by accident; giving it meaning is a format decision.
 }
 
 }  // namespace logfmt

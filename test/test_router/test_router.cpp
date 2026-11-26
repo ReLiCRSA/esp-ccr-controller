@@ -36,6 +36,10 @@ struct Bench {
     Loop loop{cfg};
     settings::Registry reg;
     uint32_t now = 0;
+    // The published deco slot the router answers DECO / GET D from — on the
+    // board it is the bridge's (Session::begin wires it); the Bench owns it
+    // directly, exactly as main.cpp owns the publisher (deco/view.h).
+    deco::ViewSlot viewSlot;
     CommandRouter router;
 
     // The reply buffer is storage the CALLER owns, as it is on the target:
@@ -44,7 +48,21 @@ struct Bench {
     // through a stack frame by value. `resp` is the bench's own buffer; a test
     // that must hold two replies at once passes its own.
     CommandRouter::Response resp;
-    Bench() : reg(), router(loop, reg, now) { reg.resetToDefaults(); }
+    Bench() : reg(), router(loop, reg, now) {
+        reg.resetToDefaults();
+        router.setDecoView(&viewSlot);
+        publishDeco();  // the board never answers from an unstarted chain:
+                        // control has run a cycle before any client speaks
+    }
+    // The ControlTask publication, mirrored: cheap scalars + plan at the
+    // chain's own depth (main.cpp publishes per cycle / at edges / at grid).
+    void publishDeco() {
+        deco::View pic{};
+        deco::viewFull(pic, loop.deco(),
+                       loop.deco().depthToBar(loop.depthSmoothedM()),
+                       loop.haveVote(), loop.shownPpo2());
+        deco::publishView(viewSlot, pic);
+    }
     const CommandRouter::Response& run(const char* line) {
         router.setNowMs(now);
         router.exec(line, resp);
@@ -63,6 +81,7 @@ struct Bench {
             sd.vbat = 12.4f;
             now += Loop::kTickMs;
             loop.cycle(sd, now);
+            publishDeco();
         }
     }
 };
@@ -453,6 +472,27 @@ void test_testcells_runs_on_the_bench_and_reports_masks() {
     b.run("GET CELLS", r);
     TEST_ASSERT_TRUE(has(r, "CELLS,4,"));   // DONE
     TEST_ASSERT_TRUE(has(r, "007,"));       // pass mask, all three, octal
+}
+
+void test_deco_answers_err_when_nothing_published_the_picture() {
+    // The SAFE-boot shape: no control cycle has published a deco generation,
+    // so DECO / GET D must refuse rather than print a plan nobody computed.
+    // (On the board Session::begin wires the slot; an unwired router is also
+    // the wiring-bug case, and it must say so out loud.)
+    Config cfg = benchCfg();
+    Loop loop(cfg);
+    settings::Registry reg;
+    uint32_t now = 0;
+    CommandRouter router(loop, reg, now);
+    reg.resetToDefaults();
+    CommandRouter::Response r;
+    router.setNowMs(now);
+    router.exec("DECO", r);
+    TEST_ASSERT_TRUE_MESSAGE(std::strncmp(r.text, "ERR", 3) == 0,
+                             "DECO answered a plan the control task never published");
+    router.exec("GET D", r);
+    TEST_ASSERT_TRUE_MESSAGE(std::strncmp(r.text, "ERR", 3) == 0,
+                             "GET D answered a plan the control task never published");
 }
 
 void test_deco_and_status_lines_come_from_the_chain() {
@@ -1111,6 +1151,7 @@ int main() {
     RUN_TEST(test_safe_mode_lockout_refuses_everything_but_ack);
     RUN_TEST(test_ack_always_honoured);
     RUN_TEST(test_testcells_runs_on_the_bench_and_reports_masks);
+    RUN_TEST(test_deco_answers_err_when_nothing_published_the_picture);
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);
     RUN_TEST(test_set_actually_moves_the_live_chain);
     RUN_TEST(test_log_and_calibration_commands_delegations);

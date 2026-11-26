@@ -113,13 +113,24 @@ struct Snapshot {
     uint16_t alarmBits;
     uint8_t cnsPct;      // capped 255
     int16_t ceilingCm;
-    int16_t ndlMin;      // 480 = effectively unlimited
+    // The ndl column's sentinel pair is ONE convention for the file and the
+    // wire (review N5, closed 2026-11-28): deco::kNDL_UNKNOWN (-1, "no valid
+    // vote, no number" — the same value `D,` has answered since v1) and
+    // deco::kNDL_UNLIMITED (480, the engine's saturation). Before that date
+    // the file wrote 480 for BOTH facts, so an unlimited NDL and an
+    // unanswerable one read alike beside each other.
+    int16_t ndlMin;
     int16_t decoTotalMin;
     uint16_t pulses;     // injection pulses in the preceding window
     uint16_t battX1000;
     int8_t tempC;
-    uint8_t flags;       // b0 sp-clamped, b1..2 voting mode(0 ok,1 2cell,2 single,3 fail)
-                         // (b3..4 are used on the wire only, never by callers)
+    // b0 sp-clamped, b1..2 voting mode(0 ok,1 2cell,2 single,3 fail) — WRITTEN
+    // since 2026-11-28 (review N3: a documented column that always answered
+    // the healthy value was worse than an absent one). The mode is the same
+    // voting::Mode the wire and the held-ppO2 rule speak: a row whose vote
+    // FAILED says FAILED here, and its ppO2 column says the held number.
+    // (b3..4 are used on the wire only, never by callers.)
+    uint8_t flags;
 };
 
 struct Event {

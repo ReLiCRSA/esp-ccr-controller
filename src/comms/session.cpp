@@ -29,6 +29,10 @@ bool Session::begin(ctrl::Loop& loop, settings::Registry& reg, bridge::Telemetry
     primeSchema();
 
     router_ = new (routerMem_) CommandRouter(loop, reg, 0);
+    // The `D,` answer and the event dive row read the CONTROL-published deco
+    // generation (deco/view.h), never the engine: wiring the slot here is
+    // what makes that rule structural for both transports (review N8).
+    router_->setDecoView(&tel.view);
     // The link's event ring is the handset's: only pump() drains it. The web
     // transport shares everything else.
     link_ = new (linkMem_) UartLink(loop, reg, *router_, tel, events, hw);

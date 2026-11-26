@@ -1445,7 +1445,7 @@ def selftest_wifi():
 def grade_dive_file(drows, want, wire=()):
     """Grade one exported dive against itself, and against the settings it claims.
 
-    Four claims, each a different lie:
+    Five claims, each a different lie:
 
       * the dive FILE holds the verdict rows the wire streamed (ids 10/11/12 for
         a failed cell proof, 1/2 for alarms, 3 for mode, 4 for setpoint): until
@@ -1458,7 +1458,13 @@ def grade_dive_file(drows, want, wire=()):
         `snapshots 0, events 0, gf 0/0, sp 0.000 x4` next to a dozen samples:
         a summary line contradicting its own dive;
       * no impossible ppO2. A dive that never voted published the -32768
-        sentinel as `-32.768` bar, in the same three decimals as a real reading.
+        sentinel as `-32.768` bar, in the same three decimals as a real reading;
+      * every `S,` row's `ndl` answers within the published domain — a number
+        0..480, or exactly one of the named sentinels (-1 unknown / 480
+        unlimited, the same pair `D,` answers since 2026-11-28 closed review
+        N5's two-sentinels-for-one-fact). Vacuous on captures older than that
+        date — they all answered inside the domain too — and it witnesses the
+        new firmware's -1 rows on a live `--dive-persist` run.
 
     `want` is what the same link answered for GET GF_LOW / GF_HIGH / SP1..SP4,
     `wire` the `E,` rows seen live while the dive was open. A claim nobody could
@@ -1495,6 +1501,17 @@ def grade_dive_file(drows, want, wire=()):
             return float(mf[col])
         except (ValueError, IndexError, TypeError):
             return None
+
+    def ndl_in_domain(line):
+        # S,<t>,<depth>,<voted>,<c0>,<c1>,<c2>,<sp>,<alarm>,<cns>,<ceil_m>,<ndl>,...
+        f = line.split(",")
+        if len(f) <= 11:
+            return False  # a documented column the row does not carry
+        try:
+            n = int(f[11])
+        except ValueError:
+            return False
+        return n == -1 or 0 <= n <= 480
 
     # Multiset, not set: two identical rows (a rejoin for two different cells
     # reads alike in value but not in id, and a duplicate edge is a duplicate
@@ -1542,6 +1559,13 @@ def grade_dive_file(drows, want, wire=()):
          f"M, min_ppo2 {mf[3] if len(mf) > 3 else '?'} max_ppo2 "
          f"{mf[4] if len(mf) > 4 else '?'}: a dive that never voted used to "
          f"publish the -32768 sentinel as -32.768 bar"),
+        ("dive file: every S, ndl column is a number or the named sentinel pair",
+         all(ndl_in_domain(l) for l in samp),
+         "an S, row stated an ndl outside the published domain — the pair is "
+         "-1 (no valid vote, the same unknown `D,` answers) and 480 (the "
+         "engine's own unlimited), anything else 0..480 (HANDSET_PROTOCOL "
+         "§2/§5.1, one convention for file and wire since 2026-11-28). A row "
+         "answering e.g. 999 states a number the controller never believed"),
     ]
     return checks
 
@@ -1604,6 +1628,10 @@ def selftest_dive_file():
         ("a dive that never voted publishes the sentinel as -32.768 bar",
          row(len(DIVE_HONEST) - 1, meta(min="0.000", max="-32.768")), DIVE_WANT,
          DIVE_HONEST_WIRE, "impossible ppO2"),
+        ("an S, row states NDL 999: neither a number the engine saturates at "
+         "nor the named pair — the column invented one (N5's domain check)",
+         row(2, DIVE_HONEST[2].replace(",0x0010,0,0,0,0,0,", ",0x0010,0,0,999,0,0,")),
+         DIVE_WANT, DIVE_HONEST_WIRE, "named sentinel pair"),
         ("no M, row at all: every claim in it is unchecked",
          drop("M,"), DIVE_WANT, DIVE_HONEST_WIRE, "snapshot count matches"),
         ("the settings query came back empty: a claim nobody can check is a fail",

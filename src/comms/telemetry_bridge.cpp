@@ -41,25 +41,28 @@ logfmt::DiveMeta DiveTotals::toMeta() const {
     return m;
 }
 
-void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
-                   PublisherState& ps) {
+int publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
+                  PublisherState& ps) {
+    // pushed = edges published this cycle. main.cpp uses a nonzero count as
+    // the deco-plan republish trigger (the ring overflow counter is separate:
+    // a DROPPED edge is still an edge — the picture must move for it too).
+    int pushed = 0;
+    auto push = [&](Event e) { if (!ring.push(e)) ring.noteDropped(); ++pushed; };
     // Alarms: raised/cleared transitions of the latch-applied bit set. The
     // ids are protocol-visible (BIT_LOW_PPO2 .. BIT_HYPOXIA): never renumber.
     const uint16_t changed = st.alarms.bits ^ ps.prevAlarmBits;
     for (uint8_t bit = 0; bit < 10; ++bit) {
         if (!(changed & (1u << bit))) continue;
         const bool raised = st.alarms.bits & (1u << bit);
-        if (!ring.push({tSec,
-                        raised ? logfmt::EVT_ALARM_RAISED : logfmt::EVT_ALARM_CLEARED,
-                        static_cast<uint16_t>(bit)}))
-            ring.noteDropped();
+        push({tSec, raised ? logfmt::EVT_ALARM_RAISED : logfmt::EVT_ALARM_CLEARED,
+              static_cast<uint16_t>(bit)});
     }
     ps.prevAlarmBits = st.alarms.bits;
 
     // AUTO/MANUAL edge (mode id: 1 auto, 2 manual, matching the T, lines).
     if (st.autoMode != ps.prevAuto) {
-        if (!ring.push({tSec, logfmt::EVT_MODE_CHANGE, st.autoMode ? 1 : 2}))
-            ring.noteDropped();
+        push({tSec, logfmt::EVT_MODE_CHANGE,
+              static_cast<uint16_t>(st.autoMode ? 1 : 2)});
         ps.prevAuto = st.autoMode;
     }
 
@@ -68,10 +71,9 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
     if (cp != ps.prevCp) {
         if (cp == static_cast<int16_t>(cellproof::State::PASS) &&
             ps.prevCp == static_cast<int16_t>(cellproof::State::RUNNING)) {
-            if (!ring.push({tSec, logfmt::EVT_CELLPROOF_PASS, st.cellproof.unprovenHighMask}))
-                ring.noteDropped();
+            push({tSec, logfmt::EVT_CELLPROOF_PASS, st.cellproof.unprovenHighMask});
         } else if (cp == static_cast<int16_t>(cellproof::State::FAIL)) {
-            if (!ring.push({tSec, logfmt::EVT_CELLPROOF_FAIL, 0})) ring.noteDropped();
+            push({tSec, logfmt::EVT_CELLPROOF_FAIL, 0});
         }
         // The clamp is a separate fact from the verdict, and it is the one the
         // diver can act on: ids 11/12 exist because "the proof failed" and "your
@@ -80,7 +82,7 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
         // cycles must not produce 200 rows.
         if (cp == static_cast<int16_t>(cellproof::State::FAIL) &&
             ps.prevCp != static_cast<int16_t>(cellproof::State::FAIL)) {
-            if (!ring.push({tSec, logfmt::EVT_CLAMP_ON, 0})) ring.noteDropped();
+            push({tSec, logfmt::EVT_CLAMP_ON, 0});
         }
         // FAIL → PASS happens exactly one way: `CELLPROOF OVERRIDE`, because a
         // FAIL never re-arms itself (the clamp is the safe state, lifting it is
@@ -90,7 +92,7 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
         // someone reads the file afterwards.
         if (ps.prevCp == static_cast<int16_t>(cellproof::State::FAIL) &&
             cp == static_cast<int16_t>(cellproof::State::PASS)) {
-            if (!ring.push({tSec, logfmt::EVT_CLAMP_OFF, 1})) ring.noteDropped();
+            push({tSec, logfmt::EVT_CLAMP_OFF, 1});
         }
         ps.prevCp = cp;
     }
@@ -102,9 +104,7 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
             const bool was = ps.prevActiveMask & (1u << ch);
             const bool now = st.vote.activeMask & (1u << ch);
             if (was == now) continue;
-            if (!ring.push({tSec, now ? logfmt::EVT_CELL_REJOIN : logfmt::EVT_CELL_EXCLUDED,
-                            ch}))
-                ring.noteDropped();
+            push({tSec, now ? logfmt::EVT_CELL_REJOIN : logfmt::EVT_CELL_EXCLUDED, ch});
         }
         ps.prevActiveMask = st.vote.activeMask;
     }
@@ -113,11 +113,12 @@ void publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
     if (ps.prevSp >= 0.0f && st.setpointBar > ps.prevSp + 0.02f) {
         // The payload is the setpoint in hundredths, and it has to be the number
         // the handset reads back with `GET SP2` — 0.29 must arrive as 29, not 28.
-        if (!ring.push({tSec, logfmt::EVT_SP_CHANGE,
-                        static_cast<uint16_t>(numfmt::scaled(st.setpointBar, 2))}))
-            ring.noteDropped();
+        push({tSec, logfmt::EVT_SP_CHANGE,
+              static_cast<uint16_t>(numfmt::scaled(st.setpointBar, 2))});
     }
     ps.prevSp = st.setpointBar;
+    return pushed;
+
 }
 
 // ---- the CAL AIR verdict ----------------------------------------------------

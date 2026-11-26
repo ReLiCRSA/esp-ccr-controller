@@ -664,7 +664,13 @@ void runDive(int id) {
             ri.vbat = 12.4f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = pulsesLastSnap;
-            ri.deco = &rig.loop().deco();
+            // The published picture, computed exactly the way ControlTask
+            // computes it (deco/view.h): the soak mirrors the PUBLICATION,
+            // not the engine walk — since N8 the engine walk does not exist.
+            ri.hasDecoPicture = true;
+            deco::viewFull(ri.deco, rig.loop().deco(),
+                           rig.loop().deco().depthToBar(ri.smoothedDepthM),
+                           ri.haveVote, ri.shownPpo2);
             logfmt::fillSnapshot(snaps[nSnap++], ri);
             pulsesLastSnap = rig.pulseCount();
             snapAlarm = 0;
@@ -1206,7 +1212,13 @@ void runDepthBusDive() {
             ri.vbat = 12.4f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = rowPulseBase;
-            ri.deco = &rig.loop().deco();
+            // The published picture, computed exactly the way ControlTask
+            // computes it (deco/view.h): the soak mirrors the PUBLICATION,
+            // not the engine walk — since N8 the engine walk does not exist.
+            ri.hasDecoPicture = true;
+            deco::viewFull(ri.deco, rig.loop().deco(),
+                           rig.loop().deco().depthToBar(ri.smoothedDepthM),
+                           ri.haveVote, ri.shownPpo2);
             logfmt::fillSnapshot(row, ri);
             rowPulseBase = ri.pulsesNow;
 
@@ -1725,7 +1737,13 @@ void runWetConnectorDive() {
             ri.vbat = 12.4f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = rowPulseBase;
-            ri.deco = &rig.loop().deco();
+            // The published picture, computed exactly the way ControlTask
+            // computes it (deco/view.h): the soak mirrors the PUBLICATION,
+            // not the engine walk — since N8 the engine walk does not exist.
+            ri.hasDecoPicture = true;
+            deco::viewFull(ri.deco, rig.loop().deco(),
+                           rig.loop().deco().depthToBar(ri.smoothedDepthM),
+                           ri.haveVote, ri.shownPpo2);
             logfmt::fillSnapshot(row, ri);
             rowPulseBase = ri.pulsesNow;
             if (!blindOpen) rowHonest = row;
@@ -1830,12 +1848,13 @@ void runWetConnectorDive() {
         FAIL("dive %d: the no-vote row carries a ppO2 that is not a measurement with nothing "
              "saying so (alarm word 0x%03x): BIT_SENSOR_FAIL is the marker", id,
              rowBlind.alarmBits);
-    if (rowBlind.ndlMin != 480)
-        FAIL("dive %d: the no-vote row reports NDL %d instead of the 480 sentinel: the held "
-             "ppO2 was allowed to reduce the diver's no-deco time", id, rowBlind.ndlMin);
-    if (rowHonest.ndlMin == 480)
-        FAIL("dive %d: the last honest row already carried the 480 sentinel, so the sentinel "
-             "assert above distinguishes nothing", id);
+    if (rowBlind.ndlMin != deco::kNDL_UNKNOWN)
+        FAIL("dive %d: the no-vote row reports NDL %d instead of the unknown sentinel (-1, "
+             "the one pair for file and wire since review N5): the held ppO2 was allowed to "
+             "reduce the diver's no-deco time", id, rowBlind.ndlMin);
+    if (rowHonest.ndlMin == deco::kNDL_UNKNOWN)
+        FAIL("dive %d: the last honest row already carried the unknown sentinel, so the "
+             "sentinel assert above distinguishes nothing", id);
     if (rowsBlindMarker != rowsBlind)
         FAIL("dive %d: only %d of %d no-vote rows carried BIT_SENSOR_FAIL: the file marks some "
              "of the held numbers and not others", id, rowsBlindMarker, rowsBlind);
@@ -2230,7 +2249,13 @@ void runFrozenChannelDive() {
             ri.vbat = 12.4f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = rowPulseBase;
-            ri.deco = &rig.loop().deco();
+            // The published picture, computed exactly the way ControlTask
+            // computes it (deco/view.h): the soak mirrors the PUBLICATION,
+            // not the engine walk — since N8 the engine walk does not exist.
+            ri.hasDecoPicture = true;
+            deco::viewFull(ri.deco, rig.loop().deco(),
+                           rig.loop().deco().depthToBar(ri.smoothedDepthM),
+                           ri.haveVote, ri.shownPpo2);
             logfmt::fillSnapshot(row, ri);
             rowPulseBase = ri.pulsesNow;
             if (!blindOpen) rowHonest = row;
@@ -2325,9 +2350,9 @@ void runFrozenChannelDive() {
              (float)rowBlind.votedX1000 / 1000.0f, heldPpo2);
     if (!(rowBlind.alarmBits & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)))
         FAIL("dive %d: the blind row carries a held ppO2 unmarked (0x%03x)", id, rowBlind.alarmBits);
-    if (rowBlind.ndlMin != 480)
-        FAIL("dive %d: the blind row reports NDL %d instead of the 480 sentinel", id,
-             (int)rowBlind.ndlMin);
+    if (rowBlind.ndlMin != deco::kNDL_UNKNOWN)
+        FAIL("dive %d: the blind row reports NDL %d instead of the unknown sentinel (-1, "
+             "one pair file+wire since N5)", id, (int)rowBlind.ndlMin);
     if (rowsBlindMarker != rowsBlind)
         FAIL("dive %d: only %d of %d blind rows carried BIT_SENSOR_FAIL", id, rowsBlindMarker,
              rowsBlind);

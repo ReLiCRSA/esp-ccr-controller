@@ -70,6 +70,16 @@ struct Fixture {
         : reg(), router(loop, reg, now), link(loop, reg, router, tel, events, hw()) {
         g_fix = this;   // hw() ran before this line; the hooks dereference g_fix
                         // only when the link fires, which is always after here.
+        // On the board, ControlTask publishes a deco generation every cycle
+        // and the `D,` stream answers from that publication (deco/view.h —
+        // review N8: this task no longer walks the engine). A fixture that
+        // never published would simulate a board where control never ran,
+        // and its first answer would be the ERR, not a D, line.
+        deco::View pic{};
+        deco::viewFull(pic, loop.deco(),
+                       loop.deco().depthToBar(loop.depthSmoothedM()),
+                       loop.haveVote(), loop.shownPpo2());
+        deco::publishView(tel.view, pic);
     }
 
     UartLink::Hardware hw() {

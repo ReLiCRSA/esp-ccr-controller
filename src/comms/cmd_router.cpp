@@ -145,31 +145,25 @@ size_t schemaLen() { return g_schemaLen; }
 
 // ---- shared formatters -------------------------------------------------------
 
-proto::DecoInfo CommandRouter::decoInfoOf(const ctrl::Loop& loop, bool hasVote) {
+proto::DecoInfo CommandRouter::decoInfoOf(const deco::View& v) {
+    // Built entirely from the PUBLISHED picture (deco/view.h). Until
+    // 2026-11-28 this function walked the live engine — ceilingM, ndlMinutes
+    // and a full schedule() — on the command/uart2 task while ControlTask
+    // integrated it (review N8's tolerated torn read; review N1's missing
+    // event-row picture was the same root). The publication is also what
+    // makes the dive file's event rows honest: they read the same generation
+    // this answer comes from, so "what the row says" and "what the diver was
+    // shown" cannot disagree.
     proto::DecoInfo d{};
-    const deco::Zhl16Ccr& z = loop.deco();
-    const double amb = z.depthToBar(loop.depthSmoothedM());
-    const double ceilingM = z.ceilingM();
-    d.ceilingM = ceilingM > 0.0f ? static_cast<float>(ceilingM) : 0.0f;
-    if (hasVote) {
-        // shownPpo2 == the live vote whenever hasVote is true (loop.cpp step 2b
-        // only refreshes the shown number from a healthy vote), so this NDL is
-        // computed from a measurement. Without a vote the answer is the protocol's
-        // -1: "no number", which is also how a handset knows the ppO2 beside it on
-        // `T,` is being held.
-        double ndl = z.ndlMinutes(amb, loop.shownPpo2());
-        d.ndlMin = ndl >= 480.0 ? 480 : (ndl < 0.0 ? 0 : static_cast<int>(ndl));
-    } else {
-        d.ndlMin = -1;  // unknown: no vote, no honest NDL to report
-    }
-    const deco::Zhl16Ccr::Schedule sch = z.schedule(amb);
-    d.decoTotalMin = static_cast<float>(sch.totalTimeMin);
-    d.stopCount = sch.count > proto::MAX_STOPS ? proto::MAX_STOPS : sch.count;
+    d.ndlMin = v.ndlMin;  // sentinels carried through: -1 unknown, 480 unlimited
+    d.decoTotalMin = static_cast<float>(v.decoTotalX10) / 10.0f;
+    d.ceilingM = static_cast<float>(v.ceilingCm) / 100.0f;
+    d.stopCount = v.stopCount > proto::MAX_STOPS ? proto::MAX_STOPS : v.stopCount;
     for (int i = 0; i < d.stopCount; ++i) {
-        d.stops[i].depthM = sch.stops[i].depthM;
-        d.stops[i].minutes = sch.stops[i].minutes;
+        d.stops[i].depthM = static_cast<float>(v.stopDepthCm[i]) / 100.0f;
+        d.stops[i].minutes = static_cast<float>(v.stopMinX10[i]) / 10.0f;
     }
-    d.cnsPct = static_cast<float>(z.cnsPct());
+    d.cnsPct = static_cast<float>(v.cnsX10) / 10.0f;
     return d;
 }
 
@@ -511,9 +505,14 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
     }
     if (std::strcmp(key, "D") == 0) {
         // formatted into r.text: a 1024-byte temporary here sat on the uart2
-        // task's stack, on top of the 1024-byte Response copies around it
-        replyInPlace(r, proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()),
-                                          r.text, sizeof(r.text)));
+        // task's stack, on top of the 1024-byte Response copies around it.
+        // From the published picture (see decoInfoOf); no slot/no generation
+        // yet = ERR, never a plan invented from a stale guess.
+        deco::View pic{};
+        if (decoView_ && deco::viewSnapshot(*decoView_, pic))
+            replyInPlace(r, proto::formatDeco(decoInfoOf(pic), r.text, sizeof(r.text)));
+        else
+            replyErr(r, "no deco picture: control not running");
         return;
     }
     if (std::strcmp(key, "TIME") == 0) {
@@ -728,10 +727,17 @@ void CommandRouter::exec(const char* line, Response& r) {
             else replyErr(r, "no clamp active");
             break;
 
-        case Kind::DECO:
-            replyInPlace(r, proto::formatDeco(decoInfoOf(loop_, loop_.haveVote()),
-                                              r.text, sizeof(r.text)));
+        case Kind::DECO: {
+            // Published picture again — the handset's spontaneous 0.5 Hz `D,`
+            // stream (uart_link) and this on-request path answer from the same
+            // generation, so a DECO asked right after a stream line repeats it.
+            deco::View pic{};
+            if (decoView_ && deco::viewSnapshot(*decoView_, pic))
+                replyInPlace(r, proto::formatDeco(decoInfoOf(pic), r.text, sizeof(r.text)));
+            else
+                replyErr(r, "no deco picture: control not running");
             break;
+        }
 
         case Kind::TIME_SET: {
             // Range-checked here, applied by the transport. Deliberately allowed

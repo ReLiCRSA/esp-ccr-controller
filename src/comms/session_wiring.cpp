@@ -252,7 +252,22 @@ void hookAppendSnap(void*) {
     // column: a decision, not a side effect of this refactor.
     ri.pulsesNow = 0;
     ri.pulsesPrev = 0;
-    // And no deco picture, as before the refactor (rowfill.h: RowInputs::deco).
+    // The deco picture: the PUBLISHED generation ControlTask computed for the
+    // edge this row records (deco/view.h — the publisher in main.cpp
+    // recomputes the plan on every event edge, so an alarm-edge row carries
+    // the plan of that instant, not of the last grid). Before 2026-11-28 this
+    // row left ceiling/NDL/deco at zero and every one of them read "no stop"
+    // (finding N1); and the numbers it now carries are the same ones the
+    // `D,` line answers with, because both read one seqlock snapshot.
+    deco::View pic{};
+    ri.hasDecoPicture = deco::viewSnapshot(g_bridgeTel.view, pic);
+    ri.deco = pic;
+    // N3: the flags byte is written now — the vote this row was taken under
+    // (a row during a held-ppO2 window says FAILED, beside a ppO2 column that
+    // shows the held number and an alarm word that marks it) and whether the
+    // proof clamp was up at this instant.
+    ri.voteMode = g_bridgeTel.voteMode;
+    ri.spClamped = g_bridgeTel.cpState == static_cast<uint8_t>(cellproof::State::FAIL);
     logfmt::Snapshot s{};
     logfmt::fillSnapshot(s, ri);
 

@@ -325,7 +325,7 @@ is **not running** in that state, and the protocol divides cleanly:
 
 | | behaviour in SAFE mode |
 |---|---|
-| downlink | **unchanged** — `T,`/`D,`/`E,` keep streaming and `T,` carries mode `SAFE`. The sensor task is alive, so a handset can still watch the machine decide. Note that the mode field is asserted by the link, not by the control chain: the chain is stopped in SAFE and would report whatever it last had, so the router's lockout is the source of truth. |
+| downlink | `T,`/`E,` **keep streaming** and `T,` carries mode `SAFE`. `D,` **goes quiet**, and `DECO`/`GET D` answer `ERR no deco picture: control not running` (since 2026-11-28). That is deliberate: the `D,` line is the ControlTask-published deco picture, and a SAFE controller has no chain that ever computed one — printing zeros (the pre-change behaviour) put a fake "no stop, 0 NDL" plan on a diver-facing deco line, which is exactly what this protocol refuses to do. Treat a missing `D,` as the same fact `T,`'s mode field already states. The mode field is asserted by the link, not by the control chain: the chain is stopped in SAFE and would report whatever it last had, so the router's lockout is the source of truth. |
 | every command except `ACK` | `ERR safe mode` |
 | `ACK` | `OK SAFE RESTART`, then the controller restarts itself cleanly |
 
@@ -395,7 +395,9 @@ D,<ndl_min>,<deco_total_min>,<ceiling_m>[,<stop_depth>|<stop_min>]...,<cns_pct>
 e.g. D,17,24.5,6.00,6|4.5,3|20.0,12.3
 ```
 `<ndl_min>`: integer; **480 = effectively unlimited; -1 = unknown (no valid
-vote yet — show "—", never 0)**. Stop pairs appear between ceiling and CNS,
+vote yet — show "—", never 0)**. Since 2026-11-28 the dive file's `ndl` column
+uses the **same pair** (§5.1), so one parser table serves both surfaces. Stop
+pairs appear between ceiling and CNS,
 zero or more (max 8), depth integer metres, minutes 1 decimal. CNS % is last
 (1 decimal). A client that ignores stop pairs must still find CNS as the
 **last** field — new pairs are only ever inserted before it (append-only rule, §7).
@@ -619,6 +621,19 @@ The renderer is the firmware's own (`logfmt::isoUtc`, closed-form civil date)
 — not newlib's `gmtime`/`strftime`, whose time and float tables do not belong
 on the task that answers clients.
 
+**The 2026-11-28 row-content changes did not bump `row_format`, and clients do
+not need to re-validate.** The append-only rule guards field order, count and
+units; none moved. What changed is that documented columns became *true*:
+event rows fill their deco columns (they had always been documented), the
+sentinel pair names a value the spec's own `D,` table has always listed, and
+`flags` finally carries the layout v2 documented. A client that had learned
+the old behaviour as fact — e.g. "event rows always show 0" — held a belief
+that was never published; the v2→v3 precedent shows the bar for a bump is a
+**new field**, and no field arrived here. The web page needed no change: its
+dive view draws only t/depth/ppO₂ from the `S,` rows (no ndl, ceiling or
+flags column anywhere), and its live `D,` handler already answers `—` for
+`ndl < 0`.
+
 **What the `M,` totals row says when there is nothing to total.** Pinned
 2026-11-24, because every one of these was previously a lie on real flash:
 
@@ -653,6 +668,39 @@ than wire errors:
 Snapshots land on a 30 s grid plus event-driven ones. Handsets can ignore the
 export rows entirely (the web page renders them); the format is documented so
 a handset *can* offer a dump-to-host feature.
+
+**Both kinds of `S,` row carry the decompression picture, and they agree**
+(pinned 2026-11-28). The grid row and the event-driven row read one published
+value snapshot that ControlTask computes — the same generation the `D,` line
+answers from — so an alarm-edge row and the `D,` the diver was shown at that
+instant cannot state different deco numbers. Before this date event rows left
+`ceiling_m`, `ndl` and `deco_min` at zero, so every alarm-edge row read as a
+diver with no stop and no NDL left; those zeros are a defect, not a shape.
+The freshness that comes with them: ceiling, NDL and CNS are computed every
+100 ms control cycle; the deco **plan** (`deco_min`) is recomputed at the 30 s
+grid and at every event edge, so an event row's plan is the plan of its edge.
+A quiet dive's plan columns are at most 30 s old; measured drift over that
+window at 45 m after 60 min is 1 cm of ceiling and +1 min of deco total
+(staying at depth makes the obligation worse, so a stale plan reads slightly
+permissive — the direction is named because the bound is only honest with it).
+
+**The `ndl` column's sentinel pair is one convention for file and wire**
+(2026-11-28): `-1` = unknown (no valid vote, nothing to total — the value `D,`
+has always answered, §2) and `480` = the engine's own "unlimited". Before this
+date the *file* wrote 480 for both facts, so an unanswerable NDL and an
+unlimited one read alike — and `-1` rows were indistinguishable from
+impossible negatives. A row's zero deco columns now belong to exactly one
+case: written in the boot window before the first control cycle published a
+picture.
+
+**The `flags` byte is written** (documented since v2, filled by nobody until
+2026-11-28 — every file ever exported said "OK 3-cell, not clamped"). b0 =
+the setpoint clamp was up at this instant; b1..2 = the voting mode the row
+was taken under (0 ok 3-cell, 1 degraded 2-cell, 2 single, 3 failed — the
+same vocabulary as `T,`'s held-ppO2 rule, §2). A row written while the chain
+**held** a ppO2 across a failed vote says FAILED here, beside a `voted` column
+showing the held number and an alarm word marking it: three bytes, one fact.
+No format change; the bits and columns already existed.
 
 **`E,` rows are ambiguous inside an export, on purpose and by shape.** An
 exported event row is `E,<t_s>,<id>,<value>` — byte-identical to the live event

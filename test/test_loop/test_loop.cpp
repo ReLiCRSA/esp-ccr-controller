@@ -869,7 +869,14 @@ void test_the_row_written_in_a_failed_vote_holds_the_number_and_marks_it() {
     ri.autoMode = st.autoMode;
     ri.alarmLogBits = st.alarms.logBits;
     ri.vbat = 12.4f;
-    ri.deco = &w.dead.deco();
+    // The published picture (deco/view.h). haveVote is false, so the picture
+    // carries the unknown sentinel — the held ppO2 is what the diver is
+    // SHOWN, never what may be TOTALLED into an NDL.
+    ri.hasDecoPicture = true;
+    deco::viewFull(ri.deco, w.dead.deco(),
+                   w.dead.deco().depthToBar(ri.smoothedDepthM),
+                   st.haveVote, st.shownPpo2);
+    ri.voteMode = 3;   // voting::FAILED — the flags byte says it (N3)
 
     logfmt::Snapshot row{};
     logfmt::fillSnapshot(row, ri);
@@ -883,9 +890,13 @@ void test_the_row_written_in_a_failed_vote_holds_the_number_and_marks_it() {
     TEST_ASSERT_TRUE_MESSAGE(row.alarmBits & (1u << alarms::BIT_SENSOR_FAIL),
                              "the row carries a ppO2 that is not a measurement with nothing "
                              "saying so: BIT_SENSOR_FAIL must be in the log alarm word");
-    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, row.ndlMin,
-                                    "a row with no vote does not carry the 480 sentinel: the "
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(deco::kNDL_UNKNOWN, row.ndlMin,
+                                    "a row with no vote does not carry the unknown sentinel "
+                                    "(-1, the one pair for file and wire — review N5): the "
                                     "held ppO2 was allowed to compute an NDL");
+    TEST_ASSERT_TRUE_MESSAGE((row.flags & 0x06) == 0x06,
+                             "the row's flags byte says OK-voting in the middle of a "
+                             "failed vote (N3: this row is the held-vote seam)");
 }
 
 int main() {

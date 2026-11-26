@@ -963,6 +963,17 @@ deco::Zhl16Ccr loadedEngine() {
     return eng;
 }
 
+// Attach the deco picture exactly the way ControlTask does (deco/view.h):
+// compute the published value snapshot from the engine at the row's own
+// depth. Since 2026-11-28 this is the ONLY way a row gets deco columns —
+// the fill itself does no engine arithmetic (N8: RowInputs::deco is the
+// value picture, not the live engine).
+void attachPicture(logfmt::RowInputs& ri, const deco::Zhl16Ccr& eng) {
+    ri.hasDecoPicture = true;
+    deco::viewFull(ri.deco, eng, eng.depthToBar(ri.smoothedDepthM),
+                   ri.haveVote, ri.shownPpo2);
+}
+
 }  // namespace
 
 // The defect this whole module guards against, at the exact inputs that caught it
@@ -1026,7 +1037,7 @@ void test_the_deco_columns_are_measured_at_the_chains_depth() {
     logfmt::RowInputs ri = benchRow();
     ri.smoothedDepthM = 40.0f;     // the chain's held depth; the diver may be elsewhere
     ri.shownPpo2 = 1.30f;
-    ri.deco = &eng;
+    attachPicture(ri, eng);
     logfmt::fillSnapshot(s, ri);
 
     TEST_ASSERT_TRUE_MESSAGE(s.ceilingCm > 0, "20 min at 40 m demanded no ceiling: the engine "
@@ -1055,40 +1066,162 @@ void test_the_deco_columns_are_measured_at_the_chains_depth() {
                                  (std::string("the appended ceiling_cm is not the value the "
                                               "fill stored: ") + line).c_str());
 
-    // No vote: the NDL column says "nothing to total" (the same 480 the engine
-    // saturates at), while the vote the chain last made stays in its column.
+    // No vote: the picture is computed with haveVote = false, so the NDL
+    // column answers the UNKNOWN sentinel (deco::kNDL_UNKNOWN, -1) — the
+    // same number `D,` has always answered, and since review N5 the same
+    // number EVERYWHERE. It is deliberately NOT 480: 480 is the engine's
+    // own "unlimited", and "unanswerable" and "unlimited" are different
+    // facts a reader must be able to tell apart. The held ppO2 itself
+    // stays in its column, marked by the alarm word.
     logfmt::Snapshot q{};
     logfmt::RowInputs qi = ri;
     qi.haveVote = false;
+    attachPicture(qi, eng);
     logfmt::fillSnapshot(q, qi);
-    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, q.ndlMin,
-                                    "a row with no vote does not carry the 480 sentinel — an "
-                                    "unanswerable NDL and an unlimited one are now the same "
-                                    "number");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(deco::kNDL_UNKNOWN, q.ndlMin,
+                                    "a row with no vote does not carry the unknown sentinel "
+                                    "(-1): an unanswerable NDL and an unlimited one (480) "
+                                    "are the same number again");
     TEST_ASSERT_EQUAL_INT16(1300, q.votedX1000);
     TEST_ASSERT_EQUAL_INT16(s.ceilingCm, q.ceilingCm);   // the ceiling is not a voted quantity
 }
 
-// The event-driven row's documented shape: no deco picture, so those three columns
-// are zero. Pinned, because it is a difference a reader can be misled by and
-// because "fixing" it must be a decision about a documented column, not an accident.
-void test_a_row_with_no_deco_picture_leaves_the_deco_columns_zero() {
-    deco::Zhl16Ccr eng = loadedEngine();
+// N1's honest replacement for the old zero-pin. The shape that was pinned
+// here until 2026-11-28 — event rows writing ceiling/NDL/deco as zeros, every
+// one readable as "no stop / no NDL left" — is now a DEFECT, not a format.
+// The event row and the grid row read the same published deco::View, so at
+// one instant they CANNOT disagree about the decompression picture, and a
+// zeroed plan column beside a demanded stop reddens this case.
+void test_event_and_grid_rows_carry_the_same_published_deco_picture() {
+    deco::Zhl16Ccr eng = loadedEngine();   // loaded: a stop IS demanded
+    logfmt::RowInputs grid = benchRow();
+    grid.smoothedDepthM = 40.0f;
+    grid.shownPpo2 = 1.30f;
+    attachPicture(grid, eng);
+    logfmt::Snapshot g{};
+    logfmt::fillSnapshot(g, grid);
+
+    // The published picture demands a stop — the guard reads the PICTURE, so
+    // a fill that drops it reddens on the comparison below, with N1's words,
+    // not on this guard.
+    TEST_ASSERT_TRUE_MESSAGE(grid.deco.ceilingCm > 0,
+                             "the loaded engine demands no ceiling: the case proves nothing");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(grid.deco.ceilingCm, g.ceilingCm,
+                                  "the row's ceiling is not the published picture's ceiling");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(grid.deco.ndlMin, g.ndlMin,
+                                  "the row's ndl is not the published picture's ndl");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(static_cast<int16_t>(grid.deco.decoTotalX10 / 10), g.decoTotalMin,
+                                    "the integer deco-total column is not the published x10 "
+                                    "value divided by 10 — column and `D,` decimal can now "
+                                    "disagree by a rounding");
+
+    // An event row at the same instant: same picture, same columns. This is
+    // the N1 fix as a test — the event row used to write zeros here.
+    logfmt::RowInputs ev = grid;
+    ev.pulsesNow = ev.pulsesPrev;         // event rows have no window of their own
+    logfmt::Snapshot e{};
+    logfmt::fillSnapshot(e, ev);
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(grid.deco.ceilingCm, e.ceilingCm,
+                                    "an event row beside a demanded stop still zeroes the "
+                                    "ceiling: finding N1 is back — every alarm-edge row "
+                                    "would read as a diver with no stop");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(grid.deco.ndlMin, e.ndlMin,
+                                    "an event row's ndl is not the published picture's: "
+                                    "N1's direction (a 0 NDL alarms the reader) is back");
+    TEST_ASSERT_EQUAL_INT16(e.decoTotalMin, g.decoTotalMin);
+    TEST_ASSERT_TRUE_MESSAGE(e.ceilingCm > 0 && e.decoTotalMin > 0,
+                             "an event row beside a demanded stop reads as no obligation: "
+                             "finding N1 is back");
+
+    // The ONLY rows that may carry zeroed deco columns now: the boot window
+    // before the first control cycle published a picture. Named, because a
+    // reader must know which zeros mean "no picture yet" and none that mean
+    // "no obligation".
+    logfmt::RowInputs boot = benchRow();
+    TEST_ASSERT_FALSE(boot.hasDecoPicture);
+    logfmt::Snapshot b{};
+    logfmt::fillSnapshot(b, boot);
+    TEST_ASSERT_EQUAL_INT16(0, b.ceilingCm);
+    TEST_ASSERT_EQUAL_INT16(0, b.ndlMin);
+    TEST_ASSERT_EQUAL_INT16(0, b.decoTotalMin);
+}
+
+// Review N5, named: ONE sentinel pair for the file and the wire, defined once
+// (deco/view.h). -1 answers "there is no number" (no valid vote) — the value
+// `D,` has always used; 480 answers "unlimited" — the engine's own saturation.
+// A dive file that conflates them makes an unanswerable NDL read as the most
+// conservative-good news column there is.
+void test_the_ndl_sentinels_are_the_named_pair_on_every_surface() {
+    deco::Zhl16Ccr loaded = loadedEngine();
+    logfmt::RowInputs ri = benchRow();
+    ri.smoothedDepthM = 40.0f;
+    ri.shownPpo2 = 1.30f;
+    ri.haveVote = false;
+    attachPicture(ri, loaded);
+    logfmt::Snapshot u{};
+    logfmt::fillSnapshot(u, ri);
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(-1, u.ndlMin,
+        "kNDL_UNKNOWN must be -1 everywhere: the wire's documented unknown "
+        "value and the file's must stay ONE number");
+    TEST_ASSERT_EQUAL_INT16(deco::kNDL_UNKNOWN, u.ndlMin);
+
+    // Unlimited: a shallow, freshly loaded engine has no NDL limit, and
+    // ndlMinutes() saturates — the file says kNDL_UNLIMITED, and it is a
+    // different fact from the row above.
+    deco::Config dc;
+    deco::Zhl16Ccr fresh(dc);
+    fresh.reset();
+    for (int i = 0; i < 20; i++) fresh.step(10.0, fresh.depthToBar(10.0), 1.30);
+    logfmt::RowInputs si = benchRow();
+    si.smoothedDepthM = 10.0f;
+    si.shownPpo2 = 1.30f;
+    si.haveVote = true;
+    attachPicture(si, fresh);
+    logfmt::Snapshot lim{};
+    logfmt::fillSnapshot(lim, si);
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, lim.ndlMin,
+        "kNDL_UNLIMITED must be 480 — the engine's saturation value, the same "
+        "number `D,` prints for unlimited NDL");
+    TEST_ASSERT_TRUE_MESSAGE(lim.ndlMin != u.ndlMin,
+        "the unlimited answer and the unanswerable one collapsed into one "
+        "number again — the N5 pair must stay distinct");
+}
+
+// Review N3: the documented flags byte is WRITTEN. The voting mode is the
+// same vocabulary the held-ppO2 rule uses (a row during a failed vote says
+// FAILED, not OK), and the clamp bit is the proof clamp up at this instant.
+void test_the_flags_byte_says_how_the_vote_and_the_clamp_stood() {
     logfmt::Snapshot s{};
     logfmt::RowInputs ri = benchRow();
-    ri.deco = nullptr;
+    ri.voteMode = 1;            // voting::DEGRADED_2CELL
+    ri.spClamped = false;
     logfmt::fillSnapshot(s, ri);
-    TEST_ASSERT_EQUAL_INT16(0, s.ceilingCm);
-    TEST_ASSERT_EQUAL_INT16(0, s.ndlMin);
-    TEST_ASSERT_EQUAL_INT16(0, s.decoTotalMin);
-    // Everything else is still filled: an event row is a measurement row, not a
-    // stub. (A ceiling of 0 here reads as "no stop demanded", which is what needs
-    // deciding before these columns are wired.)
-    TEST_ASSERT_EQUAL_INT32(2030, s.depthCm);
-    TEST_ASSERT_EQUAL_UINT16(0x0010, s.alarmBits);
-    TEST_ASSERT_TRUE_MESSAGE(eng.ceilingM() > 0.0,
-                             "the engine in this case demands no stop, so the zeros below "
-                             "would prove nothing");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0x02, s.flags,
+        "b1..2 must carry the voting mode: a two-cell dive file said OK 3-cell (N3)");
+
+    logfmt::Snapshot c{};
+    logfmt::RowInputs ci = benchRow();
+    ci.voteMode = 3;            // voting::FAILED — the held-ppO2 window (N2 synergy)
+    ci.spClamped = true;        // and under the proof clamp
+    logfmt::fillSnapshot(c, ci);
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0x07, c.flags,
+        "a row written held AND clamped must say both: b0 clamped, b1..2 FAILED");
+
+    // The codec round-trip keeps the low bits while still borrowing b3..4
+    // for the top alarm bits (divelog.h): the written byte and the borrowed
+    // byte must not collide.
+    logfmt::Snapshot p{};
+    logfmt::RowInputs pi = benchRow();
+    pi.voteMode = 2;            // SINGLE
+    pi.spClamped = true;
+    pi.alarmLogBits = (1u << 8) | (1u << 9);   // CNS + hypoxia: the borrowed pair
+    logfmt::fillSnapshot(p, pi);
+    uint8_t bytes[logfmt::SNAPSHOT_SIZE];
+    TEST_ASSERT_EQUAL(logfmt::SNAPSHOT_SIZE, logfmt::packSnapshot(p, bytes));
+    logfmt::Snapshot back{};
+    TEST_ASSERT_TRUE(logfmt::unpackSnapshot(bytes, back));
+    TEST_ASSERT_EQUAL_UINT8(0x05, back.flags);   // 1 | (2<<1)
+    TEST_ASSERT_EQUAL_UINT16(pi.alarmLogBits, back.alarmBits);
 }
 
 // The pulses column is a difference of two absolute counters, widened in uint32
@@ -1194,7 +1327,8 @@ void test_temp_and_flags_stay_unwritten_until_somebody_owns_them() {
 // WHICH existing bytes mark a held ppO2, in a form that fails if they stop
 // marking it): a row written while the vote is failed keeps the shown number in
 // the `voted` column, carries BIT_SENSOR_FAIL (bit 3) in its alarm word, and
-// states ndl 480 = "no vote, nothing to total". No new column anywhere.
+// states ndl -1 (deco::kNDL_UNKNOWN — one sentinel, file and wire, review
+// N5). No new column anywhere.
 void test_a_failed_vote_row_marks_the_held_number_with_existing_bytes() {
     deco::Zhl16Ccr eng = loadedEngine();  // a loaded engine: the sentinel must beat a real NDL
     logfmt::Snapshot s{};
@@ -1203,7 +1337,8 @@ void test_a_failed_vote_row_marks_the_held_number_with_existing_bytes() {
     ri.haveVote = false;               // and it is not a measurement any more
     ri.alarmLogBits = (1u << 3);       // alarms::BIT_SENSOR_FAIL, the LOG view
     ri.smoothedDepthM = 40.0f;
-    ri.deco = &eng;
+    ri.voteMode = 3;                       // voting::FAILED — the same fact, flags view
+    attachPicture(ri, eng);                // computes ndl as UNKNOWN (no vote)
     logfmt::fillSnapshot(s, ri);
 
     char line[256];
@@ -1217,8 +1352,13 @@ void test_a_failed_vote_row_marks_the_held_number_with_existing_bytes() {
                                               "BIT_SENSOR_FAIL beside it; row was: ") + line).c_str());
     TEST_ASSERT_NULL_MESSAGE(std::strstr(line, ",0.000,"),
                              "the failed vote wrote a 0.000 measurement into the row again");
-    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, s.ndlMin,
-                                    "no 480 sentinel: the held ppO2 was allowed to compute an NDL");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(deco::kNDL_UNKNOWN, s.ndlMin,
+                                    "no unknown sentinel (-1): the held ppO2 was allowed to "
+                                    "compute an NDL — the number that may be SHOWN is not the "
+                                    "number that may be TOTALLED");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(0x06, s.flags & 0x06,
+        "the flags byte says OK-mode beside a held ppO2: a held-vote row must "
+        "say FAILED in b1..2, not the healthy default (N3 x N2)");
 }
 
 int main() {
@@ -1258,7 +1398,9 @@ int main() {
     RUN_TEST(test_the_fill_stores_the_count_the_renderer_prints);
     RUN_TEST(test_the_fill_stores_the_digits_the_wire_prints);
     RUN_TEST(test_the_deco_columns_are_measured_at_the_chains_depth);
-    RUN_TEST(test_a_row_with_no_deco_picture_leaves_the_deco_columns_zero);
+    RUN_TEST(test_event_and_grid_rows_carry_the_same_published_deco_picture);
+    RUN_TEST(test_the_ndl_sentinels_are_the_named_pair_on_every_surface);
+    RUN_TEST(test_the_flags_byte_says_how_the_vote_and_the_clamp_stood);
     RUN_TEST(test_the_pulses_column_is_a_window_delta);
     RUN_TEST(test_mode_is_the_dive_state_not_just_the_autopilot);
     RUN_TEST(test_the_row_carries_the_log_alarm_view_whole);

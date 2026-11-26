@@ -228,6 +228,19 @@ Zhl16Ccr::Schedule Zhl16Ccr::schedule(double pAmbBar) const {
         }
     };
 
+    // Cost shape, pinned by a host budget test (test_controlplane, H2):
+    // this loop's work is QUADRATIC in the bottom depth and CAPPED twice —
+    // per-stop holds at 180 min, and the whole walk at 1000 grid steps.
+    // Worst case measured on x86 at the deepest load this sensor can legally
+    // produce (~100 m, all 16 tissues loaded, every hold capped): 382 us for
+    // schedule(), ~330 us for the whole row fill including ndlMinutes(). The
+    // ESP32 pays a further factor for its soft-float doubles; the first HB
+    // `worst=` bench reading replaces that factor with a measurement. The
+    // bound is honest because BOTH multipliers are constants: the per-stop
+    // cap, and the grid-step count, which cannot exceed the bottom depth /
+    // stopGridM and whose depth is the smoothed pressure reading the dive
+    // physics produced — this engine is never asked to plan an ascent from a
+    // depth the board has not measured.
     int guard = 0;
     while (depth > 0.001 && guard++ < 1000) {
         const double ceilM = ceilingDepth();

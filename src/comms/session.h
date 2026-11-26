@@ -159,8 +159,27 @@ size_t formatReplyMarker(char* out, size_t cap, uint16_t lines, bool dropped);
 /// Dive-log accessors for ControlTask's 30 s grid. The file itself is opened
 /// and closed by diver commands (DIVE START|END), so the control task only
 /// hands rows over to the single owner. No-ops when nothing is recording.
+/// (diveLogRecording/diveLogAppendGrid wait portMAX_DELAY and are COMMAND-TASK
+/// entry points only — nothing on the control task's call path may block on
+/// the log. The native source-scan test in test/test_controlplane pins that;
+/// review H2.)
 bool diveLogRecording();
 void diveLogAppendGrid(const logfmt::Snapshot& s);
+
+/// The CONTROL-TASK entry points: bounded waits, deferral instead of stalling,
+/// and an honest counter when a row is lost. rowgate.h carries the policy and
+/// what a dive-file reader can and cannot tell from these numbers.
+void diveLogPostGrid(const logfmt::Snapshot& s);  // one due row; small bounded wait
+void diveLogRetryGrid();                          // every cycle: zero-wait retry
+uint32_t diveLogSkippedRows();                    // the HB `logskip=` field
+
+/// Bounded surface-record append for the control task (CAL AIR / pre-dive
+/// verdict edges). One pending record slot, retried like the grid row; a
+/// record lost to a busy store is counted, never silent.
+enum SurfAppend : uint8_t { SURF_WRITTEN = 0, SURF_BUSY = 1 };
+SurfAppend surfaceLogAppendBounded(logfmt::SurfaceRecord& r);
+void surfaceRetryPending();                       // every cycle: zero-wait retry
+uint32_t surfaceSkippedRecords();                 // the HB `surfskip=` field
 
 /// Dive-file reads for the web pages. Serialized with the command path (same
 /// lock): an export must not race DIVE START opening the next file. Returns

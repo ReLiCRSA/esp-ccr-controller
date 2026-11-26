@@ -37,6 +37,32 @@
 //     a row is allowed to read is a task-ownership question, and this module must
 //     not have an opinion about it;
 //   * whether the row carries a deco picture at all — see RowInputs::deco.
+//
+// N8 — WHO OWNS DECO STATE, stated once, here, because three files used to
+// hint at it in prose and the type (a bare const pointer) enforces nothing:
+//   * ctrl::Loop::deco_ is OWNED BY ControlTask. Only the control thread ever
+//     advances it (step/stepTissues/stepCns), re-tunes it (setConfig, queued
+//     through the A5e deferred-apply path) or computes dive-file deco columns
+//     from it (the 30 s grid row: fillSnapshot with a non-null deco pointer
+//     happens at exactly one call site, on the control task).
+//   * Every OTHER reader is a stale-read-by-construction: the bridge scalars
+//     are copied once per control cycle; the event-driven snapshot row passes
+//     deco = nullptr precisely so it can never compute deco columns from a
+//     half-updated engine on the command task.
+//   * The one concurrent LIVE reader that remains is the handset/web answer
+//     builder (CommandRouter::decoInfoOf: ceilingM/ndlMinutes/schedule on the
+//     command task while ControlTask integrates). It is a benign torn read —
+//     doubles are aligned word loads on the ESP32, and the worst outcome is a
+//     D, schedule off by at most one control step of tissue movement (~100 ms
+//     of physiology) — but it is tolerated, not endorsed. The structural fix
+//     is a ControlTask-published deco SNAPSHOT (picture struct) that the
+//     command task reads instead of the engine; that is deliberately NOT in
+//     this batch: it moves the diver-visible NDL/plan freshness model and
+//     belongs with the D, line's contract, not with a control-plane stall
+//     fix. H2 kept the heavy deco math ON ControlTask (bounded: see the
+//     cost-shape comment in zhl16c schedule()) precisely because the
+//     alternative — computing it on another task — would turn this prose
+//     into a real race on the engine's live state.
 // ============================================================================
 #pragma once
 

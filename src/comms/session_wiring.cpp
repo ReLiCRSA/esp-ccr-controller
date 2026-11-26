@@ -16,6 +16,17 @@
 //   * Nothing in this file may block on anything a diver is waiting for. The
 //     session lock is held only while a command executes; every hook is a
 //     bounded, non-blocking action (flag set, record appended, radio moved).
+//     That sentence used to be a lie in one place, and review H2 caught it:
+//     the CONTROL-task paths into the two stores (the 30 s grid row, the
+//     CAL AIR / pre-dive verdict records) waited portMAX_DELAY on the very
+//     mutex a multi-second log export holds — a diver browsing his dive list
+//     mid-dive could stall the control loop into the supervisor's 1500 ms
+//     reboot. Those paths are bounded now (rowgate.h): small budget on the
+//     first attempt, zero-wait retries after, and a named lost-row counter
+//     when deferral runs out of road. The portMAX_DELAY waits that remain in
+//     this file are all command-task entry points, and a native source scan
+//     (test/test_controlplane) fails the build if a control-task entry point
+//     ever grows one again.
 // ============================================================================
 #include <Arduino.h>
 #include <esp_sleep.h>
@@ -30,6 +41,7 @@
 #include "config/defaults.h"
 #include "log/dive_store.h"
 #include "log/rowfill.h"      // the one snapshot-row fill (grid row and event row)
+#include "log/rowgate.h"      // the ControlTask grid-row deferral policy (H2)
 #include "log/surface_store.h"
 
 // The chain, the registry and the bridge belong to main.cpp; the session must
@@ -74,6 +86,26 @@ SemaphoreHandle_t g_sessionMtx = nullptr;
 SemaphoreHandle_t g_logMtx = nullptr;
 uint32_t g_diveStartMs = 0;
 
+// ---- the control task's bounded paths into the two stores (review H2) ------
+// rowgate.h owns the grid-row deferral policy and its counters; the surface
+// log gets the same shape inline (one pending record slot, zero-wait retries),
+// because it is three call sites and does not need its own class.
+logfmt::GridGate g_gridGate;
+logfmt::SurfaceRecord g_surfPending{};
+bool g_surfPendingDue = false;
+uint32_t g_surfLost = 0;
+
+// Take the log mutex for at most budgetMs. 0 is a true try-lock (xSemaphoreTake
+// with 0 ticks never yields). FreeRTOS ticks are 10 ms on this build, so a
+// sub-tick budget rounds UP to one tick: the bound is "at most one tick of
+// waiting", never a silently-zero budget.
+bool logLockTry(uint32_t budgetMs) {
+    if (!g_logMtx) return false;
+    TickType_t ticks = pdMS_TO_TICKS(budgetMs);
+    if (budgetMs && ticks == 0) ticks = 1;  // round up: a real budget never becomes a try-lock
+    return xSemaphoreTake(g_logMtx, ticks) == pdTRUE;
+}
+
 void lockAcquire(void*) {
     if (g_sessionMtx) xSemaphoreTake(g_sessionMtx, portMAX_DELAY);
 }
@@ -108,6 +140,19 @@ bool hookOpenDive(uint32_t epoch, void*) {
 void hookCloseDive(const logfmt::DiveMeta& meta, void*) {
     if (!g_logMtx) return;
     xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    // A grid row deferred by the H2 gate still belongs to THIS dive: the
+    // closer flushes it, inside the same lock, before the totals are written
+    // and the file closes. This runs on the command task, where the unbounded
+    // wait is allowed. If a row is still pending after this, it was lost, and
+    // the gate already counted it (HB `logskip=`).
+    if (g_gridGate.pending() && g_diveStore.recording()) {
+        g_diveStore.append(g_gridGate.pendingRow());
+        g_gridGate.claimPendingWritten();  // in the file: not a loss
+    }
+    if (g_surfPendingDue) {
+        if (g_surfaceStore.append(g_surfPending)) g_surfPendingDue = false;
+        else g_surfLost++;
+    }
     // The two count columns are filled from the store, not from the chain: the
     // store wrote the rows, so it is the only thing that can say how many there
     // are. `M,` claims them, and until 2026-11-24 it claimed 0/0 for a dive that
@@ -331,12 +376,63 @@ void clockBootText(char* out, size_t cap) {
                  (unsigned long)wallclock::ageS(g_clock, millis()));
 }
 
+logfmt::GridGate::Result gridAppendAttempt(uint32_t budgetMs) {
+    if (!logLockTry(budgetMs)) return logfmt::GridGate::BUSY;
+    if (g_diveStore.recording()) g_diveStore.append(g_gridGate.pendingRow());
+    // Not recording: nothing to write and nothing pending — the dive simply
+    // has no file. Treated as WRITTEN (consumed) here because a dive that is
+    // not being recorded must not have its grid counter cry wolf every cycle.
+    xSemaphoreGive(g_logMtx);
+    return logfmt::GridGate::WRITTEN;
+}
+
+void diveLogPostGrid(const logfmt::Snapshot& s) {
+    g_gridGate.post(s.tSec, s);
+}
+
+void diveLogRetryGrid() { g_gridGate.retry(); }
+
+uint32_t diveLogSkippedRows() { return g_gridGate.lostRows(); }
+
+// ---- control-task surface records: same shape (CAL AIR / pre-dive edges) ---
+
+SurfAppend surfaceLogAppendBounded(logfmt::SurfaceRecord& r) {
+    if (g_surfPendingDue) g_surfLost++;  // a record displaced is a record lost
+    r.epoch = wallclock::epoch(g_clock, millis());
+    r.flags = (g_clock.source == wallclock::CARRIED)
+                  ? logfmt::SURF_FLAG_CLOCK_CARRIED : 0u;
+    g_surfPending = r;
+    g_surfPendingDue = true;
+    if (logLockTry(2u)) {
+        const bool ok = g_surfaceStore.append(g_surfPending);
+        xSemaphoreGive(g_logMtx);
+        if (ok) {
+            g_surfPendingDue = false;
+            return SURF_WRITTEN;
+        }
+    }
+    return SURF_BUSY;  // pending stands; retried with a zero wait every cycle
+}
+
+void surfaceRetryPending() {
+    if (!g_surfPendingDue || !logLockTry(0u)) return;
+    const bool ok = g_surfaceStore.append(g_surfPending);
+    xSemaphoreGive(g_logMtx);
+    if (ok) g_surfPendingDue = false;
+}
+
+uint32_t surfaceSkippedRecords() { return g_surfLost; }
+
 bool initSession(ctrl::Loop& loop, settings::Registry& reg, bridge::Telemetry& tel,
                  bridge::EventRing& events) {
     if (g_sessionMtx == nullptr)
         g_sessionMtx = xSemaphoreCreateMutex();
     if (g_logMtx == nullptr) g_logMtx = xSemaphoreCreateMutex();
     if (g_sessionMtx == nullptr || g_logMtx == nullptr) return false;
+    // The gate's store seam (rowgate.h): attempt the append under a bounded
+    // log-mutex wait. Wired once, here, so the ONLY way ControlTask reaches
+    // the dive file is through this bounded door.
+    g_gridGate.setAppender([](uint32_t budgetMs) { return gridAppendAttempt(budgetMs); });
 
     Session::Lock lock;
     lock.acquire = lockAcquire;
@@ -360,6 +456,9 @@ void diveLogAppendGrid(const logfmt::Snapshot& s) {
     g_diveStore.append(s);
     xSemaphoreGive(g_logMtx);
 }
+
+// ---- control-task grid rows: bounded, deferred, counted (review H2) --------
+
 
 int diveLogExportCsv(int slot, void (*sink)(const char*, void*), void* ctx) {
     CsvSinkCtx o{sink, ctx, slot, -1};

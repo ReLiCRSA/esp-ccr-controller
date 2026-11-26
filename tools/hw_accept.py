@@ -319,6 +319,23 @@ CRASH_MARKERS = [
 ]
 HB_STACK_RE = re.compile(r"stk=(\d+)(?: u2stk=(\d+))?")
 
+# H2 observability fields, appended to HB after stk=/u2stk= under the same
+# append-only rule. `worst=` is the worst ControlTask cycle-to-cycle span
+# since the last beat — exactly the quantity the supervisor measures when it
+# decides to esp_restart() at TASK_STALL_CONTROL_MS = 1500 ms. The graded
+# line is 800 ms: two full supervisor periods below the reboot budget, and
+# orders of magnitude above anything the control chain legitimately costs
+# (worst-case 30 s row fill, ndlMinutes + schedule() at the deepest load the
+# depth sensor can legally report: ~1.35 ms host-measured, pinned by the
+# test_controlplane budget test). A board beating at 900 ms is not rebooting
+# yet — it is one long flash write away from it, and that is a finding.
+# `logskip=`/`surfskip=` are CUMULATIVE lost-record counters since boot
+# (rowgate.h deferral ran out of road: a row the busy store never took).
+# A healthy bench run loses nothing: a nonzero is a real hole in a dive file
+# and is graded like one.
+HB_CYCLE_RE = re.compile(r"worst=(\d+) logskip=(\d+) surfskip=(\d+)")
+HB_WORST_CYCLE_MS = 800
+
 
 def grade_depth(lines, expect_depth):
     """The depth announce, graded against the rest of the boot.
@@ -1816,6 +1833,102 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
     else:
         checks.append((f"u2stk= headroom >= 512 (worst {worst['u2stk']})",
                        worst["u2stk"] >= 512, "see HB lines"))
+
+    # H2: the stall margin and the lost-record counters, same grading shape as
+    # stk= — a missing field is itself a FAIL (the firmware must always tell),
+    # then the threshold. worst= resets every beat (per-beat margin); the
+    # skip counters are cumulative since boot, so the maximum seen is the
+    # current total.
+    worst_cycle = None
+    lost = {"logskip": None, "surfskip": None}
+    for l in list(lines) + list(boot_lines or []):
+        m = HB_CYCLE_RE.search(l)
+        if not m:
+            continue
+        w, lr, ls = (int(x) for x in m.groups())
+        worst_cycle = w if worst_cycle is None else max(worst_cycle, w)
+        for key, val in zip(("logskip", "surfskip"), (lr, ls)):
+            lost[key] = val if lost[key] is None else max(lost[key], val)
+    if worst_cycle is None:
+        checks.append(("HB reports ControlTask cycle margin (worst=)", False,
+                       "no worst= in any HB line: the 1500 ms stall budget is "
+                       "assumed, not measured"))
+    else:
+        checks.append((f"worst= cycle margin <= {HB_WORST_CYCLE_MS} ms "
+                       f"(worst {worst_cycle}, reboot budget 1500)",
+                       worst_cycle <= HB_WORST_CYCLE_MS, "see HB lines"))
+    for key, what in (("logskip", "dive-file row"), ("surfskip", "surface record")):
+        if lost[key] is None:
+            checks.append((f"HB reports lost {what} count ({key}=)", False,
+                           f"no {key}= in any HB line: a skipped record would "
+                           "be a hole in the dive nobody is told about"))
+        else:
+            checks.append((f"{key}= lost {what}s == 0 (max {lost[key]})",
+                           lost[key] == 0, "see HB lines"))
+    return checks
+
+
+def selftest_control_margin():
+    """The ControlTask-margin and lost-record grader, proven on lying captures.
+
+    The honest case is what the fixed firmware prints: per-beat cycle spans
+    far below the 800 ms line and both skip counters still at zero. Every lie
+    is a shape a regression takes: the fields vanishing (an HB change drops
+    the tail — the margin goes back to being folklore), the margin blown
+    without a reboot (the control loop degrading toward the cliff the
+    supervisor would fall off), a counter stuck visible-but-nonzero (the
+    store losing rows under a log export), and a partially-appended tail
+    (one field edited out mid-format, the append-only rule broken in
+    silence). Each must redden the check named for it.
+    """
+    def hb(worst, lskip, sskip, tail="stk=1408 u2stk=1536"):
+        return (f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
+                f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
+                f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 {tail}"
+                + (f" worst={worst} logskip={lskip} surfskip={sskip}"
+                   if worst is not None else ""))
+
+    def new_leg(checks):
+        keep = ("worst=", "logskip=", "surfskip=", "(worst=)", "(logskip=)",
+                "(surfskip=)")
+        return [c for c in checks if any(s in c[0] for s in keep)]
+
+    cases = [
+        # name, HB lines, expected failing check (None = everything must pass)
+        ("an honest run: 45 ms and 120 ms beats, nothing lost",
+         [hb(45, 0, 0), hb(120, 0, 0)], None),
+        ("pre-H2 firmware: the tail ends at u2stk=, the margin is folklore",
+         [hb(None, None, None)], "(worst=)"),
+        ("the margin blown: a beat at 1420 ms, one supervisor check from reboot",
+         [hb(45, 0, 0), hb(1420, 0, 0)], "worst= cycle margin"),
+        ("one millisecond past the line: 801 (the threshold is not a suggestion)",
+         [hb(801, 0, 0)], "worst= cycle margin"),
+        ("a dive-file row lost to the busy store and said out loud",
+         [hb(45, 3, 0)], "logskip= lost"),
+        ("a surface verdict record lost",
+         [hb(45, 0, 2)], "surfskip= lost"),
+        ("the cumulative counter climbing: 0 then 4 rows gone",
+         [hb(45, 0, 0), hb(60, 4, 0)], "logskip= lost"),
+        ("the append-only rule broken: worst= there, the counters edited out",
+         [f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
+          f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
+          f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 stk=1408 u2stk=1536 worst=45"],
+         "(logskip=)"),
+    ]
+    checks = []
+    for name, hb_lines, want in cases:
+        got = new_leg(grade_watch(list(hb_lines)))
+        failed = [c[0] for c in got if not c[1]]
+        if want is None:
+            # An honest capture grades exactly three checks in this leg — the
+            # thresholds; the "HB reports ... (field=)" checks only appear when
+            # a field is missing.
+            checks.append((f"control margin: {name}", len(got) == 3 and not failed,
+                           f"expected the three threshold checks, none failed: {failed}"))
+        else:
+            checks.append((f"control margin: {name}",
+                           any(want in f for f in failed),
+                           f"no failure matching {want!r}; failures seen: {failed}"))
     return checks
 
 
@@ -3077,7 +3190,8 @@ def main() -> int:
                          "sensor-less boot is accepted as-is.")
     ap.add_argument("--selftest", action="store_true",
                     help="grade known-lying surface logs, known-lying depth "
-                         "announces and known-lying dive exports (no board "
+                         "announces, known-lying dive exports and known-lying "
+                         "ControlTask margin/skip heartbeats (no board "
                          "needed) to prove the graders can "
                          "fail. Run it after touching the graders or the formats.")
     ap.add_argument("--replay", default=None)
@@ -3125,6 +3239,7 @@ def main() -> int:
                                   *selftest_density_lock(),
                                   *selftest_value_caps(),
                                   *selftest_dive_file(), *selftest_wifi_legs(),
+                                  *selftest_control_margin(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1

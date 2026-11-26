@@ -46,6 +46,8 @@
 #include "comms/uart2_task.h"
 #include "comms/web_server.h"
 #include "log/rowfill.h"
+#include <esp_timer.h>
+#include "util/pinfuse.h"
 #include "hud.h"
 
 // ---------------------------------------------------------------------------
@@ -254,6 +256,13 @@ static void sensorTask(void*) {
     }
 }
 
+// Worst ControlTask cycle since the last HB beat, ms (declared here so the
+// HB printer below can publish it; controlTask updates and hudTask resets —
+// the same one-writer-per-side split as every other HB field). This is the
+// H2 observability layer: the supervisor's stall budget stops being folklore
+// the moment the bench can read the margin.
+uint32_t g_worstCycleMs = 0;
+
 // ---------------------------------------------------------------------------
 // HudTask — core 1. Owns LED patterns and the periodic serial status line
 // (the status line keeps printing even if the sensor path is in trouble —
@@ -289,11 +298,25 @@ static void hudTask(void*) {
             // uart2 panic of 2026-11-23: a stack overflow was invisible on the
             // host and invisible on the bench until it rebooted the controller.
             // Free bytes left in the tightest task is now a number we watch.
+            //
+            // The H2 fields follow the same precedent, appended:
+            //   worst=    worst ControlTask cycle since the last beat, ms. The
+            //             supervisor reboots at 1500 ms of silence; this is the
+            //             margin, so hw_accept can GRADE it instead of assuming
+            //             the control loop is fast enough.
+            //   logskip=  30 s dive-file rows this boot lost to a busy log
+            //             (rowgate.h deferral ran out of road). A silent skip
+            //             would edit the dive; this counts the edit out loud.
+            //   surfskip= same policy for surface verdict records (CAL AIR,
+            //             pre-dive). Cumulative since boot, like stk's worst.
+            const uint32_t worstCycleMs = g_worstCycleMs;
+            g_worstCycleMs = 0;  // "since the last HB beat": the bench grades
+                                 // per-beat margin, not an ever-climbing max
             Serial.printf("HB st=%d c0=%d c1=%d c2=%d fresh=%d%d%d "
                           "smp=%lu i2cerr=%lu rec=%lu vbat=%s "
                           "stale=%d batlow=%d"
                           " vote=%s sp=%s al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d"
-                          " stk=%u u2stk=%u\n",
+                          " stk=%u u2stk=%u worst=%u logskip=%u surfskip=%u\n",
                           static_cast<int>(g_systemState),
                           g_ads.raw(0), g_ads.raw(1), g_ads.raw(2),
                           g_ads.fresh(0, now), g_ads.fresh(1, now),
@@ -308,7 +331,10 @@ static void hudTask(void*) {
                           g_bridgeTel.alarmBits,
                           (int)g_bridgeTel.voteMode, (unsigned long)g_bridgeTel.pulses,
                           (int)g_bridgeTel.solenoid, (int)g_controlRunning,
-                          (unsigned)stackFree, (unsigned)uart2Free);
+                          (unsigned)stackFree, (unsigned)uart2Free,
+                          (unsigned)worstCycleMs,
+                          (unsigned)comms::diveLogSkippedRows(),
+                          (unsigned)comms::surfaceSkippedRecords());
             // Shout for the machine overall AND for the handset task by name, so
             // a command-path regression is named instead of averaged away.
             if (stackFree != 0 && stackFree < stackwatch::kWarnFreeBytes) {
@@ -362,9 +388,15 @@ static void surfaceCalAir(uint8_t code, const cal::AirCalOutput& a) {
     // count down, so a reader months later cannot act on them. The record says a
     // calibration was refused for warm-up at this instant, which is the fact that
     // stays true. `GET CALAIR` still carries the countdown for whoever asks now.
-    const bool ok = comms::surfaceLogAppend(r);
+    // CONTROL-TASK CALLER (H2): bounded wait + one pending slot + a named
+    // lost-record counter (HB `surfskip=`). These verdict records land at
+    // most a handful per power-up, but "handful" is not "never": an append
+    // that waits portMAX_DELAY behind a surface.csv export is a control stall
+    // with a calibration verdict as its excuse.
+    const bool ok = comms::surfaceLogAppendBounded(r) == comms::SURF_WRITTEN;
     if (!ok)
-        Serial.println("surface: record NOT written - surface log offline");
+        Serial.println("surface: record DEFERRED - store busy (pending retried; "
+                       "a lost record shows as surfskip= on HB)");
     else
         Serial.printf("surface: record %lu id 7 value %u\n",
                       (unsigned long)r.seq, static_cast<unsigned>(code));
@@ -377,9 +409,11 @@ static void surfacePredive(bool passed, uint16_t failedStep) {
     // 4 battery — the same order the `PRE,` line prints its five fields in, so a
     // diver reading the CSV and a handset reading PRE, are counting the same list.
     r.value = passed ? 0u : failedStep;
-    const bool ok = comms::surfaceLogAppend(r);
+    // CONTROL-TASK CALLER (H2): bounded, deferred, counted — see surfaceCalAir.
+    const bool ok = comms::surfaceLogAppendBounded(r) == comms::SURF_WRITTEN;
     if (!ok)
-        Serial.println("surface: record NOT written - surface log offline");
+        Serial.println("surface: record DEFERRED - store busy (pending retried; "
+                       "a lost record shows as surfskip= on HB)");
     else
         Serial.printf("surface: record %lu id %u\n", (unsigned long)r.seq,
                       static_cast<unsigned>(r.id));
@@ -394,23 +428,94 @@ static void surfacePredive(bool passed, uint16_t failedStep) {
 // The cycle is also the heartbeat the supervisor watches: a controller that
 // stops deciding is a controller that stops injecting, and the dive needs to
 // know about it within 1.5 s, not 3.
+//
+// Two H2 layers live here (review: "unbounded schedule() math + portMAX_DELAY
+// log waits + the max-on fuse evaluated only inside cycle(), all inside
+// ControlTask against its 1500 ms stall budget"):
+//   * the solenoid fuse is evaluated AT THE PIN, not inside cycle();
+//   * every store write ControlTask makes is bounded and deferrable
+//     (session.h's diveLogPostGrid / surfaceLogAppendBounded), and the worst
+//     cycle since the last HB beat is published as HB `worst=` so the bench
+//     GRADES the margin against the stall budget instead of assuming it.
 // ---------------------------------------------------------------------------
+
+// ---- solenoid output fuse at the pin write (H2) ----------------------------
+// The injector's maxOnMs fuse lives inside ctrl::Loop::cycle(): it can only
+// fire on a cycle that RETURNS. A control iteration that stalls after driving
+// the pin HIGH — flash, mutex, anything — abandoned the valve open until the
+// supervisor rebooted the board. The fuse must not depend on the thing it is
+// a fuse FOR, so the evaluation happens where the pin is DRIVEN and wherever
+// a beat exists at all (util/pinfuse.h carries the host-tested policy):
+//   1. the WRITE SITE: every pin write goes through g_solFuse.drive(), which
+//      refuses to re-assert HIGH once the fuse has tripped. No logic path,
+//      stalled or not, gets a second HIGH past a trip through the back door.
+//   2. the task-side guard at the top of each control iteration: if the pin
+//      has been HIGH past max-on and this iteration is only now back, the cut
+//      lands BEFORE cycle() can ask for more oxygen on top of an abandoned
+//      HIGH. Covers the transient stall.
+//   3. the SUPERVISOR, for the permanent one — see supervisorTask.
+//
+// What was evaluated and rejected: a true timer-deadline fuse armed AT the
+// write. esp_timer supports ISR dispatch (ESP_TIMER_ISR), but the Arduino
+// precompiled SDK for this board ships with
+// CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD off — the enum and the code
+// path do not exist in the framework we build against, and a task-dispatched
+// esp_timer is just another task the stall can starve. A hardware alarm
+// (hardwareTimer/OneShot) is the Arduino-visible route to a real ISR fuse;
+// it is the open upgrade path for this residual, recorded here rather than
+// smuggled in unbenchmarked.
+//
+// Honest residual window, stated as a number: with the supervisor checking
+// the fuse every SUPERVISOR_PERIOD_MS, a HIGH write abandoned by a wedged
+// ControlTask is force-cut within roughly
+//     maxOnMs (the fuse threshold) + SUPERVISOR_PERIOD_MS (check cadence)
+//     + one sensor-loop beat of skew            ~= 900 + 500 + ~10  ms
+// and the reboot backstop that also clears the latch lands within
+//     TASK_STALL_CONTROL_MS + SUPERVISOR_PERIOD_MS  ~= 1500 + 500 ms.
+// Both are GRADED on the bench now (HB worst=, and the supervisor's own
+// margin), so the next acceptance run reports the real numbers instead of
+// this paragraph.
+outfuse::SolFuse g_solFuse;
+
 static void controlTask(void*) {
     esp_task_wdt_add(NULL);
     pinMode(PIN_SOLENOID, OUTPUT);  // owned from here on; SAFE mode never gets here
     digitalWrite(PIN_SOLENOID, LOW);
     g_controlRunning = true;
 
+    int64_t cycleStartUs = (int64_t)esp_timer_get_time();
     uint32_t next = millis() + CONTROL_TASK_PERIOD_MS;
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_CONTROL);
         const uint32_t now = millis();
+
+        // Worst-cycle tracking (HB `worst=`): the span from one iteration's
+        // start to the next is precisely what the supervisor would measure as
+        // a stall, so this number and the stall budget are the same quantity.
+        {
+            const int64_t nowUs = (int64_t)esp_timer_get_time();
+            const uint32_t spanMs = (uint32_t)((nowUs - cycleStartUs) / 1000);
+            if (spanMs > g_worstCycleMs) g_worstCycleMs = spanMs;
+            cycleStartUs = nowUs;
+        }
+
         if ((int32_t)(now - next) < 0) {  // not due yet
             vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
         next += CONTROL_TASK_PERIOD_MS;
         if ((int32_t)(next - now) < 0) next = now + CONTROL_TASK_PERIOD_MS;  // fell behind: skip a beat, never pile up
+
+        // H2 fuse, task-side half: if the pin has been HIGH past max-on and
+        // this iteration is only now back (a transient stall — the ISR half
+        // covers the permanent one), cut BEFORE cycle() gets a chance to ask
+        // for more oxygen on top of an abandoned HIGH.
+        if (g_solFuse.shouldCut(now, g_ctrlCfg.inj.maxOnMs)) {
+            g_solFuse.cut(now);
+            digitalWrite(PIN_SOLENOID, LOW);
+            Serial.println("!! SOLFUSE: pin HIGH past max-on at iteration entry — cut "
+                           "before cycle(); output latched until the next dive edge");
+        }
 
         ctrl::SensorData sd;
         for (int i = 0; i < 3; i++)
@@ -430,7 +535,12 @@ static void controlTask(void*) {
         sd.vbat = g_battery.volts();
 
         const ctrl::State st = g_loop->cycle(sd, now);
-        digitalWrite(PIN_SOLENOID, st.solenoid ? HIGH : LOW);
+
+        // The pin write goes through the fuse: after a trip, the desired
+        // level from ANY logic path is refused and LOW is driven — a stalled
+        // or buggy cycle cannot re-assert HIGH through the back door.
+        const bool driveHigh = g_solFuse.drive(now, st.solenoid);
+        digitalWrite(PIN_SOLENOID, driveHigh ? HIGH : LOW);
 
         // CAL AIR: sample the raw cells at air, commit the air point.
         // Refused before warmup: an un-polarised cell's "average" is fiction.
@@ -542,6 +652,11 @@ static void controlTask(void*) {
             lastSnapMs = now;
             lastPulseBase = g_loop->pulseCount();
             g_bridgeTel.diveStartMs = now;
+            // The pin fuse latches until accounted for: a board that cut its
+            // output mid-dive rebooted (or will), and the dive-start edge is
+            // the bench-visible re-entry that says the machine has been looked
+            // at. SAFE boot re-arms it too (fresh boot, fresh object).
+            g_solFuse.clear();
         }
         prevDive = st.diveActive;
 
@@ -669,7 +784,20 @@ static void controlTask(void*) {
             // and graded there. This block used to hand-roll it, in a file the
             // native env does not even build, with the soak as the only "test" of
             // it — a mirror that cannot catch a drift in its original.
-            if (comms::diveLogRecording() && now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
+            //
+            // H2: this block used to take the log mutex TWICE per control cycle
+            // and wait on it forever (the recording() probe and the append) —
+            // behind a mutex a multi-second LOG EXPORT holds on the command task. A
+            // diver browsing his dive list mid-dive could stall the control loop
+            // into the supervisor reboot, for a row that is worth 33 microseconds.
+            // The recording probe is gone (the store re-checks under the lock);
+            // the append goes through the gate: one small bounded wait at due
+            // time, zero-wait retries every cycle after, and a lost row counted
+            // (HB `logskip=`, rowgate.h says what a file reader can and cannot
+            // tell).
+            comms::diveLogRetryGrid();  // zero-wait retry of a deferred row
+            comms::surfaceRetryPending();  // same policy, surface records
+            if (now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
                 lastSnapMs = now;
                 // The row's ppO2 column is the SHOWN number, which the chain holds
                 // across a failed vote (loop.cpp step 2b), so the dive file says
@@ -698,7 +826,7 @@ static void controlTask(void*) {
                 ri.deco = &g_loop->deco();
                 logfmt::Snapshot sn{};
                 logfmt::fillSnapshot(sn, ri);
-                comms::diveLogAppendGrid(sn);
+                comms::diveLogPostGrid(sn);
             }
         }
 
@@ -753,6 +881,26 @@ static void supervisorTask(void*) {
             g_fault = {FAULT_MAGIC, 5, now, esp_reset_reason()};
             Serial.println("!! FATAL: ControlTask stalled — restart into SAFE");
             esp_restart();
+        }
+
+        // H2 output fuse, supervisor half. The pin belongs to ControlTask,
+        // but a task that owns a pin must not be the ONLY thing that can let
+        // go of it: if the pin has been continuously HIGH past max-on and the
+        // control task has not cut it (stalled after the write — the exact
+        // shape that made the injector's in-cycle fuse unreachable), force it
+        // LOW from here and latch the fuse so the write site refuses to
+        // re-assert it. Cross-task digitalWrite to a pin another task "owns"
+        // is safe in the direction that matters: HIGH->LOW is the fail-safe
+        // edge, and a torn write race can only ever produce the safe level
+        // once the latch is up. Normal pulses never reach this: pulseMs is
+        // applied strictly below maxOnMs (settings_apply clamps it), so a
+        // healthy chain's longest HIGH is a pulse.
+        if (g_controlRunning && g_solFuse.shouldCut(now, g_ctrlCfg.inj.maxOnMs)) {
+            g_solFuse.cut(now);
+            digitalWrite(PIN_SOLENOID, LOW);
+            Serial.printf("!! SOLFUSE: pin HIGH past %u ms with ControlTask "
+                          "not cutting it — supervisor forced LOW, output latched\n",
+                          (unsigned)g_ctrlCfg.inj.maxOnMs);
         }
 
         // ERR lamp: while the control chain is running it owns the alarm
@@ -941,10 +1089,11 @@ void setup() {
     xTaskCreatePinnedToCore(supervisorTask,"supervisor", 3072, nullptr, 25, nullptr, 0);
     // The controller owns the valve, so it is created last and only when the
     // boot is clean: SAFE mode never starts it, and the pin stays pulled down.
-    if (!forceSafe)
+    if (!forceSafe) {
         xTaskCreatePinnedToCore(controlTask, "control", 4096, nullptr, 22, nullptr, 1);
-    else
+    } else {
         g_controlRunning = false;
+    }
 
     // The handset and web session ride on the chain: no chain, no session.
     // SAFE mode keeps the WEB offline deliberately — a board that just

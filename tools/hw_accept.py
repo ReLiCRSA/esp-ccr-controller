@@ -810,9 +810,11 @@ def grade_surface_csv(text, want_rows, boot_hi, console_lines):
         return checks
     # id <-> name must agree, both ways: a pre-dive failure filed under the pass id
     # (or an appended id left unlabelled) is the log claiming something the machine
-    # never recorded. The three ids below are the whole vocabulary so far; anything
-    # else must arrive as `id<n>`, never as a row with a name it did not earn.
-    KNOWN = {"7": "cal_air", "13": "pre_dive_pass", "16": "pre_dive_fail"}
+    # never recorded. The ids below are the whole vocabulary so far — 17/18 joined
+    # with H1's dive continuity; anything else must arrive as `id<n>`, never as a
+    # row with a name it did not earn.
+    KNOWN = {"7": "cal_air", "13": "pre_dive_pass", "16": "pre_dive_fail",
+             "17": "continuity_restored", "18": "continuity_lost"}
     mismatch = [r for r in rows
                 if KNOWN.get(r[SURF_COL["id"]]) and r[SURF_COL["name"]] != KNOWN[r[SURF_COL["id"]]]]
     checks.append(("id and name agree", not mismatch,

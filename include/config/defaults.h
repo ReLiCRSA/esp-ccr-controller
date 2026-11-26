@@ -56,13 +56,21 @@
 #define CELL_DEFAULT_SLOPE          (CAL_AIR_REF_BAR / CELL_AIR_RAW_NOMINAL)
 
 // --- CAL AIR sampling window (cal::AirCal) ---------------------------------
-// 1 Hz x 12 raw samples; every PRESENT cell must hold within CAL_AIR_SPREAD_MAX
-// ADC counts across the window, or the count restarts. A cell drifting more
-// than that in 12 s is warm-up drift or a bad connection — averaging it
-// would commit a lie as the air point.
+// 1 Hz x 12 raw samples. The cells are not solid constants — a little drift,
+// hysteresis, and the odd momentary excursion (a cell crosses a neighbour's
+// level for one sample and comes back) is what electrochemical cells do —
+// so stability is judged against each PRESENT cell's own trend across the
+// window, not a flat line: samples must sit within CAL_AIR_SPREAD_MAX ADC
+// counts of the fitted trend, up to CAL_AIR_OUTLIER_MAX of them per cell may
+// step outside, and the trend itself must not move faster than
+// CAL_AIR_DRIFT_MAX_PS counts/s. A true warm-up ramp breaks the rate limit;
+// sustained band-crossing is not wander — averaging either would commit a
+// lie as the air point. Every reading counts in the mean, outliers included.
 #define CAL_AIR_SAMPLES             12
 #define CAL_AIR_PERIOD_MS           1000
 #define CAL_AIR_SPREAD_MAX          40.0f
+#define CAL_AIR_DRIFT_MAX_PS        10.0f
+#define CAL_AIR_OUTLIER_MAX         2
 #define CAL_AIR_TIMEOUT_MS          90000
 
 // --- Control task -------------------------------------------------------------

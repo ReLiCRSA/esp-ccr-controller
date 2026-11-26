@@ -101,7 +101,8 @@ static cal::Cal g_cellCal[3];
 // the dive state and the solenoid.
 static cal::AirCal g_airCal{cal::AirCal::Cfg{
     CAL_AIR_PERIOD_MS, static_cast<uint8_t>(CAL_AIR_SAMPLES),
-    CAL_AIR_SPREAD_MAX, CAL_AIR_TIMEOUT_MS}};
+    CAL_AIR_SPREAD_MAX, CAL_AIR_DRIFT_MAX_PS, CAL_AIR_OUTLIER_MAX,
+    CAL_AIR_TIMEOUT_MS}};
 
 #if PRESSURE_ENABLE
 // Depth lives on its own hardware I2C port (Wire1, pins.h): a wet-harness
@@ -683,7 +684,7 @@ static void controlTask(void*) {
                 surfaceCalAir(g_calAirStatus.code, none);
             } else {
                 g_airCal.start(now);
-                Serial.println("cal air: sampling (1 Hz x 12, spread-limited)");
+                Serial.println("cal air: sampling (1 Hz x 12, trend-band-limited)");
                 cal::AirCalOutput started;   // running, no samples yet
                 started.running = true;
                 bridge::publishCalAir(g_calAirStatus, started, now, calTSec, g_bridgeEvents);

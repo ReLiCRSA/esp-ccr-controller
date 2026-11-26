@@ -271,7 +271,9 @@ void test_aircal_injection_discards_the_window() {
 void test_aircal_drifting_cell_never_completes() {
     cal::AirCal ac{airCfg()};
     ac.start(0);
-    // one cell ramps: spread crosses 40 counts every window, forever
+    // one cell ramps at 20 counts/s: honest trend, but faster than the
+    // 10 counts/s the drift allowance permits — the window centre of a
+    // ramping cell is not its air point. Restarts forever, then times out.
     uint32_t t = 0;
     bool failed = false;
     cal::AirCalOutput last{};
@@ -285,6 +287,120 @@ void test_aircal_drifting_cell_never_completes() {
     }
     TEST_ASSERT_TRUE(failed);
     TEST_ASSERT_NOT_NULL(last.why);
+    TEST_ASSERT_FALSE(ac.running());
+}
+
+void test_aircal_drift_and_hysteresis_completes() {
+    // Real cells are not solid constants: a bit of drift plus hysteresis is
+    // normal wander. A 4 counts/s ramp carrying +-8 counts of hysteresis
+    // accumulates ~60 counts of spread across the window — a flat-line band
+    // check would restart forever and time out UNSETTLED. Measured against
+    // the cell's own trend it is stable, and must complete.
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    const float base[3] = {1500.0f, 1512.0f, 1494.0f};
+    uint32_t t = 0;
+    cal::AirCalOutput done{};
+    for (; t < 30000 && !done.done; t += 100) {
+        const int k = static_cast<int>(t / 1000);  // this second's sample index
+        float raw[3];
+        for (int c = 0; c < 3; c++)
+            raw[c] = base[c] + 4.0f * k + ((k & 1) ? 8.0f : -8.0f);
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        done = ac.update(in);
+    }
+    TEST_ASSERT_TRUE(done.done);
+    TEST_ASSERT_EQUAL_UINT8(12, done.samples);
+    // The mean of a drift+hysteresis window sits at its centre: samples k
+    // 0..11 average to base + 4*5.5, the +-8 hysteresis cancelling out.
+    for (int c = 0; c < 3; c++)
+        TEST_ASSERT_FLOAT_WITHIN(20.0f, base[c] + 22.0f, done.rawAvg[c]);
+}
+
+void test_aircal_step_glitch_restarts_then_completes() {
+    // A one-time step (contact flap, bubble) discards the window — but the
+    // cell is honest afterwards, so the restarted window must complete on
+    // the post-glitch values with no trace of the pre-glitch ones.
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    uint32_t t = 0;
+    cal::AirCalOutput done{};
+    for (; t < 40000 && !done.done; t += 100) {
+        const bool before = (t / 1000) < 5;
+        float raw[3] = {before ? 1500.0f : 1700.0f,
+                        before ? 1508.0f : 1712.0f,
+                        before ? 1495.0f : 1698.0f};
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        done = ac.update(in);
+    }
+    TEST_ASSERT_TRUE(done.done);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1700.0f, done.rawAvg[0]);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1712.0f, done.rawAvg[1]);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, 1698.0f, done.rawAvg[2]);
+}
+
+void test_aircal_bench_excursions_complete_and_count() {
+    // The bench capture (15 min at ambient, 2026-11-26): cells sit flat and
+    // every now and then one steps ~50 counts for a SINGLE sample — crossing
+    // a neighbour's level — then comes straight back. That is the cells
+    // themselves, not contamination, and readings must NOT be discarded:
+    // a window carrying two such excursions completes, and the committed
+    // mean includes them. Worst recorded windows had residual 44-48 vs the
+    // band of 40; outlierMax=2 is what lets them settle.
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    const float base[3] = {1563.0f, 1565.0f, 1610.0f};
+    uint32_t t = 0;
+    cal::AirCalOutput done{};
+    for (; t < 30000 && !done.done; t += 100) {
+        const int k = static_cast<int>(t / 1000);  // this second's sample index
+        float raw[3];
+        for (int c = 0; c < 3; c++)
+            raw[c] = base[c] + ((k & 1) ? 3.0f : -3.0f);
+        if (k == 3 || k == 8) raw[1] += 50.0f;  // cell 1 crosses cell 2's level
+        if (k == 6) raw[2] -= 50.0f;            // cell 2 crosses cell 1's level
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        done = ac.update(in);
+    }
+    TEST_ASSERT_TRUE(done.done);
+    TEST_ASSERT_EQUAL_UINT8(12, done.samples);
+    // Nothing discarded: two +50 excursions out of 12 shift cell 1's mean by
+    // +8.3 counts; the +-3 alternation cancels. Cell 2 loses 4.2.
+    TEST_ASSERT_FLOAT_WITHIN(2.0f, base[0], done.rawAvg[0]);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, base[1] + 100.0f / 12.0f, done.rawAvg[1]);
+    TEST_ASSERT_FLOAT_WITHIN(1.0f, base[2] - 50.0f / 12.0f, done.rawAvg[2]);
+}
+
+void test_aircal_persistent_excursions_still_fail() {
+    // Excursions counted, not fatal — but a cell stepping outside the band
+    // on most samples is not wandering, it is unsettled: outlierMax of them
+    // and the window restarts, forever, and the timeout is what says so.
+    cal::AirCal ac{airCfg()};
+    ac.start(0);
+    const float base[3] = {1563.0f, 1565.0f, 1610.0f};
+    uint32_t t = 0;
+    bool failed = false;
+    cal::AirCalOutput last{};
+    for (; t < 100000 && !failed; t += 100) {
+        const int k = static_cast<int>(t / 1000);
+        float raw[3];
+        for (int c = 0; c < 3; c++) raw[c] = base[c];
+        if (k % 2 == 0) raw[1] += 90.0f;  // swing too wide for any trend to hug
+        cal::AirCalInput in;
+        in.nowMs = t; in.fresh = true; in.presentMask = 0x7;
+        std::memcpy(in.cellsRaw, raw, sizeof(raw));
+        last = ac.update(in);
+        failed = last.failed;
+    }
+    TEST_ASSERT_TRUE(failed);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(cal::AirCalWhy::UNSETTLED),
+                          static_cast<int>(last.whyCode));
     TEST_ASSERT_FALSE(ac.running());
 }
 
@@ -326,6 +442,10 @@ int main() {
     RUN_TEST(test_aircal_stale_data_never_counts);
     RUN_TEST(test_aircal_injection_discards_the_window);
     RUN_TEST(test_aircal_drifting_cell_never_completes);
+    RUN_TEST(test_aircal_drift_and_hysteresis_completes);
+    RUN_TEST(test_aircal_step_glitch_restarts_then_completes);
+    RUN_TEST(test_aircal_bench_excursions_complete_and_count);
+    RUN_TEST(test_aircal_persistent_excursions_still_fail);
     RUN_TEST(test_aircal_diving_is_refused_and_absent_cells_ignored);
     return UNITY_END();
 }

@@ -48,6 +48,43 @@ void Solver::solveO2(const Config& cfg,
 // ---------------------------------------------------------------------------
 // CAL AIR: the disciplined averaging window (see header for the rules).
 // ---------------------------------------------------------------------------
+namespace {
+// Least-squares line through (sample index, raw) for the current window.
+// Cells are not solid constants — gentle drift and a bit of hysteresis are
+// what they do — so stability is measured against the cell's OWN trend, not
+// against a flat line. A momentary excursion (the cell wanders across a
+// neighbour's level and back) is normal behaviour, not a settling failure:
+// samples beyond `band` are COUNTED (outliers) rather than maxed, so one or
+// two of them in a window do not restart it. What still fails: enough
+// outliers to show sustained trouble, or a trend moving so fast it is a
+// warm-up ramp rather than wander — averaging either would commit a lie as
+// the air point. `maxResid` stays for the console/bench diagnostic only.
+struct Trend { float slopePerSample; float maxResid; int outliers; };
+
+Trend fitTrend(const float* ys, int n, float band) {
+    float sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int k = 0; k < n; k++) {
+        const float x = static_cast<float>(k);
+        sx += x; sy += ys[k]; sxx += x * x; sxy += x * ys[k];
+    }
+    const float nf = static_cast<float>(n);
+    const float den = nf * sxx - sx * sx;
+    const Trend zero{0.0f, 0.0f, 0};
+    if (den == 0.0f) return zero;
+    Trend t;
+    t.slopePerSample = (nf * sxy - sx * sy) / den;
+    const float a = (sy - t.slopePerSample * sx) / nf;
+    t.maxResid = 0.0f;
+    t.outliers = 0;
+    for (int k = 0; k < n; k++) {
+        const float r = std::fabs(ys[k] - (a + t.slopePerSample * static_cast<float>(k)));
+        if (r > t.maxResid) t.maxResid = r;
+        if (r > band) t.outliers++;
+    }
+    return t;
+}
+} // namespace
+
 void AirCal::resetWindow(uint32_t nowMs) {
     n_ = 0;
     for (int i = 0; i < 3; i++) sum_[i] = lo_[i] = hi_[i] = 0.0f;
@@ -94,24 +131,47 @@ AirCalOutput AirCal::update(const AirCalInput& in) {
     nextSampleMs_ = in.nowMs + cfg_.samplePeriodMs;
 
     if (n_ == 0) {
-        for (int i = 0; i < 3; i++) sum_[i] = lo_[i] = hi_[i] = in.cellsRaw[i];
+        for (int i = 0; i < 3; i++) {
+            sum_[i] = lo_[i] = hi_[i] = in.cellsRaw[i];
+            hist_[i][0] = in.cellsRaw[i];
+        }
     } else {
         for (int i = 0; i < 3; i++) {
             sum_[i] += in.cellsRaw[i];
             if (in.cellsRaw[i] < lo_[i]) lo_[i] = in.cellsRaw[i];
             if (in.cellsRaw[i] > hi_[i]) hi_[i] = in.cellsRaw[i];
+            hist_[i][n_] = in.cellsRaw[i];
         }
     }
     n_++;
 
+    o.samples = n_;
+    uint8_t need = cfg_.samples;  // clamped to the window buffer
+    if (need == 0 || need > kMaxSamples) need = kMaxSamples;
     float worst = 0.0f;
     bool any = false, unstable = false;
+    // The trend slope is per sample; the patience is per second.
+    const float maxSlope = cfg_.driftMaxPerS * static_cast<float>(cfg_.samplePeriodMs) / 1000.0f;
     for (int i = 0; i < 3; i++) {
         if (!(in.presentMask & (1u << i))) continue;  // absent cell: its raw is someone else's
         any = true;
         const float spread = hi_[i] - lo_[i];
         if (spread > worst) worst = spread;
-        if (spread > cfg_.spreadMax) unstable = true;
+        if (n_ >= 3) {
+            const Trend t = fitTrend(hist_[i], n_, cfg_.spreadMax);
+            // The band rides the trend (that is the hysteresis allowance), and
+            // momentary excursions are counted, not fatal: the bench shows
+            // cells crossing a neighbour's level for one sample and coming
+            // back. A window with more than outlierMax such samples is not
+            // wandering — it is unsettled. This verdict is live: it restarts
+            // the window as soon as it is certain, without waiting for 12.
+            if (t.outliers > cfg_.outlierMax) unstable = true;
+            // A trend moving faster than this is warm-up drift, not wander:
+            // its window centre would not be the air point. Judged on the
+            // FULL window only — a lone excursion pulls a short fit's slope
+            // and would punish a cell for the very wander we allow.
+            else if (n_ >= need && std::fabs(t.slopePerSample) > maxSlope) unstable = true;
+        }
     }
     if (!any) {  // mask empty: programming error, refuse rather than average nothing
         st_ = St::IDLE;
@@ -127,8 +187,7 @@ AirCalOutput AirCal::update(const AirCalInput& in) {
         return o;
     }
 
-    o.samples = n_;
-    if (n_ >= cfg_.samples) {
+    if (n_ >= need) {
         st_ = St::IDLE;
         o.running = false;
         o.done = true;

@@ -73,12 +73,20 @@ struct Solver {
 //   * refuses to run while diving (a pre-dive act, decided where it runs);
 //   * an injection pulse discards the window: ppO2 mid-pulse is not air;
 //   * stale ADC data does not advance the window (never average a lie);
-//   * every PRESENT cell must hold within spreadMax raw counts across the
-//     window — a cell drifting more than that is warm-up drift or a bad
-//     connection, and an average of it would lie. Absent cells are ignored
+//   * every PRESENT cell must be STABLE, but not frozen: real electro-
+//     chemical cells wander — gentle drift, hysteresis, noise, and the odd
+//     momentary excursion across a neighbour cell's level — so each cell is
+//     measured against its own trend across the window (a least-squares
+//     line), not against a flat line. Samples must sit within spreadMax raw
+//     counts of that trend, with outlierMax of them per window allowed to
+//     step outside (an excursion is normal; a window full of them is not);
+//     the trend itself may move at most driftMaxPerS counts/s. What still
+//     fails: sustained instability (more than outlierMax samples outside the
+//     band) and a true warm-up ramp breaking the rate limit — averaging
+//     either would commit a lie as the air point. Absent cells are ignored
 //     entirely: their raw register holds another channel's last value.
 //
-// One sample per samplePeriodMs, `samples` of them; a spread violation
+// One sample per samplePeriodMs, `samples` of them; a stability violation
 // restarts the count (the cell gets a chance to settle), the wall-clock
 // timeout is the outer patience.
 struct AirCalInput {
@@ -119,7 +127,9 @@ public:
     struct Cfg {
         uint32_t samplePeriodMs = 1000;
         uint8_t samples = 12;
-        float spreadMax = 40.0f;       // raw counts per cell across the window
+        float spreadMax = 40.0f;       // raw counts per cell around the window trend
+        float driftMaxPerS = 10.0f;    // raw counts/s the trend itself may carry
+        uint8_t outlierMax = 2;        // band-crossing samples per cell the window may carry
         uint32_t timeoutMs = 90000;    // patience before declaring failure
     };
     explicit AirCal(const Cfg& cfg) : cfg_(cfg) {}
@@ -137,9 +147,12 @@ private:
     enum class St : uint8_t { IDLE, RUN };
     void resetWindow(uint32_t nowMs);
 
+    static constexpr uint8_t kMaxSamples = 16;  // hist capacity; cfg_.samples clamps to it
+
     Cfg cfg_;
     St st_ = St::IDLE;
     float sum_[3] = {0, 0, 0}, lo_[3] = {0, 0, 0}, hi_[3] = {0, 0, 0};
+    float hist_[3][kMaxSamples] = {};  // window samples, for the trend fit
     uint8_t n_ = 0;
     uint32_t nextSampleMs_ = 0, deadlineMs_ = 0;
 };

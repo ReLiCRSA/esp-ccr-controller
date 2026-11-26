@@ -381,7 +381,7 @@ void test_control_task_store_entry_points_are_bounded() {
     for (const char* fn : {"logfmt::GridGate::Result gridAppendAttempt(",
                            "void diveLogPostGrid(", "void diveLogRetryGrid(",
                            "SurfAppend surfaceLogAppendBounded(",
-                           "void surfaceRetryPending(",
+                           "bool surfaceRetryPending(",
                            "bool logLockTry("}) {
         const std::string body = functionBody(w, fn);
         TEST_ASSERT_TRUE_MESSAGE(!body.empty(),
@@ -420,6 +420,33 @@ void test_the_supervisor_holds_the_fuse_half_it_promise() {
 void setUp() {}
 void tearDown() {}
 
+void test_surface_announce_carries_the_written_seq() {
+    // Caught on metal 2026-11-26: the H2 surface gate appended ITS OWN pending
+    // copy, and the console line printed the caller's pre-append record —
+    // `surface: record 0` — breaking the console<->file join the bench grades
+    // verdict records on. The join key (seq) exists only after the store
+    // stamps it, so both write paths must carry the stamped copy back to
+    // whoever prints the line.
+    const std::string w = readFile("src/comms/session_wiring.cpp");
+    const std::string append = stripComments(
+        functionBody(w, "SurfAppend surfaceLogAppendBounded("));
+    TEST_ASSERT_FALSE_MESSAGE(append.empty(), "surfaceLogAppendBounded not found");
+    TEST_ASSERT_TRUE_MESSAGE(append.find("r = g_surfPending") != std::string::npos,
+                             "the written surface record is no longer reflected back to the "
+                             "caller - the console announcement prints seq 0 again");
+    const std::string retry = stripComments(
+        functionBody(w, "bool surfaceRetryPending("));
+    TEST_ASSERT_FALSE_MESSAGE(retry.empty(), "surfaceRetryPending not found");
+    TEST_ASSERT_TRUE_MESSAGE(retry.find("landed = g_surfPending") != std::string::npos,
+                             "the deferred surface record's stamp is not carried back on retry");
+    const std::string main_src = readFile("src/main.cpp");
+    const std::string ctl = stripComments(functionBody(main_src, "static void controlTask(void*) {"));
+    TEST_ASSERT_TRUE_MESSAGE(ctl.find("delayed write") != std::string::npos,
+                             "no `surface: record <seq> (delayed write)` announce at the "
+                             "retry site - a late verdict record has no console line, and "
+                             "the bench join for that record can never succeed");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_worst_case_row_fill_fits_the_control_budget);
@@ -435,5 +462,6 @@ int main() {
     RUN_TEST(test_control_task_body_has_no_unbounded_waits_and_no_legacy_appends);
     RUN_TEST(test_control_task_store_entry_points_are_bounded);
     RUN_TEST(test_the_supervisor_holds_the_fuse_half_it_promise);
+    RUN_TEST(test_surface_announce_carries_the_written_seq);
     return UNITY_END();
 }

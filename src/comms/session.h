@@ -177,8 +177,15 @@ uint32_t diveLogSkippedRows();                    // the HB `logskip=` field
 /// verdict edges). One pending record slot, retried like the grid row; a
 /// record lost to a busy store is counted, never silent.
 enum SurfAppend : uint8_t { SURF_WRITTEN = 0, SURF_BUSY = 1 };
+// On SURF_WRITTEN the record comes back stamped: the store assigns `seq` to
+// the copy it receives, and the caller's announcement prints that seq. A
+// bounded gate that appends its own pending copy MUST reflect it back — the
+// bench saw `surface: record 0` when this was missed (2026-11-26).
 SurfAppend surfaceLogAppendBounded(logfmt::SurfaceRecord& r);
-void surfaceRetryPending();                       // every cycle: zero-wait retry
+// Every cycle: zero-wait retry. Returns true when the pending record just
+// landed, with `landed` carrying the stamped copy so the caller can announce
+// the real seq (a delayed write still has a console line — the join key).
+bool surfaceRetryPending(logfmt::SurfaceRecord& landed);
 uint32_t surfaceSkippedRecords();                 // the HB `surfskip=` field
 
 /// Dive-file reads for the web pages. Serialized with the command path (same

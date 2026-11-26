@@ -1666,6 +1666,8 @@ def selftest():
          GOOD_SURFACE_CSV, "console-noise"),
         ("the console's record number is a different record",
          GOOD_SURFACE_CSV, "console-seq"),
+        ("the console claims record 0: the stamped seq never came back",
+         GOOD_SURFACE_CSV, "console-seq0"),
     ]
     checks = []
     for name, body, expect in cases:
@@ -1675,6 +1677,12 @@ def selftest():
             # Same verdict, wrong seq: the join must be on the number, not on "some
             # record was written this run".
             console = ["surface: record 9 id 7 value 2", "surface: record 4 id 16"]
+        elif expect == "console-seq0":
+            # The real 2026-11-26 metal regression: the bounded surface gate
+            # appended its own pending copy, the store stamped the seq on THAT
+            # copy, and the caller printed its pre-append record - every
+            # record written, the console claiming record 0 for all of them.
+            console = ["surface: record 0 id 7 value 2", "surface: record 0 id 16"]
         else:
             console = GOOD_CONSOLE if expect != "console-noise" else []
         if expect == "check-hi":
@@ -1689,7 +1697,7 @@ def selftest():
         if expect == "check-hi":
             checks.append((name, "this run's records joined the log" in "".join(failed),
                            f"failures seen: {failed}"))
-        elif expect in ("console-noise", "console-seq"):
+        elif expect in ("console-noise", "console-seq", "console-seq0"):
             checks.append((name, any("console reported writing" in f for f in failed),
                            f"failures seen: {failed}"))
         else:

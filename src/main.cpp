@@ -796,7 +796,15 @@ static void controlTask(void*) {
             // (HB `logskip=`, rowgate.h says what a file reader can and cannot
             // tell).
             comms::diveLogRetryGrid();  // zero-wait retry of a deferred row
-            comms::surfaceRetryPending();  // same policy, surface records
+            // Same policy, surface records. A deferred verdict still gets its
+            // console line when it lands — `surface: record <seq>` is the join
+            // key the bench proves console↔file agreement on, and the seq only
+            // exists once the store stamps it, so the announce rides the write.
+            logfmt::SurfaceRecord landedSurf{};
+            if (comms::surfaceRetryPending(landedSurf))
+                Serial.printf("surface: record %lu id %u (delayed write)\n",
+                              (unsigned long)landedSurf.seq,
+                              static_cast<unsigned>(landedSurf.id));
             if (now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
                 lastSnapMs = now;
                 // The row's ppO2 column is the SHOWN number, which the chain holds

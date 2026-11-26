@@ -408,17 +408,27 @@ SurfAppend surfaceLogAppendBounded(logfmt::SurfaceRecord& r) {
         xSemaphoreGive(g_logMtx);
         if (ok) {
             g_surfPendingDue = false;
+            // Reflect the stamped copy (seq assigned by the store) back to the
+            // caller: its console line `surface: record <seq>` is the join key
+            // the bench uses to prove the console and the file say the same
+            // thing. Printing the caller's pre-append record says `record 0`.
+            r = g_surfPending;
             return SURF_WRITTEN;
         }
     }
     return SURF_BUSY;  // pending stands; retried with a zero wait every cycle
 }
 
-void surfaceRetryPending() {
-    if (!g_surfPendingDue || !logLockTry(0u)) return;
+bool surfaceRetryPending(logfmt::SurfaceRecord& landed) {
+    if (!g_surfPendingDue || !logLockTry(0u)) return false;
     const bool ok = g_surfaceStore.append(g_surfPending);
     xSemaphoreGive(g_logMtx);
-    if (ok) g_surfPendingDue = false;
+    if (ok) {
+        g_surfPendingDue = false;
+        landed = g_surfPending;  // the announce follows from main.cpp, seq and all
+        return true;
+    }
+    return false;
 }
 
 uint32_t surfaceSkippedRecords() { return g_surfLost; }

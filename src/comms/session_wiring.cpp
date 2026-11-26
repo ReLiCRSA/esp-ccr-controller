@@ -39,6 +39,9 @@
 #include "comms/wallclock.h"
 #include "comms/web_server.h"
 #include "config/defaults.h"
+#include "log/contgate.h"
+#include "log/continuity.h"
+#include "log/continuity_store.h"
 #include "log/dive_store.h"
 #include "log/rowfill.h"      // the one snapshot-row fill (grid row and event row)
 #include "log/rowgate.h"      // the ControlTask grid-row deferral policy (H2)
@@ -94,6 +97,33 @@ logfmt::GridGate g_gridGate;
 logfmt::SurfaceRecord g_surfPending{};
 bool g_surfPendingDue = false;
 uint32_t g_surfLost = 0;
+
+// ---- dive continuity: the record that carries tissues across a reset (H1) --
+// Three pieces, and the split is the point (contgate.h carries the reasoning):
+//   * g_contGate — ControlTask posts snapshots into it (a copy, µs). It is the
+//     only thing ControlTask touches on this path, and it never reaches flash.
+//   * continuityDrain() — HudTask (priority 10, below ControlTask's 22) is the
+//     one that takes the log mutex and commits the record, with a bounded wait
+//     like every other control-adjacent store path.
+//   * g_contMirror — the newest record this boot knows, guarded by its own tiny
+//     mutex (held for a copy, never for I/O). It is what seeds the next dive,
+//     which is why it is updated from a SUCCESSFUL store write and never before:
+//     "what this boot seeds" and "what the boot after a reset reads back" are
+//     allowed to differ only by a write that failed, and that difference is the
+//     crash window the 60 s cadence is sized around.
+ContinuityStore g_contStore;
+logfmt::ContinuityGate g_contGate;
+SemaphoreHandle_t g_contMtx = nullptr;
+bool g_contMirrorValid = false;
+logfmt::ContinuityRecord g_contMirror{};
+bool g_contReadable = true;
+
+/// The store seam, defined with the rest of the continuity wiring below and
+/// wired into the gate in initSession(). Declared here because initSession sits
+/// above its definition: one door, one wiring site, and the native source scan
+/// (test_controlplane) keeps it bounded.
+logfmt::ContinuityGate::Result contWriteAttempt(const logfmt::ContinuityRecord& in,
+                                                uint32_t budgetMs);
 
 // Take the log mutex for at most budgetMs. 0 is a true try-lock (xSemaphoreTake
 // with 0 ticks never yields). FreeRTOS ticks are 10 ms on this build, so a
@@ -360,6 +390,10 @@ void clockTick() {
     g_clockCarry.magic = wallclock::CARRY_MAGIC;
 }
 
+uint32_t clockEpoch() { return wallclock::epoch(g_clock, millis()); }
+
+uint8_t clockSource() { return g_clock.source; }
+
 void clockBootText(char* out, size_t cap) {
     const uint32_t e = wallclock::epoch(g_clock, millis());
     if (e == 0u) {
@@ -443,6 +477,10 @@ bool initSession(ctrl::Loop& loop, settings::Registry& reg, bridge::Telemetry& t
     // log-mutex wait. Wired once, here, so the ONLY way ControlTask reaches
     // the dive file is through this bounded door.
     g_gridGate.setAppender([](uint32_t budgetMs) { return gridAppendAttempt(budgetMs); });
+    // Same shape for the continuity record (contgate.h), with one difference
+    // that is the whole point of that file: nothing calls this seam from
+    // ControlTask. ControlTask posts the snapshot; HudTask drains it.
+    g_contGate.setWriter(contWriteAttempt);
 
     Session::Lock lock;
     lock.acquire = lockAcquire;
@@ -553,6 +591,140 @@ int surfaceLogExportCsv(void (*sink)(const char*, void*), void* ctx) {
     const int n = g_surfaceStore.exportCsv(sink, ctx);
     xSemaphoreGive(g_logMtx);
     return n;
+}
+
+// ---- dive continuity (H1): the wiring, and nothing else --------------------
+// The record format, the two-slot store logic, the surface-interval rule and the
+// honesty sentences all live in logfmt (log/continuity.h) and are graded on the
+// host. What is here is the FreeRTOS half: who may take which lock, and with
+// what budget. The store shares the LOG mutex (one partition, one writer at a
+// time, the same reason /surface.bin shares it), but it does NOT share the
+// surface log's sequence: the continuity seq is read off the continuity slots,
+// because a calibration record must not be able to reorder a diver's tissues.
+
+namespace {
+
+/// Publishes the chain's seed: the newest record this boot knows, plus the
+/// surface interval decided as of `nowEpoch`. `budgetMs` is how long the caller
+/// may wait for the mirror mutex — 0 for ControlTask (a skipped refresh retries
+/// at the next 1 Hz tick), a few ms for the task that just wrote a record, and a
+/// real budget at boot, where nothing else on this path is running yet. The
+/// mutex is held for a ~90-byte copy and nothing else, never for I/O.
+void publishContinuitySeed(ctrl::Loop* loop, uint32_t nowEpoch,
+                           uint32_t budgetMs) {
+    if (!loop) return;
+    ctrl::Loop::DiveSeed s{};
+    logfmt::ContinuityRecord r{};
+    bool have = false;
+    if (g_contMtx &&
+        xSemaphoreTake(g_contMtx, budgetMs == 0u ? 0 : pdMS_TO_TICKS(budgetMs)) == pdTRUE) {
+        have = g_contMirrorValid;
+        r = g_contMirror;
+        xSemaphoreGive(g_contMtx);
+    }
+    if (have && logfmt::toTissueState(r, s.st)) {
+        const logfmt::SurfaceInterval iv =
+            logfmt::surfaceIntervalS(r.kind, r.epoch, nowEpoch);
+        s.valid = true;
+        s.recordSeq = r.seq;
+        s.recordEpoch = r.epoch;
+        s.kind = r.kind;
+        // Zero credit is a decision, not an absence: surfaceIntervalS() says why
+        // (a mid-dive snapshot, no clock on one side, or a record dated after this
+        // clock), and carrying tissues with no off-gassing credit is the only
+        // direction that can be wrong safely.
+        s.creditS = iv.credit ? iv.seconds : 0u;
+        s.creditWhy = iv.why;
+    }
+    loop->postDiveSeed(s);
+}
+
+/// The store seam (contgate.h): attempt the commit with at most `budgetMs` of
+/// waiting on the log mutex. Wired once, in initSession, so the only way the
+/// continuity file is written is through this bounded door.
+logfmt::ContinuityGate::Result contWriteAttempt(const logfmt::ContinuityRecord& in,
+                                                uint32_t budgetMs) {
+    if (!logLockTry(budgetMs)) return logfmt::ContinuityGate::BUSY;
+    logfmt::ContinuityRecord r = in;
+    const bool ok = g_contStore.write(r);
+    if (ok) {
+        // The mirror follows the flash, inside the same log lock that wrote it:
+        // the record the next dive gets seeded from is the one that is actually
+        // on the partition, not one that only exists in RAM.
+        if (g_contMtx && xSemaphoreTake(g_contMtx, pdMS_TO_TICKS(5u)) == pdTRUE) {
+            g_contMirror = r;
+            g_contMirrorValid = true;
+            xSemaphoreGive(g_contMtx);
+        }
+    }
+    xSemaphoreGive(g_logMtx);
+    return ok ? logfmt::ContinuityGate::WRITTEN : logfmt::ContinuityGate::FAILED;
+}
+
+} // namespace
+
+ContinuityState continuityState() {
+    ContinuityState st;
+    st.readable = g_contReadable;
+    st.corrupt = g_contStore.corrupt();   // cached flags, no filesystem call: this
+                                          // answers on the control task
+    if (g_contMtx && xSemaphoreTake(g_contMtx, pdMS_TO_TICKS(20u)) == pdTRUE) {
+        st.mirrorValid = g_contMirrorValid;
+        st.rec = g_contMirror;
+        xSemaphoreGive(g_contMtx);
+    }
+    return st;
+}
+
+int continuityBoot(ctrl::Loop& loop, uint32_t nowEpoch,
+                   char* text, size_t cap) {
+    if (g_contMtx == nullptr) g_contMtx = xSemaphoreCreateMutex();
+    // The unbounded wait is the boot's, and it is the same lock diveLogBoot and
+    // surfaceLogBoot already take at this point in setup(): no control-path
+    // caller exists on this path, and the partition has to be mounted first.
+    if (g_logMtx) xSemaphoreTake(g_logMtx, portMAX_DELAY);
+    const bool readable = g_contStore.begin();
+    logfmt::ContinuityRecord rec{};
+    const bool have = readable && g_contStore.newest(rec);
+    const bool corrupt = g_contStore.corrupt();
+    if (g_logMtx) xSemaphoreGive(g_logMtx);
+    g_contReadable = readable;
+    if (g_contMtx && xSemaphoreTake(g_contMtx, pdMS_TO_TICKS(100u)) == pdTRUE) {
+        g_contMirror = rec;
+        g_contMirrorValid = have;
+        xSemaphoreGive(g_contMtx);
+    }
+    publishContinuitySeed(&loop, nowEpoch, 100u);
+    if (text && cap)
+        logfmt::continuityBootText(text, cap, readable, corrupt, have ? &rec : nullptr,
+                                   nowEpoch);
+    if (!readable) return -1;
+    if (corrupt) return -2;    // a record file is there and nothing in it decodes
+    return have ? 1 : 0;
+}
+
+void continuityPublish(const logfmt::ContinuityRecord& r) {
+    g_contGate.post(r);   // a copy. No store, no log lock, no flash: contgate.h.
+}
+
+ContDrain continuityDrain(ctrl::Loop& loop, uint32_t budgetMs) {
+    const bool had = g_contGate.pending();
+    if (!had) return CONT_IDLE;
+    const logfmt::ContinuityGate::Result r = g_contGate.drain(budgetMs);
+    if (r == logfmt::ContinuityGate::WRITTEN) {
+        // A record that reached flash is the newest truth this board has: re-seed
+        // from it, so dive 2 in the SAME boot is seeded from dive 1's end record
+        // and not from whatever boot happened to read.
+        publishContinuitySeed(&loop, wallclock::epoch(g_clock, millis()), 5u);
+        return CONT_WRITTEN;
+    }
+    return r == logfmt::ContinuityGate::BUSY ? CONT_BUSY : CONT_LOST;
+}
+
+uint32_t continuitySkipped() { return g_contGate.lostSnapshots(); }
+
+void continuityRefreshSeed(ctrl::Loop& loop, uint32_t nowEpoch) {
+    publishContinuitySeed(&loop, nowEpoch, 0u);
 }
 
 } // namespace comms

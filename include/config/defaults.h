@@ -174,6 +174,31 @@ static_assert((INJ_MAX_DUTY_PCT * INJ_DUTY_WINDOW_MS / 100) >=
 // 30 s snapshot grid (PLAN 10); event-driven snapshots ride the E, lines.
 #define DIVE_SNAPSHOT_GRID_MS       30000
 
+// --- Dive continuity (H1): the crash-window grid ------------------------------
+// One record carries the diver's tissues across a power cycle. The record is
+// written at DIVE END plus on this grid during a dive, and the grid's period IS
+// the crash window: restore uses the newest WRITTEN record and fast-forwards it
+// across the surface interval exactly, so the worst a reset during a dive can
+// cost is one period of depth time that the restore then credits as surface
+// off-gassing. Sized against that, not against flash:
+//   * at 60 s and 40 m, the tissue error that window can hide is bounded by
+//     (ppN2_depth - ppN2_surface) * (1 - e^(-ln2*60/300)) = 3.54 * 0.129 =
+//     0.46 bar on the FASTEST (5 min) compartment — every slower compartment
+//     moves less in 60 s — which is a few metres of ceiling. The 5 min the
+//     reviewer suggested would put that at ~1.8 bar and ~15 m for the same
+//     depth, for a 5x saving in writes that this partition does not need.
+//   * flash: 60 records/hour, against the dive log's 120 grid rows/hour on the
+//     same partition — 10x less traffic than what already ships, and the writes
+//     happen on HudTask, never on the control task (contgate.h).
+// Seed refresh: how often the surface interval is recomputed while the board
+// sits on the surface, so a dive started two days after boot is credited two
+// days. One second of granularity against intervals of minutes to days.
+#define CONTINUITY_SNAPSHOT_MS      60000
+#define CONTINUITY_SEED_REFRESH_MS  1000
+// How long HudTask may wait for the log mutex to commit one record. Its stall
+// budget is 3000 ms (TASK_STALL_HUD_MS); a record is not worth anywhere near it.
+#define CONTINUITY_DRAIN_BUDGET_MS  20
+
 // --- Depth ---------------------------------------------------------------------
 // Depth source is decided at boot by identity, not by build: the dive-rated
 // MS5837-30bar is preferred, the LPS28DFW (Adafruit #6067) is the bench and

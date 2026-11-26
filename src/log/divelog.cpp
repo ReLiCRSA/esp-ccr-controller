@@ -19,7 +19,15 @@ namespace {
 void wr16(uint8_t*& p, uint16_t v) { *p++ = v & 0xFF; *p++ = v >> 8; }
 void wr32(uint8_t*& p, uint32_t v) { wr16(p, static_cast<uint16_t>(v)); wr16(p, static_cast<uint16_t>(v >> 16)); }
 uint16_t rd16(const uint8_t*& p) { const uint16_t v = p[0] | (p[1] << 8); p += 2; return v; }
-uint32_t rd32(const uint8_t*& p) { return rd16(p) | (static_cast<uint32_t>(rd16(p)) << 16); }
+// Sequenced on purpose, and this one is a live landmine, not a hypothetical:
+// `return rd16(p) | (rd16(p) << 16)` has two unsequenced side effects on the same
+// scalar, which is undefined behaviour — the compiler may read the HIGH half
+// first, and every field after it in the record is then read from the wrong
+// offset. It happened to work here because this compiler happens to evaluate the
+// left operand first. Found on 2026-11-26 while writing the continuity codec
+// (log/continuity.cpp had the same line, and test_continuity's round-trip caught
+// it there); fixed in both codecs rather than left as a coincidence.
+uint32_t rd32(const uint8_t*& p) { const uint32_t lo = rd16(p); const uint32_t hi = rd16(p); return lo | (hi << 16); }
 
 } // namespace
 
@@ -582,6 +590,8 @@ size_t surfaceName(char* out, size_t cap, uint16_t id) {
         case EVT_CAL_AIR:  n = "cal_air"; break;
         case EVT_PREPASS:  n = "pre_dive_pass"; break;
         case EVT_PREFAIL:  n = "pre_dive_fail"; break;
+        case EVT_CONT_RESTORED: n = "continuity_restored"; break;
+        case EVT_CONT_LOST:     n = "continuity_lost"; break;
         default: break;
     }
     if (n) {

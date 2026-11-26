@@ -714,6 +714,13 @@ void test_surface_names_are_stable_and_unknown_ids_keep_their_number() {
     TEST_ASSERT_EQUAL_STRING("cal_air", (surfaceName(n, sizeof(n), EVT_CAL_AIR), n));
     TEST_ASSERT_EQUAL_STRING("pre_dive_pass", (surfaceName(n, sizeof(n), EVT_PREPASS), n));
     TEST_ASSERT_EQUAL_STRING("pre_dive_fail", (surfaceName(n, sizeof(n), EVT_PREFAIL), n));
+    // H1: the two continuity verdicts. These rows are the only durable trace of a
+    // dive that was planned from the wrong starting point, so a name is not
+    // decoration — a row a spreadsheet cannot name is a row nobody reads.
+    TEST_ASSERT_EQUAL_STRING("continuity_restored",
+                             (surfaceName(n, sizeof(n), EVT_CONT_RESTORED), n));
+    TEST_ASSERT_EQUAL_STRING("continuity_lost",
+                             (surfaceName(n, sizeof(n), EVT_CONT_LOST), n));
     // An id appended by a future build still gets a label: a row without a name
     // is a row a reader drops, which is how append-only logs start lying.
     TEST_ASSERT_EQUAL_STRING("id99", (surfaceName(n, sizeof(n), 99), n));
@@ -747,6 +754,24 @@ void test_surface_rows_are_the_documented_shape() {
     surfaceCsvLine(line, sizeof(line), p);
     TEST_ASSERT_EQUAL_STRING(
         "R,5,1795517641,2026-11-24T10:54:01Z,13,pre_dive_pass,0,0,0,0,0,0,1\n", line);
+
+    // The continuity verdicts (H1). The `value` column is id-specific in a way the
+    // calibration rows never are: for id 17 it is the surface interval credited,
+    // in seconds; for id 18 it is the reason nothing was credited (2 = "the record
+    // there does not decode"). Both rows live outside the dive file on purpose: the
+    // dive they describe may be the one whose file never got written, and "this
+    // dive was planned from carried tissues" / "this dive was not" is the fact a
+    // reader needs in order to believe the ceiling column of the dive itself.
+    SurfaceRecord c1{};
+    c1.seq = 6; c1.epoch = 1795521750u; c1.id = EVT_CONT_RESTORED; c1.value = 3600;
+    surfaceCsvLine(line, sizeof(line), c1);
+    TEST_ASSERT_EQUAL_STRING(
+        "R,6,1795521750,2026-11-24T12:02:30Z,17,continuity_restored,3600,0,0,0,0,0,0\n", line);
+    SurfaceRecord c2{};
+    c2.seq = 7; c2.id = EVT_CONT_LOST; c2.value = 2;   // 2 = CONT_LOSS_BAD
+    surfaceCsvLine(line, sizeof(line), c2);
+    TEST_ASSERT_EQUAL_STRING(
+        "R,7,0,clock-unset,18,continuity_lost,2,0,0,0,0,0,0\n", line);
 
     // Identity row: count plus the seq range, so a log that shed history admits
     // it (5..9 with only 3 records is two records gone) instead of presenting

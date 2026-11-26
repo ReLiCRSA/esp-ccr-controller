@@ -46,6 +46,7 @@
 #include "comms/uart2_task.h"
 #include "comms/web_server.h"
 #include "log/rowfill.h"
+#include "log/continuity.h"   // H1: the dive-start verdict line + snapshot stamping
 #include <esp_timer.h>
 #include "util/pinfuse.h"
 #include "hud.h"
@@ -279,6 +280,22 @@ static void hudTask(void*) {
         // resolve anything is a "page does not load" bug report every time.
         comms::web::service();
 
+        // Dive continuity (H1): the FLASH half, here rather than in ControlTask on
+        // purpose (contgate.h). ControlTask posts a snapshot; this task takes the
+        // log mutex and commits it, because its stall budget (3000 ms) is twice
+        // the control task's and one 86-byte record is worth 20 ms of waiting, not
+        // more. A snapshot the store refused outright is said once here and counted
+        // on HB (`contskip=`): the older record on flash still stands, so the
+        // diver is not in danger — but the bench has to be able to see that the
+        // picture it is restoring is one snapshot older than it thinks.
+        if (g_loop) {
+            const comms::ContDrain cd =
+                comms::continuityDrain(*g_loop, CONTINUITY_DRAIN_BUDGET_MS);
+            if (cd == comms::CONT_LOST)
+                Serial.println("continuity: ** snapshot REFUSED by the store - the older "
+                               "record still stands, this one is gone (contskip= on HB)");
+        }
+
         static uint32_t lastStatus = 0;
         if (now - lastStatus >= 5000) {
             lastStatus = now;
@@ -309,6 +326,13 @@ static void hudTask(void*) {
             //             would edit the dive; this counts the edit out loud.
             //   surfskip= same policy for surface verdict records (CAL AIR,
             //             pre-dive). Cumulative since boot, like stk's worst.
+            //   contskip= dive-continuity snapshots that came due and never
+            //             reached /continuity.bin (H1). The counter is the point:
+            //             a dive seeded from an OLDER record than the diver's
+            //             tissues is a dive whose ceiling is computed from a
+            //             stale picture, and that has to be visible on the bench
+            //             rather than inferred after the fact from the record's
+            //             own seq. Cumulative, like the two above.
             const uint32_t worstCycleMs = g_worstCycleMs;
             g_worstCycleMs = 0;  // "since the last HB beat": the bench grades
                                  // per-beat margin, not an ever-climbing max
@@ -316,7 +340,7 @@ static void hudTask(void*) {
                           "smp=%lu i2cerr=%lu rec=%lu vbat=%s "
                           "stale=%d batlow=%d"
                           " vote=%s sp=%s al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d"
-                          " stk=%u u2stk=%u worst=%u logskip=%u surfskip=%u\n",
+                          " stk=%u u2stk=%u worst=%u logskip=%u surfskip=%u contskip=%u\n",
                           static_cast<int>(g_systemState),
                           g_ads.raw(0), g_ads.raw(1), g_ads.raw(2),
                           g_ads.fresh(0, now), g_ads.fresh(1, now),
@@ -334,7 +358,8 @@ static void hudTask(void*) {
                           (unsigned)stackFree, (unsigned)uart2Free,
                           (unsigned)worstCycleMs,
                           (unsigned)comms::diveLogSkippedRows(),
-                          (unsigned)comms::surfaceSkippedRecords());
+                          (unsigned)comms::surfaceSkippedRecords(),
+                          (unsigned)comms::continuitySkipped());
             // Shout for the machine overall AND for the handset task by name, so
             // a command-path regression is named instead of averaged away.
             if (stackFree != 0 && stackFree < stackwatch::kWarnFreeBytes) {
@@ -417,6 +442,95 @@ static void surfacePredive(bool passed, uint16_t failedStep) {
     else
         Serial.printf("surface: record %lu id %u\n", (unsigned long)r.seq,
                       static_cast<unsigned>(r.id));
+}
+
+// ---------------------------------------------------------------------------
+// Dive continuity (H1): the dive-start verdict, and the snapshots that make the
+// next dive's ceiling real.
+//
+// Two sentences per dive start — one to the console, one to flash — and both say
+// what the machine did to the diver's deco picture. The SENTENCES live in
+// logfmt (continuity.h), because main.cpp is not compiled for the native env:
+// wording written in a file no test can read is wording nobody checks. What is
+// here is only which sentence to say, and where.
+//
+// Why the loss case is a durable record and not just a line: a dive that starts
+// from clean tissues because the carried record was lost is a dive whose ceiling
+// was wrong from the first minute, and the dive file — if one is ever written —
+// will not say so. It may never be written at all (a power cut on the ascent),
+// which is exactly the situation the record is about: surface records live
+// outside the dive FIFO for that reason (divelog.h).
+// ---------------------------------------------------------------------------
+static void continuityAnnounceStart() {
+    // What THIS dive start consumed, read off the chain's own memory of applying
+    // it — not off the store mirror, which a later snapshot may have moved on
+    // from (that would print a verdict about a record the dive never used).
+    const ctrl::Loop::DiveSeed s = g_loop->lastSeed();
+    char line[320];
+    logfmt::SurfaceRecord v{};
+    if (s.applied) {
+        logfmt::ContinuityRecord r{};
+        r.seq = s.recordSeq;
+        r.epoch = s.recordEpoch;
+        r.kind = s.kind;
+        const logfmt::SurfaceInterval iv{s.creditS, s.creditS > 0u, s.creditWhy};
+        logfmt::continuitySeedText(line, sizeof(line), &r, comms::clockEpoch(), iv);
+        v.id = logfmt::EVT_CONT_RESTORED;
+        // The interval credited, saturated: a reader comparing this row with the
+        // dive's own T, rows wants the number that produced the ceiling, and a
+        // three-month surface interval is not worth widening the record for.
+        v.value = s.creditS > 65535u ? 65535u : static_cast<uint16_t>(s.creditS);
+    } else {
+        // The REASON is composed here, from the store's state, and deliberately
+        // not by the chain (loop.h): "the store will not read", "a record is
+        // there and does not decode" and "there is no record" are facts about the
+        // STORE, and ctrl::Loop has no business claiming any of them.
+        const comms::ContinuityState cs = comms::continuityState();
+        uint8_t why = logfmt::CONT_LOSS_ABSENT;
+        if (!cs.readable) why = logfmt::CONT_LOSS_STORE;
+        else if (cs.corrupt) why = logfmt::CONT_LOSS_BAD;
+        else if (cs.mirrorValid) why = logfmt::CONT_LOSS_SEED;
+        logfmt::continuityLossText(line, sizeof(line), why);
+        v.id = logfmt::EVT_CONT_LOST;
+        v.value = why;
+    }
+    Serial.printf("continuity: %s\n", line);
+    // CONTROL-TASK CALLER (H2): the same bounded gate as CAL AIR and the pre-dive
+    // verdicts. A verdict record lost to a busy store is `surfskip=` on HB, not a
+    // silence — and unlike those, this one can be the only trace that a diver was
+    // owed a ceiling and was handed zero.
+    const bool ok = comms::surfaceLogAppendBounded(v) == comms::SURF_WRITTEN;
+    if (!ok)
+        Serial.println("surface: record DEFERRED - store busy (pending retried; "
+                       "a lost record shows as surfskip= on HB)");
+    else
+        Serial.printf("surface: record %lu id %u\n", (unsigned long)v.seq,
+                      static_cast<unsigned>(v.id));
+}
+
+/// ControlTask: take the engine's numbers and POST them. That is the whole cost
+/// — a struct copy (contgate.h): no store call, no log mutex, no flash, ever, on
+/// the task carrying the 1500 ms stall budget. HudTask commits what is posted.
+static void continuityPublishSnapshot(uint8_t kind, const char* edge) {
+    logfmt::ContinuityRecord r{};
+    if (!logfmt::fromTissueState(g_loop->deco().tissueState(), kind, r)) {
+        // The engine produced a number this record cannot hold. Writing a clamped
+        // one would be the worse answer: the next dive would be planned against a
+        // loading this engine never had. So: no record, and the console says so at
+        // the moment it happens.
+        Serial.printf("continuity: ** no snapshot at %s - the engine's own numbers "
+                      "will not fit the record\n", edge);
+        return;
+    }
+    // The SNAPSHOT instant, not the write instant: the write is deferred to
+    // HudTask, and a record stamped with the later time would make 60-second-old
+    // tissues look fresher than they are — which is a surface interval credited
+    // that the diver did not spend out of the water.
+    r.epoch = comms::clockEpoch();
+    if (r.epoch == 0u) r.flags |= logfmt::CONT_FLAG_CLOCK_UNSET;
+    else if (comms::clockSource() == wallclock::CARRIED)
+        r.flags |= logfmt::CONT_FLAG_CLOCK_CARRIED;
+    comms::continuityPublish(r);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +772,36 @@ static void controlTask(void*) {
             // at. SAFE boot re-arms it too (fresh boot, fresh object).
             g_solFuse.clear();
         }
+        // ---- dive continuity (H1): three edges, and every one of them is a copy
+        //   dive start  -> the verdict: what seeded this dive, in words on the
+        //                  console and as one surface record (EVT_CONT_RESTORED /
+        //                  EVT_CONT_LOST)
+        //   dive end    -> the record the reviewer's scenario needs: dive 2, from
+        //                  where dive 1 left the tissues
+        //   60 s grid   -> the crash window, bounded (defaults.h does the maths)
+        // plus a 1 Hz seed refresh while the board sits at the surface. The FLASH
+        // half is HudTask's (contgate.h): nothing in this block touches the store,
+        // and no call below waits on anything the command task holds.
+        static uint32_t contStarts = 0, contSnapMs = 0, contRefreshAt = 0;
+        const uint32_t contStartsNow = g_loop->diveStarts();
+        if (contStartsNow != contStarts) {
+            contStarts = contStartsNow;
+            contSnapMs = now;   // the grid belongs to the dive, not to boot
+            continuityAnnounceStart();
+        }
+        if (st.diveActive) {
+            if (now - contSnapMs >= CONTINUITY_SNAPSHOT_MS) {
+                contSnapMs = now;
+                continuityPublishSnapshot(logfmt::CONT_KIND_PERIODIC, "the snapshot grid");
+            }
+        } else if (prevDive) {
+            continuityPublishSnapshot(logfmt::CONT_KIND_DIVE_END, "dive end");
+        }
+        if (!st.diveActive && (int32_t)(now - contRefreshAt) >= 0) {
+            contRefreshAt = now + CONTINUITY_SEED_REFRESH_MS;
+            comms::continuityRefreshSeed(*g_loop, comms::clockEpoch());
+        }
+
         prevDive = st.diveActive;
 
         // Protocol events from the chain's transitions (alarm edges, mode,
@@ -1199,6 +1343,26 @@ void setup() {
                       (unsigned long)surfLo, (unsigned long)surfHi);
 
     Serial.printf("clock: %s\n", clockNote);
+
+    // Dive continuity (H1): the record that carries a diver's tissues across a
+    // power cycle. It gets its own line for the same reason the two above do —
+    // "no record", "a record that does not decode" and "the store will not read"
+    // are three different facts, and all three currently look like silence. The
+    // difference matters more here than anywhere else on this banner: the first
+    // means the next dive starts from clean tissues legitimately, the other two
+    // mean it starts from clean tissues because the machine LOST the answer.
+    // After surfaceLogBoot(), because that is what mounts LittleFS.
+    char contNote[192];
+    const int contRec = comms::continuityBoot(*g_loop, comms::clockEpoch(),
+                                              contNote, sizeof(contNote));
+    if (contRec < 0)
+        Serial.printf("continuity: ** %s\n", contNote);
+    else
+        Serial.printf("continuity: %s\n", contNote);
+    if (contRec >= 0)
+        Serial.println("continuity: the next DIVE START seeds from that record; "
+                       "ceiling, NDL and the schedule are recomputed from it under "
+                       "the CURRENT gradient factors");
 
     size_t schemaKeys = 0;
     settings::Registry::definitions(schemaKeys);

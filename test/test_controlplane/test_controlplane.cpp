@@ -382,7 +382,21 @@ void test_control_task_store_entry_points_are_bounded() {
                            "void diveLogPostGrid(", "void diveLogRetryGrid(",
                            "SurfAppend surfaceLogAppendBounded(",
                            "bool surfaceRetryPending(",
-                           "bool logLockTry("}) {
+                           "bool logLockTry(",
+                           // H1 — the dive-continuity path. continuityPublish is
+                           // ControlTask's half of it (a copy into the gate, never
+                           // a store call), and continuityState / RefreshSeed are
+                           // answered from RAM caches. continuityBoot() is
+                           // deliberately NOT on this list: it runs in setup(),
+                           // before any task exists, and a store wait there is the
+                           // right answer — which is exactly why it is called out
+                           // in the case below rather than left unmentioned.
+                           "void continuityPublish(",
+                           "void continuityRefreshSeed(",
+                           "ContinuityState continuityState(",
+                           "ContDrain continuityDrain(",
+                           "void publishContinuitySeed(",
+                           "logfmt::ContinuityGate::Result contWriteAttempt("}) {
         const std::string body = functionBody(w, fn);
         TEST_ASSERT_TRUE_MESSAGE(!body.empty(),
                                  (std::string("control-task store entry point not found: ") + fn +

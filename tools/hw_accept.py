@@ -329,11 +329,13 @@ HB_STACK_RE = re.compile(r"stk=(\d+)(?: u2stk=(\d+))?")
 # depth sensor can legally report: ~1.35 ms host-measured, pinned by the
 # test_controlplane budget test). A board beating at 900 ms is not rebooting
 # yet — it is one long flash write away from it, and that is a finding.
-# `logskip=`/`surfskip=` are CUMULATIVE lost-record counters since boot
-# (rowgate.h deferral ran out of road: a row the busy store never took).
+# `logskip=`/`surfskip=`/`contskip=` are CUMULATIVE lost-record counters since
+# boot (rowgate.h deferral ran out of road: a row the busy store never took;
+# contskip= is the H1 one — a continuity snapshot that never reached flash,
+# which widens the crash window the next dive seeds from).
 # A healthy bench run loses nothing: a nonzero is a real hole in a dive file
 # and is graded like one.
-HB_CYCLE_RE = re.compile(r"worst=(\d+) logskip=(\d+) surfskip=(\d+)")
+HB_CYCLE_RE = re.compile(r"worst=(\d+) logskip=(\d+) surfskip=(\d+) contskip=(\d+)")
 HB_WORST_CYCLE_MS = 800
 
 
@@ -1848,14 +1850,14 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
     # skip counters are cumulative since boot, so the maximum seen is the
     # current total.
     worst_cycle = None
-    lost = {"logskip": None, "surfskip": None}
+    lost = {"logskip": None, "surfskip": None, "contskip": None}
     for l in list(lines) + list(boot_lines or []):
         m = HB_CYCLE_RE.search(l)
         if not m:
             continue
-        w, lr, ls = (int(x) for x in m.groups())
+        w, lr, ls, cs = (int(x) for x in m.groups())
         worst_cycle = w if worst_cycle is None else max(worst_cycle, w)
-        for key, val in zip(("logskip", "surfskip"), (lr, ls)):
+        for key, val in zip(("logskip", "surfskip", "contskip"), (lr, ls, cs)):
             lost[key] = val if lost[key] is None else max(lost[key], val)
     if worst_cycle is None:
         checks.append(("HB reports ControlTask cycle margin (worst=)", False,
@@ -1865,7 +1867,8 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
         checks.append((f"worst= cycle margin <= {HB_WORST_CYCLE_MS} ms "
                        f"(worst {worst_cycle}, reboot budget 1500)",
                        worst_cycle <= HB_WORST_CYCLE_MS, "see HB lines"))
-    for key, what in (("logskip", "dive-file row"), ("surfskip", "surface record")):
+    for key, what in (("logskip", "dive-file row"), ("surfskip", "surface record"),
+                      ("contskip", "continuity snapshot")):
         if lost[key] is None:
             checks.append((f"HB reports lost {what} count ({key}=)", False,
                            f"no {key}= in any HB line: a skipped record would "
@@ -1889,16 +1892,16 @@ def selftest_control_margin():
     (one field edited out mid-format, the append-only rule broken in
     silence). Each must redden the check named for it.
     """
-    def hb(worst, lskip, sskip, tail="stk=1408 u2stk=1536"):
+    def hb(worst, lskip, sskip, cont=0, tail="stk=1408 u2stk=1536"):
         return (f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
                 f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
                 f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 {tail}"
-                + (f" worst={worst} logskip={lskip} surfskip={sskip}"
+                + (f" worst={worst} logskip={lskip} surfskip={sskip} contskip={cont}"
                    if worst is not None else ""))
 
     def new_leg(checks):
-        keep = ("worst=", "logskip=", "surfskip=", "(worst=)", "(logskip=)",
-                "(surfskip=)")
+        keep = ("worst=", "logskip=", "surfskip=", "contskip=",
+                "(worst=)", "(logskip=)", "(surfskip=)", "(contskip=)")
         return [c for c in checks if any(s in c[0] for s in keep)]
 
     cases = [
@@ -1917,6 +1920,15 @@ def selftest_control_margin():
          [hb(45, 0, 2)], "surfskip= lost"),
         ("the cumulative counter climbing: 0 then 4 rows gone",
          [hb(45, 0, 0), hb(60, 4, 0)], "logskip= lost"),
+        ("a continuity snapshot lost: the crash window the next dive seeds from grew",
+         [hb(45, 0, 0, 3)], "contskip= lost"),
+        ("the H1 tail truncated: contskip= edited out of the format",
+         [(lambda h: h[:h.index(" contskip=")])
+          (f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
+           f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
+           f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 stk=1408 u2stk=1536 "
+           f"worst=45 logskip=0 surfskip=0 contskip=0")],
+         "(contskip=)"),
         ("the append-only rule broken: worst= there, the counters edited out",
          [f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
           f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
@@ -1928,11 +1940,11 @@ def selftest_control_margin():
         got = new_leg(grade_watch(list(hb_lines)))
         failed = [c[0] for c in got if not c[1]]
         if want is None:
-            # An honest capture grades exactly three checks in this leg — the
+            # An honest capture grades exactly four checks in this leg — the
             # thresholds; the "HB reports ... (field=)" checks only appear when
             # a field is missing.
-            checks.append((f"control margin: {name}", len(got) == 3 and not failed,
-                           f"expected the three threshold checks, none failed: {failed}"))
+            checks.append((f"control margin: {name}", len(got) == 4 and not failed,
+                           f"expected the four threshold checks, none failed: {failed}"))
         else:
             checks.append((f"control margin: {name}",
                            any(want in f for f in failed),

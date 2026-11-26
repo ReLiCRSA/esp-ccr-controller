@@ -90,7 +90,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
             pending_ = Pending{};
         }
         if (p.cfg) setConfig(p.cfgVal);
-        if (p.start) { cpEng_.diveStarted(); deco_.reset(); }
+        if (p.start) beginDiveBody();   // tissues seeded or reset: see beginDiveBody
         if (p.predive) predive_.start(p.prediveStamp ? p.prediveStamp : nowMs);
         if (p.cpOverride) cpEng_.override();
         if (p.ack) alarmMgr_.ack();
@@ -445,14 +445,58 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
 
 void Loop::startDive(uint32_t /*nowMs*/) {  // control thread: apply now
     diveActive_ = true;
+    beginDiveBody();
+}
+
+// The dive-start body. One implementation for both entry points — startDive()
+// (the chain's own thread: simulator, factory paths) and cycle() step 0 (the
+// deferred handset/web path) — because "what a dive starts with" is exactly the
+// thing that must not differ between them, and until 2026-11-26 both copies said
+// `deco_.reset()` and a change to one would have left the other behind.
+void Loop::beginDiveBody() {
+    diveStarts_++;   // the edge ControlTask announces on: see diveStarts()
     cpEng_.diveStarted();
-    deco_.reset();
+
+    DiveSeed s{};
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> g(reqMux_);
+        have = seedSet_;
+        s = seed_;
+        seedSet_ = false;   // consumed: one seed, one dive start
+    }
+
+    if (have && s.valid && deco_.setTissueState(s.st)) {
+        if (s.creditS) deco_.surfaceInterval(static_cast<double>(s.creditS));
+        // `applied` is the whole claim the chain makes: these are the numbers this
+        // dive started with. WHY a dive did not seed is not the chain's to say
+        // (see loop.h): the wiring composes that from the store's state.
+        s.applied = true;
+        lastSeed_ = s;
+    } else {
+        // Today's behavior, and today's safety net: a dive with clean tissues is
+        // what this firmware has always done. What is NEW is that the dive start
+        // is observable at all: lastSeed().applied == false is what main.cpp
+        // turns into the console line and the EVT_CONT_LOST record, which is the
+        // only trace that a diver who was obligated was handed a ceiling of zero.
+        deco_.reset();
+        lastSeed_ = DiveSeed{};
+        lastSeed_.applied = false;
+    }
 }
 
 void Loop::endDive(uint32_t /*nowMs*/) {    // control thread: apply now
     diveActive_ = false;
     cpEng_.diveEnded();
 }
+
+void Loop::postDiveSeed(const DiveSeed& s) {
+    std::lock_guard<std::mutex> g(reqMux_);
+    seed_ = s;
+    seedSet_ = true;
+}
+
+Loop::DiveSeed Loop::lastSeed() const { return lastSeed_; }
 
 // ---- the command-path surface (any thread) ---------------------------------
 // Gates flip here, chain work waits for cycle() step 0. See loop.h — the split

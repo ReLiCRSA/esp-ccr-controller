@@ -28,6 +28,7 @@
 #include "comms/telemetry_bridge.h"
 #include "comms/uart_link.h"
 #include "control/loop.h"
+#include "log/continuity.h"   // ContinuityState (H1): the record travels by value
 
 namespace comms {
 
@@ -238,6 +239,58 @@ int surfaceLogBoot(uint32_t& seqLo, uint32_t& seqHi);
 /// records between the pass that writes the identity row and the pass that
 /// streams them, or the header and the rows would describe different files.
 int surfaceLogExportCsv(void (*sink)(const char*, void*), void* ctx);
+
+// ---- dive continuity: carrying a diver's tissues across a power cycle (H1) --
+// Every startDive() used to reset the tissues, so dive 2 an hour after dive 1
+// was planned as if dive 1 had never happened. The record, its two-slot store and
+// the surface-interval arithmetic live in log/continuity.h (host-tested); the
+// LittleFS adapter is log/continuity_store.{h,cpp}; the split between "who
+// publishes" (ControlTask) and "who writes" (a lower-priority task) is
+// log/contgate.h. What lives here is the wiring, and nothing else.
+
+/// The store's state plus the newest record it holds, for the boot banner, the
+/// dive-start console line and the EVT_CONT_RESTORED / EVT_CONT_LOST verdict
+/// record. `readable` false and "no record" are different facts, and the banner
+/// must not collapse them (the same rule as the surface log's count).
+struct ContinuityState {
+    bool readable = false;
+    bool corrupt = false;      // a file is present and nothing in it decodes
+    bool mirrorValid = false;  // this boot knows a record that decodes
+    logfmt::ContinuityRecord rec{};
+};
+ContinuityState continuityState();
+
+/// Boot: reads /continuity.bin and publishes the seed the first dive will use.
+/// Call after diveLogBoot(), which is what mounts LittleFS. Returns 1 when a
+/// record was found, 0 when there is none, -1 when the file will not read and
+/// -2 when a file is there and nothing in it decodes; `text` receives the
+/// sentence for the banner ("continuity: ...").
+int continuityBoot(ctrl::Loop& loop, uint32_t nowEpoch, char* text, size_t cap);
+
+/// CONTROL-TASK entry point (H2 discipline): publish the current continuity
+/// state. A copy under the gate's own mutex — never a store call, never flash,
+/// never the log mutex (contgate.h). `r` arrives without a sequence: the store
+/// assigns that, because the records are the only durable counter.
+void continuityPublish(const logfmt::ContinuityRecord& r);
+
+/// The other half: write what is pending, on a LOWER-priority task, with a
+/// bounded wait on the log mutex. CONT_WRITTEN re-seeds the chain from what is
+/// now on flash; CONT_LOST means the store refused it outright (the older record
+/// on the partition still stands, and `contskip=` counted the new one).
+enum ContDrain : uint8_t { CONT_IDLE = 0, CONT_WRITTEN = 1, CONT_BUSY = 2, CONT_LOST = 3 };
+ContDrain continuityDrain(ctrl::Loop& loop, uint32_t budgetMs);
+
+/// HB `contskip=`: snapshots that came due and never reached the store.
+uint32_t continuitySkipped();
+
+/// ControlTask, about 1 Hz while no dive is running: keep the seed the next dive
+/// will use current — the newest record, plus the surface interval AS OF NOW.
+/// That is what makes the credit honest for a board that boots and sits for two
+/// days before diving: the interval is decided at the dive start, not frozen
+/// when the record was written. Waits at most zero ticks for the mirror mutex: a
+/// skipped refresh retries on the next tick.
+void continuityRefreshSeed(ctrl::Loop& loop, uint32_t nowEpoch);
+
 // ---- wall clock: the dive log's timestamp ---------------------------------
 // No RTC chip, no NTP through an AP with no uplink: the time comes from a client
 // at the surface (`TIME SET <epoch>`, or the built-in page posting the phone's
@@ -260,6 +313,14 @@ void clockTick();
 /// here, or an explicit "unset". The banner is the instrument on this bench, so
 /// "no clock" has to be as readable as a date is.
 void clockBootText(char* out, size_t cap);
+
+/// The wall clock as everything outside this file has to see it: the current
+/// epoch, or 0 meaning "there is no clock" — the same value the dive header and
+/// the surface records are stamped with, from one place. `clockSource()` is
+/// wallclock::Source (SET / CARRIED): a date carried across a reset is not a
+/// verified date, and a record has to say which one it is.
+uint32_t clockEpoch();
+uint8_t clockSource();
 
 long unsigned diveLogUsedBytes();
 long unsigned diveLogTotalBytes();

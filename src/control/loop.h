@@ -148,6 +148,62 @@ public:
     void endDive(uint32_t nowMs);
     bool diveActive() const { return diveActive_; }
 
+    // ---- dive continuity (review H1) ---------------------------------------
+    // What a dive starts with. A reboot between dives used to mean the tissues
+    // were reset, so dive 2 was planned as if dive 1 had never happened — the
+    // one decompression gap that needs no instrument to fail.
+    //
+    // The seed is PUBLISHED by whoever holds the newest record (the boot read,
+    // and every continuity write) and CONSUMED by exactly one dive start, in
+    // cycle() step 0 — the control thread, which is where the dive-state work
+    // already lands (test_deferred). That ordering is the whole point: the
+    // command task that answers DIVE START cannot touch deco_, and the chain
+    // refuses to be mutated mid-decision from the other core.
+    //
+    // The interval arithmetic lives in logfmt::surfaceIntervalS (host-tested),
+    // so what the chain applies is a number somebody else decided and some-
+    // body-else's test can grade. `creditS` is the only physiology applied here,
+    // and it is the engine's own surface integration (deco::Zhl16Ccr::
+    // surfaceInterval).
+    struct DiveSeed {
+        bool valid = false;
+        deco::Zhl16Ccr::TissueState st{};
+        // Record identity, for the console line and the verdict record. Plain
+        // integers because loop.h must not include src/log: the dependency
+        // direction is log -> control at most (rowfill.h), never both ways.
+        // `creditWhy` and `lossWhy` carry logfmt::IntervalWhy and
+        // logfmt::ContLoss values; the values are stated at the consumer.
+        uint32_t recordSeq = 0;
+        uint32_t recordEpoch = 0;
+        uint32_t creditS = 0;
+        uint8_t kind = 0;        // logfmt::ContKind
+        uint8_t creditWhy = 0;   // logfmt::IntervalWhy
+        bool applied = false;    // this seed is what the last dive start used
+    };
+
+    /// WHY a dive start did not seed, when it did not, is deliberately NOT a
+    /// field here. It is composed by the wiring (main.cpp), the only place that
+    /// knows the store's state: "no record", "a record that does not decode" and
+    /// "the store will not read" are facts about the STORE, and the chain has no
+    /// business claiming them. logfmt::ContLoss is that vocabulary.
+
+    /// Any thread. A copy under the request mutex — the same µs-scale critical
+    /// section postConfig() uses, never held while anything decides.
+    void postDiveSeed(const DiveSeed& s);
+    /// What the LAST dive start did: seeded from a record, or not, and why.
+    /// Published by the control thread when it applies the start; the console
+    /// line and the surface verdict record read this.
+    DiveSeed lastSeed() const;
+
+    /// How many dive-start bodies have run this boot. ControlTask uses THIS as
+    /// the dive-start edge rather than `diveActive`: with a deferred start the
+    /// flag goes true on the command task and the body runs on a later tick, so
+    /// the flag would announce a seed one cycle before the tissues existed. A
+    /// verdict line printed before the thing it describes happened is the class
+    /// of lie this repo already deleted once (`OK DIVE START` meaning
+    /// "requested").
+    uint32_t diveStarts() const { return diveStarts_; }
+
     // ---- diver commands, safe from any thread (the command-path surface) ----
     // The session lock keeps commands off each other; these keep commands off
     // the control chain. Two halves, deliberately:
@@ -253,6 +309,12 @@ public:
 
 private:
     void drivePulseTest(uint32_t nowMs);
+    /// The dive-start body, shared by startDive() and cycle() step 0 so there is
+    /// ONE answer to "what happens when a dive starts": proof state, then the
+    /// tissues — seeded from the newest continuity record and fast-forwarded
+    /// across the surface interval when there is one, reset when there is not,
+    /// with the reason remembered for the console and the verdict record.
+    void beginDiveBody();
 
     Config cfg_;
     cellproof::Config cpCfg_;
@@ -319,6 +381,14 @@ private:
     };
     std::mutex reqMux_;
     Pending pending_;
+
+    // The continuity seed waiting for the next dive start (reqMux_-guarded, like
+    // pending_), and what the last dive start actually did (written by the
+    // control thread in beginDiveBody(), read by ControlTask right after).
+    DiveSeed seed_;
+    bool seedSet_ = false;
+    DiveSeed lastSeed_{};
+    uint32_t diveStarts_ = 0;   // dive-start bodies applied, this boot
 
     voting::Result vote_{};
     alarms::Result alarmRes_{};

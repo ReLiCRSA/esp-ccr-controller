@@ -2378,6 +2378,374 @@ void runFrozenChannelDive() {
                 windowCycle);
 }
 
+// ---------------------------------------------------------------------------
+// Dive 9004 — dive continuity (review H1): "the one gap that can kill without
+// any instrument failing".
+//
+// The scenario in one sentence: dive 1 ends with an obligation, the diver
+// surfaces, and dive 2 starts 60 minutes later — and dive 2 must show a ceiling
+// the moment it starts. It used not to. startDive() called deco_.reset(), so the
+// second dive was computed as if the first had never happened: ceiling 0, NDL
+// wide open, no deco schedule, and every one of those numbers displayed as a
+// fact. No sensor had failed, no alarm was due, and the controller was the only
+// thing in the system that knew the difference.
+//
+// What the rig runs here is the shipping logic with the file calls removed:
+// logfmt::ContinuitySlots is the real two-slot store (same CRC gate, same
+// "write the OLDER slot" rule, same sequence-off-the-slots), the cadence is
+// main.cpp's (dive-end record, 60 s grid during the dive, 1 Hz seed refresh at
+// the surface), and the off-gassing across the interval is the deco engine's own
+// surface integration. What is simulated is LittleFS and the wall clock
+// (Rig::epoch(), the stand-in for comms::clockEpoch()).
+//
+// The twin is the point of the whole dive: an identical rig with continuity OFF,
+// the same profile, the same diver. The difference between the two at the start
+// of dive 2 is the size of the bug, in metres and minutes, and it is measured
+// rather than asserted against a number this file made up.
+// ---------------------------------------------------------------------------
+void runContinuityPair() {
+    const int id = 9004;
+    constexpr float kBottomM = 40.0f;
+    // Chosen, not tuned. 30 minutes at this depth leaves an hour-long surface
+    // interval that clears the obligation entirely, and then dive 2's ceiling is
+    // honestly zero with or without continuity — the scenario would prove
+    // nothing. An hour on the bottom leaves a real obligation an hour later: the
+    // witness line shows the entry ceiling in metres and the no-deco time at 20 m
+    // (0 min against the twin's 39), which is the size of what the reset took.
+    constexpr float kBottomS = 3600.0f;
+    constexpr float kSurfaceS = 3600.0f;   // the reviewer's hour out of the water
+    constexpr float kDive2DepthM = 20.0f;
+    constexpr float kDive2S = 300.0f;
+    const float dtS = Rig::kTickMs / 1000.0f;
+
+    // One scripted dive, ended the way a diver ends one when he is in a hurry:
+    // down, hold, straight back up through the ceiling, log closed with the
+    // obligation still outstanding. The ascent deliberately does NOT honour the
+    // ceiling — that is the case the record exists for. A diver who decompressed
+    // all the way up would not need continuity, and a scenario built on him would
+    // prove nothing.
+    struct Profiler {
+        Rig& rig;
+        float dtS;
+        float depth = 0.0f;
+        void moveTo(float target, float rateMps) {
+            while (std::fabs(depth - target) > 1e-3f) {
+                depth = (depth < target) ? std::min(target, depth + rateMps * dtS)
+                                         : std::max(target, depth - rateMps * dtS);
+                rig.world().setDepthM(depth);
+                rig.tick();
+            }
+        }
+        void hold(float seconds) {
+            const int n = static_cast<int>(seconds / dtS);
+            for (int i = 0; i < n; i++) { rig.world().setDepthM(depth); rig.tick(); }
+        }
+    };
+    auto diveOne = [&](Rig& rig) {
+        prediveHealthy(rig);
+        if (!rig.predivePassed()) FAIL("dive %d: pre-dive failed on a clean rig", id);
+        if (!rig.requestAuto(true)) FAIL("dive %d: AUTO refused after a passed pre-dive", id);
+        rig.startDive();
+        Profiler p{rig, dtS};
+        p.moveTo(kBottomM, 0.25f);
+        p.hold(kBottomS);
+        p.moveTo(0.0f, 0.15f);        // through the ceiling: the diver chose this
+        rig.endDive();
+        p.hold(5.0f);                 // the dive-end edge lands on the next tick
+    };
+
+    // ---- the subject: continuity on -----------------------------------------
+    RigOpts on = soakOpts();
+    on.continuity = true;
+    on.bootEpoch = 1800000000u;         // a board whose clock was set at the surface
+    Rig rig(on);
+    diveOne(rig);
+
+    const float endCeilM = static_cast<float>(rig.deco().ceilingM());
+    const double endFast = rig.deco().tissueBar(0);            // 5 min half-time
+    const double endMid = rig.deco().tissueBar(7);             // 77 min half-time
+    const double endSlow = rig.deco().tissueBar(deco::Zhl16Ccr::NCOMP - 1);  // 635 min
+    const float endCns = rig.cnsPct();
+    // The premise, checked not assumed: if the first dive left no obligation,
+    // every number below is a witness about nothing.
+    if (endCeilM <= 0.3f)
+        FAIL("dive %d: dive 1 ended with a ceiling of %.1f m — the scenario needs an "
+             "obligated diver, this profile is not one", id, endCeilM);
+
+    // What the store actually holds after that dive: the dive-END record, in the
+    // slot the writes chose (the 60 s grid wrote ~30 records into two slots, so
+    // the picture is a ping-pong by now, and the newest one must still decode).
+    if (!rig.contHasRecord()) FAIL("dive %d: no continuity record after dive 1", id);
+    if (rig.contCorrupt()) FAIL("dive %d: the continuity store reports its own record corrupt", id);
+    logfmt::ContinuityRecord stored{};
+    TEST_ASSERT_TRUE(rig.contSlots().readNewest(stored));
+    TEST_ASSERT_EQUAL_UINT8(logfmt::CONT_KIND_DIVE_END, stored.kind);
+
+    // The hour out of the water. The deco engine is not integrated outside a dive
+    // (loop.cpp step 8 gates stepTissues on diveActive), so these ticks move the
+    // CLOCK, not the tissues: the off-gassing for this hour is credited once, at
+    // the dive start, by the engine's own surface integration. If that gate ever
+    // moves, this scenario becomes a double-credit and the asserts below are the
+    // thing that says so.
+    {
+        Profiler p{rig, dtS};
+        p.hold(kSurfaceS);
+    }
+    const uint32_t seqBeforeDive2 = stored.seq;
+
+    // ---- dive 2: the witness -----------------------------------------------
+    rig.startDive();
+    rig.world().setDepthM(0.0f);
+    rig.tick();
+    const ctrl::Loop::DiveSeed seed2 = rig.contLastSeed();
+    const float entryCeilM = static_cast<float>(rig.deco().ceilingM());
+    const double entryFast = rig.deco().tissueBar(0);
+    const double entryMid = rig.deco().tissueBar(7);
+    const double entrySlow = rig.deco().tissueBar(deco::Zhl16Ccr::NCOMP - 1);
+    const float entryCns = rig.cnsPct();
+    const float entryNdl20 = static_cast<float>(
+        rig.deco().ndlMinutes(rig.deco().depthToBar(kDive2DepthM), 0.9f));
+
+    if (!seed2.applied)
+        FAIL("dive %d: dive 2 did not seed from the stored record (loss reason %u) — the "
+             "diver who surfaced obligated was handed a fresh dive", id,
+             static_cast<unsigned>(rig.contLastLoss()));
+    TEST_ASSERT_EQUAL_UINT8(logfmt::CONT_KIND_DIVE_END, seed2.kind);
+    TEST_ASSERT_EQUAL_UINT32(seqBeforeDive2, seed2.recordSeq);
+    // The credited interval is the hour, give or take the 1 Hz seed refresh — and
+    // it is the number the console line and the EVT_CONT_RESTORED record carry,
+    // so the soak is asserting on what the machine SAYS it credited.
+    if (seed2.creditS < (uint32_t)kSurfaceS - 10u || seed2.creditS > (uint32_t)kSurfaceS + 10u)
+        FAIL("dive %d: dive 2 credited %u s of surface interval, expected about %u s",
+             id, (unsigned)seed2.creditS, (unsigned)kSurfaceS);
+    // The reviewer's requirement, as an assert: a ceiling AT ENTRY, before any
+    // descent, from the tissues the previous dive left.
+    if (entryCeilM <= 0.0f)
+        FAIL("dive %d: dive 2 shows ceiling %.1f m at entry with %.2f bar in the fast "
+             "tissue — the continuity this file exists for is not reaching the deco picture",
+             id, entryCeilM, entryFast);
+    // Which tissues carry the debt, and why the bug was invisible at the fast end:
+    // an hour is twelve half-times for the 5 min compartment, so it is home at the
+    // surface asymptote whether or not continuity exists. The debt an hour after
+    // a 40 m / 50 min dive lives in the slow compartments — the 77 min one is still
+    // near double its resting load, and the 635 min one has barely begun to come
+    // down. Those are the numbers a repetitive dive is planned against, and the
+    // ones a reset throws away.
+    const double resting = rig.deco().surfacePpN2Bar();
+    if (!(entryFast < endFast - 1.0))
+        FAIL("dive %d: the 5 min tissue did not off-gas across the interval (%.3f -> %.3f)",
+             id, endFast, entryFast);
+    if (entryMid <= resting + 0.5)
+        FAIL("dive %d: dive 2 started its 77 min tissue at %.3f bar, i.e. from clean tissues "
+             "(resting is %.3f)", id, entryMid, resting);
+    if (!(entryMid < endMid && entryMid > resting))
+        FAIL("dive %d: the 77 min tissue did not move into the surface interval (%.3f -> %.3f)",
+             id, endMid, entryMid);
+    if (!(entrySlow < endSlow && endSlow - entrySlow < 0.1))
+        FAIL("dive %d: the 635 min tissue moved by %.3f bar in an hour — it should have "
+             "barely begun", id, endSlow - entrySlow);
+    // CNS: carried, not decayed. This engine has no oxygen-clock decay term, so
+    // continuity carries the clock exactly; an hour out of the water buys nothing.
+    // The tolerance is half the storage quantum (CNS travels as tenths of a
+    // percent), plus one 100 ms tick of the new dive — not a fudge factor: a
+    // difference LARGER than that means the clock was recomputed somewhere, and
+    // that is exactly the drift this assert is for.
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.06, endCns, entryCns,
+                                     "CNS changed across the surface interval");
+
+    // A short second dive, so the NDL and ceiling are witnessed in a dive rather
+    // than only at entry.
+    {
+        Profiler p{rig, dtS};
+        p.moveTo(kDive2DepthM, 0.25f);
+        p.hold(kDive2S);
+    }
+    const float dive2CeilM = static_cast<float>(rig.deco().ceilingM());
+    const float dive2Ndl20 = static_cast<float>(
+        rig.deco().ndlMinutes(rig.deco().depthToBar(kDive2DepthM), 0.9f));
+    rig.endDive();
+    rig.tick();
+    // Dive 2's own end record has to be on the partition now, newer than dive 1's:
+    // the debt is cumulative across the day, which is the whole point.
+    logfmt::ContinuityRecord afterDive2{};
+    TEST_ASSERT_TRUE(rig.contSlots().readNewest(afterDive2));
+    if (afterDive2.seq <= seqBeforeDive2)
+        FAIL("dive %d: dive 2 left no newer continuity record (seq %u after %u)", id,
+             (unsigned)afterDive2.seq, (unsigned)seqBeforeDive2);
+
+    // ---- the honest twin: identical rig, continuity OFF --------------------
+    // This is the pre-H1 firmware, running now, on the same profile. Its entry
+    // numbers are the size of the bug.
+    RigOpts off = soakOpts();
+    off.continuity = false;
+    off.bootEpoch = on.bootEpoch;
+    Rig twin(off);
+    diveOne(twin);
+    const double twinEndFast = twin.deco().tissueBar(0);
+    if (std::fabs(twinEndFast - endFast) > 0.02)
+        FAIL("dive %d: twin and subject diverged during dive 1 (%.3f vs %.3f bar) — dive 2 "
+             "is not a controlled comparison", id, twinEndFast, endFast);
+    {
+        Profiler p{twin, dtS};
+        p.hold(kSurfaceS);
+    }
+    twin.startDive();
+    twin.world().setDepthM(0.0f);
+    twin.tick();
+    const float twinEntryCeilM = static_cast<float>(twin.deco().ceilingM());
+    const double twinEntryFast = twin.deco().tissueBar(0);
+    const double twinEntryMid = twin.deco().tissueBar(7);
+    const float twinEntryNdl20 = static_cast<float>(
+        twin.deco().ndlMinutes(twin.deco().depthToBar(kDive2DepthM), 0.9f));
+    if (twinEntryCeilM > 0.0f)
+        FAIL("dive %d: the continuity-OFF twin shows a ceiling of %.1f m at entry — this "
+             "rig is not the pre-H1 behaviour it is being compared against", id, twinEntryCeilM);
+    if (std::fabs(twinEntryMid - twin.deco().surfacePpN2Bar()) > 0.01)
+        FAIL("dive %d: the twin's entry 77 min tissue is %.3f bar, not the resting load — the "
+             "twin seeded when it should not have", id, twinEntryMid);
+    if (!(entryCeilM > twinEntryCeilM))
+        FAIL("dive %d: dive 2 ceiling %.1f m is not deeper than the twin's %.1f m", id,
+             entryCeilM, twinEntryCeilM);
+    if (!(entryNdl20 < twinEntryNdl20))
+        FAIL("dive %d: dive 2 NDL at 20 m is %.0f min against the twin's %.0f min", id,
+             entryNdl20, twinEntryNdl20);
+
+    // ---- no credit: the same record, a clock that cannot establish the hour --
+    // Three real paths do this (no clock on either side, a record dated after the
+    // clock, a mid-dive snapshot that cannot say when the diver surfaced), and the
+    // engine's answer is the same for all of them: carry the tissues, credit
+    // nothing. The witness here is the clock one, and the direction is the point:
+    // a deeper ceiling than the truth, never a shallower one.
+    RigOpts nc = on;
+    Rig noclock(nc);
+    diveOne(noclock);
+    const double ncEndFast = noclock.deco().tissueBar(0);
+    const double ncEndMid = noclock.deco().tissueBar(7);
+    {
+        Profiler p{noclock, dtS};
+        p.hold(kSurfaceS);
+    }
+    noclock.setClockLost(true);          // the epoch died with the previous boot
+    {
+        Profiler p{noclock, dtS};
+        p.hold(2.0f);                    // the 1 Hz refresh republishes the seed, without it
+    }
+    noclock.startDive();
+    noclock.world().setDepthM(0.0f);
+    noclock.tick();
+    const ctrl::Loop::DiveSeed ncSeed = noclock.contLastSeed();
+    const float ncCeilM = static_cast<float>(noclock.deco().ceilingM());
+    const double ncFast = noclock.deco().tissueBar(0);
+    const double ncMid = noclock.deco().tissueBar(7);
+    TEST_ASSERT_TRUE_MESSAGE(ncSeed.applied,
+                             "the no-credit rig must still seed: tissues carried, only the "
+                             "interval refused");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0u, ncSeed.creditS,
+                                     "an interval that cannot be established must credit zero");
+    TEST_ASSERT_EQUAL_UINT8(logfmt::INT_NO_NOW_CLOCK, ncSeed.creditWhy);
+    // The claim "no interval was credited" is checked on the state the chain
+    // CONSUMED, not on the state after dive 2 has been running: one tick of a new
+    // dive at the surface moves a compartment by ~1e-5 bar all by itself, and that
+    // is the dive's own integration, not credit. Against the stored record, the
+    // seed's tissues are the dive-END loadings to within the storage quantum.
+    if (std::fabs(ncSeed.st.pt[7] - ncEndMid) > 2e-4)
+        FAIL("dive %d: the no-credit rig's seed moved the 77 min tissue from %.4f to %.4f bar "
+             "— refusing an interval has to mean refusing it", id, ncEndMid, ncSeed.st.pt[7]);
+    if (std::fabs(ncMid - ncSeed.st.pt[7]) > 1e-3)
+        FAIL("dive %d: the no-credit rig's engine disagrees with the seed it was given", id);
+    if (!(ncCeilM >= entryCeilM))
+        FAIL("dive %d: refusing the interval made the ceiling SHALLOWER (%.1f m vs %.1f m) — "
+             "the conservative direction is the other way round", id, ncCeilM, entryCeilM);
+    if (ncFast + 1e-12 < entryFast)
+        FAIL("dive %d: the no-credit rig is LESS loaded than the credited one (%.3f vs %.3f)",
+             id, ncFast, entryFast);
+
+    // ---- the record is gone: reset, and say so -----------------------------
+    // A torn write or a page that stopped holding its CRC. The dive has to start
+    // from clean tissues (today's behaviour, and safe as a fallback) and the
+    // machine has to be able to name what happened: "no record" and "a record we
+    // cannot read" are different sentences, and this is the case where the diver
+    // was owed a ceiling and was given none.
+    RigOpts bad = on;
+    Rig corrupt(bad);
+    diveOne(corrupt);
+    // First the half-good news, which the two-slot layout is the whole reason for:
+    // damaging the NEWEST record costs a snapshot, not the picture. The dive-END
+    // record and the last grid snapshot are in different slots, so the older one
+    // still decodes and dive 2 is still seeded — a torn write cannot take away the
+    // only copy of a diver's debt.
+    logfmt::ContinuityRecord newestBeforeDamage{};
+    TEST_ASSERT_TRUE(corrupt.contSlots().readNewest(newestBeforeDamage));
+    const uint32_t seqBeforeDamage = newestBeforeDamage.seq;
+    corrupt.contCorruptNewest();
+    if (!corrupt.contHasRecord())
+        FAIL("dive %d: damaging one slot left the store with no record at all — the two-slot "
+             "layout is supposed to cost a snapshot, not the picture", id);
+    {
+        Profiler p{corrupt, dtS};
+        p.hold(2.0f);   // the 1 Hz refresh re-publishes: dive 2 seeds from the OTHER slot
+    }
+    corrupt.startDive();
+    corrupt.world().setDepthM(0.0f);
+    corrupt.tick();
+    const ctrl::Loop::DiveSeed halfSeed = corrupt.contLastSeed();
+    const float halfCeilM = static_cast<float>(corrupt.deco().ceilingM());
+    TEST_ASSERT_TRUE_MESSAGE(halfSeed.applied,
+                             "one damaged slot must still seed the dive from the other one");
+    if (halfSeed.recordSeq >= seqBeforeDamage || halfSeed.recordSeq == 0u)
+        FAIL("dive %d: after one slot was damaged the dive seeded from record %u, expected the "
+             "older survivor (the damaged one was %u)", id, (unsigned)halfSeed.recordSeq,
+             (unsigned)seqBeforeDamage);
+    // The survivor is a mid-dive grid snapshot, not a dive-end record — and the
+    // mid-dive rule says it credits no interval, because it cannot say when the
+    // diver surfaced. So this dive is seeded, conservatively: the ceiling it shows
+    // is the one from tissues that never got their hour.
+    TEST_ASSERT_EQUAL_UINT8(logfmt::CONT_KIND_PERIODIC, halfSeed.kind);
+    TEST_ASSERT_EQUAL_UINT32(0u, halfSeed.creditS);
+    if (halfCeilM <= 0.0f)
+        FAIL("dive %d: one damaged slot cost the diver his ceiling (%.1f m)", id, halfCeilM);
+    corrupt.endDive();
+    {
+        Profiler p{corrupt, dtS};
+        p.hold(5.0f);
+    }
+
+    // Now the case that is NOT survivable: every slot damaged (a dead page, a
+    // wiped partition). The dive has to start from clean tissues AND SAY SO.
+    corrupt.contCorruptAll();
+    if (corrupt.contHasRecord()) FAIL("dive %d: the damaged record still decodes", id);
+    if (!corrupt.contCorrupt()) FAIL("dive %d: a corrupt store is not reporting itself corrupt", id);
+    {
+        Profiler p{corrupt, dtS};
+        p.hold(kSurfaceS);
+    }
+    corrupt.startDive();
+    corrupt.world().setDepthM(0.0f);
+    corrupt.tick();
+    const float corruptCeilM = static_cast<float>(corrupt.deco().ceilingM());
+    TEST_ASSERT_FALSE_MESSAGE(corrupt.contLastSeed().applied,
+                              "a corrupt record must not seed a dive");
+    TEST_ASSERT_EQUAL_UINT8(logfmt::CONT_LOSS_BAD, static_cast<uint8_t>(corrupt.contLastLoss()));
+    if (corruptCeilM > 0.0f)
+        FAIL("dive %d: a dive with no record shows a ceiling of %.1f m", id, corruptCeilM);
+
+    // Two witness lines, in the soak's own form: the pair (subject vs honest twin)
+    // and the conservative direction of every no-credit path.
+    std::printf("dive %d  continuity  %4.0f m/%2.0f min then %3.0f min surface  "
+                "dive 1 ends obligated ceil %4.1f m  77 min tissue %5.2f -> %5.2f bar  "
+                "dive 2 entry ceil %4.1f m vs twin %4.1f m  NDL@20m %3.0f vs twin %3.0f min  "
+                "credited %u s  CNS %4.1f%% carried  seq %u->%u\n",
+                id, kBottomM, kBottomS / 60.0f, kSurfaceS / 60.0f, endCeilM, endMid, entryMid,
+                entryCeilM, twinEntryCeilM, entryNdl20, twinEntryNdl20,
+                (unsigned)seed2.creditS, entryCns, (unsigned)seqBeforeDive2,
+                (unsigned)afterDive2.seq);
+    std::printf("dive %d  continuity-views  no-credit: seeded, 0 s credited, ceil %4.1f m (never "
+                "shallower than the credited %4.1f)  corrupt record: reset, loss=%s, ceil %4.1f m  "
+                "dive 2 in-dive ceil %4.1f m, NDL %3.0f min\n",
+                id, ncCeilM, entryCeilM, logfmt::contLossName(corrupt.contLastLoss()),
+                corruptCeilM, dive2CeilM, dive2Ndl20);
+}
+
 }  // namespace
 
 // Batched so one bad dive names itself without losing the rest of the soak.
@@ -2396,6 +2764,11 @@ void test_wet_connector_all_three_cells_dead() { runWetConnectorDive(); }
 
 void test_all_three_channels_freeze_plausible() { runFrozenChannelDive(); }
 
+// Dive continuity (review H1): dive 1 ends obligated, an hour out of the water,
+// dive 2 must show a ceiling at entry — against an identical rig with continuity
+// off, which is the size of the bug in metres. See runContinuityPair.
+void test_dive_continuity_repetitive_dive() { runContinuityPair(); }
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_soak_dives_01_13);
@@ -2405,5 +2778,6 @@ int main() {
     RUN_TEST(test_depth_bus_dies_and_returns_mid_dive);
     RUN_TEST(test_wet_connector_all_three_cells_dead);
     RUN_TEST(test_all_three_channels_freeze_plausible);
+    RUN_TEST(test_dive_continuity_repetitive_dive);
     return UNITY_END();
 }

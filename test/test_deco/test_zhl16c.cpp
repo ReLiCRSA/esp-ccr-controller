@@ -241,6 +241,236 @@ void test_pco2_inclusion_is_conservative() {
     TEST_ASSERT_TRUE(a.tissueBar(0) >= b.tissueBar(0)); // pCO2=0 default loads more
 }
 
+// ===========================================================================
+// Dive continuity (review H1): taking the tissue picture out of the engine and
+// putting it back in. These are the cases the persistence layer's whole claim
+// rests on — that a seeded engine is a real engine, that the surface interval it
+// fast-forwards through is the SAME integration the engine would have done
+// itself, and that a diver who surfaces obligated and dives again an hour later
+// is holding a ceiling at entry rather than a zero.
+// ===========================================================================
+
+// Numbers a diver could not have produced must not become a plausible ceiling.
+// A record torn in half, a number quantised into a different unit, a NaN: each
+// one has to be refused, and refused WITHOUT touching the engine, because the
+// caller's fallback is reset() and it must be falling back from a whole engine,
+// not a half-seeded one.
+void test_seed_refuses_garbage_and_leaves_the_engine_untouched() {
+    Zhl16Ccr d(baseCfg());
+    holdAt(d, 40.0f, 0.8f, 30.0f);
+    const Zhl16Ccr::TissueState before = d.tissueState();
+    TEST_ASSERT_TRUE(before.cnsPct > 0.0);   // the dive clocked oxygen: worth checking
+
+    Zhl16Ccr::TissueState bad{};
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) bad.pt[i] = before.pt[i];
+    bad.cnsPct = 20.0;
+
+    bad.pt[7] = std::nan("");
+    TEST_ASSERT_FALSE(d.setTissueState(bad));
+    bad.pt[7] = -3.0;
+    TEST_ASSERT_FALSE(d.setTissueState(bad));
+    bad.pt[7] = 0.0;                       // vacuum: no such tissue
+    TEST_ASSERT_FALSE(d.setTissueState(bad));
+    bad.pt[7] = 100.0;                     // == kSeedMaxBar: allowed
+    bad.pt[8] = 100.01;                    // above anything this hardware can measure
+    TEST_ASSERT_FALSE(d.setTissueState(bad));
+    bad.pt[8] = 5.0;
+    bad.cnsPct = std::nan("");
+    TEST_ASSERT_FALSE(d.setTissueState(bad));
+
+    // Nothing above changed anything: still exactly the dive it was on, oxygen
+    // clock included. A caller that reacts to false by calling reset() must be
+    // reacting to an engine that still holds its previous state, not to a
+    // half-seeded one — which is why validation happens before any commit.
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i)
+        TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.0, before.pt[i], d.tissueBar(i),
+                                         "a refused seed must not move a compartment");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.0, before.cnsPct, d.cnsPct(),
+                                     "a refused seed must not move the oxygen clock");
+
+    // The CNS clock is clamped to the engine's own ceiling rather than believed
+    // past it (stepCns caps at 999 %): a stored 5000 % is a corrupt field, and
+    // the honest answer is the cap, not a number the engine would never reach.
+    bad.pt[7] = 5.0;
+    bad.cnsPct = 5000.0;
+    TEST_ASSERT_TRUE(d.setTissueState(bad));
+    TEST_ASSERT_FLOAT_WITHIN(0.001, 999.0, d.cnsPct());
+}
+
+// A seeded engine round-trips: what comes out is what went in, to the last bit
+// the engine itself keeps.
+void test_tissue_state_round_trips_through_the_engine() {
+    Zhl16Ccr a(baseCfg());
+    holdAt(a, 52.0f, 1.3f, 60.0f);
+    const Zhl16Ccr::TissueState s = a.tissueState();
+
+    Zhl16Ccr b(baseCfg());
+    TEST_ASSERT_TRUE(b.setTissueState(s));
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i)
+        TEST_ASSERT_FLOAT_WITHIN(1e-12, a.tissueBar(i), b.tissueBar(i));
+    TEST_ASSERT_FLOAT_WITHIN(1e-12, a.cnsPct(), b.cnsPct());
+    // And it plans identically: ceiling, NDL and the whole schedule are pure
+    // functions of these numbers, which is exactly why none of them is stored.
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, a.ceilingBar(), b.ceilingBar());
+}
+
+// The fast-forward's whole justification, stated as an assertion: this engine
+// integrates a constant ppN2 in <=10 s substeps, each one multiplying the
+// under-saturation by e^-k*h, and those compose EXACTLY into e^-k*t. So one
+// closed-form step over a surface interval IS the integration the engine would
+// have done, at 16 exp() calls instead of elapsed/10 substeps. If anyone ever
+// changes stepTissues() to a different integrator, this test goes red and says
+// which claim stopped being true.
+void test_surface_interval_equals_the_engine_own_substep_integration() {
+    const double kInspiredO2 = 0.21;   // inspired air, what the model resets to
+    const Config c = baseCfg();
+    Zhl16Ccr a(c), b(c);
+    Zhl16Ccr::TissueState seed{};
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) seed.pt[i] = 5.0 + 0.4 * i;
+    seed.cnsPct = 33.3;
+    TEST_ASSERT_TRUE(a.setTissueState(seed));
+    TEST_ASSERT_TRUE(b.setTissueState(seed));
+
+    // 90 minutes at the surface, in one step.
+    a.surfaceInterval(90.0 * 60.0);
+    // The same 90 minutes as the engine's own 10 s substeps, breathing air at the
+    // configured surface pressure. The inspired ppO2 is 0.21 x (P - p_H2O), not
+    // 0.21 flat: that is the single definition surfacePpN2Bar() aims reset() at,
+    // and using the ambient-air value instead would be a second surface model.
+    const double ps = c.pSurfaceBar, ph2o = c.ph2oBar, pco2 = c.pco2Bar;
+    // The air the surface interval breathes is the air this model resets to:
+    // inspired ppN2 == surfacePpN2Bar(), so ppO2 is whatever is left of
+    // (P - p_H2O) after that. Taking 0.21 x (P - p_H2O) instead would be a
+    // second surface model — it differs from the first by about 2e-8 bar
+    // (0.79 vs 1-0.21 in binary), which is nothing to a diver and everything to
+    // an assertion that claims one integration rather than two.
+    const double ppO2 = (ps - ph2o) - (a.surfacePpN2Bar() + pco2);
+    TEST_ASSERT_TRUE_MESSAGE(ppO2 > 0.15 && ppO2 < 0.25,
+                             "the surface asymptote implies an impossible inspired ppO2");
+    for (int s = 0; s < 90 * 6; ++s) b.stepTissues(10.0, ps, ppO2);
+    // Compared in double, not through Unity's float macro: the claim here is that
+    // the two integrations agree to floating-point noise, and float resolution at
+    // these magnitudes (~6e-8) is a thousand times coarser than that.
+    double worst = 0.0;
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) {
+        const double diff = std::fabs(a.tissueBar(i) - b.tissueBar(i));
+        if (diff > worst) worst = diff;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(worst < 1e-12,
+                             "surfaceInterval() is no longer the engine's own integration");
+    // The oxygen clock is NOT decayed, because this engine has no decay term to
+    // decay it with. Pinned so a future "improvement" cannot quietly seed a dive
+    // from physiology the engine does not run.
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, 33.3, a.cnsPct());
+}
+
+// Independent arithmetic, hand-computed rather than copied from the code: the
+// fast compartment (5 min half-time) over an hour is 12 half-times, so its
+// under-saturation must be down by 2^-12. Written with literals, the way
+// test_depthscale pins its conversions, so a change to the model cannot be
+// accompanied by a silent change to the expectation.
+void test_surface_interval_is_hand_worked_arithmetic() {
+    Zhl16Ccr d(baseCfg());
+    const double ps = d.surfacePpN2Bar();
+    Zhl16Ccr::TissueState seed{};
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) seed.pt[i] = 5.0;   // 5 bar everywhere
+    seed.cnsPct = 0.0;
+    TEST_ASSERT_TRUE(d.setTissueState(seed));
+
+    d.surfaceInterval(3600.0);   // exactly one hour
+
+    // compartment 0: 5 min half-time -> 12 half-times in an hour
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, 5.0 + (ps - 5.0) * (1.0 - 1.0 / 4096.0), d.tissueBar(0));
+    // compartment 1: 8 min -> 7.5 half-times
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, 5.0 + (ps - 5.0) * (1.0 - std::pow(2.0, -7.5)), d.tissueBar(1));
+    // compartment 15: 635 min -> 60/635 half-times
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, 5.0 + (ps - 5.0) * (1.0 - std::pow(2.0, -60.0 / 635.0)),
+                             d.tissueBar(15));
+    // The slow compartment has barely moved; the fast one is nearly at the surface
+    // asymptote. That ordering IS the point of the persistence layer: dive 2's
+    // ceiling is set mostly by what the fast tissues still hold.
+    TEST_ASSERT_TRUE(d.tissueBar(0) < d.tissueBar(15));
+    TEST_ASSERT_TRUE(d.tissueBar(15) > 4.5);   // the 635 min tissue has barely begun
+}
+
+// A clock can name an interval of 136 years (a uint32 epoch difference). The
+// clamp at 40 half-times of the slowest compartment makes that arithmetic
+// boring — and it must not change the answer by anything this engine can
+// represent, nor produce a NaN.
+void test_an_absurd_interval_saturates_at_equilibrium_without_a_nan() {
+    Zhl16Ccr a(baseCfg()), b(baseCfg());
+    Zhl16Ccr::TissueState seed{};
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) seed.pt[i] = 9.0;
+    seed.cnsPct = 12.0;
+    TEST_ASSERT_TRUE(a.setTissueState(seed));
+    TEST_ASSERT_TRUE(b.setTissueState(seed));
+
+    a.surfaceInterval(4.0e9);                    // 126 years
+    b.surfaceInterval(40.0 * 635.0 * 60.0);      // the clamp: 40 slowest half-times
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) {
+        TEST_ASSERT_TRUE_MESSAGE(std::isfinite(a.tissueBar(i)), "a NaN seeded into the engine");
+        TEST_ASSERT_FLOAT_WITHIN(1e-12, a.surfacePpN2Bar(), a.tissueBar(i));
+        TEST_ASSERT_FLOAT_WITHIN(1e-12, b.tissueBar(i), a.tissueBar(i));
+    }
+    // Equilibrium is not an obligation: a diver who has been out of the water for
+    // a century starts clean, and the machine is entitled to say so. Note the
+    // quantity: ceilingBar() is a tolerated tissue PRESSURE and is positive even
+    // for clean tissues; the thing a diver can act on is ceilingM(), that pressure
+    // expressed as a depth above the surface, which is what the dive file's
+    // ceiling_m column and the handset both carry.
+    TEST_ASSERT_TRUE(a.ceilingBar() < a.surfacePpN2Bar() + 1e-9);
+    TEST_ASSERT_FLOAT_WITHIN(1e-6, 0.0, a.ceilingM());
+    // Zero and negative intervals do nothing at all: no credit is not a step.
+    a.surfaceInterval(0.0);
+    a.surfaceInterval(-3600.0);
+    TEST_ASSERT_FLOAT_WITHIN(1e-12, a.surfacePpN2Bar(), a.tissueBar(0));
+}
+
+// The reviewer's scenario, at engine level: a diver surfaces with an obligation
+// and dives again. A reset engine gives a ceiling of zero at the surface; the
+// same engine seeded from where the last dive left off gives a real one.
+void test_a_seeded_engine_shows_a_ceiling_at_the_surface_and_a_reset_does_not() {
+    Zhl16Ccr d(baseCfg());
+    holdAt(d, 48.0f, 0.9f, 45.0f);
+    TEST_ASSERT_TRUE(d.ceilingM() > 0.0);            // obligated at depth: premise
+    const Zhl16Ccr::TissueState endOfDive = d.tissueState();
+
+    // Today's firmware: the next dive starts from the tissues reset() leaves.
+    Zhl16Ccr clean(baseCfg());
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, 0.0, clean.ceilingM());
+    TEST_ASSERT_FLOAT_WITHIN(1e-9, 480.0, clean.ndlMinutes(clean.depthToBar(0.0f), 0.7f));
+
+    // One hour of surface time, credited with the engine's own integration.
+    Zhl16Ccr seeded(baseCfg());
+    TEST_ASSERT_TRUE(seeded.setTissueState(endOfDive));
+    seeded.surfaceInterval(3600.0);
+    const float ceilSeeded = seeded.ceilingM();
+    // NDL is asked at a DEPTH, not at the surface: sitting at 0 m nobody is ever
+    // obligated (the tissues only off-gas), so the surface NDL is the 480 minute
+    // cap for every engine and proves nothing. At 20 m the seeded engine runs out
+    // of no-deco time long before a clean one, and that is what dive 2 loses.
+    const float ndlSeeded = seeded.ndlMinutes(seeded.depthToBar(20.0f), 0.7f);
+    const float ndlClean = clean.ndlMinutes(clean.depthToBar(20.0f), 0.7f);
+    TEST_ASSERT_TRUE_MESSAGE(ceilSeeded > 0.0f,
+                             "a diver who surfaced obligated must be given a ceiling on entry");
+    // Carrying the tissues and NOT crediting the interval is the conservative
+    // direction: a deeper ceiling than the truth, never a shallower one. That is
+    // the inequality the whole no-credit policy (no clock, future epoch, mid-dive
+    // record) rests on, pinned here as a number rather than as a comment.
+    Zhl16Ccr stale(baseCfg());
+    TEST_ASSERT_TRUE(stale.setTissueState(endOfDive));
+    TEST_ASSERT_TRUE(stale.ceilingM() >= ceilSeeded);
+    TEST_ASSERT_TRUE(stale.ceilingM() > 0.0f);
+    TEST_ASSERT_TRUE_MESSAGE(ndlSeeded < ndlClean,
+                             "a seeded dive 2 must have less no-deco time than a clean one");
+    TEST_ASSERT_TRUE(ndlSeeded < 480.0f);
+    // And the fast-forward is not free invention: it moved the loadings down
+    // towards the surface asymptote by exactly the amount the model says.
+    TEST_ASSERT_TRUE(stale.tissueBar(0) > seeded.tissueBar(0));
+    TEST_ASSERT_TRUE(seeded.tissueBar(0) > seeded.surfacePpN2Bar());
+    (void)ndlSeeded;
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_reset_surface_balance_ceiling_zero);
@@ -254,6 +484,12 @@ int main() {
     RUN_TEST(test_step_tissues_only_loads_tissues_without_clocking_cns);
     RUN_TEST(test_step_wrapper_equals_the_two_halves_no_time_lost_or_double_counted);
     RUN_TEST(test_pco2_inclusion_is_conservative);
+    RUN_TEST(test_seed_refuses_garbage_and_leaves_the_engine_untouched);
+    RUN_TEST(test_tissue_state_round_trips_through_the_engine);
+    RUN_TEST(test_surface_interval_equals_the_engine_own_substep_integration);
+    RUN_TEST(test_surface_interval_is_hand_worked_arithmetic);
+    RUN_TEST(test_an_absurd_interval_saturates_at_equilibrium_without_a_nan);
+    RUN_TEST(test_a_seeded_engine_shows_a_ceiling_at_the_surface_and_a_reset_does_not);
     RUN_TEST(test_pub_air_table_schedules);
     RUN_TEST(test_pub_ndl_structure);
     RUN_TEST(test_pub_vs_paliers_cross_impl);

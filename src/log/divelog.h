@@ -76,6 +76,22 @@ enum EventId : uint16_t {
     // reads a pass correctly, and one that does not know 16 loses one row rather
     // than misreading a pass as a failure.
     EVT_PREFAIL = 16,
+    // 17 and 18: the two halves of dive-start continuity (review H1), and both
+    // are SURFACE records for the same reason 13/16 are: they are facts about the
+    // machine between dives, and the dive they describe may be the one whose file
+    // never gets written. `value` is id-specific, as everywhere in this log:
+    //   17 EVT_CONT_RESTORED — a dive was seeded from a stored record; value is
+    //      the surface interval credited, in seconds, saturated at 65535 (0 here
+    //      means "seeded with NO credit", which is its own fact, and the ISO date
+    //      column plus the continuity record's own seq are how a reader checks it).
+    //   18 EVT_CONT_LOST — a dive started from clean tissues when continuity was
+    //      the whole point; value is a logfmt::ContLoss reason (continuity.h).
+    // This is the row that exists for the scenario the reviewer named: a diver
+    // who was obligated, surfaced, and whose machine then forgot. "The dive starts
+    // fresh" is a fact the machine must keep, because it is exactly the moment the
+    // diver was owed a ceiling and was not given one.
+    EVT_CONT_RESTORED = 17,
+    EVT_CONT_LOST = 18,
 };
 
 struct Snapshot {
@@ -294,8 +310,11 @@ constexpr int SURFACE_MAX_RECORDS = 256;
 struct SurfaceRecord {
     uint32_t epoch;    // wall clock at the record; 0 = no clock, renders kNoClock
     uint32_t seq;      // 1..SEQ_MAX, monotonic across boots, derived from the file
-    uint16_t id;       // logfmt::EventId (7 cal air, 13 pre-dive pass, 16 fail)
-    uint16_t value;    // id-specific: 7 = bridge::CalAirCode, 16 = failing Step
+    uint16_t id;       // logfmt::EventId (7 cal air, 13 pre-dive pass, 16 fail,
+                       // 17 continuity restored, 18 continuity lost)
+    uint16_t value;    // id-specific: 7 = bridge::CalAirCode, 16 = failing Step,
+                       // 17 = surface interval credited (s, saturated),
+                       // 18 = logfmt::ContLoss reason
     // Raw ADC counts, the numbers that tell a dead cell from a fouled one. They
     // are integers here because the protocol already publishes them as integers
     // (`CALAIR,` prints 0 decimals); storing a float would imply a precision the

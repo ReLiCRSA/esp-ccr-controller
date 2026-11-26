@@ -51,10 +51,57 @@ void Zhl16Ccr::computeGf() {
 
 void Zhl16Ccr::reset() {
     // Resting tissue load: inspired ppN2 breathing air at the surface.
-    const double ppN2 =
-        (cfg_.pSurfaceBar - cfg_.ph2oBar) * 0.79 - cfg_.pco2Bar;
+    const double ppN2 = surfacePpN2Bar();
     for (int i = 0; i < NCOMP; ++i) pt_[i] = ppN2;
     cnsPct_ = 0.0;
+}
+
+Zhl16Ccr::TissueState Zhl16Ccr::tissueState() const {
+    TissueState s{};
+    for (int i = 0; i < NCOMP; ++i) s.pt[i] = pt_[i];
+    s.cnsPct = cnsPct_;
+    return s;
+}
+
+double Zhl16Ccr::surfacePpN2Bar() const {
+    return (cfg_.pSurfaceBar - cfg_.ph2oBar) * 0.79 - cfg_.pco2Bar;
+}
+
+bool Zhl16Ccr::setTissueState(const TissueState& s) {
+    // Validate into a local copy FIRST: a record that fails half-way through
+    // must leave the engine exactly as it was, so a caller that reacts to false
+    // by calling reset() is reacting to an engine that still holds its previous
+    // state, not to a half-seeded one.
+    double tmp[NCOMP];
+    for (int i = 0; i < NCOMP; ++i) {
+        if (!std::isfinite(s.pt[i])) return false;
+        if (s.pt[i] <= 0.0 || s.pt[i] > kSeedMaxBar) return false;
+        tmp[i] = s.pt[i];
+    }
+    if (!std::isfinite(s.cnsPct) || s.cnsPct < 0.0) return false;
+    for (int i = 0; i < NCOMP; ++i) pt_[i] = tmp[i];
+    // The engine's own ceiling for the clock (stepCns caps at 999): a stored
+    // value above it is clamped, not believed, and a negative one is refused —
+    // there is no such thing as having breathed less than no oxygen.
+    cnsPct_ = std::min(s.cnsPct, 999.0);
+    return true;
+}
+
+void Zhl16Ccr::surfaceInterval(double elapsedSec) {
+    if (!(elapsedSec > 0.0)) return;  // no interval established: no credit
+    const double ppN2 = surfacePpN2Bar();
+    // No staleness cap, and none is needed for correctness: 40 half-times of the
+    // SLOWEST compartment (635 min => ~10.6 days) drives exp() to 1e-12, which is
+    // equilibrium to within a picobar, and a uint32 epoch difference can name
+    // 136 years. Clamping at 40 half-times keeps that arithmetic boring without
+    // changing the answer by anything this engine can represent.
+    const double tMax = 40.0 * 60.0 * kHalfTimeMin[NC - 1];
+    const double t = elapsedSec > tMax ? tMax : elapsedSec;
+    for (int i = 0; i < NCOMP; ++i) {
+        const double k = kLn2 / (kHalfTimeMin[i] * 60.0);
+        const double f = 1.0 - std::exp(-k * t);   // composes exactly with stepTissues
+        pt_[i] += (ppN2 - pt_[i]) * f;
+    }
 }
 
 double Zhl16Ccr::barToDepthM(double bar) const {

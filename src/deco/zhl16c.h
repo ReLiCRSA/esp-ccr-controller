@@ -80,6 +80,69 @@ public:
 
     void reset();  // tissues equilibrated to surface air (0.21)
 
+    // ---- the part of the engine that has to outlive a power cycle (H1) ------
+    // What a dive computer must not do is forget what the last dive left in the
+    // diver: a surface interval is minutes, and a reboot between dives used to
+    // make the next dive read as if the first never happened (review H1 — "the
+    // one gap that can kill without any instrument failing"). Everything needed
+    // to seed a dive is HERE, and nothing else is: ceiling, NDL and the ascent
+    // schedule are DERIVED from these numbers plus the gradient factors in force,
+    // so storing them would let a persisted picture disagree with the GF pair the
+    // diver has set now. Loadings and the CNS clock are the whole state.
+    //
+    // ZH-L16C as implemented here is ONE inert gas (nitrogen): `pt_` is 16
+    // compartments, there is no helium array anywhere in this engine, so 16
+    // loadings are what round-trips — not 32.
+    struct TissueState {
+        double pt[NCOMP];   // absolute tissue pressure, bar (same units as tissueBar())
+        double cnsPct;      // the CNS O2 clock, %
+    };
+
+    /// The copy ControlTask publishes for the persistence layer. Reading it is
+    /// the same class of read as the bridge scalars: the engine is owned by the
+    /// control thread (rowfill.h N8), so everyone else takes a COPY, never the
+    /// live array.
+    TissueState tissueState() const;
+
+    /// Seeds the engine from stored state. FALSE and no change at all when the
+    /// numbers are not numbers a diver could have produced — a torn record, a
+    /// number quantised wrong or one written by a different model must never
+    /// become a plausible ceiling. The caller then does what it always did
+    /// (reset()) and says out loud that continuity was lost.
+    bool setTissueState(const TissueState& s);
+
+    /// Air at this board's configured surface pressure: the resting tissue load.
+    /// ONE definition — reset() and surfaceInterval() both aim at it, so a
+    /// fast-forward over a surface interval and a fresh reset cannot drift to
+    /// two different asymptotes.
+    double surfacePpN2Bar() const;
+
+    /// Off-gas the tissues for `elapsedSec` AT THE SURFACE, breathing air: what
+    /// a diver did between the record and this dive, when the machine was off.
+    ///
+    /// This is the engine's own model, not a second one. stepTissues() integrates
+    /// a constant ppN2 in <=10 s substeps, each substep multiplying the
+    /// under-saturation by (1 - (1 - e^-kh)) = e^-kh; those substeps compose to
+    /// e^-k*total EXACTLY (modulo float rounding), so one closed-form step over
+    /// the whole interval IS the same integration the engine would do — and it
+    /// costs 16 exp() calls instead of elapsed/10 substeps. That is what keeps a
+    /// 72-hour surface interval from becoming H2 work on the control task, which
+    /// is where a dive start is applied. test_deco pins the equivalence.
+    ///
+    /// CNS is deliberately untouched: this engine models oxygen-clock
+    /// ACCUMULATION only (stepCns, and cnsLimitMin has no decay term anywhere),
+    /// so carrying the clock over unchanged is the model's own answer. Inventing
+    /// a decay here would seed a dive from a physiology the engine does not run.
+    /// elapsed <= 0 does nothing (the caller credits nothing when it cannot
+    /// establish an interval — the conservative direction, and stated).
+    void surfaceInterval(double elapsedSec);
+
+    /// What setTissueState() refuses: a loading outside what any dive this
+    /// hardware can measure could produce. The deepest pressure this sensor
+    /// reports is ~25 bar absolute (LPS28DFW bottoms at 250 mbar), so 100 bar is
+    /// "a number no dive made", not a physical limit.
+    static constexpr double kSeedMaxBar = 100.0;
+
     // Integrate one real-time step: both halves, tissues AND the CNS clock.
     // pAmbBar = measured absolute pressure, ppO2Bar = VOTED loop ppO2.
     // Internally subdivided (<=10 s substeps). This is the wrapper: it forwards

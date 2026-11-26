@@ -149,6 +149,11 @@ enum class O2State : uint8_t { IDLE, ENRICHING, SETTLING, DONE, FAILED };
 
 struct O2Input {
     bool diveActive = false;      // refuses while diving: bench-only procedure
+    /// The RAW vote, never ctrl::Loop's held display value: the enrichment verdict
+    /// is about the loop's actual ppO2, and a held number would end the enrich at a
+    /// target the loop never reached. Nothing wires this state machine into the
+    /// firmware yet (no caller builds an O2Input), so this is the contract for
+    /// whoever does.
     float votedBar = 0.21f;
     float cellsRaw[3] = {0, 0, 0};
     uint32_t nowMs = 0;
@@ -199,6 +204,10 @@ enum class TestState : uint8_t { IDLE, BASELINE, PULSING, RECOVER, DONE };
 
 struct PulseTestInput {
     float cellsBar[3];            // calibrated ppO2 per cell
+    /// Copied by the chain and NOT read by PulseTest today (it grades the per-cell
+    /// rise, not the level). If it gains a consumer it must be the RAW vote: a held
+    /// baseline would flatten the very rise the test is looking for, making healthy
+    /// cells look dead and dead ones look fine.
     float votedBar;
     uint8_t presentMask = 0b111;
     uint32_t pulsesDelivered = 0; // monotonic count from injector

@@ -647,7 +647,7 @@ void runDive(int id) {
             ri.diveStartMs = 0;
             ri.smoothedDepthM = rig.loop().depthSmoothedM();
             ri.haveVote = rig.loop().haveVote();
-            ri.votedBar = rig.vote().votedPpo2;
+            ri.shownPpo2 = rig.loop().shownPpo2();
             for (int c = 0; c < 3; c++)
                 ri.cellBar[c] = rig.cellStatus(static_cast<uint8_t>(c)).last;
             ri.setpointBar = sp;
@@ -1191,7 +1191,7 @@ void runDepthBusDive() {
             ri.diveStartMs = 0;
             ri.smoothedDepthM = rig.loop().depthSmoothedM();
             ri.haveVote = rig.loop().haveVote();
-            ri.votedBar = rig.vote().votedPpo2;
+            ri.shownPpo2 = rig.loop().shownPpo2();
             for (int c = 0; c < 3; c++)
                 ri.cellBar[c] = rig.cellStatus(static_cast<uint8_t>(c)).last;
             ri.setpointBar = rig.spTarget();
@@ -1380,6 +1380,508 @@ void runDepthBusDive() {
                 id, rowsBlindMarker, rowsBlind, ackSilencedCycles);
 }
 
+// ---------------------------------------------------------------------------
+// Dive 9002 — "wet connector, all three cells dead" (finding N2). The end-to-end
+// witness for the ppO2 hold: the dive where the chain stops having any ppO2 it is
+// willing to believe, and what the handset, the dive file, the valve, the alarms,
+// the tissue model and the oxygen clock do about it.
+//
+// The route to that state is the physically honest one, and it takes three acts,
+// because `Mode::FAILED` with cells seen is not somewhere a dead cell walks you:
+//   1. water in the cell harness. Two of three galvanic channels are frozen at
+//      plausible-but-wrong values (each biased differently — a flooded connector
+//      does not bias channels equally), the third is still honest. What the chain
+//      does here is NOT what a naive model expects: the two channels do not drag
+//      the median down with them, because a 0.5 bar step in one second is past
+//      voting's dropout slope, so those channels are dropped from the vote
+//      immediately and the dive goes on with one honest cell and CELL_DRIFT up.
+//      (The median-follows-the-liars shape is real too, and it is a CREEP, not a
+//      step: the soak's F_TWIN_DRIFT dives own that one.)
+//   2. CellProof's re-arm is the machine's next move, and the dive needs its
+//      verdict: a REJECTED cell arguing with the vote by ~0.5 bar for 20 s is the
+//      "your cell picture is stale" evidence, the re-run judges every fitted cell
+//      on whether it TRACKED the demand change, and the two frozen channels never
+//      moved — so they come back marked unproven-at-high and proof-banned. That
+//      ban is what makes act 3 a failed vote instead of an argument.
+//   3. then the connector takes the last channel's ADC channel with it. The cell
+//      is fine — the machine simply stops being told what it says — so the only
+//      fitted cells left are the two it has evidence against, nothing may vote,
+//      and the vote FAILS with cells seen: BIT_SENSOR_FAIL. That is the instant
+//      finding N2 is about. Until 2026-11-26 the handset's ppO2 column and every
+//      dive-file row of the window said 0.00 — a fabricated catastrophic hypoxia,
+//      argued with the machine's own "I cannot see your loop" alarm. Now the
+//      number is HELD and the marker bytes say so.
+//
+// Act 3 needs `Rig::setCellsFitted` and it is worth stating what that means for
+// shipping firmware: the mask there is a boot constant (main.cpp CELLS_PRESENT_MASK),
+// so a real diver reaches this state only if the fitted set changes mid-dive (a
+// SET, or a future hot-swap path). Reported as an audit finding, not hidden: the
+// dive grades the chain's behaviour in the state, and the reachability of the
+// state in the shipped configuration is a separate question with a separate answer.
+//
+// The twin, as in dive 9001: same options, same diver, same true depth every
+// tick, honest harness. The two dives are identical until act 1, so a difference
+// at the end of the blind window is the fault and nothing else — which is what
+// lets the deco asserts below assert a DIRECTION (the blind rig must be the
+// conservative one) instead of a hard-coded tissue number.
+// ---------------------------------------------------------------------------
+void runWetConnectorDive() {
+    const int id = 9002;
+    constexpr float kBottomM = 32.0f;    // SP3 band: 1.00 bar, deep enough to matter
+    constexpr float kWetAtS = 430.0f;    // steady on the bottom: deadlines mean something
+    constexpr float kBlindAtS = 570.0f;  // act 3, after the proof marked the frozen pair
+    // 65 s with no believable ppO2: long enough to fill two whole 30 s dive-file
+    // rows, short enough that the loop is still survivable when it ends. At 32 m the
+    // diver burns 1.2 l/min x 4.2 bar out of 8 l, so a blind minute takes ~0.6 bar of
+    // the loop — which is the honest consequence of this fault and worth stating: the
+    // machine cannot hold a loop it cannot see, its answer is the CRITICAL alarm, and
+    // the diver's answer is bailout. Grading that the loop stayed perfect would be
+    // grading a fiction.
+    constexpr float kWindowS = 65.0f;
+    // Frozen channels, biased apart (0.45 is the agreed 2-vs-1 lie depth; 0.52 keeps
+    // the two frozen readings apart from each other, which is what a connector does).
+    // Both are well inside the plausibility band: these are not readings the chain can
+    // dismiss as noise, they are a loop that is no longer being measured.
+    constexpr float kBiasCh0 = 0.45f, kBiasCh1 = 0.52f;
+    // The chain notices the collapse quickly (the step is past the dropout slope):
+    // a few cycles to drop the channels, then the 20 s suspect hold and the 60 s
+    // proof run bring the ban. Measured on this dive: news ~1 s, ban ~22 s.
+    constexpr float kNewsDeadlineS = 10.0f;
+    constexpr float kBanDeadlineS = 200.0f;
+    // BIT_SENSOR_FAIL is raised from the failed vote itself, so one tick is the
+    // deadline; anything slower and the held number would sit unmarked.
+    constexpr float kSensorFailDeadlineS = 1.0f;
+    constexpr float kRecoverDeadlineS = 3.0f;
+    // Premise of the deco asserts: by the end of the window the hold must be a
+    // materially WRONG number. Injection is off for the whole window at 32 m and the
+    // diver burns ~0.6 bar/min there, so the true loop ends well below the held value.
+    // A held (rich) ppO2 lowers ppN2, so feeding it to the tissues would be wrong
+    // in the direction that costs the diver deco time — that is the decision this
+    // dive is grading (loop.h kNoVotePpo2Bar).
+    constexpr float kPremiseLoopFallBar = 0.25f;
+    // Over the window, ppN2 = pAmb vs ppN2 = pAmb - ~1.0 bar moves the 5-minute
+    // tissue by a visible fraction of that gap. 0.08 bar is far under what the inputs produce and
+    // far over what a held ppO2 would leave, so it grades the decision without
+    // freezing a GF-dependent number.
+    constexpr float kMinTissueGainBar = 0.08f;
+    constexpr float kSpFloorBar = 0.39f, kSpCeilBar = 1.31f;
+
+    RigOpts o = soakOpts();
+    Rig rig(o);
+    prediveHealthy(rig);
+    if (!rig.predivePassed()) FAIL("dive %d: pre-dive failed on a rig with no fitted faults", id);
+    if (!rig.requestAuto(true)) FAIL("dive %d: AUTO refused after a passed pre-dive", id);
+
+    Rig twin(o);
+    prediveHealthy(twin);
+    if (!twin.predivePassed()) FAIL("dive %d: the twin's pre-dive failed", id);
+    if (!twin.requestAuto(true)) FAIL("dive %d: the twin refused AUTO", id);
+
+    rig.startDive();
+    twin.startDive();
+
+    Diver dv;
+    dv.depthM[0] = kBottomM;
+    dv.holdS[0] = 780.0f;  // long enough that act 1 and act 3 are both on the bottom
+    dv.nWp = 1;
+    dv.holdLeft = dv.holdS[0];
+
+    const float clearAtS = kBlindAtS + kWindowS;
+    const float dtS = Rig::kTickMs / 1000.0f;
+    const float ackDelayS = 8.0f;
+
+    // ---- state the grading needs ------------------------------------------
+    bool wetDone = false, banSeen = false, blindOpen = false, blindClosed = false;
+    bool voteBack = false, pulsesResumed = false, cpAttemptsChecked = false;
+    float wetAtS = 0.0f, banAtS = -1.0f, newsAtS = -1.0f, voteBackS = -1.0f;
+    float heldPpo2 = 0.0f;                 // the last believable vote, shown all window
+    float pTrueAtOpen = 0.0f, pTrueMinInWindow = 9.0f;
+    float heldSeenMin = 9.0f, heldSeenMax = -1.0f;  // the published number, cycle by cycle
+    int failAtCycle = -1, windowCycle = 0;
+    int lowDuring = 0, highDuring = 0, pulsesInWindow = 0, twinPulsesInWindow = 0;
+    uint8_t cpAttemptsAtOpen = 0;
+    double fastOpen = 0.0, fastClose = 0.0, twinFastOpen = 0.0, twinFastClose = 0.0;
+    double cnsOpen = 0.0, cnsClose = 0.0, twinCnsOpen = 0.0, twinCnsClose = 0.0;
+    double ceilClose = 0.0, twinCeilClose = 0.0;
+    uint32_t pulsesAtOpen = 0, twinPulsesAtOpen = 0;
+    // Rows, built by the firmware's own fill exactly as main.cpp calls it.
+    logfmt::Snapshot row{}, rowHonest{}, rowBlind{};
+    uint32_t rowPulseBase = 0;
+    float rowClockS = 0.0f;
+    int rowsBlind = 0, rowsBlindMarker = 0, blindCyclesInRow = 0;
+    int ackSilencedCycles = 0;
+    bool logFailAfterRecovery = false;
+    uint16_t alarmUnion = 0;
+    float alarmSinceS = -1.0f;
+    bool finished = false;
+    float tS = 0.0f;
+
+    for (; tS < 2400.0f && !finished; tS += dtS) {
+        // ---- act 1: water in the harness ---------------------------------
+        if (!wetDone && tS >= kWetAtS) {
+            const float voted = rig.vote().votedPpo2;
+            if (!rig.loop().haveVote() || voted < 0.6f)
+                FAIL("dive %d: the vote was %.2f bar (haveVote=%d) when the connector was "
+                     "flooded — the scenario is starting from the wrong state",
+                     id, voted, (int)rig.loop().haveVote());
+            if (std::fabs(rig.deco().tissueBar(0) - twin.deco().tissueBar(0)) > 0.02)
+                FAIL("dive %d: twin (%.2f bar) and faulted rig (%.2f bar) already differed when "
+                     "the connector was flooded — the comparison below is not a control",
+                     id, twin.deco().tissueBar(0), rig.deco().tissueBar(0));
+            World& w = rig.world();
+            w.cells[0].fault = CellFault::STUCK_AT;
+            w.cells[0].stuckValue = voted - kBiasCh0;
+            w.cells[1].fault = CellFault::STUCK_AT;
+            w.cells[1].stuckValue = voted - kBiasCh1;
+            wetDone = true;
+            wetAtS = tS;
+        }
+
+        // Did the machine notice the two channels going deaf to the loop? Either
+        // news counts, because both are things the diver is told about.
+        if (wetDone && newsAtS < 0.0f &&
+            ((rig.alarmLogBits() & (uint16_t)(1u << alarms::BIT_CELL_DRIFT)) ||
+             !(rig.vote().activeMask & 0b011)))
+            newsAtS = tS;
+
+        // ---- act 2 is the machine's own: the proof re-arms and bans them --
+        if (!banSeen && rig.cpState() == cellproof::State::PASS &&
+            rig.cpUnprovenMask() == 0b011 && rig.proofExclusion() == 0b011 &&
+            rig.loop().haveVote()) {
+            banSeen = true;
+            banAtS = tS;
+        }
+
+        // ---- act 3: the last channel's channel goes deaf ------------------
+        if (!blindOpen && tS >= kBlindAtS) {
+            if (!banSeen)
+                FAIL("dive %d: %.0f s after the connector was flooded, the proof had not "
+                     "banned the two frozen channels (cp=%d unproven=0o%o ban=0o%o vote=%.2f) — "
+                     "without a proof ban on the fitted set there is no failed vote here, only "
+                     "a vote that lies",
+                     id, tS - wetAtS, (int)rig.cpState(), rig.cpUnprovenMask(),
+                     rig.proofExclusion(), rig.vote().votedPpo2);
+            if (banAtS - wetAtS > kBanDeadlineS)
+                FAIL("dive %d: the lying pair was not marked until %.0f s after the fault "
+                     "(deadline %.0f s): a diver spends that long enriching a loop the vote "
+                     "says is lean", id, banAtS - wetAtS, kBanDeadlineS);
+            heldPpo2 = rig.loop().shownPpo2();
+            if (heldPpo2 < 0.30f)
+                FAIL("dive %d: the last believable ppO2 was %.2f bar — there is no believable "
+                     "number to hold, so the window below cannot grade a hold", id, heldPpo2);
+            pTrueAtOpen = rig.world().ppo2True();
+            fastOpen = rig.deco().tissueBar(0);
+            twinFastOpen = twin.deco().tissueBar(0);
+            cnsOpen = rig.cnsPct();
+            twinCnsOpen = twin.cnsPct();
+            pulsesAtOpen = rig.pulseCount();
+            twinPulsesAtOpen = twin.pulseCount();
+            cpAttemptsAtOpen = rig.loop().cellproof().attempts;
+            blindOpen = true;
+            // The channel that goes deaf is the one the whole dive has been voting
+            // on. The cell is not broken: the machine stops being told what it says.
+            rig.setCellsFitted(0b011);
+        }
+        if (blindOpen && !blindClosed && tS >= clearAtS) {
+            rig.setCellsFitted(0b111);
+            fastClose = rig.deco().tissueBar(0);
+            twinFastClose = twin.deco().tissueBar(0);
+            cnsClose = rig.cnsPct();
+            twinCnsClose = twin.cnsPct();
+            ceilClose = rig.deco().ceilingM();
+            twinCeilClose = twin.deco().ceilingM();
+            pulsesInWindow = (int)(rig.pulseCount() - pulsesAtOpen);
+            twinPulsesInWindow = (int)(twin.pulseCount() - twinPulsesAtOpen);
+            blindClosed = true;
+        }
+
+        // ---- the rig and its twin, at the same true depth -----------------
+        rig.world().setDepthM(dv.depth);
+        twin.world().setDepthM(dv.depth);
+        rig.tick();
+        twin.tick();
+
+        const uint16_t live = rig.alarmBits();
+        const uint16_t logv = rig.alarmLogBits();
+        alarmUnion |= live;
+        const float sp = rig.spTarget();
+        if (sp < kSpFloorBar || sp > kSpCeilBar)
+            FAIL("dive %d: setpoint escaped to %.2f bar at t=%.0fs depth=%.1fm", id, sp, tS,
+                 dv.depth);
+        const float pTrue = rig.world().ppo2True();
+        if (pTrue < 0.12f)
+            FAIL("dive %d: loop fell to %.2f bar at %.1f m (t=%.0fs alarms=0x%03x) — the "
+                 "scenario drove the rig into a starvation the twin was not in", id, pTrue,
+                 dv.depth, tS, alarmUnion);
+        if (pTrue > 2.20f)
+            FAIL("dive %d: loop reached %.2f bar (toxic) at t=%.0fs: the raw-cell high veto "
+                 "let a lie about the vote drive the valve", id, pTrue, tS);
+        float maxCell = 0.0f;
+        for (int c = 0; c < 3; c++)
+            if (rig.cellStatus((uint8_t)c).last > maxCell) maxCell = rig.cellStatus((uint8_t)c).last;
+        if (maxCell >= kHighWall && rig.injOut().pulseStarted)
+            FAIL("dive %d: pulse started while a cell read %.2f bar (wall %.2f) at t=%.0fs",
+                 id, maxCell, kHighWall, tS);
+
+        // ---- inside the blind window, cycle by cycle ----------------------
+        if (blindOpen && !blindClosed) {
+            windowCycle++;
+            if (pTrue < pTrueMinInWindow) pTrueMinInWindow = pTrue;
+            if (rig.state().shownPpo2 < heldSeenMin) heldSeenMin = rig.state().shownPpo2;
+            if (rig.state().shownPpo2 > heldSeenMax) heldSeenMax = rig.state().shownPpo2;
+            if (rig.state().haveVote)
+                FAIL("dive %d: the vote came back at t=%.0fs with every fitted cell barred — "
+                     "either the ban leaked or the failed set is not what this dive thinks",
+                     id, tS);
+            // What the chain publishes and what the chain holds must be the same
+            // number: main.cpp feeds the handset, the HUD and the dive file from
+            // State, so a hold that lives only in the accessor would be invisible
+            // on the wire and this dive would grade the wrong thing.
+            if (std::fabs(rig.state().shownPpo2 - rig.loop().shownPpo2()) > 1e-6f)
+                FAIL("dive %d: the published State shows %.3f ppO2 while the chain holds %.3f — "
+                     "the number a diver downloads is not the number the chain decided on",
+                     id, rig.state().shownPpo2, rig.loop().shownPpo2());
+            // The published number: held, not 0.00, and not moving.
+            if (std::fabs(rig.state().shownPpo2 - heldPpo2) > 1e-6f)
+                FAIL("dive %d: the published ppO2 moved to %.3f during a failed vote (held "
+                     "%.3f): the handset number is being made from something other than the "
+                     "last believable vote", id, rig.state().shownPpo2, heldPpo2);
+            if (rig.vote().votedPpo2 != 0.0f)
+                FAIL("dive %d: a failed vote reported %.2f bar to the consumers gated on "
+                     "haveVote — the hold belongs to the display, not to the measurement",
+                     id, rig.vote().votedPpo2);
+            // The marker has to be there from the first cycle, or the held number
+            // is an unmarked claim for as long as it takes to arrive.
+            if (live & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)) {
+                if (failAtCycle < 0) failAtCycle = windowCycle;
+            }
+            if (windowCycle * dtS >= kSensorFailDeadlineS && failAtCycle < 0)
+                FAIL("dive %d: %.0f s into a failed vote with cells seen, BIT_SENSOR_FAIL had "
+                     "not been raised (alarms=0x%03x): the held ppO2 arrived with nothing "
+                     "saying it is held", id, windowCycle * dtS, live);
+            if (!(logv & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)))
+                FAIL("dive %d: the LOG view lost BIT_SENSOR_FAIL at t=%.0fs while the condition "
+                     "was still standing — the dive file's marker is not a latch, it is the fact",
+                     id, tS);
+            // Level alarms are statements about a measurement, and there is none.
+            if (live & (uint16_t)(1u << alarms::BIT_LOW_PPO2)) lowDuring++;
+            if (live & (uint16_t)(1u << alarms::BIT_HIGH_PPO2)) highDuring++;
+            // Injection: stopped. The held value sits far below the setpoint, so a
+            // hold that reached the valve would pulse the whole window.
+            if (rig.pulseCount() != pulsesAtOpen)
+                FAIL("dive %d: the valve pulsed at t=%.0fs with no believable ppO2 (held "
+                     "%.2f bar vs setpoint %.2f): the shown number drove injection",
+                     id, tS, rig.loop().shownPpo2(), sp);
+            if (rig.loop().cellproof().attempts != cpAttemptsAtOpen && !cpAttemptsChecked) {
+                cpAttemptsChecked = true;
+                FAIL("dive %d: CellProof re-armed (%d -> %d attempts) inside the blind window: "
+                     "this dive would be grading a proof run instead of the no-vote path",
+                     id, (int)cpAttemptsAtOpen, (int)rig.loop().cellproof().attempts);
+            }
+        }
+        if (blindClosed && !voteBack && rig.loop().haveVote()) {
+            voteBack = true;
+            voteBackS = tS;
+        }
+        if (voteBack && rig.pulseCount() > pulsesAtOpen && !pulsesResumed) pulsesResumed = true;
+        if (blindClosed && tS > clearAtS + 5.0f &&
+            (logv & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)))
+            logFailAfterRecovery = true;
+
+        // ---- the simulated diver -----------------------------------------
+        const bool bits = live != 0;
+        if (bits && alarmSinceS < 0.0f) alarmSinceS = tS;
+        if (!bits) alarmSinceS = -1.0f;
+        if (alarmSinceS >= 0.0f && tS - alarmSinceS >= ackDelayS) {
+            rig.ackAlarms();
+            alarmSinceS = -1.0f;
+        }
+        if (blindOpen && !blindClosed &&
+            !(live & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)) &&
+            (logv & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)))
+            ackSilencedCycles++;
+
+        // ---- the 30 s dive-file row, by the firmware's own fill -----------
+        if (blindOpen && !blindClosed) blindCyclesInRow++;
+        if (tS >= rowClockS) {
+            // Same mapping main.cpp makes, from the same source it reads: the
+            // published State. The row is then the record the controller would
+            // have written, not a paraphrase of the chain's internals.
+            const ctrl::State& st = rig.state();
+            logfmt::RowInputs ri{};
+            ri.nowMs = static_cast<uint32_t>(tS * 1000.0f);
+            ri.diveStartMs = 0;
+            ri.smoothedDepthM = st.depthSmoothedM;
+            ri.haveVote = st.haveVote;
+            ri.shownPpo2 = st.shownPpo2;
+            for (int c = 0; c < 3; c++)
+                ri.cellBar[c] = rig.cellStatus(static_cast<uint8_t>(c)).last;
+            ri.setpointBar = st.setpointBar;
+            ri.diveActive = true;
+            ri.autoMode = st.autoMode;
+            ri.alarmLogBits = st.alarms.logBits;
+            const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
+            ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
+            ri.vbat = 12.4f;
+            ri.pulsesNow = rig.pulseCount();
+            ri.pulsesPrev = rowPulseBase;
+            ri.deco = &rig.loop().deco();
+            logfmt::fillSnapshot(row, ri);
+            rowPulseBase = ri.pulsesNow;
+            if (!blindOpen) rowHonest = row;
+            if (blindCyclesInRow >= 150 && blindOpen && !blindClosed) {
+                rowsBlind++;
+                rowBlind = row;
+                if (row.alarmBits & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)) rowsBlindMarker++;
+            }
+            rowClockS += 30.0f;
+            blindCyclesInRow = 0;
+        }
+
+        // ---- the diver moves (under the faulted machine's own ceiling) ----
+        if (dv.step(dtS, rig.deco(), tS)) finished = true;
+    }
+    rig.endDive();
+    twin.endDive();
+
+    // ---- grading ----------------------------------------------------------
+    if (!wetDone) FAIL("dive %d: the connector was never flooded", id);
+    if (!blindClosed) FAIL("dive %d: the blind window never opened/closed (blind=%d closed=%d)",
+                           id, (int)blindOpen, (int)blindClosed);
+    if (newsAtS < 0.0f || newsAtS - wetAtS > kNewsDeadlineS)
+        FAIL("dive %d: %d s after two channels froze at plausible-but-wrong values the chain "
+             "had neither dropped them from the vote nor raised CELL_DRIFT (news at %.0f s, "
+             "activeMask 0o%o) — act 3 would be built on a fault nobody saw",
+             id, (int)(tS - wetAtS), newsAtS, (unsigned)rig.vote().activeMask);
+    if (failAtCycle < 0) FAIL("dive %d: BIT_SENSOR_FAIL was never raised in the window", id);
+    if (failAtCycle * dtS > kSensorFailDeadlineS)
+        FAIL("dive %d: BIT_SENSOR_FAIL took %d cycles to follow a failed vote: the held ppO2 "
+             "was on the handset unmarked for that long", id, failAtCycle);
+    if (heldSeenMax - heldSeenMin > 1e-6f)
+        FAIL("dive %d: the published ppO2 drifted across the window (%.3f -> %.3f) — a held "
+             "number that moves is a measurement being guessed", id, heldSeenMin, heldSeenMax);
+    if (std::fabs(heldSeenMin - heldPpo2) > 1e-6f)
+        FAIL("dive %d: the window showed %.3f bar, not the last believable vote (%.3f)",
+             id, heldSeenMin, heldPpo2);
+    if (lowDuring || highDuring)
+        FAIL("dive %d: a level alarm (LOW %d cycles, HIGH %d cycles) stood on a ppO2 that was "
+             "no longer a measurement — the failure alarm is what the diver is owed, not a "
+             "verdict about a number the chain stopped measuring", id, lowDuring, highDuring);
+    if (pulsesInWindow != 0)
+        FAIL("dive %d: %d injection pulses with no believable ppO2: the held %.2f bar was "
+             "driving the valve (the twin pulsed %d times at the same depth)", id,
+             pulsesInWindow, heldPpo2, twinPulsesInWindow);
+    if (twinPulsesInWindow <= 0)
+        FAIL("dive %d: the twin pulsed %d times across the window, so the assert above cannot "
+             "tell a stopped valve from a stopped dive", id, twinPulsesInWindow);
+
+    // The premise the deco direction depends on: the hold has to be a materially
+    // wrong number by the end of the window. The loop fell while the valve was shut;
+    // the machine kept showing the number it had before the fall.
+    if (pTrueAtOpen - pTrueMinInWindow < kPremiseLoopFallBar)
+        FAIL("dive %d: the loop only fell %.2f bar during %0.0f s of no injection (%.2f -> %.2f), "
+             "so a held ppO2 and kNoVotePpo2Bar would barely differ and the deco asserts below "
+             "prove nothing", id, pTrueAtOpen - pTrueMinInWindow, kWindowS, pTrueAtOpen,
+             pTrueMinInWindow);
+
+    // Tissues: decision (a) of finding N2 — no vote, tissues loaded at
+    // kNoVotePpo2Bar (ppN2 = pAmb, the most inert gas this depth allows). The
+    // direction is graded against the twin over the same span at the same true
+    // depth; the held ppO2 (0.45..1.3 bar rich) would have UNDER-recorded.
+    if (!(rig.deco().tissueBar(0) > twin.deco().tissueBar(0)))
+        FAIL("dive %d: the blind rig's fast tissue (%.3f bar) is not above the twin's (%.3f) — "
+             "the window's gas loading is not reaching the model", id, rig.deco().tissueBar(0),
+             twin.deco().tissueBar(0));
+    const double gainBlind = fastClose - fastOpen, gainTwin = twinFastClose - twinFastOpen;
+    if (!(gainBlind >= gainTwin + kMinTissueGainBar))
+        FAIL("dive %d: across the %.0f s no-vote window the fast tissue gained %.3f bar against "
+             "the twin's %.3f bar at the same depth: the tissues are being fed the held ppO2 "
+             "instead of kNoVotePpo2Bar, which under-records decompression debt",
+             id, kWindowS, gainBlind, gainTwin);
+    if (!(ceilClose >= twinCeilClose))
+        FAIL("dive %d: the ceiling after the window is %.1f m against the twin's %.1f m — the "
+             "conservative no-vote loading has to leave the diver with at least as much deco",
+             id, ceilClose, twinCeilClose);
+
+    // CNS: frozen with nothing to integrate. This is the one window in this dive
+    // that UNDER-records, so it is stated in loop.cpp step 8 and pinned here: if the
+    // rule changes, this reddens and the residual has to be re-argued, not lost.
+    if (!(std::fabs(cnsClose - cnsOpen) < 1e-9))
+        FAIL("dive %d: the oxygen clock advanced %.4f %% during a failed vote — the held ppO2 "
+             "reached stepCns, or the frozen-clock residual changed silently",
+             id, cnsClose - cnsOpen);
+    if (!(twinCnsClose > twinCnsOpen + 0.01))
+        FAIL("dive %d: the twin's CNS moved %.4f %% over the same span, so the frozen clock "
+             "above may just be a stopped dive", id, twinCnsClose - twinCnsOpen);
+
+    // The dive file: the rows the diver would download out of that window.
+    if (rowsBlind == 0)
+        FAIL("dive %d: no dive-file row was wholly inside the %.0f s no-vote window, so the "
+             "record of it is ungraded", id, kWindowS);
+    if (rowBlind.votedX1000 <= 0)
+        FAIL("dive %d: the dive file recorded %.3f ppO2 in the no-vote window — the handset was "
+             "showing %.3f, and 0.000 is the fabricated hypoxia this finding closed",
+             id, (float)rowBlind.votedX1000 / 1000.0f, heldPpo2);
+    const int32_t wantX = static_cast<int32_t>(numfmt::scaled(heldPpo2, 3));
+    if (std::abs(rowBlind.votedX1000 - wantX) > 1)
+        FAIL("dive %d: the row's ppO2 column is %.3f, not the held value %.3f the chain was "
+             "publishing at the same instant", id, (float)rowBlind.votedX1000 / 1000.0f, heldPpo2);
+    if (!(rowBlind.alarmBits & (uint16_t)(1u << alarms::BIT_SENSOR_FAIL)))
+        FAIL("dive %d: the no-vote row carries a ppO2 that is not a measurement with nothing "
+             "saying so (alarm word 0x%03x): BIT_SENSOR_FAIL is the marker", id,
+             rowBlind.alarmBits);
+    if (rowBlind.ndlMin != 480)
+        FAIL("dive %d: the no-vote row reports NDL %d instead of the 480 sentinel: the held "
+             "ppO2 was allowed to reduce the diver's no-deco time", id, rowBlind.ndlMin);
+    if (rowHonest.ndlMin == 480)
+        FAIL("dive %d: the last honest row already carried the 480 sentinel, so the sentinel "
+             "assert above distinguishes nothing", id);
+    if (rowsBlindMarker != rowsBlind)
+        FAIL("dive %d: only %d of %d no-vote rows carried BIT_SENSOR_FAIL: the file marks some "
+             "of the held numbers and not others", id, rowsBlindMarker, rowsBlind);
+    if (ackSilencedCycles == 0)
+        FAIL("dive %d: across %d no-vote rows the ACK never took BIT_SENSOR_FAIL off the live "
+             "word while the log view kept it — nothing here separates the two views", id,
+             rowsBlind);
+    if (logFailAfterRecovery)
+        FAIL("dive %d: 5 s after the channel came back, the dive-file view still claimed "
+             "BIT_SENSOR_FAIL — the marker is a fact about now, not a latch", id);
+
+    // Recovery: the channel returns, the vote returns with it, the shown number
+    // steps to the fresh measurement, and control takes the valve back.
+    if (!voteBack)
+        FAIL("dive %d: the vote never came back when the channel did", id);
+    if (voteBackS - clearAtS > kRecoverDeadlineS)
+        FAIL("dive %d: the vote took %.1f s to return after the channel did (deadline %.1f s)",
+             id, voteBackS - clearAtS, kRecoverDeadlineS);
+    if (rig.state().shownPpo2 <= 0.001f)
+        FAIL("dive %d: the vote is back and the shown ppO2 is still %.3f — the hold outlived "
+             "the reason for it", id, rig.state().shownPpo2);
+    if (std::fabs(rig.state().shownPpo2 - rig.vote().votedPpo2) > 1e-6f)
+        FAIL("dive %d: with a vote running the shown ppO2 (%.3f) is not the vote (%.3f)",
+             id, rig.state().shownPpo2, rig.vote().votedPpo2);
+    if (!pulsesResumed)
+        FAIL("dive %d: injection never resumed after the vote did (loop at %.2f bar, setpoint "
+             "%.2f)", id, rig.world().ppo2True(), rig.spTarget());
+    if (!(rig.proofExclusion() & 0b011))
+        FAIL("dive %d: the proof ban on the two frozen channels was lifted by the channel "
+             "coming back — a cell the machine has evidence against is back in the vote", id);
+
+    std::printf("dive %d  wet-connector  %5.0f m  flooded %3.0f s -> noticed %3.0f s -> banned "
+                "%3.0f s -> blind "
+                "%3.0f s  held ppO2 %.3f (loop fell to %.2f)  pulses %d vs twin %d  "
+                "CNS %+.2f%% vs twin %+.2f%%  fast tissue %+.2f vs twin %+.2f  ceil %.1f vs "
+                "twin %.1f m  rows %d (all marked, NDL %d)  no-vote cycles %d  alarms 0x%03x\n",
+                id, kBottomM, wetAtS, newsAtS, banAtS, kWindowS, heldPpo2, pTrueMinInWindow,
+                pulsesInWindow, twinPulsesInWindow, cnsClose - cnsOpen,
+                twinCnsClose - twinCnsOpen, gainBlind, gainTwin, ceilClose, twinCeilClose,
+                rowsBlind, (int)rowBlind.ndlMin, (int)windowCycle, alarmUnion);
+    std::printf("dive %d  ppO2-view  %d/%d no-vote dive-file rows hold %.3f and carry "
+                "BIT_SENSOR_FAIL across the ACK  (live word silent for %d cycles, level alarms "
+                "quiet, valve frozen for %.0f s, log view clear after recovery)\n",
+                id, rowsBlindMarker, rowsBlind, heldPpo2, ackSilencedCycles, kWindowS);
+}
+
 }  // namespace
 
 // Batched so one bad dive names itself without losing the rest of the soak.
@@ -1392,6 +1894,10 @@ void test_soak_dives_39_50() { for (int i = 39; i <= 50; i++) runDive(i); }
 // runDepthBusDive for why the pool is left alone.
 void test_depth_bus_dies_and_returns_mid_dive() { runDepthBusDive(); }
 
+// The oxygen leg (finding N2): a flooded harness that leaves the chain with no
+// ppO2 it is willing to believe, and the held-and-marked number it shows instead.
+void test_wet_connector_all_three_cells_dead() { runWetConnectorDive(); }
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_soak_dives_01_13);
@@ -1399,5 +1905,6 @@ int main() {
     RUN_TEST(test_soak_dives_26_38);
     RUN_TEST(test_soak_dives_39_50);
     RUN_TEST(test_depth_bus_dies_and_returns_mid_dive);
+    RUN_TEST(test_wet_connector_all_three_cells_dead);
     return UNITY_END();
 }

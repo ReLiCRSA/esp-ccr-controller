@@ -303,7 +303,7 @@ static void hudTask(void*) {
                           (unsigned long)st.recoveries,
                           numfmt::fixed(vb, sizeof(vb), g_battery.volts(), 2),
                           g_sensorStale, g_battery.low(),
-                          numfmt::fixed(vt, sizeof(vt), g_bridgeTel.votedBar, 3),
+                          numfmt::fixed(vt, sizeof(vt), g_bridgeTel.shownPpo2, 3),
                           numfmt::fixed(sp, sizeof(sp), g_bridgeTel.setpointBar, 2),
                           g_bridgeTel.alarmBits,
                           (int)g_bridgeTel.voteMode, (unsigned long)g_bridgeTel.pulses,
@@ -506,7 +506,7 @@ static void controlTask(void*) {
                 if (g_ctrlCfg.presentMask & (1u << i))
                     g_cellHist.sample(i, g_loop->cellBar(i), now);
 
-        g_bridgeTel.votedBar = st.votedBar;
+        g_bridgeTel.shownPpo2 = st.shownPpo2;
         g_bridgeTel.setpointBar = st.setpointBar;
         g_bridgeTel.depthM = st.depthSmoothedM;
         g_bridgeTel.vbat = sd.vbat;
@@ -617,7 +617,15 @@ static void controlTask(void*) {
             g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
             const int32_t dCm = static_cast<int32_t>(numfmt::scaled(st.depthSmoothedM, 2));
             if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;
-            const int32_t v = static_cast<int32_t>(numfmt::scaled(st.votedBar, 3));
+            const int32_t v = static_cast<int32_t>(numfmt::scaled(st.shownPpo2, 3));
+            // The META extremes count MEASUREMENTS only, and the haveVote gate is
+            // what does it: while the vote is failed, st.shownPpo2 is the held
+            // display number, and re-counting it 10 times a second would inflate a
+            // dive's min/max with a sample that stopped being true the cycle the
+            // cells died. The grid rows below DO carry the held number, marked by
+            // their alarm word — the row and the summary answer different questions
+            // (what the diver was shown vs what was measured), and that difference
+            // is documented in log/rowfill.h rather than accidental.
             if (st.haveVote) {
                 if (v < g_bridgeTotals.minVotedX1000) g_bridgeTotals.minVotedX1000 = v;
                 if (v > g_bridgeTotals.maxVotedX1000) g_bridgeTotals.maxVotedX1000 = v;
@@ -663,12 +671,19 @@ static void controlTask(void*) {
             // it — a mirror that cannot catch a drift in its original.
             if (comms::diveLogRecording() && now - lastSnapMs >= DIVE_SNAPSHOT_GRID_MS) {
                 lastSnapMs = now;
+                // The row's ppO2 column is the SHOWN number, which the chain holds
+                // across a failed vote (loop.cpp step 2b), so the dive file says
+                // what the diver was shown at this instant — and the alarm word
+                // written beside it says that number is held (logfmt/rowfill.h).
+                // The three cell columns stay RAW per-channel readings: they are
+                // what each cell reported, hold or no hold, and they are how a
+                // reader sees the "held" vote was built on cells reading nothing.
                 logfmt::RowInputs ri{};
                 ri.nowMs = now;
                 ri.diveStartMs = diveStartMs;
                 ri.smoothedDepthM = st.depthSmoothedM;
                 ri.haveVote = st.haveVote;
-                ri.votedBar = st.votedBar;
+                ri.shownPpo2 = st.shownPpo2;
                 for (int i = 0; i < 3; i++) ri.cellBar[i] = sd.cells[i];
                 ri.setpointBar = st.setpointBar;
                 ri.diveActive = true;  // the enclosing block is inside a dive

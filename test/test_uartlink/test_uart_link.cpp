@@ -167,7 +167,7 @@ void test_periodic_lines_keep_their_cadence() {
     std::vector<std::string> out;
     g_out = &out;
     Fixture f;
-    f.tel.votedBar = 0.62f;
+    f.tel.shownPpo2 = 0.62f;
     f.tel.cellBar[0] = 0.62f; f.tel.cellBar[1] = 0.63f; f.tel.cellBar[2] = 0.61f;
     f.tel.setpointBar = 0.70f;
     f.tel.depthM = 18.0f;

@@ -38,6 +38,9 @@ struct Config {
 };
 
 struct Input {
+    /// The RAW vote (0.0f when the vote failed), never ctrl::Loop's held display
+    /// value: a held ppO2 here would drive the valve against a number that stopped
+    /// being a measurement. `sensorHealthy` below is what enforces that.
     float votedBar;
     float setpointBar;
     bool sensorHealthy = true;

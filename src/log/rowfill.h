@@ -66,9 +66,22 @@ struct RowInputs {
 
     // ---- the oxygen picture --------------------------------------------
     bool haveVote = false;
-    float votedBar = 0.0f;     // stored whether or not there is a vote: the row
-                               // says what the chain last voted, and "no vote" is
-                               // recorded in the ndl sentinel and the alarm word
+    /// The ppO2 column: the SHOWN number, which the chain holds across a failed
+    /// vote (control/loop.h State::shownPpo2, loop.cpp step 2b). The claim this
+    /// field used to make — "the row says what the chain last voted" — was false
+    /// until 2026-11-26 (the code wrote voting::Result's default 0.0f, so every
+    /// row of a sensor-failure window recorded a hard 0.00 ppO2: finding N2). It
+    /// is now what the code does, and it is marked rather than naked: the row's
+    /// alarm word carries BIT_SENSOR_FAIL / BIT_SENSOR_STALE for exactly those
+    /// cycles (the LOG view, so an ACK cannot delete it) and `ndl` carries the 480
+    /// sentinel for "no vote, nothing to total". Before the first vote ever the
+    /// column still says 0, because there is no history to hold — and
+    /// BIT_SENSOR_STALE is up from the first cycle for the same reason.
+    /// The deliberate asymmetry with the dive META next to these rows: min_ppo2/
+    /// max_ppo2 IGNORE a held value (main.cpp gates them on haveVote), because the
+    /// summary answers "what was measured" and a row answers "what the diver was
+    /// shown". The cell columns are unaffected by all of this: raw readings.
+    float shownPpo2 = 0.0f;
     float cellBar[3] = {};
     float setpointBar = 0.0f;
 

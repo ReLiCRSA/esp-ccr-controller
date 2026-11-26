@@ -270,9 +270,13 @@ void test_two_threads_never_split_the_chain() {
 
     TEST_ASSERT_FALSE_MESSAGE(loop.diveActive(), "a posted END could not close the dive");
     TEST_ASSERT_TRUE_MESSAGE(loop.haveVote(), "the vote died under concurrent posting");
-    TEST_ASSERT_TRUE_MESSAGE(std::isfinite(loop.votedBar()), "torn sample produced a NaN vote");
-    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.01, 0.55f, loop.votedBar(),
-                                     "the vote drifted under concurrent config churn");
+    // The published ppO2, because that is the number a torn sample would corrupt
+    // on a handset: with haveVote true it is the vote, and a torn read would show up
+    // as a value that is not one any cell reported.
+    TEST_ASSERT_TRUE_MESSAGE(std::isfinite(loop.shownPpo2()),
+                             "a torn sample produced a NaN ppO2 on the published state");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.01, 0.55f, loop.shownPpo2(),
+                                     "the reported ppO2 drifted under concurrent config churn");
     TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.01, 1.50f, loop.setpointBar(),
                                      "the final config did not land whole (SP2 band at 5 m)");
     TEST_ASSERT_FLOAT_WITHIN(0.01, 5.0f, loop.depthSmoothedM());

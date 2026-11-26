@@ -20,10 +20,11 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
     // one sample ever disagree).
     s.depthCm = static_cast<int32_t>(numfmt::scaled(in.smoothedDepthM, 2));
 
-    // The vote is stored whether or not there is one: the row records what the
-    // chain last voted, and the absence of a vote is recorded in `nd` (480) and
-    // in the alarm word, not by zeroing a measurement.
-    s.votedX1000 = static_cast<int16_t>(numfmt::scaled(in.votedBar, 3));
+    // The row's ppO2 is the number the diver was shown, and the chain holds that
+    // across a failed vote (RowInputs::shownPpo2 — the contract, and the finding
+    // it closes, are both in rowfill.h). The absence of a vote is not recorded by
+    // zeroing this column: it is recorded in the alarm word and in `ndl` = 480.
+    s.votedX1000 = static_cast<int16_t>(numfmt::scaled(in.shownPpo2, 3));
     for (int i = 0; i < 3; i++)
         s.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(in.cellBar[i], 3));
     s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(in.setpointBar, 3));
@@ -47,9 +48,12 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
         s.ceilingCm = static_cast<int16_t>(numfmt::scaled(in.deco->ceilingM(), 2));
         // 480 is the "no vote, nothing to total" sentinel, and it is the same
         // sentinel ndlMinutes() saturates at, so an unlimited NDL and an
-        // unanswerable one cannot be confused with a real stop budget.
-        s.ndlMin = in.haveVote ? static_cast<int16_t>(in.deco->ndlMinutes(pAmbBar, in.votedBar))
-                               : 480;
+        // unanswerable one cannot be confused with a real stop budget. The gate
+        // also keeps a HELD ppO2 out of the NDL arithmetic: the number that is
+        // allowed to reduce a diver's NDL has to be a measurement.
+        s.ndlMin = in.haveVote
+                       ? static_cast<int16_t>(in.deco->ndlMinutes(pAmbBar, in.shownPpo2))
+                       : 480;
         s.decoTotalMin = static_cast<int16_t>(in.deco->schedule(pAmbBar).totalTimeMin);
     }
 

@@ -381,6 +381,13 @@ aggregates bits 6..9 (stuck open, sensor stale, CNS, hypoxia) into bit 3 —
 they are all "major fault, act now" from a handset's point of view. A handset
 must treat bit 0 and 1 as critical (ppO2 low = act immediately), 3 as major.
 
+`<voted_ppo2>` is the number the diver is shown, which while the vote has
+**failed** is the last ppO2 the controller believed rather than this cycle's
+measurement (a hard `0.00` there would be a hypoxia that never happened, argued
+with the machine's own "I cannot see your loop" alarm) — **bit 3 is the marker
+that says it is held**, exactly as `D,`'s `-1` NDL is its "no number" marker, and
+the grammar above is unchanged either way.
+
 ### `D,` decompression (0.5 Hz)
 
 ```

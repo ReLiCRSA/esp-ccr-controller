@@ -152,7 +152,12 @@ proto::DecoInfo CommandRouter::decoInfoOf(const ctrl::Loop& loop, bool hasVote) 
     const double ceilingM = z.ceilingM();
     d.ceilingM = ceilingM > 0.0f ? static_cast<float>(ceilingM) : 0.0f;
     if (hasVote) {
-        double ndl = z.ndlMinutes(amb, loop.votedBar());
+        // shownPpo2 == the live vote whenever hasVote is true (loop.cpp step 2b
+        // only refreshes the shown number from a healthy vote), so this NDL is
+        // computed from a measurement. Without a vote the answer is the protocol's
+        // -1: "no number", which is also how a handset knows the ppO2 beside it on
+        // `T,` is being held.
+        double ndl = z.ndlMinutes(amb, loop.shownPpo2());
         d.ndlMin = ndl >= 480.0 ? 480 : (ndl < 0.0 ? 0 : static_cast<int>(ndl));
     } else {
         d.ndlMin = -1;  // unknown: no vote, no honest NDL to report
@@ -489,7 +494,10 @@ void CommandRouter::getSpecial(Response& r, const char* key) {
     if (std::strcmp(key, "T") == 0) {
         proto::Telemetry t;
         t.depthM = loop_.depthSmoothedM();
-        t.votedPpo2 = loop_.votedBar();
+        // The shown value, held while the vote is failed (loop.cpp step 2b): a
+        // handset must never be handed 0.00 as a measurement. FLAGS bit 3
+        // (SENSOR_FAIL/STALE aggregate) is what tells the client it is held.
+        t.votedPpo2 = loop_.shownPpo2();
         for (int i = 0; i < 3; i++) t.cells[i] = loop_.cellBar(i);
         t.setpoint = loop_.setpointBar();
         // SAFE is a fact about the machine, and the router is the one that

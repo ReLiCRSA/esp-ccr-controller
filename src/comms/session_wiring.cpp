@@ -156,7 +156,7 @@ void hookAppendSnap(void*) {
     ri.diveStartMs = g_diveStartMs;
     ri.smoothedDepthM = g_bridgeTel.depthM;
     ri.haveVote = g_bridgeTel.haveVote;
-    ri.votedBar = g_bridgeTel.votedBar;
+    ri.shownPpo2 = g_bridgeTel.shownPpo2;
     for (int i = 0; i < 3; i++) ri.cellBar[i] = g_bridgeTel.cellBar[i];
     ri.setpointBar = g_bridgeTel.setpointBar;
     ri.diveActive = g_bridgeTel.diveActive;  // an edge drained after DIVE END is

@@ -915,7 +915,7 @@ logfmt::RowInputs benchRow() {
     ri.diveStartMs = 0u;
     ri.smoothedDepthM = 20.30f;
     ri.haveVote = true;
-    ri.votedBar = 0.55f;
+    ri.shownPpo2 = 0.55f;
     ri.cellBar[0] = 0.549f; ri.cellBar[1] = 0.55f; ri.cellBar[2] = 0.551f;
     ri.setpointBar = 0.70f;
     ri.diveActive = true;
@@ -1000,7 +1000,7 @@ void test_the_deco_columns_are_measured_at_the_chains_depth() {
     logfmt::Snapshot s{};
     logfmt::RowInputs ri = benchRow();
     ri.smoothedDepthM = 40.0f;     // the chain's held depth; the diver may be elsewhere
-    ri.votedBar = 1.30f;
+    ri.shownPpo2 = 1.30f;
     ri.deco = &eng;
     logfmt::fillSnapshot(s, ri);
 
@@ -1165,6 +1165,37 @@ void test_temp_and_flags_stay_unwritten_until_somebody_owns_them() {
                                     "E, rows already say, and nothing defined it");
 }
 
+// The marker bytes, as a diver's download shows them (the requirement to say
+// WHICH existing bytes mark a held ppO2, in a form that fails if they stop
+// marking it): a row written while the vote is failed keeps the shown number in
+// the `voted` column, carries BIT_SENSOR_FAIL (bit 3) in its alarm word, and
+// states ndl 480 = "no vote, nothing to total". No new column anywhere.
+void test_a_failed_vote_row_marks_the_held_number_with_existing_bytes() {
+    deco::Zhl16Ccr eng = loadedEngine();  // a loaded engine: the sentinel must beat a real NDL
+    logfmt::Snapshot s{};
+    logfmt::RowInputs ri = benchRow();
+    ri.shownPpo2 = 1.05f;              // the last believable vote
+    ri.haveVote = false;               // and it is not a measurement any more
+    ri.alarmLogBits = (1u << 3);       // alarms::BIT_SENSOR_FAIL, the LOG view
+    ri.smoothedDepthM = 40.0f;
+    ri.deco = &eng;
+    logfmt::fillSnapshot(s, ri);
+
+    char line[256];
+    logfmt::snapshotCsvLine(line, sizeof(line), s);
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, ",1.050,"),
+                                 (std::string("the ppO2 column of a failed-vote row is not the "
+                                              "held value the handset was showing; row was: ") +
+                                  line).c_str());
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(line, "0x0008"),
+                                 (std::string("a held ppO2 reached the dive file with no "
+                                              "BIT_SENSOR_FAIL beside it; row was: ") + line).c_str());
+    TEST_ASSERT_NULL_MESSAGE(std::strstr(line, ",0.000,"),
+                             "the failed vote wrote a 0.000 measurement into the row again");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, s.ndlMin,
+                                    "no 480 sentinel: the held ppO2 was allowed to compute an NDL");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_snapshot_roundtrip_and_size);
@@ -1208,5 +1239,6 @@ int main() {
     RUN_TEST(test_the_row_carries_the_log_alarm_view_whole);
     RUN_TEST(test_the_cns_column_is_the_dive_peak_untouched);
     RUN_TEST(test_temp_and_flags_stay_unwritten_until_somebody_owns_them);
+    RUN_TEST(test_a_failed_vote_row_marks_the_held_number_with_existing_bytes);
     return UNITY_END();
 }

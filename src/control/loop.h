@@ -78,7 +78,23 @@ struct State {
     bool solenoid = false;         // drive the O2 valve
     bool autoMode = false;
     bool diveActive = false;
-    float votedBar = 0.0f;
+    /// THE ppO2 this chain shows and records: the handset's `T,` field 2, the web
+    /// gauge and the dive file's `voted` column. While the vote is FAILED this is
+    /// the LAST ppO2 a healthy vote produced — not 0.00 — exactly like
+    /// depthSmoothedM below. The name says it: it is the SHOWN number, and a
+    /// shown number is not a measurement.
+    ///
+    /// It used to be `votedBar`, copied straight from `vote_` every cycle, so a
+    /// failed vote erased the last believable value and the handset answered a
+    /// hard `0.00` — a false catastrophic hypoxia, shown at the same moment
+    /// BIT_SENSOR_FAIL was telling the diver the readout could not be trusted
+    /// (finding N2). Consumers that must not believe a held value read
+    /// `vote().votedPpo2` instead (loop.cpp steps 3, 4, 6, 7, 8), and that
+    /// distinction is why this field is not called `voted`.
+    /// The marker for "held" is not a new byte: `T,` FLAGS bit 3 carries
+    /// BIT_SENSOR_FAIL (vote failed with cells seen) and BIT_SENSOR_STALE, and
+    /// the dive row's alarm word carries the same bits un-aggregated.
+    float shownPpo2 = 0.0f;
     float setpointBar = 0.0f;
     /// Filtered depth. While the pressure bus is invalid this is the LAST depth
     /// the bus measured, not the current one: consumers (handset display, dive
@@ -102,6 +118,14 @@ struct State {
 class Loop {
 public:
     static constexpr uint32_t kTickMs = 100;
+
+    /// The ppO2 substituted for a missing vote when step 8 steps the tissues.
+    /// A constant, so the display hold (loop.cpp step 2b) cannot reach the deco
+    /// model by accident: the row showing a held ppO2 must not silently change
+    /// what the tissues were loaded with. 0.0 bar = ppN2 = pAmb = the maximum
+    /// inert loading the depth allows, i.e. deliberately conservative. loop.cpp
+    /// step 8 carries the decision and why the held value is the wrong input.
+    static constexpr float kNoVotePpo2Bar = 0.0f;
 
     explicit Loop(const Config& cfg);
 
@@ -204,9 +228,16 @@ public:
     const cellproof::Output& cellproof() const { return cpOut_; }
     const inj::Output& injector() const { return injOut_; }
     bool outputFuseTripped() const { return injector_.outputFuseTripped(); }
-    float votedBar() const { return vote_.votedPpo2; }
+    /// What the handset and the dive file show: the held value (see State's
+    /// shownPpo2). Never use this where a MEASUREMENT is required — use
+    /// vote().votedPpo2 together with haveVote().
+    float shownPpo2() const { return shownPpo2_; }
     float setpointBar() const { return spTarget_; }
     float depthSmoothedM() const { return depthSmooth_; }
+    /// Is there a believable ppO2 this cycle? false ⇒ shownPpo2() is the last
+    /// believable value, not a measurement, and the raw vote is 0 by contract
+    /// (voting::Result). Every consumer that must not act on a held value asks
+    /// this question first.
     bool haveVote() const { return haveVote_; }
     bool solenoid() const { return solenoid_; }
     uint32_t pulseCount() const { return injector_.pulsesTotal(); }
@@ -240,6 +271,24 @@ private:
 
     bool solenoid_ = false;
     bool haveVote_ = false;
+    /// The published/recorded ppO2, held across a failed vote (loop.cpp step 2b).
+    /// It starts at 0.0f, and that is a decision, not a leftover: before the first
+    /// believable vote there is no history to hold, so 0.00 means "never measured"
+    /// and the flag that says so is already up — the ADC chain has delivered nothing
+    /// fresh yet (main.cpp feeds cellsFresh = !g_ads.anyStale(), and a channel with no
+    /// sample is stale), so BIT_SENSOR_STALE — FLAGS bit 3 — is set from the first
+    /// cycle. The one state where a no-vote 0.00 reaches a handset with bit 3 quiet is
+    /// a chain that has NEVER had a plausible cell reading and is now getting fresh
+    /// samples: cellsSeen is what tells "booting" from "it went blind" (alarms.cpp,
+    /// finding C2) and it is still false, so SENSOR_FAIL stays down. Deliberate — a
+    /// controller that has never measured its loop is not reporting a fault that
+    /// started — and narrow: an instrument in that state has also failed the pre-dive
+    /// air step, so AUTO is unreachable and the number shown is on a locked machine.
+    /// Seeding air's 0.21 instead would be a phantom reading, and a harmful one: 0.21
+    /// is above the LOW threshold (0.18), so a boot-time 0.21 would silence the
+    /// low-ppO2 alarm on a number nobody measured. Same rule as depth: hold when there
+    /// is something to hold, 0 plus a flag when there never was.
+    float shownPpo2_ = 0.0f;
     float depthSmooth_ = 0.0f, depthPrev_ = 0.0f, depthRate_ = 0.0f;
     float cellBar_[3] = {0.21f, 0.21f, 0.21f};
     float vbat_ = 0.0f;  // last sample seen: telemetry, never a control input

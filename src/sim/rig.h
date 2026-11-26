@@ -62,11 +62,28 @@ public:
     void cpOverride() { loop_.cellproofOverride(); }
     void clearStuckOpen() { loop_.clearStuckOpen(); }
 
+    /// Mid-dive change to which galvanic channels the ADC chain reports at all —
+    /// the shape of "this cell's channel went deaf": the driver stops delivering
+    /// it, rather than delivering a number nobody believes. Rig-side only: the
+    /// firmware's mask is a boot constant (main.cpp CELLS_PRESENT_MASK), so this
+    /// knob exists to reach the one state a scenario has to be able to witness —
+    /// every fitted, seen cell barred from the vote, i.e. Mode::FAILED with
+    /// cellsSeen and BIT_SENSOR_FAIL up. Loop::setConfig re-tunes the rules in
+    /// place and keeps dive activity, cell exclusions, the proof verdict and the
+    /// tissues, so nothing else about the dive is restarted.
+    void setCellsFitted(uint8_t mask);
+
     // ---- observation surface for the scenarios/tests -----------------------
     uint32_t t() const { return tickMs_; }
     World& world() { return world_; }
     const World& world() const { return world_; }
     const ctrl::Loop& loop() const { return loop_; }
+    /// The State the chain PUBLISHED on the last cycle — what the firmware's own
+    /// consumers read (main.cpp feeds this to the telemetry bridge, the HUD and
+    /// the dive-file row fill). A scenario that reads loop() accessors instead is
+    /// grading the chain's internals, not the numbers that reach a handset or a
+    /// download, and the two can disagree exactly where a hold is involved.
+    const ctrl::State& state() const { return lastState_; }
     const voting::Result& vote() const { return loop_.vote(); }
     const voting::CellStatus& cellStatus(uint8_t ch) const { return loop_.cell(ch); }
     const alarms::Result& alarmRes() const { return loop_.alarms(); }
@@ -103,8 +120,13 @@ public:
     }
 
 private:
+    // The opts the rig was built with, kept because setCellsFitted() has to
+    // re-apply the whole control config to change one mask bit — and re-applying
+    // anything other than what the chain is running would silently retune it.
+    RigOpts opts_;
     World world_;
     ctrl::Loop loop_;
+    ctrl::State lastState_{};
     float vbat_ = 12.4f;
     uint32_t tickMs_ = 0;
     bool lastSolOn_ = false;

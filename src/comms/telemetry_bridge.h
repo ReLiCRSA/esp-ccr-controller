@@ -20,7 +20,10 @@
 namespace bridge {
 
 struct Telemetry {
-    volatile float votedBar = 0.0f;
+    /// The ppO2 the handset and the dive file show: the chain's held value while
+    /// the vote is failed (control/loop.h State::shownPpo2), never a 0 that the
+    /// failure invented. haveVote below is what says whether it is a measurement.
+    volatile float shownPpo2 = 0.0f;
     volatile float cellBar[3] = {0.0f, 0.0f, 0.0f};  // calibrated, pre-vote
     volatile float setpointBar = 0.0f;
     volatile float depthM = 0.0f;

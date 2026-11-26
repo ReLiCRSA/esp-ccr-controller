@@ -10,7 +10,12 @@ constexpr float kTickS = Rig::kTickMs / 1000.0f;
 }
 
 Rig::Rig(const RigOpts& opts)
-    : world_(opts.world), loop_(opts), vbat_(opts.vbat) {}
+    : opts_(opts), world_(opts.world), loop_(opts), vbat_(opts.vbat) {}
+
+void Rig::setCellsFitted(uint8_t mask) {
+    opts_.presentMask = mask;
+    loop_.setConfig(opts_);
+}
 
 void Rig::tick() {
     const uint32_t now = tickMs_ + kTickMs;
@@ -39,14 +44,17 @@ void Rig::tick() {
     sd.vbat = vbat_;
 
     const ctrl::State st = loop_.cycle(sd, now);
+    lastState_ = st;  // published state, for state() — see rig.h
     lastSolOn_ = st.solenoid || world_.solenoidStuckOpen;
 
     // ---- running envelope, for scenario asserts ----------------------------
     // Only while the vote is real: a cold start (no samples yet) or a failed
     // sensor set legitimately reads 0 and must not pollute the dive envelope.
     if (st.haveVote) {
-        if (st.votedBar > maxVotedSeen) maxVotedSeen = st.votedBar;
-        if (st.votedBar < minVotedSeen) minVotedSeen = st.votedBar;
+        // The envelope counts MEASUREMENTS: st.shownPpo2 is the held display
+        // number, and a held value must not be counted again as if it were fresh.
+        if (st.shownPpo2 > maxVotedSeen) maxVotedSeen = st.shownPpo2;
+        if (st.shownPpo2 < minVotedSeen) minVotedSeen = st.shownPpo2;
     }
     const float truePpo2 = world_.ppo2True();
     if (truePpo2 > maxTrueSeen) maxTrueSeen = truePpo2;

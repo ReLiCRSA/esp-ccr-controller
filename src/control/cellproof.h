@@ -66,6 +66,9 @@ enum class State : uint8_t { INACTIVE, IDLE, ARMED, RUNNING, PASS, FAIL };
 struct Input {
     bool diveActive = false;
     float depthM = 0.0f;
+    // The RAW vote, not ctrl::Loop's held display value: this is the layer that
+    // decides which cells may be believed, so it may not be graded against a number
+    // built out of the very cells it is judging.
     float votedBar = 0.0f;
     float cellsBar[3] = {0, 0, 0};
     uint8_t activeMask = 0b111; // voting: which cells are in the vote

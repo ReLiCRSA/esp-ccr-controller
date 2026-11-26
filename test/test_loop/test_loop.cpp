@@ -15,6 +15,7 @@
 #include <cmath>
 
 #include "control/loop.h"
+#include "log/rowfill.h"   // the dive-file row fill, fed a real chain State below
 
 using namespace ctrl;
 
@@ -566,6 +567,302 @@ void test_pre_dive_rides_through_a_short_depth_bus_dropout() {
                              "AUTO refused after a pre-dive that passed through a dropout");
 }
 
+// ---- finding N2: a failed vote and the number the diver is shown -------------
+// The state this grades is a wet connector in the cell harness: two of three
+// galvanic channels die at DIFFERENT values (a flooded connector biases each
+// channel differently), CellProof runs at depth and marks them unproven because
+// they never moved, and then the last live channel stops being answered at all.
+// The chain then has no fitted cell it is willing to believe: Mode::FAILED with
+// cellsSeen, which is the one state in which the handset's ppO2 column stops
+// being a measurement.
+//
+// That route is worth spelling out, because it is the ONLY one the chain can
+// reach: voting.cpp returns FAILED only when every fitted AND seen cell is
+// banned, and the ban a proof run produces can never cover the whole fitted set
+// (a run with nothing proven sets the clamp, not the mask — cellproof.cpp), while
+// changing presentMask clears the "this cell answered" claim that BIT_SENSOR_FAIL
+// is built on. So a mid-dive FAILED + cellsSeen needs the fitted set to lose the
+// last honest channel on top of a proof ban, and that is why the case below pulls
+// that lever itself instead of pretending a dead cell reads something implausible.
+// (It also proves the reachability result: in the shipping firmware presentMask is
+// a boot constant — main.cpp CELLS_PRESENT_MASK — so today a diver can only reach
+// this state if a SET changes it. Reported, not papered over.)
+//
+// Two rigs, identical to the cycle, and one difference: `dead` loses ch2's
+// channel and `live` keeps it. Every assert is a comparison between them, so a
+// held number that leaked into the valve, the alarms, the tissue model or the dive
+// file would make the two rigs agree — and the assert says so.
+namespace {
+
+Config wetCfg() {
+    Config c = benchCfg();
+    c.cellproof.depthM = 8.0f;  // the proof runs on arrival at 32 m
+    return c;
+}
+
+struct WetConnector {
+    Loop dead, live;
+    uint32_t nd = 0, nl = 0;
+    ctrl::State lastDead{}, lastLive{};  // the State each rig last published
+    float heldBar = 0.0f;        // the last believable ppO2 when the channel died
+    uint32_t pulsesDead = 0, pulsesLive = 0;
+    double cnsDead = 0.0, cnsLive = 0.0;
+    double fastDead = 0.0, fastLive = 0.0;
+
+    WetConnector() : dead(wetCfg()), live(wetCfg()) {
+        dead.setAutoMode(true);
+        live.setAutoMode(true);
+        dead.startDive(nd);
+        live.startDive(nl);
+        drive();
+    }
+
+    /// One control cycle with the three channels scripted independently.
+    State step(Loop& loop, uint32_t& now, float c0, float c1, float c2, float depth) {
+        SensorData sd;
+        sd.cells[0] = c0; sd.cells[1] = c1; sd.cells[2] = c2;
+        sd.depthM = depth;
+        sd.pressureValid = true;
+        sd.cellsFresh = true;
+        sd.vbat = 12.4f;
+        now += Loop::kTickMs;
+        return loop.cycle(sd, now);
+    }
+
+    // `live` first, `dead` last, so lastDead/lastLive name the rig they came
+    // from: mixing them up would silently grade the control rig's State.
+    void both(float c0, float c1, float c2, float depth) {
+        lastLive = step(live, nl, c0, c1, c2, depth);
+        lastDead = step(dead, nd, c0, c1, c2, depth);
+    }
+
+    void drive() {
+        // 0. on the surface with the cells in air, so CellProof can ARM: it arms
+        //    shallow and runs on the first crossing of its depth (cellproof.cpp),
+        //    and a chain that starts at 32 m never gives it that edge.
+        for (int i = 0; i < 20; i++) both(0.21f, 0.21f, 0.21f, 0.0f);
+
+        // 1. descent to 7 m while the channels settle. The steps stay under the
+        //    voting layer's glitch wall (0.5 bar per sample), which is what a real
+        //    loop does on the way down; ch0/ch1 end up a little apart from each
+        //    other, which is how a flooded connector biases its channels.
+        for (int i = 0; i < 20; i++) {
+            const float f = static_cast<float>(i + 1) / 20.0f;
+            both(0.21f + 0.84f * f, 0.21f + 0.89f * f, 0.21f + 0.94f * f, 7.0f * f);
+        }
+
+        // 2. the rest of the descent with ch0/ch1 frozen where they are, and ch2
+        //    free to move. The proof run starts at 8 m, so its per-cell tracking
+        //    window sees exactly that: two channels that do not move at all.
+        for (int i = 20; i < 40; i++) both(1.05f, 1.10f, 1.15f, 7.0f + 25.0f * (i - 20) / 20.0f);
+
+        // 3. the loop goes lean (the fault the diver would be fighting) and the
+        //    machine follows it on the one cell it still believes: 0.15 bar is a
+        //    MEASUREMENT here, LOW and all. The fall is also what lets ch2 prove
+        //    itself — a cell proves itself by TRACKING the loop, so a proof run in
+        //    which nothing moves can only fail (cellproof.cpp sets its clamp and
+        //    marks nobody), and the ban this case needs comes from a PASS that
+        //    marks the two frozen channels unproven. It is deliberately slow
+        //    (0.03 bar/s): a cell climbing at that depth while the valve is shut is
+        //    the stuck-open signature, and a latched stuck-open valve would make
+        //    the "injection stopped" comparison below vacuous.
+        // The scripted descent moves the cell readings faster than a real loop's
+        // gas chemistry does, which trips the injector's stuck-open gate (a ppO2 rise
+        // with the valve shut at steady depth) — the gate is correct, it is just not the
+        // fault this case is about. Clear the artifact, and the asserts below check no
+        // latch is standing when the window starts.
+        dead.clearStuckOpen();
+        live.clearStuckOpen();
+
+        for (int i = 0; i < 350; i++) {
+            const float v = 1.15f - 1.00f * static_cast<float>(i + 1) / 350.0f;
+            both(1.05f, 1.10f, v, 32.0f);
+        }
+        TEST_ASSERT_TRUE_MESSAGE(dead.cellproof().state == cellproof::State::PASS,
+                                 "CellProof did not reach PASS, so no cell is proof-banned and "
+                                 "the case below cannot reach a failed vote");
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0b011, dead.cellproof().unprovenHighMask,
+                                        "the two channels that never moved were not marked unproven");
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(0b011, dead.proofExclusion(),
+                                        "the proof ban never reached the voting layer");
+        TEST_ASSERT_TRUE_MESSAGE(dead.haveVote(),
+                                 "the rig lost its vote before the last channel died: the "
+                                 "window below would be grading a different fault");
+        TEST_ASSERT_TRUE_MESSAGE(dead.alarmBits() & (1u << alarms::BIT_LOW_PPO2),
+                                 "a measured 0.15 bar loop did not raise LOW: the level alarms "
+                                 "are not behaving as this case assumes");
+        heldBar = dead.shownPpo2();
+        pulsesDead = dead.pulseCount();
+        pulsesLive = live.pulseCount();
+        TEST_ASSERT_GREATER_THAN_UINT_MESSAGE(
+            0, pulsesDead, "the valve was never pulsing, so 'injection stopped' below is vacuous");
+
+        // 3. the last live channel dies. ch2 stops being fitted; ch0/ch1 are still
+        //    fitted and still seen, and still proof-banned — so nothing may vote.
+        Config c2 = wetCfg();
+        c2.presentMask = 0b011;
+        dead.setConfig(c2);
+    }
+};
+
+}  // namespace
+
+void test_a_failed_vote_holds_the_shown_ppo2_instead_of_showing_zero() {
+    WetConnector w;
+    const float held = w.heldBar;
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(0.05f, held,
+                                           "the last believable ppO2 was not believable");
+
+    const double cns0 = w.dead.cnsPct(), cnsLive0 = w.live.cnsPct();
+    const double fast0 = w.dead.deco().tissueBar(0);
+    const uint32_t pulses0 = w.dead.pulseCount(), pulsesLive0 = w.live.pulseCount();
+    int sensorFailAt = -1, lowDuring = 0, highDuring = 0, zeroShown = 0, rawNonZero = 0;
+
+    // 150 s with the channel dead, fed a loop that has recovered to 0.90 bar —
+    // which the dead rig cannot see, and must not invent.
+    for (int i = 0; i < 1500; i++) {
+        const float v = 0.15f + 0.75f * static_cast<float>(i + 1) / 1500.0f;
+        w.both(1.05f, 1.10f, v, 32.0f);
+        const ctrl::State& st = w.lastDead;
+
+        // The vote layer still reports 0 on FAILED: the hold lives in the chain, so
+        // no consumer can pick up a held number and call it a measurement.
+        if (st.vote.votedPpo2 != 0.0f) rawNonZero++;
+        if (st.haveVote) continue;  // graded separately below
+        if (st.shownPpo2 <= 0.001f) zeroShown++;
+        if (st.alarms.bits & (1u << alarms::BIT_SENSOR_FAIL)) {
+            if (sensorFailAt < 0) sensorFailAt = i;
+        }
+        if (st.alarms.bits & (1u << alarms::BIT_LOW_PPO2)) lowDuring++;
+        if (st.alarms.bits & (1u << alarms::BIT_HIGH_PPO2)) highDuring++;
+        TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-6, held, st.shownPpo2,
+                                         "the published ppO2 moved during a failed vote: the "
+                                         "shown number must be held until a vote is believable");
+    }
+
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, rawNonZero,
+                                  "the raw vote stopped reporting 0 when it failed: consumers "
+                                  "that must not believe a held value lost their guarantee");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, zeroShown,
+                                  "a failed vote published 0.00 ppO2 again — a fabricated "
+                                  "catastrophic hypoxia on the handset and in the dive file");
+    TEST_ASSERT_TRUE_MESSAGE(sensorFailAt >= 0,
+                             "BIT_SENSOR_FAIL never went up: the held number arrived with no "
+                             "marker saying it is held");
+    if (sensorFailAt >= 0)
+        TEST_ASSERT_LESS_OR_EQUAL_INT_MESSAGE(5, sensorFailAt,
+                                              "BIT_SENSOR_FAIL took more than a few cycles to "
+                                              "follow a failed vote");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, lowDuring,
+                                  "a LOW alarm stood while the vote was failed: LOW is a claim "
+                                  "about a measurement, and in this window there is none — the "
+                                  "held 0.15 must not be graded as a level, and neither must the "
+                                  "raw 0.0 the vote reports on failure (the failure alarm is what "
+                                  "the diver is owed)");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, highDuring, "HIGH fired off a held ppO2");
+
+    // Injection: the rig that can see the loop pulses at these same numbers, the
+    // rig that cannot must not pulse at all. The held 0.15 is well below the 1.00
+    // setpoint, so a held value reaching the valve would pulse the whole window.
+    TEST_ASSERT_EQUAL_UINT_MESSAGE(pulses0, w.dead.pulseCount(),
+                                   "the valve pulsed with no believable ppO2: the held number "
+                                   "drove injection");
+    TEST_ASSERT_GREATER_THAN_UINT_MESSAGE(pulsesLive0, w.live.pulseCount(),
+                                          "the control rig stopped pulsing, so the comparison "
+                                          "above proves nothing");
+
+    // The tissue model: decision (a) of finding N2. With no vote the tissues are
+    // loaded at kNoVotePpo2Bar (0 bar ⇒ ppN2 = pAmb ⇒ the most inert gas this
+    // depth allows), which is MORE debt than the held ppO2 would give. If someone
+    // feeds the held number to stepTissues, the two rigs agree and this reddens.
+    TEST_ASSERT_TRUE_MESSAGE(Loop::kNoVotePpo2Bar == 0.0f,
+                             "kNoVotePpo2Bar is no longer the conservative 0 the deco decision "
+                             "was made on (loop.h: no vote ⇒ ppN2 = pAmb)");
+    const double fastDead = w.dead.deco().tissueBar(0), fastLive = w.live.deco().tissueBar(0);
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(fast0 + 0.05, fastDead,
+                                           "the tissues stopped integrating during a failed vote: "
+                                           "the window's gas loading never reached the model");
+    TEST_ASSERT_TRUE_MESSAGE(fastDead > fastLive + 0.015,
+                             "the failed-vote rig loaded its tissues like the rig that still had "
+                             "a vote: the deco model is being fed the held ppO2 instead of "
+                             "kNoVotePpo2Bar, which under-records decompression debt");
+
+    // CNS: frozen with nothing to integrate. Stated residual (loop.cpp step 8),
+    // pinned so it stays a decision and not an accident waiting to be forgotten.
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-9, cns0, w.dead.cnsPct(),
+                                     "the CNS clock advanced on a held ppO2 — either the "
+                                     "residual changed or it changed silently");
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(cnsLive0 + 0.01, w.live.cnsPct(),
+                                           "the control rig stopped clocking CNS, so the frozen "
+                                           "clock above proves nothing");
+
+    // Recovery: the channel comes back, the vote comes back with it, and the shown
+    // number steps to the fresh measurement — never through 0.00.
+    Config back = wetCfg();
+    back.presentMask = 0b111;
+    w.dead.setConfig(back);
+    // The reading coming back at 0.90 after minutes of nothing IS, to the
+    // injector's stuck-open gate, a ppO2 rising with the valve shut at steady
+    // depth — the latch is the gate doing its job, not a new fault, so the case
+    // clears it the way the diver would (`CLEAR STUCK`) before asking whether
+    // control resumed.
+    w.dead.clearStuckOpen();
+    const uint32_t pulsesAtRecovery = w.dead.pulseCount();
+    bool voteBack = false;
+    for (int i = 0; i < 100; i++) {
+        w.both(1.05f, 1.10f, 0.90f, 32.0f);
+        if (w.dead.haveVote()) { voteBack = true; break; }
+    }
+    TEST_ASSERT_TRUE_MESSAGE(voteBack, "the vote never came back when the channel did");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.02f, 0.90f, w.dead.shownPpo2(),
+                                     "after recovery the shown ppO2 is not the fresh vote");
+    TEST_ASSERT_FALSE_MESSAGE(w.dead.alarmBits() & (1u << alarms::BIT_SENSOR_FAIL),
+                              "BIT_SENSOR_FAIL stayed up after the vote returned");
+    TEST_ASSERT_GREATER_THAN_UINT_MESSAGE(pulsesAtRecovery, w.dead.pulseCount(),
+                                          "injection did not resume when the vote did");
+}
+
+// The row a diver would download from that window: logfmt::fillSnapshot fed the
+// State of a chain that is actually in it, which is what main.cpp does. This is
+// the assert-level version of the rowfill.h contract — the ppO2 column is the
+// held number, and the marker bytes are what say so.
+void test_the_row_written_in_a_failed_vote_holds_the_number_and_marks_it() {
+    WetConnector w;
+    for (int i = 0; i < 400; i++) w.both(1.05f, 1.10f, 0.60f, 32.0f);
+    const ctrl::State& st = w.lastDead;
+    TEST_ASSERT_FALSE_MESSAGE(st.haveVote, "the rig recovered before the row was written");
+
+    logfmt::RowInputs ri{};
+    ri.nowMs = w.nd;
+    ri.diveStartMs = 0;
+    ri.smoothedDepthM = st.depthSmoothedM;
+    ri.haveVote = st.haveVote;
+    ri.shownPpo2 = st.shownPpo2;
+    for (int i = 0; i < 3; i++) ri.cellBar[i] = w.dead.cellBar(static_cast<uint8_t>(i));
+    ri.setpointBar = st.setpointBar;
+    ri.diveActive = true;
+    ri.autoMode = st.autoMode;
+    ri.alarmLogBits = st.alarms.logBits;
+    ri.vbat = 12.4f;
+    ri.deco = &w.dead.deco();
+
+    logfmt::Snapshot row{};
+    logfmt::fillSnapshot(row, ri);
+
+    TEST_ASSERT_TRUE_MESSAGE(row.votedX1000 > 0,
+                             "the dive file recorded a 0.000 ppO2 row for a window in which the "
+                             "diver was shown a held value — the row and the handset disagree");
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(1e-3, w.heldBar, static_cast<float>(row.votedX1000) / 1000.0f,
+                                     "the row's ppO2 column is not the held value the chain is "
+                                     "publishing");
+    TEST_ASSERT_TRUE_MESSAGE(row.alarmBits & (1u << alarms::BIT_SENSOR_FAIL),
+                             "the row carries a ppO2 that is not a measurement with nothing "
+                             "saying so: BIT_SENSOR_FAIL must be in the log alarm word");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(480, row.ndlMin,
+                                    "a row with no vote does not carry the 480 sentinel: the "
+                                    "held ppO2 was allowed to compute an NDL");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_stale_sensors_stop_injection);
@@ -579,5 +876,7 @@ int main() {
     RUN_TEST(test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alarm);
     RUN_TEST(test_pre_dive_refuses_a_dead_depth_bus);
     RUN_TEST(test_pre_dive_rides_through_a_short_depth_bus_dropout);
+    RUN_TEST(test_a_failed_vote_holds_the_shown_ppo2_instead_of_showing_zero);
+    RUN_TEST(test_the_row_written_in_a_failed_vote_holds_the_number_and_marks_it);
     return UNITY_END();
 }

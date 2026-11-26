@@ -60,6 +60,9 @@ struct Config {
 };
 
 struct Inputs {
+    /// The RAW vote, not ctrl::Loop's held display value: LOW/HIGH/CELL_DRIFT are
+    /// statements about a measurement, and update() evaluates them only when
+    /// haveVote is true. A held number reaching here must not raise them.
     float votedBar = 0.5f;
     float cnsPct = 0.0f;
     float vbat = 12.0f;

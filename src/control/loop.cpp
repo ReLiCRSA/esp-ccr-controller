@@ -45,6 +45,12 @@ void Loop::drivePulseTest(uint32_t nowMs) {
 
     cal::PulseTestInput pi;
     for (int i = 0; i < 3; i++) pi.cellsBar[i] = cellBar_[i];
+    // RAW vote, never the held shown value. The cell test grades whether each
+    // cell MOVES when the valve fires, so a held number is the wrong input the
+    // day this field gains a consumer — today it has none: PulseTest reads
+    // in.cellsBar / in.pulsesDelivered / in.presentMask only and never looks at
+    // votedBar (dead input, reported rather than quietly deleted, because removing
+    // a field from a test's input struct is a decision about that test's contract).
     pi.votedBar = vote_.votedPpo2;
     pi.presentMask = cfg_.presentMask;
     pi.pulsesDelivered = injector_.pulsesTotal() - ptPulseBase_;
@@ -143,6 +149,37 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     vote_ = voting_.update(cellBar_, dt);
     haveVote_ = vote_.mode != voting::Mode::FAILED;
 
+    // ---- 2b. the ppO2 the diver is shown ----------------------------------
+    // `vote_` is replaced wholesale above, and voting::Result::votedPpo2 is 0.0f
+    // by construction when the vote fails (voting.h, and the n == 0 early return),
+    // so until 2026-11-26 everything downstream of it — the handset's `T,` field 2,
+    // the web gauge, the dive file's `voted` column — showed a hard 0.00 the cycle
+    // the cells stopped being believed. That is a fabricated catastrophic hypoxia
+    // (finding N2), and the worst part is that it fought the machine's own
+    // warning: BIT_SENSOR_FAIL says "I cannot see the loop", and 0.00 says "I can,
+    // and the loop is dead". Of the two, the number reads like a measurement.
+    //
+    // The contract is now the depth contract: hold the last ppO2 a healthy vote
+    // produced, and let the marker bytes say it is held. No new wire field:
+    //   * `T,` FLAGS bit 3 aggregates BIT_SENSOR_FAIL (vote FAILED with cells
+    //     seen) and BIT_SENSOR_STALE, and bit 2 (CELL_DRIFT) covers a vote that
+    //     degraded rather than failed;
+    //   * `D,` answers NDL as -1 = "unknown, show —, never 0" when there is no
+    //     vote (cmd_router.cpp), which is the handset's own "no number" marker;
+    //   * the dive row carries the un-aggregated LOG alarm word (so bit 3 is
+    //     bit 3, and rows keep it after an ACK) plus ndl=480, the sentinel for
+    //     "no vote, nothing to total";
+    //   * the console's HB line and `GET *` print the raw vote mode, which says
+    //     FAILED outright. There is no vote-mode byte on `T,` itself — the FLAGS
+    //     aggregate is what a handset has, and it is enough to say "held".
+    //
+    // What does NOT change here: the raw vote stays 0 on FAILED, exactly so that
+    // no consumer can accidentally believe a held number (steps 3, 4, 6, 7, 8 all
+    // read vote_.votedPpo2, and each says why at the site). And before the first
+    // believable vote this holds 0.0f — there is no history, and inventing air's
+    // 0.21 would silence the LOW alarm on a phantom reading (see shownPpo2_).
+    if (haveVote_) shownPpo2_ = vote_.votedPpo2;
+
     // ---- 3. pre-dive sequencer + its solenoid step -------------------------
     if (predive_.running()) {
         predive::Inputs pi;
@@ -184,6 +221,13 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     cellproof::Input ci;
     ci.diveActive = diveActive;
     ci.depthM = depthSmooth_;
+    // RAW vote: CellProof is the layer that DECIDES whether a cell may be believed,
+    // so it may not be handed the chain's held number as its yardstick — a held
+    // 1.30 would be compared against cells it is trying to judge, and the cells it
+    // rejected would look wrong by exactly the amount the hold is stale. With no
+    // vote it sees 0 (unchanged from before the display fix): that makes its
+    // rejected-cell disagreement test degrade to "rejected cells read above zero",
+    // which can only re-arm a proof run, never re-admit a banned cell.
     ci.votedBar = vote_.votedPpo2;
     for (int i = 0; i < 3; i++) ci.cellsBar[i] = cellBar_[i];
     ci.activeMask = vote_.activeMask;
@@ -241,6 +285,14 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
 
     // ---- 6. injector -------------------------------------------------------
     inj::Input ii;
+    // RAW vote, and the gate two lines below is why that is safe: the held value
+    // must never reach the valve. If it did, a chain that cannot see the loop would
+    // keep injecting against a setpoint it last met minutes ago — or STOP injecting
+    // because the stale number says the loop is already there, which is the fatal
+    // direction. `sensorHealthy` (haveVote_ && cellsFresh) keeps demand control off
+    // entirely in that window, so `ii.votedBar` is unread the moment it would be a
+    // fiction. Verified unchanged by this fix: the display hold does not touch this
+    // path, and test_loop's no-vote case asserts the pulse count stays flat.
     ii.votedBar = vote_.votedPpo2;
     ii.setpointBar = spTarget_;
     // Demand control is suspended while the pre-dive sequencer is scripting
@@ -255,6 +307,10 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     // HIGH side: if it were the honest one, the loop is heading into oxygen
     // toxicity and its reading still has to stop injection.
     ii.sensorHealthy = haveVote_ && in.cellsFresh;
+    // The HIGH veto stays built from the RAW per-cell readings (max over every
+    // fitted cell, vote or no vote) — deliberately not the held value: a poisoned
+    // pair can agree on a plausible low number while the honest third sees a loop
+    // heading into toxicity, and that third reading has to keep reaching the wall.
     ii.highVetoBar = ii.votedBar;
     for (int i = 0; i < 3; i++)
         if (cfg_.presentMask & (1u << i)) ii.highVetoBar = std::max(ii.highVetoBar, cellBar_[i]);
@@ -265,6 +321,12 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
 
     // ---- 7. alarms: the single authority -----------------------------------
     alarms::Inputs ai;
+    // RAW vote, never the held value: LOW/HIGH/CELL_DRIFT are statements about a
+    // measurement, and alarms.cpp keeps them outside the arithmetic entirely when
+    // haveVote is false (its own gate, evaluated as `false`, not as unknown). A held
+    // 1.30 reaching here would have raised LOW the moment the setpoint band moved
+    // under it, or HIGH from a number that is not what the loop is at. `highVetoBar`
+    // is the raw-cell maximum built in step 6 — that one has no vote to be gated on.
     ai.votedBar = vote_.votedPpo2;
     ai.highVetoBar = ii.highVetoBar;
     ai.cnsPct = static_cast<float>(deco_.cnsPct());
@@ -301,6 +363,8 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     // they stop trusting its deco picture.
     if (diveActive && haveVote_ && in.cellsFresh)
         deco_.stepCns(dt / 1000.0, vote_.votedPpo2);
+    // (RAW vote, gated on haveVote_ && cellsFresh: the held value never drives the
+    // oxygen clock, which freezes with the vote instead — the residual above.)
 
     // Tissues: ambient pressure x time, and during a depth fault the pressure
     // available is the one depthSmooth_ last MEASURED (held, not believed —
@@ -326,18 +390,32 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     //     a frozen band rather than following the diver down. No phantom depth
     //     excursion is invented to paper over it: the model does not get to be
     //     cleverer than the sensor that went away.
+    //
+    // The ppO2 it is loaded with follows the same rule, and is now a named
+    // constant rather than a side effect of voting::Result's default: with a vote,
+    // the vote's own value; without one, kNoVotePpo2Bar (0.0 bar ⇒ ppN2 = pAmb ⇒
+    // the maximum inert loading this depth allows). Decision (a) of finding N2,
+    // chosen over feeding the held value on purpose:
+    //   * over-record is the fenced direction — a deeper ceiling and a shorter NDL
+    //     can only ever ask the diver for more deco;
+    //   * the held value is not merely stale, it is wrong in the unsafe direction:
+    //     a rich ppO2 SUBTRACTS from ppN2, so tissues would be loaded as if the
+    //     loop were still oxygen-rich while injection is off and the real loop is
+    //     falling. That under-records debt, and no marker byte can undo an
+    //     under-recorded ceiling;
+    //   * naming the constant also keeps the display hold (step 2b) from reaching
+    //     the deco model by accident — the diff that fixes a handset number cannot
+    //     silently change what the tissues were loaded with.
+    const float tissuePpo2 = haveVote_ ? vote_.votedPpo2 : kNoVotePpo2Bar;
     if (diveActive)
         deco_.stepTissues(dt / 1000.0, deco_.depthToBar(std::max(0.0f, depthSmooth_)),
-                          vote_.votedPpo2);
-    // (With no vote, votedPpo2 is 0.0f, so ppN2 is computed HIGHER and the
-    // tissues load more than they would on a real ppO2 — unchanged from before
-    // this split, and the conservative side of "no measurement".)
+                          tissuePpo2);
 
     // ---- 9. fill the report ------------------------------------------------
     st.solenoid = solenoid_;
     st.autoMode = ii.autoMode;
     st.diveActive = diveActive;
-    st.votedBar = vote_.votedPpo2;
+    st.shownPpo2 = shownPpo2_;  // held across a failed vote — see step 2b
     st.setpointBar = spTarget_;
     st.depthSmoothedM = depthSmooth_;
     st.haveVote = haveVote_;

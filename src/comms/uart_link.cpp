@@ -87,7 +87,7 @@ void UartLink::applyActions(uint32_t actions, Sink sink, void* ctx) {
 void UartLink::emitT(Sink sink, void* ctx) {
     proto::Telemetry t;
     t.depthM = tel_.depthM;
-    t.votedPpo2 = tel_.votedBar;
+    t.votedPpo2 = tel_.shownPpo2;
     for (int i = 0; i < 3; i++) t.cells[i] = tel_.cellBar[i];
     t.setpoint = tel_.setpointBar;
     t.battV = tel_.vbat;

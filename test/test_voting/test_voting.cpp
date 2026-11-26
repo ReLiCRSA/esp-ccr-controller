@@ -192,6 +192,40 @@ void test_unfitting_a_cell_forgets_its_history() {
                               "an uninstalled cell kept the data claim alive");
 }
 
+// Finding N2's other half, pinned at the layer that owns it: a failed vote
+// reports 0.00 ppO2 and keeps doing so. The held number the diver is shown lives
+// in ctrl::Loop (loop.cpp step 2b), NOT here, precisely so that no consumer can
+// pick up the last believable value from Result and treat it as this cycle's
+// measurement. A "helpful" Engine that returned the last vote on FAILED would put
+// a stale ppO2 back into the injector, the level alarms and the tissue model, and
+// the compiler would never mention it.
+void test_a_failed_vote_reports_zero_and_keeps_doing_it() {
+    Engine e{Config{}};
+    feedRet(e, 1.20f, 1.21f, 1.19f);
+    TEST_ASSERT_EQUAL_UINT8(Mode::OK_3CELL, last.mode);
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(1.0f, last.votedPpo2,
+                                           "this case assumes a healthy vote first");
+    const float believable = last.votedPpo2;
+
+    e.setProofExclusion(0b111);  // every fitted cell banned: nothing may vote
+    feedRet(e, 1.20f, 1.21f, 1.19f);
+    TEST_ASSERT_EQUAL_UINT8(Mode::FAILED, last.mode);
+    TEST_ASSERT_EQUAL_FLOAT_MESSAGE(0.0f, last.votedPpo2,
+                                    "a failed vote returned a ppO2: consumers gated on haveVote "
+                                    "would be handed a number that is not a measurement");
+    TEST_ASSERT_GREATER_THAN_FLOAT_MESSAGE(0.0f, believable,
+                                           "the healthy vote was already 0, so the assert above "
+                                           "could not tell a held value from a real one");
+
+    // And it stays 0 for as long as the vote stays failed: the failure is not a
+    // one-cycle blip that leaks a value on the second cycle.
+    for (int i = 0; i < 20; i++) {
+        feedRet(e, 1.20f, 1.21f, 1.19f);
+        TEST_ASSERT_EQUAL_UINT8(Mode::FAILED, last.mode);
+        TEST_ASSERT_EQUAL_FLOAT(0.0f, last.votedPpo2);
+    }
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_median_of_three_rejects_outlier_after_window);
@@ -206,5 +240,6 @@ int main() {
     RUN_TEST(test_ban_that_empties_the_vote_falls_back_to_a_drifted_cell);
     RUN_TEST(test_cells_seen_distinguishes_boot_from_a_lost_vote);
     RUN_TEST(test_unfitting_a_cell_forgets_its_history);
+    RUN_TEST(test_a_failed_vote_reports_zero_and_keeps_doing_it);
     return UNITY_END();
 }

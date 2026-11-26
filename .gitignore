@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 logs/
+
+# soak_logger.py's captured stdout (nohup redirect). The raw HB log it
+# writes lives in logs/, already ignored above; this is the run's console
+# echo — an artifact, re-grown by every 24 h soak, never an input.
+soak_run.out

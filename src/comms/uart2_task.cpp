@@ -10,8 +10,12 @@
 // Hang rules for this task: the read never blocks past the stream timeout, an
 // overlong burst gets one ERR and its whole line is dropped (no echo storm, no
 // unbounded buffer, no truncated command executed), and the watchdog is fed
-// once per pump. If Serial2 ever wedges, this task dies into the supervisor's
-// SAFE policy — logging dies before control, never the other way round.
+// once per pump. One command does not return from a pump in bounded time:
+// `LOG EXPORT` streams the whole dive through the sink below, so the link feeds
+// from inside that row loop as each row reaches the wire (review M-1,
+// util/wdtfeed.h). Neither feed is a way to survive a hang: if Serial2 wedges,
+// both stop being reached, and this task dies into the supervisor's SAFE
+// policy — logging dies before control, never the other way round.
 // ============================================================================
 #include "uart2_task.h"
 

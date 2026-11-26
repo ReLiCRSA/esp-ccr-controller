@@ -3,10 +3,14 @@
 // receives. Commands answer, periodic lines hold their cadence, events from
 // the control core reach the wire as E, lines (and grab an event-driven
 // snapshot with them), and a dive log that fails to open is announced —
-// an unlogged dive is acceptable, an unannounced one is not.
+// an unlogged dive is acceptable, an unannounced one is not. A long LOG EXPORT
+// is graded too: every row once, in order, in one call, and the watchdog feed
+// that rides on that row loop only ever follows a row that reached the wire
+// (review M-1).
 // ============================================================================
 #include <unity.h>
 
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <string>
@@ -14,6 +18,7 @@
 
 #include "comms/telemetry_bridge.h"
 #include "comms/uart_link.h"
+#include "util/wdtfeed.h"
 
 using comms::CommandRouter;
 using comms::UartLink;
@@ -25,8 +30,12 @@ void tearDown() {}
 namespace {
 
 std::vector<std::string>* g_out = nullptr;  // sink context (test-local, single-thread)
+void* g_sinkCtx = nullptr;                  // the ctx the caller's sink last saw
 
-void sinkLine(const char* line, void*) { g_out->push_back(line); }
+void sinkLine(const char* line, void* ctx) {
+    g_sinkCtx = ctx;
+    g_out->push_back(line);
+}
 
 bool hasLineStarting(const char* prefix) {
     for (auto& l : *g_out)
@@ -53,6 +62,12 @@ struct Hooks {
 struct Fixture;
 static Fixture* g_fix = nullptr;
 static void* g_exportCtx = reinterpret_cast<void*>(0x1);  // 'not called yet'
+
+// A 6 h dive at the 30 s grid is ~720 snapshot rows, which is the size that
+// actually outran the task watchdog on the bench (review M-1). 400 rows is
+// enough to cross the feed interval (util::kWdtFeedEvery) two dozen times,
+// which is what makes the row-counting wrapper's bookkeeping observable here.
+constexpr int kLongExportRows = 400;
 
 struct Fixture {
     Config cfg;
@@ -123,10 +138,32 @@ struct Fixture {
             // (a WebSocket client id) would otherwise be handed the
             // firmware's hook object. Recorded here so the test can see it.
             g_exportCtx = ctx;
-            if (!g_fix || slot != 3) return -1;
+            if (!g_fix) return -1;
+            // Slot 5 stands for a dive with an afternoon in it, because what is
+            // being exercised here is the row LOOP. The store hands the whole
+            // dive to the link one row at a time (DiveStore::exportCsv ->
+            // logfmt::emitCsvRows), and since 2026-11-26 the link counts those
+            // calls so the task doing the streaming can feed the watchdog it is
+            // registered with (review M-1, util/wdtfeed.h). A wrapper that
+            // dropped, duplicated or reordered rows to get its count would be
+            // invisible in a three-row export, so this one is long.
+            if (slot == 5) {
+                char row[24];
+                sink("DIVE,5,1700000000,3\n", ctx);
+                for (int i = 0; i < kLongExportRows; i++) {
+                    std::snprintf(row, sizeof(row), "S,%d\n", i);
+                    sink(row, ctx);
+                }
+                return kLongExportRows;
+            }
+            if (slot != 3) return -1;
+            // Every call back carries the ctx the export was handed. That is the
+            // store's contract (logfmt::emitCsvRows passes it to every row), and
+            // the link's row counter now depends on it, so the fixture must not
+            // wave it away with a nullptr the real store would never pass.
             sink("CTX-SEEN\n", ctx);
-            sink("DIVE,3,1700000000,3\n", nullptr);
-            sink("S,30,25.00,0.700,0.700,0.700,0.700,0.700,0x0000,12,0,480,0,5,12500\n", nullptr);
+            sink("DIVE,3,1700000000,3\n", ctx);
+            sink("S,30,25.00,0.700,0.700,0.700,0.700,0.700,0x0000,12,0,480,0,5,12500\n", ctx);
             return 1;
         };
         return h;
@@ -394,16 +431,170 @@ void test_log_list_and_export_stream_over_the_session() {
 
 // LOG EXPORT over a WebSocket is the case that bites: the export streams
 // through the *transport's* sink, so it must receive the transport's context.
+// Since M-1 the link sits between the two (it counts rows to keep the watchdog
+// fed), so the contract is pinned at both ends now: the export is never handed
+// the firmware's hook object, and the caller's sink still gets the caller's own
+// ctx back — which is the fact a WebSocket sink actually depends on.
 void test_an_export_hands_the_callers_sink_context_back() {
     std::vector<std::string> out;
     g_out = &out;
     Fixture f;
     int callerMarker = 0x5a;
     g_exportCtx = reinterpret_cast<void*>(0x1);
+    g_sinkCtx = reinterpret_cast<void*>(0x1);
     f.sendWithCtx("LOG EXPORT 3", &callerMarker);
-    TEST_ASSERT_TRUE_MESSAGE(g_exportCtx == &callerMarker,
+    // hw_.ctx is the firmware's hook object: handing it to a transport sink is
+    // the wild-pointer cast this case exists to catch.
+    TEST_ASSERT_TRUE_MESSAGE(g_exportCtx != static_cast<void*>(&f),
                              "export ran with the firmware's ctx, not the caller's");
+    TEST_ASSERT_TRUE_MESSAGE(g_sinkCtx == &callerMarker,
+                             "the caller's sink received someone else's ctx");
     TEST_ASSERT_TRUE(hasLineStarting("CTX-SEEN"));   // and the sink kept using it
+}
+
+// M-1: a read-only handset command must not be able to watchdog-panic a dive.
+// LOG EXPORT holds no dive lock and streams EVERY row of the dive through the
+// asking transport's sink in one handleLine() call; on the handset that sink is
+// Serial2.print at 115200 (~87 µs/byte, no yield), and the uart2 task feeds the
+// task watchdog once per pump. A long dive's export therefore blew the watchdog
+// budget of a registered task, which on this build panics — a mid-dive reset
+// into SAFE mode, caused by downloading a dive. The link now feeds from inside
+// the export's per-row sink (util/wdtfeed.h).
+//
+// What the host can grade is the half that a feed change could break: the
+// stream. The feed rides on the row loop, so the row loop must still hand over
+// every row, exactly once, in order, in the one call — 400 rows of it. A
+// wrapper that counted rows it never sent, or dropped one at the wrap, or
+// stopped early to "get back to the pump", is invisible on a three-line export.
+void test_a_long_export_streams_every_row_once() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+
+    f.send("LOG EXPORT 5");
+
+    // One OK, one `DIVE,` identity line, then every row. Not one more, not one
+    // fewer: the export has no framing and no resume, so a row lost inside the
+    // wrapper is a row the diver never gets.
+    TEST_ASSERT_EQUAL_MESSAGE(kLongExportRows + 2, static_cast<int>(out.size()),
+                              "a long export did not stream every row in one call");
+    TEST_ASSERT_TRUE_MESSAGE(!out.empty() && out[0].compare(0, 2, "OK") == 0,
+                             "the reply is not the first line of the export");
+    TEST_ASSERT_TRUE_MESSAGE(out.size() > 1 && out[1].compare(0, 5, "DIVE,") == 0,
+                             "the DIVE identity line is not the first streamed row");
+    for (int i = 0; i < kLongExportRows; i++) {
+        const std::string want = "S," + std::to_string(i) + "\n";
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(want.c_str(), out[2 + i].c_str(),
+                                         "a row was lost, duplicated or reordered");
+    }
+}
+
+// ---- the source-scan kit (the same three helpers test_controlplane uses) ----
+// The ESP watchdog call cannot execute on the host, so the rule that keeps the
+// M-1 fix honest is pinned against the source. Comments are stripped first:
+// test_controlplane's mutation run (M6) proved a green scan that is only green
+// because the banned/called string survived in a comment.
+namespace {
+
+std::string readFile(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return "";
+    std::string out;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+// A top-level function: from its header line through the first line that is
+// exactly "}" (project formatting puts closing braces at col 0).
+std::string functionBody(const std::string& src, const std::string& header) {
+    const size_t at = src.find(header);
+    if (at == std::string::npos) return "";
+    const size_t end = src.find("\n}\n", at);
+    if (end == std::string::npos) return "";
+    return src.substr(at, end - at + 3);
+}
+
+std::string stripComments(const std::string& s) {
+    std::string out;
+    enum { CODE, LINE, BLOCK } st = CODE;
+    for (size_t i = 0; i < s.size();) {
+        const char c = s[i];
+        const char n = i + 1 < s.size() ? s[i + 1] : '\0';
+        if (st == CODE) {
+            if (c == '/' && n == '/') { st = LINE; i += 2; continue; }
+            if (c == '/' && n == '*') { st = BLOCK; i += 2; continue; }
+            out.push_back(c);
+            ++i;
+        } else if (st == LINE) {
+            if (c == '\n') { st = CODE; out.push_back(c); }
+            ++i;
+        } else {
+            if (c == '*' && n == '/') { st = CODE; i += 2; continue; }
+            ++i;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// The feed's cadence, graded on the host because the ESP call itself cannot be:
+// every Nth completed row, never more often (the point is a light hot path) and
+// never further apart than N rows (the point is the watchdog window). A constant
+// that stopped being a power of two would silently break the mask below.
+void test_the_feed_cadence_is_every_n_completed_rows() {
+    int feeds = 0;
+    for (unsigned rows = 1; rows <= 400; rows++)
+        if (util::wdtFeedDue(rows)) feeds++;
+    TEST_ASSERT_EQUAL_MESSAGE(400 / static_cast<int>(util::kWdtFeedEvery), feeds,
+                              "the watchdog feed is not once per N rows");
+    TEST_ASSERT_FALSE(util::wdtFeedDue(1));
+    TEST_ASSERT_TRUE(util::wdtFeedDue(util::kWdtFeedEvery));
+    TEST_ASSERT_FALSE(util::wdtFeedDue(util::kWdtFeedEvery + 1));
+    TEST_ASSERT_TRUE(util::wdtFeedDue(util::kWdtFeedEvery * 2));
+    // A feed at the point of the work is only honest if the work is bounded by
+    // N; the mask only holds while the interval is a power of two.
+    TEST_ASSERT_TRUE_MESSAGE((util::kWdtFeedEvery & (util::kWdtFeedEvery - 1)) == 0,
+                             "kWdtFeedEvery is not a power of two: wdtFeedDue's mask lies");
+
+    // On the host there is no watchdog to feed, and the call must still be safe
+    // to make from a task that was never registered with one — the same call the
+    // web transport makes from a task deliberately left unregistered (PLAN 9).
+    // If the guard ever leaked an ESP call into the host build, this file would
+    // not compile, which is the point.
+    util::wdtFeed();
+}
+
+// The source scan half of M-1. The ESP watchdog call cannot run on the host, so
+// the rule that makes the fix safe is pinned as text: the link's row sink hands
+// the row to the caller's sink BEFORE it feeds, and it feeds only every N rows.
+// A feed hoisted above the sink would keep a wedged UART alive indefinitely —
+// exactly the hang uart2_task.cpp's header says must reach the supervisor.
+void test_the_export_feeds_only_after_a_row_reached_the_wire() {
+    const std::string ul = readFile("src/comms/uart_link.cpp");
+    TEST_ASSERT_TRUE_MESSAGE(!ul.empty(), "cannot read src/comms/uart_link.cpp");
+    const std::string body = stripComments(functionBody(ul, "void exportRowSink("));
+    TEST_ASSERT_TRUE_MESSAGE(!body.empty(),
+                             "exportRowSink not found: renamed? the scan must keep seeing it");
+    const size_t sent = body.find("e.sink(");
+    const size_t fed = body.find("wdtFeed()");
+    TEST_ASSERT_TRUE_MESSAGE(sent != std::string::npos && fed != std::string::npos,
+                             "the export's row sink no longer both sends the row and feeds");
+    TEST_ASSERT_TRUE_MESSAGE(sent < fed,
+                             "the watchdog feed moved above the row write: a blocked UART "
+                             "would then be fed while it emitted nothing");
+    TEST_ASSERT_TRUE_MESSAGE(body.find("wdtFeedDue") != std::string::npos,
+                             "the export feeds every row instead of every Nth");
+    // And the export must go through that wrapper, not the caller's bare sink.
+    const std::string exp = stripComments(
+        functionBody(ul, "void UartLink::streamLogExport("));
+    TEST_ASSERT_TRUE_MESSAGE(!exp.empty(), "streamLogExport not found");
+    TEST_ASSERT_TRUE_MESSAGE(exp.find("hw_.exportDive(slot, exportRowSink") != std::string::npos,
+                             "the export bypasses the counting row sink: the row loop is "
+                             "unbounded again, and the task that runs it is TWDT-registered");
 }
 
 void test_publish_state_is_not_static_between_dives() {
@@ -657,6 +848,9 @@ int main() {
     RUN_TEST(test_cellproof_clamp_edges_publish_once);
     RUN_TEST(test_cal_air_verdicts_reach_the_wire_once_each);
     RUN_TEST(test_an_export_hands_the_callers_sink_context_back);
+    RUN_TEST(test_a_long_export_streams_every_row_once);
+    RUN_TEST(test_the_feed_cadence_is_every_n_completed_rows);
+    RUN_TEST(test_the_export_feeds_only_after_a_row_reached_the_wire);
     RUN_TEST(test_the_depth_source_publisher_leaves_nothing_to_interpret);
     return UNITY_END();
 }

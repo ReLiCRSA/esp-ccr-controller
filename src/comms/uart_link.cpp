@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include "util/wdtfeed.h"
+
 namespace comms {
 
 namespace {
@@ -14,6 +16,39 @@ void emit(UartLink::Sink sink, void* ctx, char* line, size_t n) {
         if (n < 512) line[n] = '\0';   // formatters return the NEEDED length
         sink(line, ctx);               // when the buffer was too small
     }
+}
+
+// ---- the export's row sink: the same bytes, counted (review M-1) -----------
+// A handset `LOG EXPORT n` has no size: the store streams the whole dive file
+// as CSV rows inside ONE handleLine() call, and there is no dive lock on the
+// command (whether there should be is a separate decision, not this one). On
+// the handset the sink below that stream is Serial2.print at 115200 — ~87 us a
+// byte, no yield inside it — and the task running it is registered with the
+// task watchdog, which it feeds once per pump (uart2_task.cpp). A 6-12 h dive
+// therefore puts thousands of rows between two feeds, and a registered task
+// that blows that budget on this build does not warn, it panics (main.cpp
+// re-initialises the TWDT with panic enabled, and a TASK_WDT reset reason forces
+// SAFE at the next boot). So the answer to a diver's read-only question can
+// reset his own controller mid-dive: an export that takes a long time to write
+// is indistinguishable, to the watchdog, from a task that stopped.
+//
+// So the link counts the rows and feeds the watchdog from the task that is
+// doing the work, every util::kWdtFeedEvery rows (util/wdtfeed.h carries the
+// sizing). What is NOT changed: one sink call per row, the row's own bytes, the
+// caller's sink and ctx, and no feed until a row has actually been handed to
+// that sink — so the feed is evidence of progress, not a cover for its absence.
+// A UART that has genuinely wedged blocks inside the sink and never reaches the
+// feed, and the watchdog still does its job.
+struct ExportSink {
+    UartLink::Sink sink;
+    void* ctx;
+    unsigned rows;      // rows already handed over
+};
+
+void exportRowSink(const char* line, void* v) {
+    ExportSink& e = *static_cast<ExportSink*>(v);
+    e.sink(line, e.ctx);                     // the wire first, always
+    if (util::wdtFeedDue(++e.rows)) util::wdtFeed();
 }
 } // namespace
 
@@ -198,8 +233,11 @@ void UartLink::streamLogExport(int slot, Sink sink, void* ctx) {
     // browser socket), so the export must hand the *caller's* sink context
     // back to it — hw_.ctx is the firmware's hook object, and handing that to
     // a transport sink is a wild-pointer cast waiting for the first LOG
-    // EXPORT over WiFi.
-    if (hw_.exportDive(slot, sink, ctx) < 0) {
+    // EXPORT over WiFi. The row counter rides beside them rather than in a
+    // global because one export at a time is the rule the session lock already
+    // enforces, and a stack frame that dies with the call cannot outlive it.
+    ExportSink ex{sink, ctx, 0u};
+    if (hw_.exportDive(slot, exportRowSink, &ex) < 0) {
         char buf[64];
         const size_t n = proto::formatErr("no such dive", buf, sizeof(buf));
         emit(sink, ctx, buf, n);

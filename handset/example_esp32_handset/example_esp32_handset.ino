@@ -223,9 +223,207 @@ static void onClock(const hs::Clock& c, void* ctx) {
 static char epochIn[16];
 static size_t epochLen = 0;
 
+// ---- link self-test: press `t` on the handset console -----------------------
+// "Is my UART alive, or is the wiring dead?" is the first question a new board
+// asks, and it used to need a scope. It does not: the controller pushes `T,` on
+// its handset port immediately and forever, with no handshake at all
+// (docs/HANDSET_PROTOCOL.md §1), so a correctly wired handset facing a running
+// controller is NEVER silent. A handset that prints `*** LINK DOWN ***` beside a
+// controller whose own console is beating is therefore proof of a broken path,
+// not of a protocol mystery, and these two jumper tests say which half:
+//
+//   1. Jumper the handset's own link RX to its own link TX (13 to 14) and press
+//      t. The marker must come back. If it does not, look at the handset: wrong
+//      pins in this file, or a module whose 13/14 are not where you think.
+//   2. Remove the jumper, wire to the controller, press t again. A `T,` line in
+//      the reply proves BOTH directions, because that line only exists if the
+//      request arrived and the answer found its way home.
+//
+// `link rx` counts every byte that has ever reached the link RX pin. Nonzero
+// with the link down means wiring good / protocol problem; zero means nothing is
+// arriving, and reading more protocol will not tell you anything new.
+static uint32_t linkRxBytes = 0;
+
+static void linkSelfTest() {
+    Serial.printf("link self-test: `GET T` out of GPIO%d into GPIO%d, listening 1500 ms. "
+                  "rx so far %lu\n", H_TX_PIN, H_RX_PIN, (unsigned long)linkRxBytes);
+    hsLink.get("T");
+    char line[128];
+    size_t n = 0;
+    uint32_t got = 0;
+    const uint32_t stop = millis() + 1500;
+    while (millis() < stop) {
+        while (Serial2.available() > 0) {
+            const int c = Serial2.read();
+            if (c < 0) break;
+            ++got;
+            ++linkRxBytes;
+            hsLink.feedByte(c);          // the link state machine must still see it
+            if (c == '\n' || c == '\r') {
+                if (n) { line[n] = '\0'; Serial.printf("   << %s\n", line); n = 0; }
+            } else if (n + 1 < sizeof(line)) {
+                line[n++] = static_cast<char>(c);
+            }
+        }
+        delay(5);
+    }
+    if (!got)
+        Serial.println("   nothing at all came back. With the 13->14 jumper in: the handset "
+                       "is wrong. With the controller wired: check GND first, then that "
+                       "handset GPIO14 goes to controller GPIO16 and 13 to GPIO17 (crossed, "
+                       "not straight).");
+    else
+        Serial.printf("   %lu bytes back. Both directions carry if the controller is "
+                      "running; a self-echo means the jumper test passed and the fault is "
+                      "in the wiring to the controller.\n", (unsigned long)got);
+}
+
+// ---- link pin probe: press `u` on the handset console -----------------------
+// Answers the question the byte counter leaves open: is the link pin wired to
+// something that drives it, or is it floating? A floating pin and a wrongly
+// pinned wire both read as "nothing arrived", and the fix is different for each.
+//
+// It detaches the UART, then holds each link pin through a weak pull-up and a
+// weak pull-down for 20 ms each and counts the high samples. A pin with nothing
+// behind it follows whichever pull is applied — high against pull-up, zero
+// against pull-down. A pin the controller is driving stays high against both
+// (UART idles high, and the driver is far stronger than the ~45 kΩ pull), with
+// dips while bits move. A pin pinned to GND reads zero against both.
+//
+// Read the numbers this way:
+//   pull-up high ≈ all, pull-down high ≈ all   -> driven (wired, and alive)
+//   pull-up high ≈ all, pull-down high ≈ 0     -> FLOATING: open wire, wrong pin,
+//                                                or no common ground
+//   zero against both                          -> shorted low
+// The TX pin is usually released to a floating input when the UART is detached,
+// so reading it as floating is normal; it is the RX column that decides.
+static void linkPinProbe() {
+    Serial.printf("link pin probe: detaching the UART for ~90 ms, then re-opening it "
+                  "on rx%d tx%d\n", H_RX_PIN, H_TX_PIN);
+    Serial2.end();
+    const int pins[2] = { H_RX_PIN, H_TX_PIN };
+    const char* names[2] = { "rx", "tx" };
+    for (int i = 0; i < 2; ++i) {
+        const int p = pins[i];
+        int hiUp = 0, hiDn = 0, totUp = 0, totDn = 0;
+        pinMode(p, INPUT_PULLUP);
+        for (uint32_t stop = millis() + 20; millis() < stop;) { ++totUp; hiUp += digitalRead(p); }
+        pinMode(p, INPUT_PULLDOWN);
+        for (uint32_t stop = millis() + 20; millis() < stop;) { ++totDn; hiDn += digitalRead(p); }
+        Serial.printf("   gpio %-2d %s: pull-up %d/%d high, pull-down %d/%d high -> ",
+                      p, names[i], hiUp, totUp, hiDn, totDn);
+        if (hiUp > totUp * 3 / 4 && hiDn < totDn / 4) Serial.println("FLOATING: nothing driving it");
+        else if (hiDn > totDn * 3 / 4) Serial.println("driven high (a real idle-high line)");
+        else if (hiUp < totDn / 4) Serial.println("held LOW (shorted to GND?)");
+        else Serial.println("indeterminate: watch it change, or check ground");
+    }
+    Serial2.begin(115200, SERIAL_8N1, H_RX_PIN, H_TX_PIN);
+    Serial.println("   UART re-opened. A link that was up may drop for a moment: the "
+                   "probe had to let go of the pins to read them.");
+}
+
+// ---- pin sweep: press `a` on the handset console ----------------------------
+// For the case the byte counter and the probe both point at: the wire is in the
+// wrong hole. Instead of guessing which hole, ask every pin the S3 may legally
+// use which of them something OUTSIDE this board is driving. The UART is
+// detached first, so the handset drives nothing during the sweep and any
+// "driven high" verdict can only come from the other end of a wire.
+//
+// The controller's handset TX (its GPIO17) idles high and keeps transmitting, so
+// the pin it lands on is the one to look for. 26-37 are skipped on purpose: on
+// this module they are the SPI flash and the octal PSRAM, and poking them can
+// take the chip down. Pin 48 is the onboard RGB LED's data line: pulling it
+// around may flicker that LED, which is harmless but is also what it looks like.
+// Which hole is which, as the firmware sees it. The sweep prints this beside each
+// pin because the interesting failure it found once was a wire in a hole this
+// board also drives — the controller's TX landed on the pin the S3 map uses for
+// the buzzer, so both boards were driving the same copper and neither could read
+// anything. Saying so at the moment of measurement is worth more than a wiring
+// table three files away.
+static const char* hsRole(int p) {
+    if (p == H_RX_PIN) return "link RX";
+    if (p == H_TX_PIN) return "link TX";
+    if (p == BTN_ACK) return "btn ACK";
+    if (p == BTN_AUTO) return "btn AUTO";
+    if (p == BTN_MANUAL) return "btn MANUAL";
+    if (p == BTN_CHECK) return "btn CHECK";
+    if (p == BTN_DIVE) return "btn DIVE";
+    if (p == PIN_BUZZER) return "BUZZER - this board drives it";
+    if (p == PIN_LINK_LED) return "link LED - this board drives it";
+    return "";
+}
+
+// Defined below the button array, because it touches it. Declared here so the
+// sweep can call it: the Arduino build inserts its own prototypes *above* the
+// type declarations in a .ino, which is the same trap this file already warns
+// about for `Button::pressed`.
+static void restoreOwnPins();
+
+static void pinSweep() {
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    // S3: 22-25 do not exist, 26-37 are this module's flash and octal PSRAM (do
+    // not poke them), 19/20 are the native USB port that is cabled.
+    static const int cand[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                16, 17, 18, 21, 38, 39, 40, 41, 42, 45, 46, 48 };
+#else
+    // Classic ESP32: 6-11 are the SPI flash, 34/35/36/39 have NO internal pull
+    // resistors so the pull-up/pull-down trick cannot read them at all, and the
+    // 12-15 JTAG group is left in because this board's link sits in it.
+    static const int cand[] = { 0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 18, 19, 21, 22, 23,
+                                25, 26, 27, 32, 33 };
+#endif
+    Serial.printf("pin sweep: UART detached, %d pins, ~1.2 s. Looking for anything an "
+                  "external wire drives.\n", int(sizeof(cand) / sizeof(cand[0])));
+    Serial2.end();
+    int driven = 0;
+    for (int p : cand) {
+        int hiUp = 0, hiDn = 0, totUp = 0, totDn = 0;
+        pinMode(p, INPUT_PULLUP);
+        for (uint32_t stop = millis() + 20; millis() < stop;) { ++totUp; hiUp += digitalRead(p); }
+        pinMode(p, INPUT_PULLDOWN);
+        for (uint32_t stop = millis() + 20; millis() < stop;) { ++totDn; hiDn += digitalRead(p); }
+        const char* verdict = "floating";
+        if (hiDn > totDn * 3 / 4) { verdict = "DRIVEN HIGH"; ++driven; }
+        else if (hiUp < totUp / 4) { verdict = "held low"; ++driven; }
+        const char* role = hsRole(p);
+        Serial.printf("   gpio %-2d up %5d/%5d  dn %5d/%5d  %-28s %s\n",
+                      p, hiUp, totUp, hiDn, totDn, role, verdict);
+        if (verdict[0] == 'D' && p == PIN_BUZZER)
+            Serial.println("        ^ COLLISION: that pin is this handset's buzzer output, "
+                           "and something outside is driving it too. Two outputs on one "
+                           "wire: neither side can read the other, and the handset is "
+                           "holding the controller's TX down.");
+        if (verdict[0] == 'D' && p == H_RX_PIN)
+            Serial.println("        ^ that is the controller's TX arriving on the link RX. "
+                           "Correct hole.");
+    }
+    Serial2.begin(115200, SERIAL_8N1, H_RX_PIN, H_TX_PIN);
+    restoreOwnPins();
+    Serial.printf("sweep done: %d pin(s) driven from outside. Re-opened the link on "
+                  "rx%d tx%d.\n", driven, H_RX_PIN, H_TX_PIN);
+    if (driven)
+        Serial.println("   the driven pin is where the controller's wire actually is. If it "
+                       "is not the rx below, move that one wire.");
+}
+
 static void pollConsole() {
     while (Serial.available()) {
         const int c = Serial.read();
+        if (c == 't' || c == 'T') {   // not a digit, so it can never be clock input
+            epochLen = 0;
+            linkSelfTest();
+            continue;
+        }
+        if (c == 'u' || c == 'U') {
+            epochLen = 0;
+            linkPinProbe();
+            continue;
+        }
+        if (c == 'a' || c == 'A') {
+            epochLen = 0;
+            pinSweep();
+            continue;
+        }
         if (c == '\n' || c == '\r') {
             if (!epochLen) continue;
             epochIn[epochLen] = '\0';
@@ -274,6 +472,13 @@ struct Button {
 static Button buttons[] = {
     { BTN_ACK }, { BTN_AUTO }, { BTN_MANUAL }, { BTN_CHECK }, { BTN_DIVE },
 };
+
+static void restoreOwnPins() {
+    for (Button& b : buttons) pinMode(b.pin, INPUT_PULLUP);
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW);
+    pinMode(PIN_LINK_LED, OUTPUT);
+}
 
 // ---- buzzer: a pattern per alarm class, never a blocking tone() -------------
 // Steady piezo at 3 kHz would need PWM; for the example an on/off tick at the
@@ -430,12 +635,19 @@ void setup() {
                   HS_BOARD, H_RX_PIN, H_TX_PIN, BTN_ACK, BTN_AUTO, BTN_MANUAL, BTN_CHECK,
                   BTN_DIVE, PIN_BUZZER, PIN_LINK_LED);
     Serial.println("clock unset? type the unix epoch and Enter, e.g. 1795517641");
+    Serial.println("link down? t = link self-test, u = probe the two link pins, "
+                   "a = sweep every pin for an external driver");
 }
 
 void loop() {
     const uint32_t now = millis();
 
-    while (Serial2.available() > 0) hsLink.feedByte(Serial2.read());
+    while (Serial2.available() > 0) {
+        const int c = Serial2.read();
+        if (c < 0) break;
+        ++linkRxBytes;
+        hsLink.feedByte(c);
+    }
     hsLink.tick(now);                       // link-health watchdog
 
     // buttons

@@ -394,6 +394,30 @@ ESP-CCR handset up
 pins (ESP32-S3): link rx13 tx14 (controller is tx17 rx16) | btns ack4 auto5 man6 chk7 dive15 | buzzer 16 | led 21
 ```
 
+### Three console keys that find a dead link without a scope
+
+The controller pushes `T,` on its handset port immediately and forever, with **no
+handshake** (§1), so a correctly wired handset facing a running controller is
+never silent. That makes `*** LINK DOWN ***` next to a beating controller console a
+statement about copper, and three keys on the handset's own console localise it:
+
+| key | what it does | what the answer means |
+|---|---|---|
+| `t` | sends `GET T` on the link and prints every byte that comes back for 1.5 s, plus a running count of bytes ever seen on the link RX pin | bytes back = both directions work. Nonzero count with the link down = data arrives, protocol problem. **Zero bytes while the controller pushes = an open circuit**, not noise: bad baud or a missing ground gives garbled *bytes*, silence gives nothing |
+| `u` | detaches the UART and holds each link pin through a 45 kΩ pull-up then a pull-down for 20 ms, counting highs | follows whichever pull = **floating**: open wire or wrong hole. High against both = a real idle-high driver. Zero against both = shorted low |
+| `a` | the same test on every pin the S3 may legally use (26-37 skipped: flash and PSRAM), and prints what the firmware uses each hole for | finds the wire that is in the wrong hole. A driven pin the table also drives is a **collision** — two outputs on one wire — and the sweep says so |
+
+The sweep found a real instance of that collision on 2026-11-27: the link showed
+zero bytes and both link holes read floating, while **GPIO16 — the buzzer output
+in the S3 map — read as actively driven, with dips consistent with a 115200 bit
+stream.** The controller's TX was in the buzzer hole, so the handset was holding
+the controller's TX down and neither side could read anything. Repeated twice, so
+it was a measurement and not a glance. The fix is one wire: move it to 13.
+
+The sweep leaves the pins it borrowed back as `setup()` had them (buttons
+pull-up, buzzer and LED outputs), because a diagnostic that silences the buzzer
+until the next reboot is a worse bug than the one it was hunting.
+
 That line is worth reading on a board with two USB connectors, because they are
 not interchangeable: flashing went in through the native USB-Serial-JTAG
 (`/dev/ttyACM0`) while the readout came out of the UART bridge (`/dev/ttyACM1`),

@@ -1578,6 +1578,16 @@ def grade_dive_file(drows, want, wire=()):
     total = None
     if len(mf) > 5 and mf[5].isdigit():
         total = int(mf[5])
+    if total == 0:
+        # Say it out loud. A dive that never injected is legitimate — at the
+        # surface, in STANDBY, or with AUTO refused by a failed pre-dive check
+        # (its BATTERY step refuses below vbatMin, and the injector only ever
+        # wants a pulse in AUTO) — but every window check below is then vacuous:
+        # a wall of zeros is indistinguishable from a real one. A PASS printed
+        # over a vacuous check is the shape of bug this bench has been burned by.
+        print(f"    note: M, total is 0 — the chain injected nothing in this dive, "
+              f"so the pulses-window checks below witness nothing. Run the dive in "
+              f"AUTO (pack above vbatMin) to make them mean something.")
 
     def val(key):
         s = want.get(key, "")

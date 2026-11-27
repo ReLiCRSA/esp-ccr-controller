@@ -19,6 +19,7 @@ void test_pub_air_table_schedules();
 void test_pub_ndl_structure();
 void test_pub_vs_paliers_cross_impl();
 void test_pub_gf3085_variant_documented();
+void test_the_published_view_saturates_rather_than_wraps();
 
 static Config baseCfg() {
     Config c; // defaults: GF 30/85, sea water, 6 m/min
@@ -494,5 +495,6 @@ int main() {
     RUN_TEST(test_pub_ndl_structure);
     RUN_TEST(test_pub_vs_paliers_cross_impl);
     RUN_TEST(test_pub_gf3085_variant_documented);
+    RUN_TEST(test_the_published_view_saturates_rather_than_wraps);
     return UNITY_END();
 }

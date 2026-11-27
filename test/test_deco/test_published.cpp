@@ -28,6 +28,9 @@
 // ============================================================================
 #include <unity.h>
 
+#include <string>
+
+#include "deco/view.h"
 #include "deco/zhl16c.h"
 
 using deco::Config;
@@ -160,4 +163,63 @@ void test_pub_gf3085_variant_documented() {
         TEST_ASSERT_TRUE_MESSAGE(d >= -2.0f && d <= 16.0f,
                                  "GF30/85 schedule moved outside documented variant band");
     }
+}
+
+// The published picture is int16, and the engine's own range is wider than that:
+// the widest tissue load setTissueState will accept is kSeedMaxBar = 100 bar,
+// which is a ceiling of about 950 m — past the 327.67 m an int16 centimetre field
+// holds. Reproduced on host 2026-11-27 (all 16 compartments at the seed maximum,
+// the CNS clock at its cap, 60 m absolute): viewFull wrote ceilingCm = 29800 and
+// stop0Depth = 29864, both the wrapped remainder of a much larger number.
+//
+// No dive reaches this — the sensor bottoms at ~25 bar absolute (~250 m), so the
+// only route is a continuity record that is well-formed and wrong. The guard is
+// the net for that route, and the direction matters: 0 or a negative ceiling is
+// what `D,` and the dive file both read as "no decompression obligation", so a
+// wrap turns the largest obligation the engine can compute into permission to
+// ascend. Saturation keeps the obligation and names the column's own limit.
+void test_the_published_view_saturates_rather_than_wraps() {
+    Config cfg;
+    Zhl16Ccr z(cfg);
+    Zhl16Ccr::TissueState s{};
+    for (int i = 0; i < Zhl16Ccr::NCOMP; ++i) s.pt[i] = Zhl16Ccr::kSeedMaxBar;
+    s.cnsPct = 999.0;
+    TEST_ASSERT_TRUE_MESSAGE(z.setTissueState(s),
+                             "the seed the saturation case is built on is no longer legal");
+
+    deco::View v{};
+    deco::viewFull(v, z, z.depthToBar(60.0), true, 1.30);
+
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(32767, v.ceilingCm,
+                                    "the ceiling column wrapped instead of saturating: 29800 is "
+                                    "a plausible shallow ceiling read as permission to ascend");
+    TEST_ASSERT_TRUE_MESSAGE(v.ceilingCm > 0,
+                             "an impossible ceiling must never read as no obligation");
+
+    // Stops: a wrapped DEPTH would be negative (a stop below the surface, which a
+    // handset would draw as a shallower stop than any real one), and a wrapped
+    // minute would shorten the stop. Both saturate at the field's limit instead.
+    TEST_ASSERT_TRUE_MESSAGE(v.stopCount > 0, "a fully loaded engine must demand stops");
+    for (uint8_t i = 0; i < v.stopCount; ++i) {
+        // Unity's message is a plain C string, so the stop number is composed — a
+        // failure has to say which stop, or the reader has to re-run to find out.
+        const std::string which = ", stop " + std::to_string(i);
+        TEST_ASSERT_GREATER_THAN_INT16_MESSAGE(0, v.stopDepthCm[i],
+                                               ("a demanded stop has a non-positive depth: a "
+                                                "wrapped int16 depth" + which).c_str());
+        TEST_ASSERT_GREATER_OR_EQUAL_INT16_MESSAGE(0, v.stopMinX10[i],
+                                                   ("a demanded stop has negative minutes" + which).c_str());
+    }
+    // The total is minutes x10: this seed sums 2398.0 min, still inside int16, so
+    // this case proves the sum is not being clamped away — only that a wrap cannot
+    // happen. The bound is asserted rather than the exact figure, because the
+    // figure is the engine's business (pinned by the table cases above).
+    TEST_ASSERT_GREATER_OR_EQUAL_INT16_MESSAGE(1, v.decoTotalX10,
+                                               "the deco total vanished on the widest legal load");
+    TEST_ASSERT_LESS_OR_EQUAL_INT16_MESSAGE(32767, v.decoTotalX10,
+                                            "the deco total overflowed its column");
+
+    // The CNS clock: 999 % is inside the column (9990 tenths), and its own cap is
+    // the engine's, so the picture can never print a clock the engine refused.
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(9990, v.cnsX10, "the CNS clock column lost a decimal");
 }

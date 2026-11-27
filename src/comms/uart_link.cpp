@@ -178,11 +178,24 @@ void UartLink::emitD(Sink sink, void* ctx) {
     if (n) linesOut_++;
 }
 
-void UartLink::drainEvents(Sink sink, void* ctx) {
+void UartLink::drainEvents(Sink sink, void* ctx, uint32_t nowMs) {
     bridge::Event e;
     char buf[32];
     int sent = 0;
+    bridge::EdgeSnap snap{};
+    bool haveSnap = false;
     while (events_.pop(e) && sent < 8) {   // bounded: never flood one pump
+        // The batch's instant, taken before the FIRST row of the batch is
+        // written (and before its `E,` row, so a snapshot row's stamp can never
+        // be later than the write that files the verdict beside it). Capture
+        // once, not per event: eight edges drained together used to be eight
+        // rows read from eight control cycles, and a dive file that shows the
+        // alarm word moving, the clamp engaging and the diver overriding it is
+        // exactly the burst where the numbers underneath them were moving too.
+        if (!haveSnap) {
+            bridge::captureEdge(tel_, hw_.totals, nowMs, snap);
+            haveSnap = true;
+        }
         const size_t n = proto::formatEvent(e.tSec, e.id, e.value, buf, sizeof(buf));
         emit(sink, ctx, buf, n);
         if (n) linesOut_++;
@@ -194,7 +207,7 @@ void UartLink::drainEvents(Sink sink, void* ctx) {
         // and the setpoint get capped, but never the FAIL, the clamp or the
         // diver's override - the effects survived, the verdicts did not.
         if (n && hw_.appendEventNow) hw_.appendEventNow(e.id, e.value, e.tSec, hw_.ctx);
-        if (hw_.appendSnapNow) hw_.appendSnapNow(hw_.ctx);
+        if (hw_.appendSnapNow) hw_.appendSnapNow(snap, hw_.ctx);
         sent++;
     }
 }
@@ -209,7 +222,7 @@ void UartLink::pump(Sink sink, void* ctx, uint32_t nowMs, uint32_t telemetryMs) 
         lastDMs_ = nowMs;
         emitD(sink, ctx);
     }
-    drainEvents(sink, ctx);
+    drainEvents(sink, ctx, nowMs);
 }
 
 void UartLink::streamLogList(Sink sink, void* ctx) {

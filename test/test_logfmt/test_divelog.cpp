@@ -1133,17 +1133,29 @@ void test_event_and_grid_rows_carry_the_same_published_deco_picture() {
                              "an event row beside a demanded stop reads as no obligation: "
                              "finding N1 is back");
 
-    // The ONLY rows that may carry zeroed deco columns now: the boot window
-    // before the first control cycle published a picture. Named, because a
-    // reader must know which zeros mean "no picture yet" and none that mean
-    // "no obligation".
+    // The ONLY rows that carry no deco picture now: the boot window before the
+    // first control cycle published one. Named, because a reader must know which
+    // zeros mean "no picture yet" and none that mean "no obligation".
+    //
+    // `ndl` must not be 0 there: 0 minutes means "your no-deco time is finished,
+    // you are obligated NOW", which is a reading, and the more alarming reading
+    // there is, on a row whose picture does not exist. The absence answers the
+    // same sentinel `D,` has always answered for "no number" (-1, show "—"), so
+    // one parser rule serves the wire and the file. The other two columns stay 0
+    // because the format defines no absence for them: a negative ceiling would
+    // read as a shallower obligation, not as no picture.
     logfmt::RowInputs boot = benchRow();
     TEST_ASSERT_FALSE(boot.hasDecoPicture);
     logfmt::Snapshot b{};
     logfmt::fillSnapshot(b, boot);
-    TEST_ASSERT_EQUAL_INT16(0, b.ceilingCm);
-    TEST_ASSERT_EQUAL_INT16(0, b.ndlMin);
-    TEST_ASSERT_EQUAL_INT16(0, b.decoTotalMin);
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(0, b.ceilingCm,
+                                    "a row with no picture must not claim a ceiling");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(deco::kNDL_UNKNOWN, b.ndlMin,
+                                    "a row with no picture claims an NDL of 0 minutes — "
+                                    "'obligated now' printed where 'no number' belongs");
+    TEST_ASSERT_EQUAL_INT16(-1, b.ndlMin);  // the wire's documented unknown, same number
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(0, b.decoTotalMin,
+                                    "a row with no picture must not claim deco minutes");
 }
 
 // Review N5, named: ONE sentinel pair for the file and the wire, defined once
@@ -1224,9 +1236,15 @@ void test_the_flags_byte_says_how_the_vote_and_the_clamp_stood() {
     TEST_ASSERT_EQUAL_UINT16(pi.alarmLogBits, back.alarmBits);
 }
 
-// The pulses column is a difference of two absolute counters, widened in uint32
-// and truncated into the uint16 the record holds — the behaviour the firmware has
-// always had, now named where a reader can see it.
+// The pulses column is a difference of two absolute counters, and it is the same
+// quantity as `M,`'s `totalPulses` — which has narrowed by saturation since
+// 2026-11-27. A window that WRAPPED while the total saturated put the two
+// columns of one count in different arithmetic, and §5 sells them to a client as
+// a truncation check ("so a client can use them as a truncation check"): a dive
+// whose rows summed to 4464 beside a summary saying 65535 would fail a check the
+// spec publishes. Unreachable in a real dive — the widest legal window is 25% of
+// 10 s at a 50 ms pulse, 50 injections — so this is the guard for a counter or
+// wiring fault, and it now fails the same way every other column does.
 void test_the_pulses_column_is_a_window_delta() {
     logfmt::Snapshot s{};
     logfmt::RowInputs ri = benchRow();
@@ -1236,12 +1254,24 @@ void test_the_pulses_column_is_a_window_delta() {
 
     logfmt::Snapshot w{};
     logfmt::RowInputs wi = benchRow();
-    wi.pulsesNow = 65536u + 7u;    // 21+ min of continuous pulsing: wraps, as it always did
+    wi.pulsesNow = 65536u + 7u;    // past the column: saturates, as the total does
     wi.pulsesPrev = 0u;
     logfmt::fillSnapshot(w, wi);
-    TEST_ASSERT_EQUAL_UINT16_MESSAGE(7, w.pulses,
-                                     "the pulse window no longer truncates where it always "
-                                     "did — a silent change to an existing column");
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(65535, w.pulses,
+                                     "a pulse window past the column wrapped while `M,`'s total "
+                                     "saturated: the two columns of one count would disagree by "
+                                     "a wrap, and §5 publishes them as a truncation check");
+
+    // A counter that moved BACKWARDS used to become a huge count, because the
+    // subtraction is unsigned arithmetic on uint32 and only the cast hid it.
+    // Nothing in this window, which is what the column's minimum means.
+    logfmt::Snapshot b{};
+    logfmt::RowInputs bi = benchRow();
+    bi.pulsesNow = 100u; bi.pulsesPrev = 400u;
+    logfmt::fillSnapshot(b, bi);
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(0, b.pulses,
+                                     "a pulse counter that moved backwards reported injections "
+                                     "no valve made");
 
     logfmt::Snapshot z{};
     logfmt::RowInputs zi = benchRow();

@@ -314,6 +314,81 @@ void test_scaled_refuses_rather_than_wrapping() {
     TEST_ASSERT_EQUAL_INT64(0, numfmt::scaled(0.0, 99));
 }
 
+// scaled() answers long long, and the log fields are int16 and uint16. Between
+// the two sits a narrowing that a plain cast gets wrong: out of range it WRAPS,
+// and for the deco picture the wrap points the wrong way for a diver. Reproduced
+// on host 2026-11-27 with every tissue seeded at kSeedMaxBar (100 bar) and the
+// CNS clock at its cap: the engine's ceiling is 95336 cm, and the int16 column
+// the wire and the dive file print held 29800 — still a number, still plausible,
+// and about 3 m short of the truth a client reads as "you may ascend".
+//
+// Saturation is the only narrowing that cannot make an obligation disappear: the
+// field's own maximum keeps the diver MORE obligated than the truth, and is at
+// least recognisable as the limit of the column rather than a reading from a
+// different dive.
+void test_scaledInto_saturates_where_a_cast_wraps() {
+    const double ceilingM = 953.36;  // the probe's worst case, in metres
+    TEST_ASSERT_EQUAL_INT64(95336, numfmt::scaled(ceilingM, 2));
+    // The wrap, pinned as the thing to prevent: 95336 - 65536 = 29800.
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(29800, static_cast<int16_t>(numfmt::scaled(ceilingM, 2)),
+                                    "the cast no longer wraps past int16 — if this changes, "
+                                    "the number the helper below protects against changed too");
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(std::numeric_limits<int16_t>::max(),
+                                    numfmt::scaledInto<int16_t>(ceilingM, 2),
+                                    "an unrepresentable ceiling must saturate at the field's "
+                                    "maximum: a smaller number is a shorter stop");
+
+    // The negative direction saturates low rather than wrapping high. No field
+    // here should be negative, so the wrap it prevents would be an implausibly
+    // LARGE positive number — which is what a wrapped spread or battery looks
+    // like, and it reads as a dead sensor rather than a broken record.
+    TEST_ASSERT_EQUAL_INT16(std::numeric_limits<int16_t>::min(),
+                            numfmt::scaledInto<int16_t>(-400.0, 2));
+    TEST_ASSERT_EQUAL_INT16(30000, numfmt::scaledInto<int16_t>(300.0, 2));  // in range: exact
+
+    // Unsigned columns wrap into the wrong magnitude in the other direction:
+    // 70.000 V of battery is 70000 counts, and a cast hands the reader 4464 mV
+    // — a flat pack in a dive file that has to be comparable with the wire.
+    TEST_ASSERT_EQUAL_UINT16(std::numeric_limits<uint16_t>::max(),
+                             numfmt::scaledInto<uint16_t>(70.0, 3));
+    TEST_ASSERT_EQUAL_UINT16(4464, static_cast<uint16_t>(numfmt::scaled(70.0, 3)));
+    TEST_ASSERT_EQUAL_UINT16(12345, numfmt::scaledInto<uint16_t>(12.345, 3));
+
+    // A uint8 column is where a deco figure is most likely to be forgotten: the
+    // GF settings. The schema will not let a legal value reach the limit, which
+    // is exactly why the guard belongs in the conversion, not in the schema.
+    TEST_ASSERT_EQUAL_UINT8(std::numeric_limits<uint8_t>::max(),
+                            numfmt::scaledInto<uint8_t>(999.0, 0));
+
+    // 32-bit fields narrow too (depth and ppO2 in the row fill and the totals):
+    // a long long is wider, so the same rule applies one level up.
+    TEST_ASSERT_EQUAL_INT32(std::numeric_limits<int32_t>::max(),
+                            numfmt::scaledInto<int32_t>(3e7, 2));
+    TEST_ASSERT_EQUAL_INT32(-2000, numfmt::scaledInto<int32_t>(-20.0, 2));
+
+    // A non-finite value takes scaled()'s refusal (0), which is a claim of
+    // "nothing", not a saturated maximum. The engine gates its inputs
+    // (setTissueState rejects non-finite, schedule() is bounded twice), so
+    // nothing that reaches here is a NaN; the behaviour is recorded so a future
+    // caller cannot mistake the 0 for a saturated value.
+    TEST_ASSERT_EQUAL_INT16(0, numfmt::scaledInto<int16_t>(
+                                  std::numeric_limits<double>::quiet_NaN(), 2));
+}
+
+// The integer form of the same rule: the dive summary's extremes and counters
+// accumulate in wider types than the columns they land in.
+void test_narrow_saturates_where_a_cast_wraps() {
+    TEST_ASSERT_EQUAL_INT16(std::numeric_limits<int16_t>::max(), numfmt::narrow<int16_t>(40000));
+    TEST_ASSERT_EQUAL_INT16(std::numeric_limits<int16_t>::min(), numfmt::narrow<int16_t>(-40000));
+    TEST_ASSERT_EQUAL_UINT16(std::numeric_limits<uint16_t>::max(), numfmt::narrow<uint16_t>(70000));
+    // The pulses counter is the case this exists for: uint32 on the chain, uint16
+    // in the file's `totalPulses`. A dive that injected 70000 counts wrote 4464 —
+    // a plausible number from a shorter dive, not an absence.
+    TEST_ASSERT_EQUAL_UINT16(4464, static_cast<uint16_t>(70000u));
+    TEST_ASSERT_EQUAL_UINT16(1234, numfmt::narrow<uint16_t>(1234));
+    TEST_ASSERT_EQUAL_UINT8(std::numeric_limits<uint8_t>::max(), numfmt::narrow<uint8_t>(300));
+}
+
 void test_stored_values_go_through_the_helper() {
     // The structural claim, enforced on the text — the same trick that keeps one
     // depth formula in one file. main.cpp and session_wiring.cpp are not
@@ -327,9 +402,27 @@ void test_stored_values_go_through_the_helper() {
     // host-compiled and executed by test_logfmt, so the scan is now the weaker of
     // two checks over that one file. It stays scanned because the rule is about
     // the NEXT field someone adds, wherever they add it.
+    //
+    // 2026-11-27: src/deco/view.h joined the list (it stores the ceiling, the CNS
+    // clock and the deco plan the wire and the dive file print), and the rule got
+    // a second half: a scaled value must be NARROWED by scaledInto, never cast.
+    // The fields these files store are int16 and uint16, numfmt::scaled answers in
+    // long long, and a cast of a value past the field wraps — the dive file spent a
+    // year one count away from the wire through exactly this shape, and a wrapped
+    // ceiling reads as "no decompression obligation".
     const char* kUsers[] = {"src/main.cpp", "src/log/rowfill.cpp",
-                            "src/comms/telemetry_bridge.cpp", "src/control/cellhist.cpp"};
+                            "src/comms/telemetry_bridge.cpp", "src/control/cellhist.cpp",
+                            "src/deco/view.h"};
     int calls = 0;
+    // Every narrowing that can wrap a scaled value, spelled out. `long long` and
+    // `double` are absent on purpose: narrowing those is the helper's own business.
+    const char* kNarrowingCasts[] = {"static_cast<int16_t>(numfmt::scaled",
+                                     "static_cast<uint16_t>(numfmt::scaled",
+                                     "static_cast<int8_t>(numfmt::scaled",
+                                     "static_cast<uint8_t>(numfmt::scaled",
+                                     "static_cast<int32_t>(numfmt::scaled",
+                                     "static_cast<uint32_t>(numfmt::scaled",
+                                     "static_cast<unsigned>(numfmt::scaled"};
     for (const char* path : kUsers) {
         const std::string src = readFile(path);
         TEST_ASSERT_MESSAGE(!src.empty(),
@@ -360,19 +453,33 @@ void test_stored_values_go_through_the_helper() {
                                               " scales or rounds by hand (" + forbidden +
                                               "); go through numfmt::scaled").c_str());
                 }
+                for (const char* forbidden : kNarrowingCasts) {
+                    TEST_ASSERT_NULL_MESSAGE(std::strstr(line.c_str(), forbidden),
+                                             (std::string(path) + ":" + std::to_string(lineno) +
+                                              " casts a scaled value into a narrower field, which "
+                                              "wraps it; go through numfmt::scaledInto, which "
+                                              "saturates").c_str());
+                }
             }
-            for (size_t at = src.find("numfmt::scaled(", pos);
-                 at != std::string::npos && at < (eol == std::string::npos ? src.size() : eol + 1);
-                 at = src.find("numfmt::scaled(", at + 1))
-                ++calls;
+            // Counted on the code line only: a comment that NAMES the helper is
+            // not a call site, and a count that a comment can pad is a count that
+            // cannot go below the threshold it exists to police.
+            if (!t.empty() && t.rfind("//", 0) != 0) {
+                for (const char* call : {"numfmt::scaled(", "numfmt::scaledInto"}) {
+                    for (size_t at = line.find(call); at != std::string::npos;
+                         at = line.find(call, at + 1))
+                        ++calls;
+                }
+            }
             if (eol == std::string::npos) break;
             pos = eol + 1;
         }
     }
     // A scan is only as good as the number of sites it found.
     TEST_ASSERT_GREATER_OR_EQUAL_INT_MESSAGE(12, calls,
-                                             "fewer than 12 scaled() call sites: someone removed "
-                                             "the conversions the scan exists to police");
+                                             "fewer than 12 numfmt::scaled/scaledInto call sites: "
+                                             "someone removed the conversions the scan exists "
+                                             "to police");
 
     // And there must still be exactly one rounding engine, used by both entry
     // points — otherwise "one rule" is a comment, not a fact.
@@ -407,6 +514,8 @@ int main() {
     RUN_TEST(test_stored_and_printed_never_disagree);
     RUN_TEST(test_ties_go_to_the_even_side_like_the_renderer);
     RUN_TEST(test_scaled_refuses_rather_than_wrapping);
+    RUN_TEST(test_scaledInto_saturates_where_a_cast_wraps);
+    RUN_TEST(test_narrow_saturates_where_a_cast_wraps);
     RUN_TEST(test_stored_values_go_through_the_helper);
     return UNITY_END();
 }

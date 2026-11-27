@@ -26,7 +26,12 @@
 // that prints it uses (centimetres for the ceiling, like the dive file;
 // minutes x10 like `D,`'s one decimal). numfmt::scaled with that decimal
 // count — the store and the digits must agree, the same rule the CSV columns
-// follow (2026-11-24).
+// follow (2026-11-24) — narrowed through numfmt::scaledInto, because these
+// fields are int16 and the engine's own range is wider than int16: a bare
+// cast wraps a 950 m ceiling to 298 m, and 0 or a negative ceiling is what
+// every consumer reads as "no decompression obligation". Saturation is the
+// narrowing that cannot lie in that direction (2026-11-27): an obligation
+// must never disappear because a field ran out of bits.
 //
 // THE NDL SENTINELS (review N5) — one pair, one home, THIS header, identical
 // on the dive file and on the wire:
@@ -82,7 +87,7 @@ struct View {
 inline void viewScalars(View& v, const Zhl16Ccr& z, double pAmbBar,
                         bool haveVote, double shownPpo2) {
     v.haveVote = haveVote;
-    v.ceilingCm = static_cast<int16_t>(numfmt::scaled(z.ceilingM(), 2));
+    v.ceilingCm = numfmt::scaledInto<int16_t>(z.ceilingM(), 2);
     if (haveVote) {
         const double ndl = z.ndlMinutes(pAmbBar, shownPpo2);
         v.ndlMin = ndl >= static_cast<double>(kNDL_UNLIMITED)
@@ -91,7 +96,7 @@ inline void viewScalars(View& v, const Zhl16Ccr& z, double pAmbBar,
     } else {
         v.ndlMin = kNDL_UNKNOWN;
     }
-    v.cnsX10 = static_cast<int16_t>(numfmt::scaled(z.cnsPct(), 1));
+    v.cnsX10 = numfmt::scaledInto<int16_t>(z.cnsPct(), 1);
 }
 
 // The full plan including schedule(). Cost shape: quadratic in bottom depth,
@@ -101,11 +106,21 @@ inline void viewScalars(View& v, const Zhl16Ccr& z, double pAmbBar,
 // viewScalars, which is the discipline the publisher in main.cpp keeps.
 inline void viewPlan(View& v, const Zhl16Ccr& z, double pAmbBar) {
     const auto sch = z.schedule(pAmbBar);
-    v.decoTotalX10 = static_cast<int16_t>(numfmt::scaled(sch.totalTimeMin, 1));
+    // Saturation, twice over: the total AND each stop. schedule() caps each
+    // stop's minutes at its own ceiling and sets `capped` when it does, but a
+    // capped 16-stop plan still sums past int16 — the sum is minutes x10, so
+    // 32767 here is 3276.7 minutes, which no dive reaches and only a wrong
+    // tissue load can reach. A wrap would print a deco total SMALLER than the
+    // obligation, and a smaller deco total is what a diver reads as a shorter
+    // stop.
+    v.decoTotalX10 = numfmt::scaledInto<int16_t>(sch.totalTimeMin, 1);
     v.stopCount = static_cast<uint8_t>(sch.count > kViewStops ? kViewStops : sch.count);
     for (int i = 0; i < v.stopCount; ++i) {
-        v.stopDepthCm[i] = static_cast<int16_t>(numfmt::scaled(sch.stops[i].depthM, 2));
-        v.stopMinX10[i] = static_cast<int16_t>(numfmt::scaled(sch.stops[i].minutes, 1));
+        // The stop DEPTH saturates too, and in the same direction: a stop
+        // deeper than 327.67 m stays a stop, and never becomes the negative
+        // depth a wrapped int16 would put on the wire.
+        v.stopDepthCm[i] = numfmt::scaledInto<int16_t>(sch.stops[i].depthM, 2);
+        v.stopMinX10[i] = numfmt::scaledInto<int16_t>(sch.stops[i].minutes, 1);
     }
     v.capped = sch.capped ? 1u : 0u;
 }

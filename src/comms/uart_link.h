@@ -41,7 +41,11 @@ public:
         bool (*setClock)(uint32_t epoch, void* ctx) = nullptr;
         void (*closeDive)(const logfmt::DiveMeta&, void* ctx) = nullptr;
         bridge::DiveTotals* totals = nullptr;  // in-force totals for closeDive
-        void (*appendSnapNow)(void* ctx) = nullptr;    // event-driven snapshot
+        // The event-driven snapshot row, written from an instant the link
+        // captured before it wrote anything (bridge::captureEdge): every row of
+        // one drain batch describes the same machine, not one control cycle
+        // apiece.
+        void (*appendSnapNow)(const bridge::EdgeSnap& snap, void* ctx) = nullptr;
         // The event row itself, into the dive file. It exists because the
         // snapshot alongside an event shows the STATE at that moment, while the
         // event row is the machine's VERDICT: a dive file full of samples whose
@@ -84,7 +88,7 @@ private:
     void applyActions(uint32_t actions, Sink sink, void* ctx);
     void emitT(Sink sink, void* ctx);
     void emitD(Sink sink, void* ctx);
-    void drainEvents(Sink sink, void* ctx);
+    void drainEvents(Sink sink, void* ctx, uint32_t nowMs);
     void streamLogList(Sink sink, void* ctx);
     void streamLogExport(int slot, Sink sink, void* ctx);
 

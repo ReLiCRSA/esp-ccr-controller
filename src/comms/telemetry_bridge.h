@@ -11,6 +11,7 @@
 // ============================================================================
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 #include "control/calibration.h"
@@ -159,26 +160,50 @@ class EventRing {
 public:
     static constexpr uint16_t kSize = 32;  // power of two
 
+    /// Stages a batch: everything pushed after this is invisible to pop() until
+    /// commitTx(). ControlTask brackets its event publication with the pair,
+    /// because the snapshot row an edge drags along must carry the deco picture
+    /// the machine published FOR that edge (deco/view.h, N1's freshness rule).
+    /// Staged, the ring used to be readable in the window between push() and the
+    /// plan recompute — two statements in the wrong order, and the handset task
+    /// filed "the machine decided X" beside the plan of the last 30 s grid.
+    void beginTx() { tx_ = true; }
+
+    /// Makes everything since beginTx() visible, ordered: the release store on
+    /// head_ is what puts the event payloads before the head move, so a consumer
+    /// that sees an event sees the whole Event and never a torn slot. (head_/
+    /// tail_ became std::atomic with this rule: a volatile plain store carries no
+    /// ordering, and "the payload is visible before the head is" is an ordering.)
+    void commitTx() {
+        tx_ = false;
+        head_.store(write_, std::memory_order_release);
+    }
+
     bool push(const Event& e) {  // producer: ControlTask
-        const uint16_t n = (head_ + 1) & (kSize - 1);
-        if (n == tail_) return false;      // full: newest event dropped, counted
-        slot_[head_] = e;
-        head_ = n;
+        const uint16_t n = (write_ + 1) & (kSize - 1);
+        if (tail_.load(std::memory_order_acquire) == n) return false;  // full
+        slot_[write_] = e;
+        write_ = n;
+        if (!tx_) head_.store(n, std::memory_order_release);  // no batch: at once
         return true;
     }
     bool pop(Event& e) {                    // consumer: handset task
-        if (tail_ == head_) return false;
+        const uint16_t h = head_.load(std::memory_order_acquire);
+        if (tail_ == h) return false;
         e = slot_[tail_];
-        tail_ = (tail_ + 1) & (kSize - 1);
+        tail_.store((tail_ + 1) & (kSize - 1), std::memory_order_release);
         return true;
     }
     uint32_t dropped() const { return dropped_; }
     void noteDropped() { dropped_++; }
 
 private:
-    volatile uint16_t head_ = 0, tail_ = 0;
+    std::atomic<uint16_t> head_{0}, tail_{0};
     Event slot_[kSize];
     volatile uint32_t dropped_ = 0;
+    uint16_t write_ = 0;   // producer-private write cursor: head_ is the only
+                           // thing that tells the consumer what exists
+    bool tx_ = false;
 };
 
 // Publication bookkeeping: what the chain looked like last cycle. Owned by
@@ -195,9 +220,13 @@ struct PublisherState {
 
 // Publish the chain's changes since last cycle as protocol events. One call
 // per ControlTask cycle; cheap when nothing changed. Returns how many rows
-// were pushed: ControlTask uses a nonzero count as the trigger to republish
-// the deco plan, so an event-driven snapshot row reads a picture computed
-// for the edge it records — not one from the last 30 s grid (N1's freshness).
+// were pushed.
+//
+// The caller STAGES the batch it publishes into (EventRing::beginTx before,
+// commitTx after) and republishes the deco picture in between, so an
+// event-driven snapshot row reads a picture computed for the edge it records —
+// not one from the last 30 s grid (N1's freshness), and not one the handset task
+// caught half-way across the cycle that decided it.
 int publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
                   PublisherState& ps);
 
@@ -233,5 +262,55 @@ struct DiveTotals {
     int16_t sp1X1000 = 0, sp2X1000 = 0, sp3X1000 = 0, sp4X1000 = 0;
     logfmt::DiveMeta toMeta() const;
 };
+
+// ---- one instant, for the event-driven dive row ---------------------------
+// The event-driven snapshot row used to read the bridge scalars and the deco
+// generation at whatever moment it happened to run. A pump drains up to eight
+// events, and ControlTask republishes every 100 ms, so three edges drained in
+// one pump produced three rows whose depth, alarm word and deco picture came
+// from three different control cycles — one row per edge, and none of them the
+// instant of its own edge. The capture is what makes a batch describe ONE
+// instant: copy here, then write every row of the batch from the copy.
+//
+// What this does NOT claim: the captured instant is not the edge's instant. It
+// is never OLDER than the edge — the picture is published before the edges
+// become readable (EventRing::beginTx, and main.cpp keeps that order) — and it
+// is at most one pump interval newer. That bound replaces the one it had
+// before, "the plan may be up to 30 s old", and it is the drain cadence rather
+// than the plan grid. Naming the direction is the point: a row can read a
+// slightly later machine, it can no longer read an earlier one.
+struct EdgeSnap {
+    uint32_t nowMs = 0;         // millis() of the capture: the row's own stamp
+    // The dive's start on the CONTROL task's clock — the same base the `E,` line
+    // beside this row was counted from (main.cpp publishes it at the dive edge
+    // and publishEvents counts t_s from it). The command task used to count the
+    // event row from its own file-open instant, which is a different instant by
+    // up to one control cycle, so the `E,` line and the `S,` row written from the
+    // same edge disagreed about when the edge was. 0 means the chain has not
+    // announced a dive start yet; the row writer treats that as t_s = 0.
+    uint32_t diveStartMs = 0;
+    deco::View pic{};
+    bool hasPic = false;        // false = no generation published yet (boot window)
+    float depthM = 0.0f;
+    float shownPpo2 = 0.0f;     // the held value included — see Telemetry
+    float cellBar[3] = {0.0f, 0.0f, 0.0f};
+    float setpointBar = 0.0f;
+    float vbat = 0.0f;
+    bool haveVote = false;
+    bool diveActive = false;
+    bool autoMode = false;
+    uint16_t alarmLogBits = 0;  // the LOG view — see Telemetry::alarmLogBits
+    uint8_t voteMode = 0;
+    uint8_t cpState = 0;
+    uint8_t cnsPeakPct = 0;     // the dive's running peak, from the totals
+};
+
+/// Copies the published scalars, the dive totals' CNS peak and ONE seqlock
+/// generation into `out`. `totals` may be null (no dive open on a host test).
+/// `out.hasPic` is false when nothing has been published yet, which is the only
+/// case in which a row written from this has no deco columns at all — and
+/// logfmt::fillSnapshot then says "no number" in `ndl` rather than 0.
+void captureEdge(const Telemetry& tel, const DiveTotals* totals, uint32_t nowMs,
+                 EdgeSnap& out);
 
 } // namespace bridge

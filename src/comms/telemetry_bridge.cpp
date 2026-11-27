@@ -7,7 +7,7 @@
 #include "telemetry_bridge.h"
 
 #include "control/alarms.h"
-#include "util/numfmt.h"           // scaled(): the payload digits must match the GET answer
+#include "util/numfmt.h"           // scaled()/narrow(): payload and summary digits must match the GET answer, and a column narrower than the accumulator saturates instead of wrapping
 
 #include <cstdio>              // snprintf for the depth-source identity copy (bounded)
 
@@ -17,14 +17,19 @@ logfmt::DiveMeta DiveTotals::toMeta() const {
     logfmt::DiveMeta m{};
     m.durationSec = durationSec;
     m.maxDepthCm = maxDepthCm;
-    m.minVotedX1000 = minVotedX1000 == 32767 ? 0 : static_cast<int16_t>(minVotedX1000);
+    // The sentinels are checked FIRST, then the value is narrowed by `narrow`,
+    // not by a cast: these accumulators are int32 and the columns are int16, and
+    // a cast of anything past the column wraps into a plausible negative ppO2.
+    // Both guards are written for the value that is actually in the field, so a
+    // dive that somehow voted 40.000 bar prints 32.767 instead of -32.769.
+    m.minVotedX1000 = minVotedX1000 == 32767 ? 0 : numfmt::narrow<int16_t>(minVotedX1000);
     // Symmetric with the min side. The previous guard (`< -32768`) could never
     // be true, so the "never voted" sentinel was published verbatim: a dive
     // started with no cells reading, or with them all rejected, wrote
     // `max_ppo2 = -32.768` into its own summary — an impossible ppO2, printed
     // with the same three decimals as every real one.
-    m.maxVotedX1000 = maxVotedX1000 <= -32768 ? 0 : static_cast<int16_t>(maxVotedX1000);
-    m.totalPulses = totalPulses > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(totalPulses);
+    m.maxVotedX1000 = maxVotedX1000 <= -32768 ? 0 : numfmt::narrow<int16_t>(maxVotedX1000);
+    m.totalPulses = numfmt::narrow<uint16_t>(totalPulses);
     m.cnsPeakPct = cnsPeakPct;
     // The plan in force, not a guess at one: these are the values the control
     // chain was running when the dive ended. Left at zero by a chain that has
@@ -114,7 +119,7 @@ int publishEvents(const ctrl::State& st, uint32_t tSec, EventRing& ring,
         // The payload is the setpoint in hundredths, and it has to be the number
         // the handset reads back with `GET SP2` — 0.29 must arrive as 29, not 28.
         push({tSec, logfmt::EVT_SP_CHANGE,
-              static_cast<uint16_t>(numfmt::scaled(st.setpointBar, 2))});
+              numfmt::scaledInto<uint16_t>(st.setpointBar, 2)});
     }
     ps.prevSp = st.setpointBar;
     return pushed;
@@ -194,6 +199,30 @@ void publishDepthSource(DepthSource& out, bool locked, bool used, bool healthy,
     out.lastGoodMs = lastGoodMs;
     std::snprintf(out.identity, sizeof(out.identity), "%s",
                   identity ? identity : "none");
+}
+
+void captureEdge(const Telemetry& tel, const DiveTotals* totals, uint32_t nowMs,
+                 EdgeSnap& out) {
+    out = EdgeSnap{};
+    out.nowMs = nowMs;
+    out.diveStartMs = tel.diveStartMs;   // the `E,` rows' own base — see EdgeSnap
+    out.depthM = tel.depthM;
+    out.shownPpo2 = tel.shownPpo2;
+    for (int i = 0; i < 3; i++) out.cellBar[i] = tel.cellBar[i];
+    out.setpointBar = tel.setpointBar;
+    out.vbat = tel.vbat;
+    out.haveVote = tel.haveVote;
+    out.diveActive = tel.diveActive;
+    out.autoMode = tel.autoMode;
+    out.alarmLogBits = tel.alarmLogBits;
+    out.voteMode = tel.voteMode;
+    out.cpState = tel.cpState;
+    out.cnsPeakPct = totals ? totals->cnsPeakPct : 0u;
+    // One generation, or none. The seqlock's own retry bound is what makes this
+    // copy self-consistent; `hasPic` is the honest answer when ControlTask has
+    // not published yet (SAFE boot, or the first cycles of a cold start), and
+    // the row writer turns that into the `ndl` sentinel rather than zeros.
+    out.hasPic = deco::viewSnapshot(tel.view, out.pic);
 }
 
 } // namespace bridge

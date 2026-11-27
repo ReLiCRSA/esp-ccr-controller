@@ -412,7 +412,11 @@ static void surfaceCalAir(uint8_t code, const cal::AirCalOutput& a) {
     for (int i = 0; i < 3; i++)
         nums = logfmt::countsFromFloat(a.rawAvg[i], raw[i]) && nums;
     if (nums) {
-        r.spread = static_cast<uint16_t>(spread);
+        // narrow, not a cast: the column is uint16 and countsFromFloat hands back
+        // an int16, so a negative spread — which the sampler cannot produce, a
+        // worst-spread is a magnitude — would wrap into a huge one and look like a
+        // dead cell rather than an absence.
+        r.spread = numfmt::narrow<uint16_t>(spread);
         for (int i = 0; i < 3; i++) r.raw[i] = raw[i];
     }
     // The seconds left in the warm-up gate are deliberately NOT recorded: they
@@ -669,6 +673,19 @@ static void controlTask(void*) {
         // state, and a terminal verdict also lands on the wire as E,*,7,<code>.
         // Same t base as the other E, rows (seconds since dive start, or since
         // boot at the surface — see the spec's E, section).
+        // The cycle's events are STAGED, not published. ControlTask produces
+        // them here and the handset task drains them on the other core; the row
+        // an edge drags into the dive file must carry the deco picture this
+        // cycle publishes for that edge, so the ring only becomes readable after
+        // publishView below. Left unstaged, push() made the edge visible a
+        // schedule() call before the plan was recomputed for it, and a drain
+        // landing in that window filed "the machine decided X" beside the plan of
+        // the last 30 s grid — the freshness rule stated, broken by the order of
+        // two statements next to each other. Nothing between here and the commit
+        // exits the iteration early (the only `continue` in this loop is above
+        // the beginTx), so a staged batch never outlives the cycle that staged it.
+        g_bridgeEvents.beginTx();
+
         const uint32_t calTSec = (now - g_bridgeTel.diveStartMs) / 1000u;
         if (g_calAirRequest) {
             g_calAirRequest = false;
@@ -859,6 +876,11 @@ static void controlTask(void*) {
         // the plan — coalesced (one recompute per cycle however many edges
         // fired: an alarm storm costs one schedule(), and that is the same
         // per-cycle bound the H2 budget test pins).
+        //
+        // And in this order: the edges staged at the top of the cycle are
+        // committed only once the picture they will be read against exists.
+        // The publish and the commit are one pair; swapping them is the bug
+        // they exist to prevent.
         if (bridge::publishEvents(st, (now - diveStartMs) / 1000u, g_bridgeEvents, pub) > 0)
             decoPlanDirty = true;
         if (decoPlanDirty) {
@@ -866,6 +888,7 @@ static void controlTask(void*) {
                            g_loop->deco().depthToBar(st.depthSmoothedM));
             deco::publishView(g_bridgeTel.view, g_decoView);
         }
+        g_bridgeEvents.commitTx();   // the edges become readable beside a current plan
 
         // A pre-dive PASS or FAIL becomes a surface record on its rising edge.
         // Edges, not levels: the check runs once and its verdict stands until
@@ -932,9 +955,9 @@ static void controlTask(void*) {
             // through the same fill this block calls: a held depth in the dive
             // file is a depth marked as held.
             g_bridgeTotals.durationSec = (now - diveStartMs) / 1000u;
-            const int32_t dCm = static_cast<int32_t>(numfmt::scaled(st.depthSmoothedM, 2));
+            const int32_t dCm = numfmt::scaledInto<int32_t>(st.depthSmoothedM, 2);
             if (dCm > g_bridgeTotals.maxDepthCm) g_bridgeTotals.maxDepthCm = dCm;
-            const int32_t v = static_cast<int32_t>(numfmt::scaled(st.shownPpo2, 3));
+            const int32_t v = numfmt::scaledInto<int32_t>(st.shownPpo2, 3);
             // The META extremes count MEASUREMENTS only, and the haveVote gate is
             // what does it: while the vote is failed, st.shownPpo2 is the held
             // display number, and re-counting it 10 times a second would inflate a
@@ -965,15 +988,19 @@ static void controlTask(void*) {
             // answered, so they must not be one count away from it — which is exactly
             // how the `S,` rows were wrong until 2026-11-24 (the same helper now
             // covers both, and test_numfmt fails if they ever disagree).
-            g_bridgeTotals.gfLow = static_cast<uint8_t>(numfmt::scaled(g_ctrlCfg.deco.gfLow, 0));
-            g_bridgeTotals.gfHigh = static_cast<uint8_t>(numfmt::scaled(g_ctrlCfg.deco.gfHigh, 0));
+            g_bridgeTotals.gfLow = numfmt::scaledInto<uint8_t>(g_ctrlCfg.deco.gfLow, 0);
+            g_bridgeTotals.gfHigh = numfmt::scaledInto<uint8_t>(g_ctrlCfg.deco.gfHigh, 0);
             for (int i = 0; i < 4; i++) {
-                const long long sx = numfmt::scaled(g_ctrlCfg.sp.sp[i], 3);
-                const int16_t v = sx > 32767 ? 32767 : static_cast<int16_t>(sx);
-                if (i == 0) g_bridgeTotals.sp1X1000 = v;
-                else if (i == 1) g_bridgeTotals.sp2X1000 = v;
-                else if (i == 2) g_bridgeTotals.sp3X1000 = v;
-                else g_bridgeTotals.sp4X1000 = v;
+                // scaledInto, not a hand-rolled ternary: the columns are
+                // int16 and a value past the column used to wrap into a negative
+                // setpoint in the dive file. The schema will not let a legal
+                // configuration reach the limit, which is exactly why the guard
+                // belongs in the conversion and not in the schema.
+                const int16_t sv = numfmt::scaledInto<int16_t>(g_ctrlCfg.sp.sp[i], 3);
+                if (i == 0) g_bridgeTotals.sp1X1000 = sv;
+                else if (i == 1) g_bridgeTotals.sp2X1000 = sv;
+                else if (i == 2) g_bridgeTotals.sp3X1000 = sv;
+                else g_bridgeTotals.sp4X1000 = sv;
             }
 
             // 30 s snapshot grid (PLAN 10). Event-driven snapshots are taken

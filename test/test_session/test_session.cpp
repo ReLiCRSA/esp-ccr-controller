@@ -97,7 +97,7 @@ struct Fix {
         h.onWifi = [](bool on, void*) { if (g_hk) g_hk->wifi.push_back(on ? 1 : 0); };
         h.openDive = [](uint32_t, void*) { if (g_hk) g_hk->opens++; return true; };
         h.closeDive = [](const logfmt::DiveMeta&, void*) { if (g_hk) g_hk->closes++; };
-        h.appendSnapNow = [](void*) { if (g_hk) g_hk->snaps++; };
+        h.appendSnapNow = [](const bridge::EdgeSnap&, void*) { if (g_hk) g_hk->snaps++; };
         h.saveSettings = [](void*) { return true; };
         h.onSettings = [](void*) {
             if (!g_hk) return;

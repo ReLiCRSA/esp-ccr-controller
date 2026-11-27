@@ -18,7 +18,7 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
     // away from the wire it has to be comparable with (fixed 2026-11-24; the
     // same rule in the `M,` totals; test_numfmt fails if the two renderings of
     // one sample ever disagree).
-    s.depthCm = static_cast<int32_t>(numfmt::scaled(in.smoothedDepthM, 2));
+    s.depthCm = numfmt::scaledInto<int32_t>(in.smoothedDepthM, 2);
 
     // The row's ppO2 is the number the diver was shown, and the chain holds that
     // across a failed vote (RowInputs::shownPpo2 — the contract, and the finding
@@ -27,10 +27,17 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
     // voting-mode bits, and in `ndl` = deco::kNDL_UNKNOWN (-1, "no number" — the
     // same value `D,` answers, and now the same value everywhere; 480 means the
     // engine's own "unlimited" and nothing else).
-    s.votedX1000 = static_cast<int16_t>(numfmt::scaled(in.shownPpo2, 3));
+    //
+    // Every int16 field below goes through scaledInto rather than a cast for the
+    // same reason the deco picture does (deco/view.h): the stored integer is
+    // narrower than long long, a cast wraps, and a wrapped ppO2 or battery is a
+    // plausible-looking number from a different dive. The ppO2 columns wrap at
+    // 32.767 bar and the battery at 65.535 V — neither is reachable here, and
+    // 0x0000 for a battery would read as a dead pack to whoever reviews the file.
+    s.votedX1000 = numfmt::scaledInto<int16_t>(in.shownPpo2, 3);
     for (int i = 0; i < 3; i++)
-        s.cellX1000[i] = static_cast<int16_t>(numfmt::scaled(in.cellBar[i], 3));
-    s.setpointX1000 = static_cast<int16_t>(numfmt::scaled(in.setpointBar, 3));
+        s.cellX1000[i] = numfmt::scaledInto<int16_t>(in.cellBar[i], 3);
+    s.setpointX1000 = numfmt::scaledInto<int16_t>(in.setpointBar, 3);
 
     s.mode = in.diveActive ? (in.autoMode ? 1 : 2) : 0;
     s.alarmBits = in.alarmLogBits;  // the LOG view — see RowInputs
@@ -53,10 +60,37 @@ void fillSnapshot(Snapshot& s, const RowInputs& in) {
         // x10 — never re-round, so the column and `D,`'s decimal agree by
         // construction (both derive from one scaled store).
         s.decoTotalMin = static_cast<int16_t>(in.deco.decoTotalX10 / 10);
+    } else {
+        // No picture published yet: the boot window before ControlTask's first
+        // cycle, or a build where no control task runs at all. The three deco
+        // columns cannot carry a number then, and what they say about that has to
+        // be an absence rather than a reading. For `ndl` the honest absence is
+        // NOT 0: 0 minutes means "your no-deco time is finished, you are
+        // obligated now", which is the opposite of "no number" and the more
+        // alarming one. It answers deco::kNDL_UNKNOWN (-1), the same sentinel the
+        // wire has always used for "show —" (§4), so one parser rule serves both.
+        //
+        // `ceiling` and `deco_min` stay 0 because the format has no sentinel for
+        // them: a negative ceiling is not a defined value and would read as a
+        // shallower obligation, not as an absence. The ndl sentinel is the row's
+        // marker for "no deco picture", which docs/HANDSET_PROTOCOL.md 5 states.
+        // On this build the case is unreachable in normal operation — a dive file
+        // only opens once the chain is running, and the chain publishes a picture
+        // on its first cycle — so the honesty is for the wiring, not the bench: if
+        // a row ever arrives before the first publication, it must not claim a
+        // diver has no stop.
+        s.ndlMin = deco::kNDL_UNKNOWN;
     }
 
-    s.pulses = static_cast<uint16_t>(in.pulsesNow - in.pulsesPrev);
-    s.battX1000 = static_cast<uint16_t>(numfmt::scaled(in.vbat, 3));
+    // A window's injections, narrowed the same way as every other column. The
+    // counter is uint32 and the column is uint16, and the subtraction is unsigned
+    // arithmetic, so a counter that ever moved BACKWARDS used to become a huge
+    // count (0xFFFF-ish) rather than nothing — a dive file claiming injections
+    // that no valve made. narrow() sends a negative delta to the column's minimum
+    // (0, "nothing in this window") and a delta past 65535 to its maximum.
+    s.pulses = numfmt::narrow<uint16_t>(static_cast<long long>(in.pulsesNow) -
+                                        static_cast<long long>(in.pulsesPrev));
+    s.battX1000 = numfmt::scaledInto<uint16_t>(in.vbat, 3);
     // The documented flags byte (divelog.h): b0 = the setpoint clamp up,
     // b1..2 = the voting mode the row was written under (voting::Mode).
     // Until 2026-11-28 nothing wrote this column and every dive file said

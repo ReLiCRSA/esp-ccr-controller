@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <limits>
 
 // ============================================================================
 // numfmt — fixed-point number rendering, because float printf is a stack bomb
@@ -69,8 +70,50 @@ char* fixedScaled(char* buf, std::size_t cap, long long scaled, int decimals);
 // away from zero and fixed() does not, so the pair would differ on a tie.)
 //
 // Returns 0 only for a non-finite value or one too large to hold. Callers keep
-// their own clamps where the field is narrower than long long (an int16_t count
-// of centimetres saturates at 327.67 m, which no dive reaches).
+// their own clamps where the field is narrower than long long — and that clamp
+// is scaledInto below, never a static_cast.
 long long scaled(double v, int decimals);
+
+// Narrowing an INTEGER into a type that may not hold it: saturates instead of
+// wrapping. The same rule as scaledInto below, for the values that are already
+// integers — the dive summary's extremes and counters, where the accumulation
+// is wider than the column it lands in (`totalPulses` counts a dive's injections
+// in uint32 and exports a uint16; a wrap there says "a quarter of the injections
+// happened", which is the same class of lie as a wrapped ceiling).
+template <class T>
+inline T narrow(long long v) {
+    const long long hi = static_cast<long long>(std::numeric_limits<T>::max());
+    const long long lo = static_cast<long long>(std::numeric_limits<T>::min());
+    if (v > hi) return std::numeric_limits<T>::max();
+    if (v < lo) return std::numeric_limits<T>::min();
+    return static_cast<T>(v);
+}
+
+// scaled() fits in long long. A log field usually does not: ceiling, NDL, deco
+// minutes, stop depths, ppO2 and battery are int16 or uint16, and a plain
+// static_cast of an out-of-range long long is a WRAP, not a refusal — 95336 cm
+// of ceiling becomes 29800, and 32768 becomes -32768. That is not a cosmetic
+// overflow: `ceiling_m` and `ceiling_cm` are read as "0 or negative = no
+// decompression obligation" by the handset, the web page and the dive file, so
+// a wrapped ceiling tells a diver he may ascend.
+//
+// Saturation is the only narrowing that cannot make an obligation disappear.
+// An unrepresentable value becomes the largest number the field holds (or the
+// smallest, for a negative one), which keeps the diver MORE obligated than the
+// truth rather than less, and it is at least a number a client can recognise as
+// the field's own ceiling instead of a plausible reading from a different dive.
+//
+// No dive reaches this. The engine's ceiling is bounded by the deepest tissue
+// load it will accept (deco::kSeedMaxBar = 100 bar, about 950 m), which a real
+// dive at the deepest legal depth (~16 bar) cannot come near, so the only way
+// here is a continuity record that is well-formed and wrong — a future format
+// or unit mistake. The guard is the safety net for that case, and the native
+// test feeds exactly that seed (test_controlplane).
+//
+// A non-finite input takes scaled()'s 0, which is a refusal, not a claim: the
+// engine gates its inputs (setTissueState rejects non-finite, schedule() is
+// bounded twice), so nothing that reaches here is a NaN.
+template <class T>
+inline T scaledInto(double v, int decimals) { return narrow<T>(scaled(v, decimals)); }
 
 } // namespace numfmt

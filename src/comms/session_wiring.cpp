@@ -218,7 +218,14 @@ bool hookSetClock(uint32_t epoch, void*) {
 
 /// Event-driven snapshot (PLAN 10): the moment an alarm/mode/cellproof edge
 /// happened is worth a row of its own, not just a 30 s grid row nearby.
-void hookAppendSnap(void*) {
+///
+/// Written from the instant the link captured before its first row of the batch
+/// (bridge::captureEdge), never from the bridge as it is while the row is being
+/// built. Eight edges drained together are eight rows about eight decisions;
+/// reading the live scalars eight times made those rows eight measurements of
+/// eight different control cycles, so the numbers underneath the verdicts moved
+/// between the rows that recorded them.
+void hookAppendSnap(const bridge::EdgeSnap& snap, void*) {
     if (!g_loop || !g_logMtx) return;
     // Built from the published bridge scalars, never from the live chain: the
     // control task owns that object. That is the ONLY difference between this row
@@ -227,24 +234,32 @@ void hookAppendSnap(void*) {
     // and the two kinds of row cannot drift apart in scaling, mode, alarm view or
     // the pulses delta.
     logfmt::RowInputs ri{};
-    ri.nowMs = millis();
-    ri.diveStartMs = g_diveStartMs;
-    ri.smoothedDepthM = g_bridgeTel.depthM;
-    ri.haveVote = g_bridgeTel.haveVote;
-    ri.shownPpo2 = g_bridgeTel.shownPpo2;
-    for (int i = 0; i < 3; i++) ri.cellBar[i] = g_bridgeTel.cellBar[i];
-    ri.setpointBar = g_bridgeTel.setpointBar;
-    ri.diveActive = g_bridgeTel.diveActive;  // an edge drained after DIVE END is
-                                            // neither auto nor manual: mode 0
-    ri.autoMode = g_bridgeTel.autoMode;
+    ri.nowMs = snap.nowMs;
+    // The dive's start as the CONTROL task counts it, not as this task opened the
+    // file: `E,<t_s>` is counted from the published base (main.cpp's dive edge),
+    // so this row and the `E,` line written from the same edge state the same
+    // second. The command task's file-open instant is up to one control cycle
+    // later, and a row counted from it could sit a second away from the verdict
+    // it exists to explain. 0 means the chain has not announced a start yet —
+    // then this row IS the first thing about the dive, so it says t_s = 0 rather
+    // than counting from boot.
+    ri.diveStartMs = snap.diveStartMs ? snap.diveStartMs : snap.nowMs;
+    ri.smoothedDepthM = snap.depthM;
+    ri.haveVote = snap.haveVote;
+    ri.shownPpo2 = snap.shownPpo2;
+    for (int i = 0; i < 3; i++) ri.cellBar[i] = snap.cellBar[i];
+    ri.setpointBar = snap.setpointBar;
+    ri.diveActive = snap.diveActive;  // an edge drained after DIVE END is
+                                     // neither auto nor manual: mode 0
+    ri.autoMode = snap.autoMode;
     // Same view as the grid row: the dive file records what was true, so a
     // snapshot taken at the very edge where the diver ACKed an alarm still says
     // the condition was standing. That edge is exactly when the live word goes
     // quiet, and it is exactly when a row written from the live word used to lose
     // the marker (finding #5).
-    ri.alarmLogBits = g_bridgeTel.alarmLogBits;
-    ri.cnsPeakPct = g_bridgeTotals.cnsPeakPct;
-    ri.vbat = g_bridgeTel.vbat;
+    ri.alarmLogBits = snap.alarmLogBits;
+    ri.cnsPeakPct = snap.cnsPeakPct;
+    ri.vbat = snap.vbat;
     // No window of its own, so 0 — which is what these rows have always recorded:
     // `Telemetry::pulsesWindow` is declared and read but written nowhere, so the
     // pulses column of every event row has always been 0. Fixing that means
@@ -253,21 +268,20 @@ void hookAppendSnap(void*) {
     ri.pulsesNow = 0;
     ri.pulsesPrev = 0;
     // The deco picture: the PUBLISHED generation ControlTask computed for the
-    // edge this row records (deco/view.h — the publisher in main.cpp
-    // recomputes the plan on every event edge, so an alarm-edge row carries
-    // the plan of that instant, not of the last grid). Before 2026-11-28 this
-    // row left ceiling/NDL/deco at zero and every one of them read "no stop"
-    // (finding N1); and the numbers it now carries are the same ones the
-    // `D,` line answers with, because both read one seqlock snapshot.
-    deco::View pic{};
-    ri.hasDecoPicture = deco::viewSnapshot(g_bridgeTel.view, pic);
-    ri.deco = pic;
+    // edge this row records (deco/view.h — main.cpp publishes the plan while the
+    // cycle's edges are still staged in the ring, so an alarm-edge row cannot be
+    // drained against a picture older than the edge). Before 2026-11-28 this row
+    // left ceiling/NDL/deco at zero and every one of them read "no stop" (finding
+    // N1); and the numbers it now carries are the same ones the `D,` line answers
+    // with, because both read one seqlock snapshot.
+    ri.hasDecoPicture = snap.hasPic;
+    ri.deco = snap.pic;
     // N3: the flags byte is written now — the vote this row was taken under
     // (a row during a held-ppO2 window says FAILED, beside a ppO2 column that
     // shows the held number and an alarm word that marks it) and whether the
     // proof clamp was up at this instant.
-    ri.voteMode = g_bridgeTel.voteMode;
-    ri.spClamped = g_bridgeTel.cpState == static_cast<uint8_t>(cellproof::State::FAIL);
+    ri.voteMode = snap.voteMode;
+    ri.spClamped = snap.cpState == static_cast<uint8_t>(cellproof::State::FAIL);
     logfmt::Snapshot s{};
     logfmt::fillSnapshot(s, ri);
 

@@ -20,6 +20,7 @@
 #include "comms/telemetry_bridge.h"
 #include "comms/uart_link.h"
 #include "control/cellproof.h"
+#include "log/rowfill.h"
 #include "util/wdtfeed.h"
 
 using comms::CommandRouter;
@@ -53,6 +54,26 @@ struct Hooks {
     // event row and "S" for a snapshot. The order matters — the verdict row has
     // to be in the file alongside the state it caused, not somewhere else.
     std::vector<std::string> appends;
+    // The instant and picture each event-driven snapshot row was built from
+    // (bridge::EdgeSnap). One drain batch must hand over ONE capture: eight
+    // edges drained together are eight rows about eight decisions, and if the
+    // numbers underneath them differ between the rows then the rows are eight
+    // measurements of eight control cycles, which is what the capture exists
+    // to prevent (review M-4's sibling).
+    struct SnapRec {
+        uint32_t nowMs = 0;
+        uint32_t diveStartMs = 0;
+        float depthM = 0.0f;
+        float shownPpo2 = 0.0f;
+        bool hasPic = false;
+        int16_t ceilingCm = 0;
+        int16_t ndlMin = 0;
+    };
+    std::vector<SnapRec> snapRecs;
+    // When true, the hook moves the bridge scalars after every row it is handed:
+    // the control task does exactly that while the command task is halfway across
+    // a drain batch. Set only by the coherence test below.
+    bool bumpBetweenRows = false;
     logfmt::DiveMeta lastMeta{};
     bool hasMeta = false;
     bool open(uint32_t) { opens++; return !openFails; }
@@ -110,10 +131,25 @@ struct Fixture {
         h.onWifi = [](bool on, void*) { if (g_fix) { g_fix->hooks.wifi++; g_fix->hooks.wifiLast = on; } };
         h.openDive = [](uint32_t, void*) { return g_fix && g_fix->hooks.open(0); };
         h.closeDive = [](const logfmt::DiveMeta& m, void*) { if (g_fix) g_fix->hooks.close(m); };
-        h.appendSnapNow = [](void*) {
+        h.appendSnapNow = [](const bridge::EdgeSnap& s, void*) {
             if (!g_fix) return;
             g_fix->hooks.snaps++;
             g_fix->hooks.appends.push_back("S");
+            Hooks::SnapRec r;
+            r.nowMs = s.nowMs;
+            r.diveStartMs = s.diveStartMs;
+            r.depthM = s.depthM;
+            r.shownPpo2 = s.shownPpo2;
+            r.hasPic = s.hasPic;
+            r.ceilingCm = s.pic.ceilingCm;
+            r.ndlMin = s.pic.ndlMin;
+            g_fix->hooks.snapRecs.push_back(r);
+            // Stand in for ControlTask integrating between the rows of one drain
+            // batch. The capture the rows were built from must not move with it.
+            if (g_fix->hooks.bumpBetweenRows) {
+                g_fix->tel.depthM += 1.0f;
+                g_fix->tel.shownPpo2 += 0.05f;
+            }
         };
         h.appendEventNow = [](uint16_t id, uint16_t value, uint32_t tSec, void*) {
             if (!g_fix) return;
@@ -356,6 +392,155 @@ void test_event_rows_are_written_into_the_dive_file_beside_their_snapshot() {
     TEST_ASSERT_TRUE(hasLineStarting("E,54,10,0"));
     TEST_ASSERT_TRUE(hasLineStarting("E,54,11,0"));
     TEST_ASSERT_TRUE(hasLineStarting("E,66,12,1"));
+}
+
+void test_a_staged_batch_is_invisible_until_it_is_committed() {
+    // beginTx/commitTx is the ordering the event row's freshness depends on. An
+    // edge must not be drainable in the window between push() and the deco
+    // republish that belongs to it: on the board the handset task runs on the
+    // other core, and a drain landing in that window filed "the machine decided
+    // X" beside the plan of the last 30 s grid — N1's freshness rule broken by
+    // the order of two statements next to each other (main.cpp).
+    bridge::EventRing ring;
+    bridge::Event e{};
+    ring.beginTx();
+    TEST_ASSERT_TRUE(ring.push({10, logfmt::EVT_ALARM_RAISED, alarms::BIT_LOW_PPO2}));
+    TEST_ASSERT_TRUE(ring.push({11, logfmt::EVT_MODE_CHANGE, 1}));
+    TEST_ASSERT_FALSE_MESSAGE(ring.pop(e),
+                              "a staged event is already readable: a drain could pair the edge "
+                              "with a deco picture computed before it happened");
+    ring.commitTx();
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT32(10u, e.tSec);
+    TEST_ASSERT_EQUAL_UINT16(static_cast<uint16_t>(logfmt::EVT_ALARM_RAISED), e.id);
+    TEST_ASSERT_EQUAL_UINT16(alarms::BIT_LOW_PPO2, e.value);
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT32(11u, e.tSec);
+    TEST_ASSERT_FALSE_MESSAGE(ring.pop(e),
+                              "the commit published more than the batch it staged");
+}
+
+void test_a_push_outside_a_batch_is_readable_at_once() {
+    // Not every producer stages. A caller outside ControlTask's cycle (the host
+    // tests drive publishEvents this way) must not have its event held back
+    // waiting for a commit that never comes, and a commit with nothing staged
+    // must be harmless rather than publish a stale cursor.
+    bridge::EventRing ring;
+    bridge::Event e{};
+    TEST_ASSERT_TRUE(ring.push({5, logfmt::EVT_MODE_CHANGE, 2}));
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT32(5u, e.tSec);
+    ring.commitTx();
+    TEST_ASSERT_FALSE(ring.pop(e));
+    // And staging is still available afterwards: tx_ is not sticky.
+    ring.beginTx();
+    TEST_ASSERT_TRUE(ring.push({6, logfmt::EVT_MODE_CHANGE, 3}));
+    TEST_ASSERT_FALSE(ring.pop(e));
+    ring.commitTx();
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT32(6u, e.tSec);
+}
+
+void test_a_staged_batch_still_respects_the_rings_capacity() {
+    // Staging must not turn the ring into an unbounded buffer: the producer that
+    // fills it is an alarm storm, and the honest answer to a full ring is a
+    // refused push the caller counts (`dropped()`), not silent overwrite.
+    bridge::EventRing ring;
+    bridge::Event e{};
+    ring.beginTx();
+    int ok = 0;
+    for (int i = 0; i < 64; i++)
+        if (ring.push({static_cast<uint32_t>(i), logfmt::EVT_ALARM_RAISED,
+                       static_cast<uint16_t>(i)}))
+            ok++;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(static_cast<int>(bridge::EventRing::kSize) - 1, ok,
+                                  "a staged batch holds something other than kSize-1 events: "
+                                  "the ring's full condition is producer-cursor based");
+    ring.commitTx();
+    int seen = 0;
+    while (ring.pop(e)) seen++;
+    TEST_ASSERT_EQUAL_INT(ok, seen);
+}
+
+void test_one_drain_batch_reads_one_instant() {
+    // Eight edges drained together are eight rows about eight decisions, and the
+    // numbers underneath them must be ONE measurement. Reading the live scalars
+    // per event made each row a sample of a different control cycle, so a dive
+    // file showing the clamp engage beside an override showed the ppO2 and depth
+    // drifting between the rows that recorded them.
+    //
+    // The hook here moves the bridge scalars after every row: that is what the
+    // control task does while the command task is halfway across a batch.
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+    f.tel.depthM = 18.35f;
+    f.tel.shownPpo2 = 0.712f;
+    f.tel.diveStartMs = 5000u;
+    f.hooks.bumpBetweenRows = true;
+
+    f.events.beginTx();
+    TEST_ASSERT_TRUE(f.events.push({12, logfmt::EVT_ALARM_RAISED, alarms::BIT_LOW_PPO2}));
+    TEST_ASSERT_TRUE(f.events.push({12, logfmt::EVT_MODE_CHANGE, 1}));
+    TEST_ASSERT_TRUE(f.events.push({12, logfmt::EVT_CLAMP_ON, 0}));
+    f.events.commitTx();
+
+    f.pump(8000);
+    TEST_ASSERT_EQUAL_MESSAGE(3u, f.hooks.snapRecs.size(), "one snapshot row per drained event");
+    const Hooks::SnapRec& first = f.hooks.snapRecs[0];
+    TEST_ASSERT_TRUE_MESSAGE(first.hasPic,
+                             "the batch took no deco picture: the fixture publishes a generation");
+    TEST_ASSERT_EQUAL_FLOAT_MESSAGE(18.35f, first.depthM,
+                                    "the batch's instant is not the depth the control task held");
+    for (size_t i = 1; i < f.hooks.snapRecs.size(); i++) {
+        const Hooks::SnapRec& r = f.hooks.snapRecs[i];
+        // Unity's message is a plain C string, so the row number is composed
+        // rather than printf'd — and a failing row has to say WHICH row.
+        const std::string which = ", row " + std::to_string(i);
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(first.nowMs, r.nowMs,
+                                         ("the rows of one drain carry different stamps" + which).c_str());
+        TEST_ASSERT_EQUAL_FLOAT_MESSAGE(first.depthM, r.depthM,
+                                        ("a row of one drain was captured from a later control "
+                                         "cycle: the rows of a batch must describe one instant" +
+                                         which).c_str());
+        TEST_ASSERT_EQUAL_FLOAT_MESSAGE(first.shownPpo2, r.shownPpo2,
+                                        ("a row of one drain shows a different ppO2" + which).c_str());
+        TEST_ASSERT_EQUAL_INT16_MESSAGE(first.ceilingCm, r.ceilingCm,
+                                        ("a row of one drain carries a different deco picture" +
+                                         which).c_str());
+        TEST_ASSERT_EQUAL_INT16_MESSAGE(first.ndlMin, r.ndlMin,
+                                        ("a row of one drain carries a different NDL" + which).c_str());
+    }
+    // The row's seconds come from the CHAIN's dive start — the same base the E,
+    // line beside it was counted from — not from the instant this task happened
+    // to open the file. A pump at 8000 ms on a dive started at 5000 ms is t_s = 3.
+    TEST_ASSERT_EQUAL_UINT32(5000u, first.diveStartMs);
+}
+
+void test_a_capture_before_the_first_picture_says_there_is_no_picture() {
+    // SAFE boot, or the first cycles of a cold start: ControlTask has published
+    // nothing yet, so the picture a row would carry does not exist. hasPic is the
+    // honest answer, and the fill turns it into the `ndl` sentinel rather than a
+    // 0-minute NDL — which reads "your no-deco time is finished", the opposite
+    // claim and the more alarming one.
+    bridge::Telemetry fresh;
+    bridge::EdgeSnap s{};
+    bridge::captureEdge(fresh, nullptr, 1234u, s);
+    TEST_ASSERT_FALSE_MESSAGE(s.hasPic,
+                              "captureEdge claims a deco picture nobody has published");
+    TEST_ASSERT_EQUAL_INT16(0, s.pic.ceilingCm);
+
+    logfmt::RowInputs ri{};
+    ri.nowMs = s.nowMs;
+    ri.diveStartMs = s.diveStartMs ? s.diveStartMs : s.nowMs;
+    ri.hasDecoPicture = s.hasPic;
+    ri.deco = s.pic;
+    logfmt::Snapshot row{};
+    logfmt::fillSnapshot(row, ri);
+    TEST_ASSERT_EQUAL_INT16_MESSAGE(deco::kNDL_UNKNOWN, row.ndlMin,
+                                    "a row with no published picture states an NDL of 0 minutes");
+    TEST_ASSERT_EQUAL_INT16(0, row.ceilingCm);
+    TEST_ASSERT_EQUAL_INT16(0, row.decoTotalMin);
 }
 
 void test_dive_summary_states_the_plan_the_dive_ran_on() {
@@ -900,6 +1085,11 @@ int main() {
     RUN_TEST(test_cns_high_gets_its_own_flag_bit_and_stays_out_of_the_fault_aggregate);
     RUN_TEST(test_events_reach_the_wire_and_snapshot_the_log);
     RUN_TEST(test_event_rows_are_written_into_the_dive_file_beside_their_snapshot);
+    RUN_TEST(test_a_staged_batch_is_invisible_until_it_is_committed);
+    RUN_TEST(test_a_push_outside_a_batch_is_readable_at_once);
+    RUN_TEST(test_a_staged_batch_still_respects_the_rings_capacity);
+    RUN_TEST(test_one_drain_batch_reads_one_instant);
+    RUN_TEST(test_a_capture_before_the_first_picture_says_there_is_no_picture);
     RUN_TEST(test_dive_summary_states_the_plan_the_dive_ran_on);
     RUN_TEST(test_publish_events_from_a_real_chain_cycle);
     RUN_TEST(test_dive_lifecycle_opens_and_closes_the_log_and_announces_failure);

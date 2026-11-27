@@ -174,7 +174,7 @@ Refusals are honest `ERR` lines — a handset should display them, not hide them
 
 | Command | Reply |
 |---|---|
-| `CAL AIR` | `OK CAL AIR` / `ERR cal locked in dive` — **a receipt, not a verdict**: it starts (or queues) a ~12 s sampling window (1 Hz × 12, spread-limited). Read the outcome with `GET CALAIR` or from the `E,<t>,7,<code>` event |
+| `CAL AIR` | `OK CAL AIR` / `ERR cal locked in dive` — **a receipt, not a verdict**: it starts (or queues) a ~12 s sampling window (1 Hz × 12, each cell judged stable against its own trend — see the rule under the codes below). Read the outcome with `GET CALAIR` or from the `E,<t>,7,<code>` event |
 | `GET CALAIR` | `CALAIR,<code>,<age_s>,<samples>,<spread>,<raw0>,<raw1>,<raw2>,<warmup_left_s>` |
 | `CAL O2` | `ERR not implemented` |
 | `CAL O2 CONFIRM` | `ERR not implemented` |
@@ -198,8 +198,20 @@ task, so the verdict arrives on its own, two ways:
 | 2 | calibrated: air point committed for every fitted cell | yes |
 | 3 | refused: cells still warming up, `<warmup_left_s>` to go | yes |
 | 4 | aborted: a dive started (CAL AIR is a pre-dive act) | yes |
-| 5 | failed: cells never settled inside the spread band | yes |
+| 5 | failed: no cell window stayed inside its stability band before the patience ran out (see the rule below) | yes |
 | 6 | failed: no fitted cells to sample | yes |
+
+**What "settled" means** (rewritten 2026-11-26, because the old rule could not be
+met by real cells). Every present cell is judged against **its own least-squares
+trend across the window**, not against a flat line: samples must sit within
+`spreadMax` raw counts (40 as shipped) of that trend, at most `outlierMax` (2) of
+them per cell may step outside — a momentary excursion across a neighbour cell's
+level is normal electrochemistry and is *counted, not discarded* — and the trend
+itself may move at most `driftMaxPerS` (10 counts/s). A stability violation
+restarts the count and the wall-clock patience is 90 s, so code 5 means "one cell
+was genuinely unstable for a whole window", not "the cells are too noisy to ever
+pass". `<spread>` is reported as the worst per-cell min-to-max range over the
+window, so a client can see how far the accepted window actually wandered.
 
 The codes are append-only: never renumbered, new outcomes are added on the right,
 and an unrecognised code means "a verdict this client has no name for", not an
@@ -699,6 +711,33 @@ window at 45 m after 60 min is 1 cm of ceiling and +1 min of deco total
 (staying at depth makes the obligation worse, so a stale plan reads slightly
 permissive — the direction is named because the bound is only honest with it).
 
+**Which rows have no picture at all, and what they say.** Only the rows written
+before ControlTask's first cycle — the boot window — have no deco picture. Their
+`ndl` column is `-1`, the same "no number" marker `D,` has always used (§4), and
+not `0`: `0` means "your no-deco time is finished, you are obligated now", which
+is a reading, and the most alarming one available on a row whose picture does not
+exist. `ceiling_m`/`ceiling_cm`/`deco_min` stay `0` there because the row defines
+no absence for them — a negative ceiling would read as a *shallower* obligation,
+not as no picture. A client that shows these columns should render `-1` as "—" on
+both surfaces with one rule.
+
+**A number too big for its column saturates; it never wraps** (pinned
+2026-11-27). Every field narrows into its column through one helper that clamps to
+the field's own range, so an out-of-range value arrives as the column's extreme
+(`ceiling_cm = 32767`) rather than the wrapped remainder of a larger number. That
+direction is deliberate and it is the *conservative* one: a wrapped ceiling comes
+back small or negative, which both this document and the web page read as "no
+decompression obligation", and a wrapped deco total shortens the stop. It also
+keeps the two columns of one quantity in the same arithmetic — `S,`'s window
+`pulses` and `M,`'s `pulses` total now saturate alike, which is what makes the
+sum-vs-total check above usable. Reproduced
+on host with every tissue seeded at the widest value the loader accepts (100 bar,
+a load no measurable dive produces — the sensor bottoms near 25 bar absolute):
+the engine's ceiling is 953 m, and the int16 column held `29800` before the
+guard, i.e. a plausible shallow ceiling read as permission to ascend. Nothing on
+the wire changes for any value inside a column, so this is not a format change;
+it is the rule that decides what a fault looks like.
+
 **The `ndl` column's sentinel pair is one convention for file and wire**
 (2026-11-28): `-1` = unknown (no valid vote, nothing to total — the value `D,`
 has always answered, §2) and `480` = the engine's own "unlimited". Before this
@@ -827,6 +866,29 @@ before a surface) and none are safety-flagged.
 Note: GF_* and ascent rates stay writable **during** a dive (normal diving:
 the schedule moves, the gas plan does not); setpoints, alarms and injection do
 not.
+
+**A `SET` can be legal per key and still invert a rule between keys** (listed
+2026-11-27, because nothing on the wire says it). Registry ranges are per-key;
+the dangerous combinations are *between* keys, so one applier enforces the
+ordering at the last moment before the numbers steer the valve and reports what
+it changed on the USB console — at boot and at the `SET` that caused it:
+`settings: CLAMPED GF_ORDER — ordering enforced over what was set`. Those words
+are debug output, not protocol (§7 rule 5): there is no clamp field on any line,
+and inventing one would be a protocol change, not a clarification. The registry
+keeps what the diver typed, so **`GET GF_LOW` answers the typed value while the
+chain runs the clamped one**. Client rule: a read-back proves the key was
+*stored*, not that the pair was consistent — a client that displays an ordered
+pair shows both keys, so the operator sees the combination.
+
+| pair | on inversion | why it does what it does |
+|---|---|---|
+| `GF_LOW` ≤ `GF_HIGH` | `GF_LOW` takes `GF_HIGH`'s value — both edges run the stricter number | the gradient line interpolates fast→slow across the tissue set, so a crossed pair hands the permissive factor to the fast tissues and shortens the stop a diver is allowed to miss. Swapping would put the strict factor on the slow tissues, where it does almost nothing |
+| `D1` < `D2` | **swapped** | the edges are one ascending ladder (`d < D1` is the shallow band, `d > D2` the deep band); crossed edges select the *lowest* setpoint past the deeper edge. Equal edges, or closer than `2*SP_HYST`, leave the middle band empty — the engine steps from band 0 to band 2, which is not a runaway and is not repaired here |
+| `SP1…SP4` ascending | **sorted** | a shuffled ladder would hand the deepest band the shallowest target gas |
+| `ALLO_HIGH` below the injection wall | alarm lowered to wall − 0.05 | an alarm above the wall could never fire before the valve fuse did |
+| `ALLO_CUTOFF` at/below the wall | cutoff raised to wall + 0.15 | a cutoff below the wall is not a cutoff |
+| `INJ_PULSE_MS` ≥ the pulse wall | pulse shortened to wall − 100 | a pulse as wide as the stuck-valve fuse makes every legitimate pulse look like a failure |
+| `INJ_MAX_DUTY` too small for the proof test | duty raised to cover it | the cell-proof pulse train has to fit inside the window the fuse allows |
 
 **`WATER_DENSITY` is the ruler, not a cosmetic preference.** Since 2026-11-24 it
 is the one density behind *every* depth this controller publishes: the metres in
@@ -985,6 +1047,14 @@ dive and was rewritten afterwards.
   file carries whatever offset the sensor and the assumed surface pressure leave
   behind — measured at **about 0.04 m** on the 2026-11-24 bench, with the checks
   here therefore running a ±0.5 m tolerance rather than a centimetre one.
+* **The `S,` row's `pulses` column is a window, and an event-driven row has no
+  window of its own** (stated 2026-11-27, because it is a column a client will
+  sum). A grid row's `pulses` is the injections since the previous grid row; an
+  event-driven row's is always `0` — the row marks a decision, not an interval,
+  and publishing a per-event window would move a byte on an existing column,
+  which is a protocol decision rather than a side effect. The dive's total is
+  `M,`'s `pulses`. Reading a `0` there as "nothing was injected at this moment"
+  is reading something the column never claimed.
 * Event ids 7, 8, 11, 12, 13, 14 are reserved in the log format and **not
   published** (§4 table). Do not build notifications on them.
 * `PULSE` is **retired** (2026-11-26). A handset has no manual injection path:

@@ -570,8 +570,50 @@ void test_no_consumer_walks_the_live_engine_anymore() {
     TEST_ASSERT_TRUE_MESSAGE(picsGrid == 1 && picsEv == 1,
                              "both dive-row fills (grid in main.cpp + event in "
                              "session_wiring.cpp) must take the published picture");
-    TEST_ASSERT_TRUE_MESSAGE(sw.find("deco::viewSnapshot") != std::string::npos,
-                             "the event row no longer reads the published generation");
+    // The event row takes the picture from its batch's CAPTURE (bridge::EdgeSnap),
+    // not by reading the seqlock itself: captureEdge is the one place a drain
+    // takes an instant, so eight edges drained together are eight rows about one
+    // measurement instead of eight measurements of eight control cycles.
+    TEST_ASSERT_TRUE_MESSAGE(sw.find("snap.hasPic") != std::string::npos &&
+                             sw.find("snap.pic") != std::string::npos,
+                             "the event row no longer takes the captured generation: what is "
+                             "hookAppendSnap filling the deco columns from?");
+    const std::string tb = stripComments(readFile("src/comms/telemetry_bridge.cpp"));
+    TEST_ASSERT_TRUE_MESSAGE(tb.find("deco::viewSnapshot") != std::string::npos,
+                             "captureEdge no longer reads the published generation: an event "
+                             "row would carry no deco picture at all (finding N1 is back)");
+
+    // One capture per drain batch, handed to every row of it. captureEdge inside
+    // the loop would be the old per-event read wearing new clothes.
+    const std::string drain = stripComments(
+        functionBody(ul, "void UartLink::drainEvents(Sink sink, void* ctx, uint32_t nowMs) {"));
+    TEST_ASSERT_TRUE_MESSAGE(!drain.empty(), "drainEvents not found by the scan: renamed?");
+    size_t captures = 0;
+    for (size_t at = 0; (at = drain.find("captureEdge", at)) != std::string::npos; at += 11)
+        ++captures;
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, captures,
+                                  "drainEvents captures the batch's instant more than once: "
+                                  "the rows of one drain would again be separate measurements");
+    TEST_ASSERT_TRUE_MESSAGE(drain.find("appendSnapNow(snap") != std::string::npos,
+                             "the snapshot row no longer takes the batch's capture — it is "
+                             "reading something live again");
+
+    // The staging pair, as an order and not as a comment: beginTx before the
+    // publication, commitTx after the plan republish. Reverse either half and the
+    // handset task can drain an edge against the plan of the last 30 s grid,
+    // which is N1's freshness rule broken by the order of two statements.
+    const size_t bt = mc.find("beginTx");
+    const size_t ct = mc.find("commitTx");
+    TEST_ASSERT_TRUE_MESSAGE(bt != std::string::npos && ct != std::string::npos,
+                             "ControlTask no longer stages its event batch (EventRing "
+                             "beginTx/commitTx): an edge would be readable before the picture "
+                             "computed for it exists");
+    TEST_ASSERT_TRUE_MESSAGE(bt < pe && pe < ct,
+                             "the event publication moved out of the staged window: edges "
+                             "would go live before the plan that belongs to them is published");
+    TEST_ASSERT_TRUE_MESSAGE(mc.find("commitTx") > mc.find("deco::viewPlan"),
+                             "the batch is committed before the plan recompute: an event row "
+                             "drained in that window carries a stale deco plan");
 }
 
 void test_the_supervisor_holds_the_fuse_half_it_promise() {

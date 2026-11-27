@@ -271,13 +271,18 @@ void hookAppendSnap(const bridge::EdgeSnap& snap, void*) {
     ri.alarmLogBits = snap.alarmLogBits;
     ri.cnsPeakPct = snap.cnsPeakPct;
     ri.vbat = snap.vbat;
-    // No window of its own, so 0 — which is what these rows have always recorded:
-    // `Telemetry::pulsesWindow` is declared and read but written nowhere, so the
-    // pulses column of every event row has always been 0. Fixing that means
-    // publishing a real per-event window, which moves a byte on an existing
-    // column: a decision, not a side effect of this refactor.
-    ri.pulsesNow = 0;
-    ri.pulsesPrev = 0;
+    // The pulses window is the edge's own, captured at the edge instant
+    // (EdgeSnap::pulsesNow/Prev, from the published scalars — the command task
+    // never reads the chain). An event row's window runs since the PREVIOUS
+    // GRID row, the same base the grid row's window uses, so the event row and
+    // the grid row that follows report overlapping windows and §9 forbids
+    // summing the column across row kinds. Until 2026-11-27 these two lines
+    // were hard zeros: the row marked a decision and no window had ever been
+    // published to go with it. Making it real moves a value on an existing
+    // column — the decision was taken on 2026-11-27 (review batch E) and is
+    // written in §9, not smuggled in as a side effect.
+    ri.pulsesNow = snap.pulsesNow;
+    ri.pulsesPrev = snap.pulsesPrev;
     // The deco picture: the PUBLISHED generation ControlTask computed for the
     // edge this row records (deco/view.h — main.cpp publishes the plan while the
     // cycle's edges are still staged in the ring, so an alarm-edge row cannot be

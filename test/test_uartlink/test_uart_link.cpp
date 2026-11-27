@@ -68,6 +68,8 @@ struct Hooks {
         bool hasPic = false;
         int16_t ceilingCm = 0;
         int16_t ndlMin = 0;
+        uint32_t pulsesNow = 0;   // the row's own window base (batch E)
+        uint32_t pulsesPrev = 0;
     };
     std::vector<SnapRec> snapRecs;
     // When true, the hook moves the bridge scalars after every row it is handed:
@@ -143,12 +145,16 @@ struct Fixture {
             r.hasPic = s.hasPic;
             r.ceilingCm = s.pic.ceilingCm;
             r.ndlMin = s.pic.ndlMin;
+            r.pulsesNow = s.pulsesNow;
+            r.pulsesPrev = s.pulsesPrev;
             g_fix->hooks.snapRecs.push_back(r);
             // Stand in for ControlTask integrating between the rows of one drain
             // batch. The capture the rows were built from must not move with it.
             if (g_fix->hooks.bumpBetweenRows) {
                 g_fix->tel.depthM += 1.0f;
                 g_fix->tel.shownPpo2 += 0.05f;
+                g_fix->tel.pulses += 2u;
+                g_fix->tel.pulsesWindow += 2u;
             }
         };
         h.appendEventNow = [](uint16_t id, uint16_t value, uint32_t tSec, void*) {
@@ -569,6 +575,8 @@ void test_one_drain_batch_reads_one_instant() {
     f.tel.depthM = 18.35f;
     f.tel.shownPpo2 = 0.712f;
     f.tel.diveStartMs = 5000u;
+    f.tel.pulses = 120u;
+    f.tel.pulsesWindow = 7u;
     f.hooks.bumpBetweenRows = true;
 
     f.events.beginTx();
@@ -602,11 +610,25 @@ void test_one_drain_batch_reads_one_instant() {
                                          which).c_str());
         TEST_ASSERT_EQUAL_INT16_MESSAGE(first.ndlMin, r.ndlMin,
                                         ("a row of one drain carries a different NDL" + which).c_str());
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(first.pulsesNow, r.pulsesNow,
+                                         ("a row of one drain captured a later pulse count: the "
+                                          "events of a batch were decided at one instant and "
+                                          "their injection window must say so" + which).c_str());
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(first.pulsesPrev, r.pulsesPrev,
+                                         ("a row of one drain moved the window base" + which).c_str());
     }
     // The row's seconds come from the CHAIN's dive start — the same base the E,
     // line beside it was counted from — not from the instant this task happened
     // to open the file. A pump at 8000 ms on a dive started at 5000 ms is t_s = 3.
     TEST_ASSERT_EQUAL_UINT32(5000u, first.diveStartMs);
+    // And the window is the published one, not a placeholder: total 120, seven
+    // since the last grid row. An event row whose base is not the grid's is the
+    // hard-zero bug wearing a real number, so both halves are pinned.
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(120u, first.pulsesNow,
+                                     "the row's pulse total is not what the control task published");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(113u, first.pulsesPrev,
+                                     "the row's window base is not total minus the published "
+                                     "window: the event row must subtract the grid row's base");
 }
 
 void test_a_capture_before_the_first_picture_says_there_is_no_picture() {

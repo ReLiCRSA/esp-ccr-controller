@@ -1065,14 +1065,18 @@ dive and was rewritten afterwards.
   file carries whatever offset the sensor and the assumed surface pressure leave
   behind — measured at **about 0.04 m** on the 2026-11-24 bench, with the checks
   here therefore running a ±0.5 m tolerance rather than a centimetre one.
-* **The `S,` row's `pulses` column is a window, and an event-driven row has no
-  window of its own** (stated 2026-11-27, because it is a column a client will
-  sum). A grid row's `pulses` is the injections since the previous grid row; an
-  event-driven row's is always `0` — the row marks a decision, not an interval,
-  and publishing a per-event window would move a byte on an existing column,
-  which is a protocol decision rather than a side effect. The dive's total is
-  `M,`'s `pulses`. Reading a `0` there as "nothing was injected at this moment"
-  is reading something the column never claimed.
+* **The `S,` row's `pulses` column is a window, and the two row kinds' windows
+  overlap** (restated 2026-11-27, batch E: an event-driven row now carries a
+  real window instead of `0`). A grid row's `pulses` is the injections since
+  the previous grid row. An event-driven row's `pulses` is the injections
+  since the previous **grid** row, sampled at the edge — the row marks a
+  decision and reports what had been injected up to that decision inside the
+  same interval. The two windows therefore cover overlapping spans: **do not
+  sum the column across both row kinds** — the grid row already contains the
+  event rows beside it. The dive's total is `M,`'s `pulses`. (Before this
+  decision event rows carried `0`, which invited exactly the misreading that
+  "nothing was injected at this moment"; a `0` there now genuinely means no
+  pulses since the last grid row.)
 * Event ids 7, 8, 11, 12, 13, 14 are reserved in the log format and **not
   published** (§4 table). Do not build notifications on them.
 * `PULSE` is **retired** (2026-11-26). A handset has no manual injection path:

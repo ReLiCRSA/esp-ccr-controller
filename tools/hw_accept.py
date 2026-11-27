@@ -1462,6 +1462,29 @@ def selftest_wifi():
     return checks
 
 
+def split_dive_rows(lines):
+    """`S,`/`E,` rows from a dive export, in file order.
+
+    The export writes the two kinds as separate `write()` batches, so a chunked
+    transport can tear a row at a batch boundary and pyserial hands back two
+    halves (`S,2,14.6,0.612,0.220,...` arriving as `S,2,14.6,0.6` + `12,...`).
+    Framing is graded separately and at length (run_framing); what this splitter
+    guarantees is that the row grader sees what the FILE holds: short fragments
+    are re-joined until each line starts with a row id. A row that never
+    completes stays its own line and fails its shape check — the honest verdict:
+    the file is corrupt, and no repair here may make that read as clean."""
+    out = []
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        if not out or t.split(",")[0] in ("S", "E", "M", "DIVE"):
+            out.append(t)
+        else:
+            out[-1] += t
+    return out
+
+
 def grade_dive_file(drows, want, wire=()):
     """Grade one exported dive against itself, and against the settings it claims.
 
@@ -1496,10 +1519,41 @@ def grade_dive_file(drows, want, wire=()):
     `DIVE END`) legitimately has no file row. Asserting equality in both
     directions would fail a dive that worked as designed.
     """
+    # Re-joined first: see split_dive_rows. Every count below is a count of
+    # what the FILE holds, not of what the transport happened to frame.
+    drows = split_dive_rows(drows)
     samp = [l for l in drows if l.startswith("S,")]
     ev = [l for l in drows if l.startswith("E,")]
     meta = next((l for l in drows if l.startswith("M,")), "")
     mf = meta.split(",")
+
+    # ---- the pulses column: every window must be real, and both row kinds
+    # must read one base (decision 2026-11-27, batch E: an event-driven `S,`
+    # row carries a real window now, where it used to be hard-wired to 0).
+    #
+    # Three claims, graded on the exported file:
+    #   * every `S,` row's window parses — a column the grader cannot read is a
+    #     column that moved without the format saying so;
+    #   * the file is not a wall of zeros beside a non-zero total. That is what
+    #     the export used to look like for its event rows: injections counted
+    #     for the grid rows, `0` published for the decisions in between;
+    #   * no window exceeds the dive's total. The two kinds' windows OVERLAP by
+    #     design (§9), so their SUM telling a bigger story than the total is not
+    #     evidence; one window larger than everything the dive injected is
+    #     arithmetic that cannot happen if both kinds subtract the same base.
+    def window(line):
+        """The `pulses` column of an `S,` row (§5: column 14, 1-based)."""
+        f = line.split(",")
+        try:
+            return int(f[13])
+        except (IndexError, ValueError):
+            return None
+
+    sw = [window(l) for l in samp]
+    good_sw = [w for w in sw if w is not None]
+    total = None
+    if len(mf) > 5 and mf[5].isdigit():
+        total = int(mf[5])
 
     def val(key):
         s = want.get(key, "")
@@ -1540,7 +1594,28 @@ def grade_dive_file(drows, want, wire=()):
     it = iter(ev)
     in_order = all(any(w == x for x in it) for w in wire)
 
+    # Event-driven rows split out by whether they sit beside an injection: an
+    # `E,` row inside a 30 s span that injected pulses must NOT read 0 (that is
+    # the placeholder shape the decision removed), and one inside a silent span
+    # legitimately does.
     checks = [
+        ("dive file: every S, row has a pulses column that parses",
+         len(good_sw) == len(samp),
+         f"{len(samp)} S, rows, {len(good_sw)} parsed — a window the grader "
+         f"cannot read is a column that moved without the format saying so"),
+        ("dive file: the pulses windows are not a wall of zeros beside a "
+         "non-zero total (the placeholder shape: the file counted injections "
+         "for some row kinds and hard-wired 0 for the others)",
+         not (total and total > 0 and good_sw and not any(good_sw)),
+         f"M, total {total}, S, windows {good_sw[:12]}"),
+        ("dive file: no row claims more injections in its window than the dive "
+         "injected in total (§9: the two row kinds' windows OVERLAP, so their "
+         "sum may exceed the total by design — but a window larger than the "
+         "total is arithmetic that cannot happen if both kinds read one base)",
+         total is not None and all(w <= total for w in good_sw),
+         f"windows {good_sw[:12]} vs M, total {total}"),
+    ]
+    checks += [
         ("dive file: the link saw the dive's verdict rows live, so the join "
          "below is not vacuous", bool(wire),
          "no E, row was captured while the dive was open. Every dive opens with "
@@ -1608,6 +1683,35 @@ def selftest_dive_file():
     def drop(prefix):
         return [l for l in DIVE_HONEST if not l.startswith(prefix)]
 
+    def zerod_pulses(rowline):
+        """Zero the `pulses` window of one `S,` row (§5 column 14)."""
+        f = rowline.split(",")
+        f[13] = "0"
+        return ",".join(f)
+
+    def set_pulses(rowline, v):
+        f = rowline.split(",")
+        f[13] = str(v)
+        return ",".join(f)
+
+    # An injecting dive: 20 grid-row windows of 7 (140 total) with an event row
+    # beside them. Real bench numbers from the 2026-11-27 acceptance run's dive
+    # (slot 1, `M,` total 140). This corpus exists because the honest dive above
+    # never injected, so it cannot witness the placeholder shape at all.
+    S_INJ = ("S,30,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,-1,0,7,1562,"
+             "2,0,0,0")
+    S_INJ2 = ("S,60,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,-1,0,9,1562,"
+              "2,0,0,0")
+    S_EV = ("S,41,0.04,0.214,0.213,0.214,0.214,0.400,0x0010,0,0,-1,0,3,1562,"
+            "2,0,0,0")     # event-driven: 3 of the 7 in this 30 s span
+    DIVE_INJECT = [
+        "DIVE,10,1795540808,3,3,2026-11-24T17:20:08Z",
+        "E,0,6,0", S_INJ,
+        "E,41,1,4", S_EV,
+        S_INJ2,
+        "M,60,4,0.213,0.214,16,0,3,2,30,85,0.400,0.550,1.000,1.300",
+    ]
+
     honest_m = DIVE_HONEST[-1].split(",")
 
     def meta(**over):
@@ -1648,6 +1752,16 @@ def selftest_dive_file():
         ("a dive that never voted publishes the sentinel as -32.768 bar",
          row(len(DIVE_HONEST) - 1, meta(min="0.000", max="-32.768")), DIVE_WANT,
          DIVE_HONEST_WIRE, "impossible ppO2"),
+        ("the placeholder shape: a dive that injected 16 pulses and every "
+         "window reads 0 — the file's event rows were hard-wired to 0 until the "
+         "2026-11-27 decision, and this is what that looked like",
+         [set_pulses(l, 0) if l.startswith("S,") else l for l in DIVE_INJECT],
+         DIVE_WANT, ["E,0,6,0", "E,41,1,4"], "wall of zeros"),
+        ("an event row's window reads 40 while the dive injected 16: the base "
+         "the event row subtracts is not the grid row's (one base, or the same "
+         "injections count twice)",
+         [set_pulses(l, 40) if l == S_EV else l for l in DIVE_INJECT],
+         DIVE_WANT, ["E,0,6,0", "E,41,1,4"], "injections in its window"),
         ("an S, row states NDL 999: neither a number the engine saturates at "
          "nor the named pair — the column invented one (N5's domain check)",
          row(2, DIVE_HONEST[2].replace(",0x0010,0,0,0,0,0,", ",0x0010,0,0,999,0,0,")),
@@ -3353,7 +3467,7 @@ def main() -> int:
                                   *selftest_density_lock(),
                                   *selftest_value_caps(),
                                   *selftest_dive_file(), *selftest_wifi_legs(),
-                                  *selftest_control_margin(),
+                                  *selftest_control_margin(), *selftest_stream(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1

@@ -992,9 +992,22 @@ static void controlTask(void*) {
         // chain) files the same fact the 30 s grid row does. Nothing on the wire
         // reads this: `T,` FLAGS and the router answers stay on alarmBits, because
         // an ACK has to silence those.
+        // Publisher bookkeeping, hoisted above the scalar publication because
+        // `pulsesWindow` below is the count SINCE the previous grid row and
+        // must not move the base — the grid block further down is the only
+        // place lastPulseBase advances.
+        static bool prevDive = false;
+        static bridge::PublisherState pub;
+        static uint32_t diveStartMs = 0, lastSnapMs = 0, lastPulseBase = 0;
+
         g_bridgeTel.alarmLogBits = st.alarms.logBits;
         g_bridgeTel.voteMode = static_cast<uint8_t>(st.vote.mode);
         g_bridgeTel.pulses = g_loop->pulseCount();
+        // The event-row pulses window: count since the previous grid row, raw
+        // and unsigned (rowfill narrows with saturation, the same helper the
+        // grid row's own window goes through — the two kinds of row cannot
+        // disagree about arithmetic because there is no second one).
+        g_bridgeTel.pulsesWindow = g_bridgeTel.pulses - lastPulseBase;
         g_bridgeTel.solenoid = st.solenoid;
         g_bridgeTel.haveVote = st.haveVote;
         for (int i = 0; i < 3; i++) g_bridgeTel.cellBar[i] = sd.cells[i];
@@ -1025,10 +1038,8 @@ static void controlTask(void*) {
 
         // Dive edges, in the chain's own clock: publisher bookkeeping, totals
         // and the snapshot grid all restart with the dive (the handset/web
-        // command task opens and closes the actual file).
-        static bool prevDive = false;
-        static bridge::PublisherState pub;
-        static uint32_t diveStartMs = 0, lastSnapMs = 0, lastPulseBase = 0;
+        // command task opens and closes the actual file). The statics live at
+        // the top of the cycle now (the scalar publication reads them).
         if (st.diveActive && !prevDive) {
             pub = bridge::PublisherState{};
             g_bridgeTotals = bridge::DiveTotals{};

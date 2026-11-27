@@ -1805,6 +1805,22 @@ That is a decision: a graded mock wire line that shows a refusal cannot be mista
 promise. Implementing the sequencer is a feature decision, open as §1 P6, and whichever way
 it goes, `test_designwire` has to change with it.
 
+### 4.7 Human-readable labels in the web Settings page — investigated, **not doing it**
+
+Asked and answered on 2026-11-27 without touching a file: the page's field label is the
+wire key itself (`lab.innerHTML = key + …`, `data/index.html:467`), so all 36 settings keys
+reach the diver as `GF_LOW`, `D1`, `SP_HYST`, `CELLPROOF_MAXSP` with unitless range lines.
+Renaming keys is not available anyway — they are NVS keys under a hard 15-char limit, the
+wire keys on `SET`/`GET` and in the `K,` schema, and what the dive file's clamp rows and the
+console use — so it would have been a display-side map: ~2 KB over a 38,525 B page against
+273 KB of free flash, no RAM, no protocol change, with `tools/sync_webdata.py` plus
+`web_probe.py`'s page graders as the gate.
+
+**Decision: not doing it.** Recorded so it is not re-proposed from the observation alone.
+The keys stay as they are on screen — which is defensible on its own terms: they are the
+same strings a diver meets in a toast, in an `E,` clamp row, on the console and in the spec,
+so the UI currently names things the way every other surface does.
+
 ---
 
 ## 5. Corrections: claims that did not survive checking

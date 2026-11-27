@@ -190,6 +190,15 @@ strong reading:
 | xtensa, `env:esp32`, real ELF | `publishView` 3 `memw`, `viewSnapshot` 5 | (not buildable — that is the point) |
 | x86-64 host, `env:native_o2`, `-O0` and `-O2` | 874/874 | **874/874 green at both optimisations with both fences commented out** |
 
+Neither half is inherited. Re-witnessed on 2026-11-27, on the tree this file describes:
+commenting out both fences in `src/deco/view.h` gives **874/874 green at `-O0` and at
+`-O2`**; restoring them leaves an empty `git diff` and 437/437 again. The target half was
+re-run the same day — `tools/fence_probe_report.py` rebuilt `tools/fence_probe.cpp` with
+the shipping xtensa toolchain and regenerated `logs/m4_fence_probe_20261127_disasm.txt`
+against an ELF from this tree (sha256 `63e3e0ec…`): probe publish 3 `memw` with the release
+fence and 2 without, probe read 4 with the acquire fence and 3 without, shipped
+`publishView` 3, shipped `viewSnapshot` 5.
+
 So they are one real instruction each on the target (which kills the "zero cost"
 argument) and invisible to every test we run (which kills the "they must be load-bearing,
 the suite is green with them" argument). Nobody has demonstrated a payload/sequence

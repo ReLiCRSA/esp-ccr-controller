@@ -108,11 +108,18 @@ A 10 k bottom leg to ground would hold a floating pin near 0 V and stable; 1.56�
 drifting everywhere is a floating input. Today is the first time anything has been
 driven onto that net.
 
-Why it matters, in code: `control/alarms.cpp` asks only `vbat < vbatMin`; `predive.cpp`'s
-BATTERY step asks only `vbat >= vbatMin`; `main.cpp` stores whatever number arrives into
-the dive snapshot. So the pinned pad produced `batlow=0`, **passed the dive-blocking
-battery step on a 5 V feed**, and would have stored 34.71 V as that dive's pack voltage.
-`stale=` covers the I2C sensors and never the battery ADC. A saturated sense input and a
+Why it matters — the three places that consume it, each with the whole test it makes:
+
+| site | the entire test it makes on `vbat` |
+|---|---|
+| `src/control/alarms.cpp:99` | `evaluate(BIT_BATTERY, in.vbat < cfg_.vbatMin, …)` — nothing else |
+| `src/control/predive.cpp:153` | `if (in.vbat >= cfg_.vbatMin) { advance(S_BATTERY); }` — the dive-blocking gate |
+| `src/main.cpp:873` | `sd.vbat = g_battery.volts();` — straight into the dive snapshot, and from there to `T,` (`:988`) and the dive row (`:1301`) |
+
+So the pinned pad produced `batlow=0`, **passed the dive-blocking battery step on a 5 V
+feed**, and would have stored 34.71 V as that dive's pack voltage. `stale=` is
+`g_ads.anyStale(now)` (`main.cpp:393`) — the cell ADC — and says nothing about the battery
+ADC, so `batlow=` is the only battery verdict the heartbeat carries. A saturated sense input and a
 healthy pack are indistinguishable to this firmware — the same class of fault this repo
 keeps meeting, a number that cannot be believed entering a safety decision unmarked.
 
@@ -136,8 +143,10 @@ number that is not a measurement, and on a 5 V supply the valve may not open.
 
 The handset half of this is closed (Round E item 3): `LOG EXPORT`
 is refused mid-dive, witnessed on metal both ways. `/dive/N.csv` deliberately still reads
-the flash during a dive and **has never been measured** — batch D's storm was run at the
-surface, where `worst=` peaked at 8–9 ms.
+the flash during a dive and **has never been measured in a dive** — every storm this repo
+has (`tools/web_storm.py`, 4/8/16/24 clients, BENCH.md's table) ran at the surface, where
+the control cycle held at 4–9 ms. The highest `worst=` anywhere in the repo's logs is
+**505 ms**, also at the surface and from a different cause (P3).
 
 **To close it:** the same harness with a dive running, and a `worst=` number to compare
 with the 1500 ms budget and the 3011–3061 ms expiry. Decide from the number: lock the web
@@ -146,11 +155,23 @@ export too, or document the margin.
 
 ### P3 — nothing stress-tests the control cycle toward the watchdog
 
-Batch D measured the detector (trip 3011–3061 ms, `CONFIG_ESP_TASK_WDT_TIMEOUT_MS=3000`,
-CPU0 idle monitored, `CONFIG_ESP_TASK_WDT_INIT` confirmed phantom — Round A's M-2, measured in Round D item 1). What
-has not been done is driving the control cycle *toward* that number on purpose: `worst=`
-is graded at 800 ms, the supervisor's budget is 1500 ms, and every measured `worst=` sits
-at 4–9 ms. So the detector's trip time is known and the headroom is not.
+Round D measured the detector. `esp_task_wdt_init(3, true)` at `src/main.cpp:1627` asks
+for 3000 ms and the measured expiry is **3011–3061 ms** (3061/3011 with SensorTask
+subscribed alone, 3059/3019 with all four — `logs/twdt_measure_1.log`,
+`twdt_measure_2.log`, `twdt_mask_1.log`). The SDK's own `CONFIG_ESP_TASK_WDT_TIMEOUT_S 5`
+decides nothing, because nothing in the linked image initialises the watchdog before that
+call, and `CONFIG_ESP_TASK_WDT_INIT` is a macro this SDK never reads. And it **subscribes
+no idle task at all** — the review's premise that a hogged core trips the watchdog through
+a CPU0 idle subscription describes machinery this build does not run, so the watchdog
+watches exactly the tasks that register.
+
+What has not been done is driving the control cycle *toward* that number on purpose.
+`worst=` is graded at 800 ms and the supervisor reboots at `TASK_STALL_CONTROL_MS = 1500`
+ms (`src/main.cpp:1373`). Across the 639 `worst=` samples this repo keeps, the maximum is
+**505 ms** — a `CAL AIR` leg, `logs/accept_20261127_122109_watch.log`; the previous
+maximum was 457 ms — and quiet benches beat at 4–300 ms while the storm configurations sit
+at 4–9 ms. So the trip time is known, the largest cycle ever observed is known, and the
+gap between them has never been pushed on purpose.
 
 **To close it:** a bench leg that lengthens the control cycle deliberately (a flash storm
 during a dive is the obvious lever, which is also P2) and reports `worst=` against the
@@ -159,13 +180,15 @@ during a dive is the obvious lever, which is also P2) and reports `worst=` again
 
 ### P4 — m-4: the fences are measured, and still unjustified
 
-The seqlock's `__atomic_thread_fence(release/acquire)` (MbedTLS-style pairing). Batch E
-measured both ends (Round E item 5) and neither end supports the strong reading:
+The seqlock's two fences — `std::atomic_thread_fence(std::memory_order_release)` in
+`publishView` (`src/deco/view.h:155`) and `…_acquire` in `viewSnapshot` (`:172`), the
+MbedTLS-style pairing. Round E item 5 measured both ends and neither end supports the
+strong reading:
 
 | platform | fences in | fences out |
 |---|---|---|
 | xtensa, `env:esp32`, real ELF | `publishView` 3 `memw`, `viewSnapshot` 5 | (not buildable — that is the point) |
-| x86-64 host, `env:native_o2`, `-O0` and `-O2` | 874/874 | **874/874 green both optimisations, all four fences deleted** |
+| x86-64 host, `env:native_o2`, `-O0` and `-O2` | 874/874 | **874/874 green at both optimisations with both fences commented out** |
 
 So they are one real instruction each on the target (which kills the "zero cost"
 argument) and invisible to every test we run (which kills the "they must be load-bearing,
@@ -221,9 +244,15 @@ These need hands and parts, not code. They are listed here so they cannot be los
 * The battery divider (§1 P1 has the procedure).
 * Mechanical O₂ inhibit, with the board actually injecting.
 * Solenoid driver fails-closed rig.
-* The handset UI itself: the design sheet is a handoff, and the example handset board has
-  never been flashed. The firmware's side of the protocol is complete and graded; the
-  handset's side of the §12 handshake is not.
+* The handset's screen. `handset/example_esp32_handset/` is complete working firmware —
+  buttons, buzzer, link-loss alarm — and deliberately has **no display**: it prints its
+  readout to its own USB serial and tells the integrator to swap `draw()` for a real one.
+  The 320 × 172 OLED UI in `design/handset-screen/` therefore has no implementation, and
+  the design sheet is a handoff. The board has also never been flashed, so the §12
+  handshake is graded only by `test_handset`'s conformance suite, never on metal.
+* One C3-b leg is stale rather than unfinished: it cross-checks depth "vs BMP085 on the
+  same standpipe", and the BMP085 was removed from the rig on 2026-11-23 for never ACKing
+  (PLAN.md). Retire or re-point that leg; do not tick it.
 
 **To close them:** BENCH.md's C3 checklist, one leg at a time, each with a measured
 number in the log rather than a tick.
@@ -232,17 +261,22 @@ number in the log rather than a tick.
 ### P8 — the config box's 284-byte payload
 
 Batch C's open item. Round E item 7 measured it and deliberately left it **not done**,
-decision recorded there. `sizeof(ctrl::Config) = 284`; the naive box costs ~1.1 KB against
-327 KB of free DRAM and ~0 against flash, so the original "may be a few hundred bytes"
-worry was a guess in the right direction. The cost is reviewability, not size: the box has
-to cover the union of what `GET SETTINGS`, `GET CONFIG` and the handset can change, or it
-becomes the same silent gap batch A's M-3 closed — one surface showing a value another
-surface has changed. The field lists and three implementation shapes are recorded in
-Round E item 7, with a recommendation.
+decision recorded there. `sizeof(ctrl::Config) = 284`, published as it is; the cost today
+is one published copy (284 B) plus three per-task snapshots (852 B) ≈ **1.1 KB of 327 KB**
+DRAM and ~0 flash, and `stk=` is unaffected because those copies have been statics since
+Round C's copy-placement finding. Narrowing the three snapshots would recover roughly 850 B
+— and only the snapshots: the writer path (`hookSettings` → `applySettings` →
+`configPublish`) reads carried fields it never writes, so a narrow *published* payload
+breaks it. That is why the cost is reviewability rather than size: a narrow `Applied`
+struct re-lists fields, and a field a later reader wants then needs a new publish path.
+Round E item 7 records the measured per-reader field lists and three shapes.
 
-**To close it:** pick a shape, and anchor it with a host test comparing the box's decoded
-fields against the live registry, the way `test_cfgparity` already does for the other two
-surfaces.
+**To close it:** pick a shape, and anchor it the way the existing anchors do —
+`test_configbox`'s `test_no_task_reads_the_old_global` and
+`test_only_the_boot_and_the_settings_path_publish` keep the publish/read sites honest, and
+`test_settings`'s `test_every_key_reaches_its_own_declared_bounds` is what keeps a key from
+drifting out of the box's coverage. A narrower snapshot needs a test that fails when a
+consumer reads a field the snapshot no longer carries.
 
 
 ---
@@ -258,13 +292,13 @@ column: **§A … §E are the five round sections in §3**, and §D1 means Round
 
 | finding | what it was | status | resolution | section |
 |---|---|---|---|---|
-| **M-2** | the task watchdog was never initialised; "3 s" was a fiction | **closed** | explicit `esp_task_wdt_init(3u, true)` + `esp_task_wdt_reconfigure()`; the Kconfig symbol is a confirmed phantom (§5), and the 3 s is now a measured 3011–3061 ms | §A, §D1 |
+| **M-2** | the task watchdog was never initialised; "3 s" was a fiction | **closed** | one `esp_task_wdt_init(3, true)` in `setup()` (`src/main.cpp:1627`), its result checked and announced on failure; nothing in the linked image initialises the TWDT earlier, and it subscribes no idle task; the 3 s is now a measured 3011–3061 ms | §A, §D1 |
 | **M-3** | the FLAGS byte dropped `CNS_HIGH` in **both** duplicate mappings under a comment claiming the aggregate covered it; and bit 6 was labelled `SENSOR` on a cell-proof failure | **closed** | one projection — `comms::flagsFromAlarmWord` in `src/comms/flags.h` — called by both transports, CNS appended as bit 7 with no renumbering; `test/test_flaglabels` grades all four vocabularies against each other | §A, §D2 |
 | **m-1** | two 32-bit wrap bugs whose failure direction was a *lie*, not a hazard: the injector duty window, and the warm-up gate's deadline | **closed** (the gate's fix was itself wrong — §5) | wrap-safe signed comparison, native test with the sign pinned by mutation; the gate's logic now lives in `util::WarmupGate`, host-tested | §A, §E4 |
 | **m-2** | values legal per key that were inverted *together*, silently — `GF_LOW=90`+`GF_HIGH=50`, `D1=40`+`D2=15` | **closed** | ordered/clamped in `settings_apply.cpp` with per-pair result bits visible on the console; host-tested | §A |
 | **m-4** | the published deco view had no ordering guarantee between payload and sequence number | **fix verified live; necessity open (§1 P4)** | seqlock with fences; the torn read is witnessed on metal; the fences are 1 `memw` each on xtensa (measured) and invisible on x86 (measured) | §A, §B1, §D1, §E5 |
 | **N1** | the freshness rule was stated in `deco/view.h` and broken by the order of two statements | **closed** | the event ring is staged and committed atomically at the tick's end; a native test proves an event cannot be read against a plan it was not computed from | §B1 |
-| **N1, the row beside it** | an event-driven dive row's picture could come from a different cycle than its own fields | **closed** (a second bug in this same code found in E) | `eventInstant` / `commitEvents` / `abortEvents`, one instant per drain batch | §B2, §E1 |
+| **N1, the row beside it** | an event-driven dive row's picture could come from a different cycle than its own fields | **closed** (a second bug in this same code found in E) | `EventRing::beginTx()`/`commitTx()` staging, and `bridge::EdgeSnap` + `bridge::captureEdge` taken before the first row of a drain, handed to `Hooks::appendSnapNow` — one instant per drain batch | §B2, §E1 |
 | **"a value out of range reads as *no obligation*"** | int16/uint16 narrowings that wrapped | **closed** | narrowing saturates at every site that feeds a decision, each with a host test; `ndl` is `-1` on the only rows that have no picture | §B3, §B4 |
 | `g_ctrlCfg` double-buffering (batch B's open item 2) | `postConfig()` copied a struct while ControlTask read it | **closed** | the applied rules are one generation — `src/control/configbox.h`, a per-reader private copy, and a third publisher refused with the skew printed on HB | §C, §D4 |
 | the 3 s trip time was unmeasured (batch B open 1) | a detector whose trip time nobody knew | **closed as a measurement** (headroom open, §1 P3) | measured 3011–3061 ms on metal, CPU0 idle monitored; the mechanism the review proposed was wrong (§5) | §D1 |
@@ -1773,11 +1807,12 @@ who has to catch the next one.
 | claim, where it was written | what checking found | where the correction lives |
 |---|---|---|
 | "the watchdog trips at 3 s; `-DCONFIG_ESP_TASK_WDT_INIT=0` avoids double-init" (the review's fix for M-2) | `CONFIG_ESP_TASK_WDT_INIT` is a **phantom on this toolchain** — no such symbol in the SDK the `env:esp32` build compiles against, so the flag would have done nothing. The init is explicit in code instead | Round A M-2 |
-| "3 s is now real… the trip is not measured on hardware" (Round A residual 1) | still unmeasured a day later, and measured after that: **3011–3061 ms** with `CONFIG_ESP_TASK_WDT_TIMEOUT_MS=3000`; and the mechanism the review assumed (a subscribed idle task on both cores) is not what this build does | Round D item 1 |
+| "3 s is now real… the trip is not measured on hardware" (Round A residual 1) | still unmeasured a day later, and measured after that: **3011–3061 ms** against the 3000 ms asked for by `esp_task_wdt_init(3, true)` (`CONFIG_ESP_TASK_WDT_TIMEOUT_MS` is not even this SDK's symbol — it uses `CONFIG_ESP_TASK_WDT_TIMEOUT_S 5`, which decides nothing here); and the mechanism the review assumed is not just wrong in detail, it is absent: `esp_task_wdt_init` in this build subscribes **no idle task at all** | Round D item 1 |
 | "the warm-up extraction was implemented but did not survive concurrent edits" (Round A residual 4) | the code **was** on disk, and its arithmetic wrapped: a signed `120000 - millis()` turns positive past ~24.9 days, so the gate refused calibration forever and printed an unrelated countdown. Wrong once in the review's framing, wrong twice in the fix | Round E item 4 |
 | "nothing tests that the doc table and the JS array agree" (Round A residual 5, repeated verbatim into Round E's open list) | false when Round E wrote it: Round D had landed `test/test_flaglabels`, which parses `comms/flags.h`, `FLAGNAMES` in `src/comms/web_page.h`, the flashed `data/index.html` **and** §4's table in `docs/HANDSET_PROTOCOL.md`, asserting §4 publishes exactly bits 0..7 in order with each pill's keyword. Batch D's mutation table shows shortening §4's bit-3 row reddens it | Round E item 1's follow-up; commit `b9922fd` |
-| "the fences are compiler-level guarantees, unobservable natively; only an ARM compiler at `-O2` could show the difference" (Round A residual 3) | the honest version is narrower and worse: an `env:native_o2` gate on **x86-64** shows **874/874 green with all four fences deleted**, at `-O0` and `-O2`. So this host cannot witness them at all; on the target each fence is one `memw` | Round E item 5, `tools/fence_probe.cpp` |
+| "the fences are compiler-level guarantees, unobservable natively; only an ARM compiler at `-O2` could show the difference" (Round A residual 3) | the honest version is narrower and worse: an `env:native_o2` gate on **x86-64** shows **874/874 green with both fences commented out**, at `-O0` and `-O2`. So this host cannot witness them at all; on the target each fence is one `memw` | Round E item 5, `tools/fence_probe.cpp` |
 | "`vbat` is a pack voltage; `batlow=0` means the pack is above `vbatMin`" (implicit in the alarms, predive and the dive snapshot) | the bench drove the sense pad to its clamp and `vbat=34.71` **cleared the dive-blocking battery step on a 5 V feed**. No upper bound or validity check exists anywhere in `src/ include/ test/` | §1 P1, open |
+| six citations **this file itself** carried when the five documents were merged — `esp_task_wdt_reconfigure()`, `eventInstant`/`commitEvents`/`abortEvents`, `test_cfgparity`, `__atomic_thread_fence`, "all four fences deleted", and `CONFIG_ESP_TASK_WDT_TIMEOUT_MS=3000` — plus two numbers, "every measured `worst=` sits at 4–9 ms" and "CPU0 idle monitored" (2026-11-27, the audit run after the merge) | none of those identifiers exist in this tree: the real call is `esp_task_wdt_init(3, true)`, the staging pair is `beginTx()`/`commitTx()`, the fences are `std::atomic_thread_fence` and `src/deco/view.h` has **two**, and the parity anchors are in `test_configbox` and `test_settings`. "4–9 ms" described only the storm runs: the repo's 639 `worst=` samples peak at **505 ms**. And "CPU0 idle monitored" repeated, in the very section about verifying claims, the exact premise Round D had disproved. All corrected in place. The finding for the reader: a citation copied out of a summary is not a citation — **grep the identifier before you put it in a sentence** | §1 and §2 as they now stand |
 | a dive-file grader that printed **PASS** while the file contained `M,` total 0, and a pulse witness that would have reported a PASS on a dive that injected nothing | both now say so: `tools/hw_accept.py` prints a vacuity note when the total is 0, and `tools/pulse_witness.py` exits **2** rather than print a vacuous PASS. A check that cannot witness anything must say so | Round E item 2's follow-up |
 
 ---

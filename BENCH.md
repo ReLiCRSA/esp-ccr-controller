@@ -310,7 +310,9 @@ than argued: the quantity the watchdog measures never moved by even a factor of 
 The **client-side** counts are a different story and are not credited to the
 controller: at the same 8-client setting, one pass answered 101 requests (60×200,
 23×404, 10×503, 8×302, 636 KB) and the next pass answered none with 38 connects
-timing out. That spread is larger than any effect the board could have, so on this
+timing out. The logs kept in `logs/` are the SECOND pass — the sweep overwrites its
+own filenames — so the 101-request pass is quoted here as an observation, and the
+files show the silent one. That spread is larger than any effect the board could have, so on this
 bench the HTTP failure rate measures the 2.4 GHz link and the PC's own association
 as much as the server — an earlier run caught NetworkManager keeping
 `ESP-CCR-3828` "activated" while ARP for 192.168.4.1 was `INCOMPLETE`. The tool

@@ -2343,7 +2343,7 @@ def run_cal_air(console, port, baud, watch, settle=1.5, log=None,
         ok = code == 2
         checks.append(("the verdict is CALAIR_OK with numbers, not a bare code", ok,
                        f"answer: {verdict}" + ("" if ok else
-                       " — the cells did not settle in the spread band on this bench "
+                       " — no cell window stayed inside its stability band on this bench "
                        "(code 5) or aborted: a real bench condition, not a harness fault")
                        if not ok else verdict))
         if ok:

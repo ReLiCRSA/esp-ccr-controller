@@ -107,7 +107,7 @@ struct AirCalInput {
 enum class AirCalWhy : uint8_t {
     NONE = 0,
     DIVING = 1,       // a dive started; CAL AIR is a pre-dive act
-    UNSETTLED = 2,    // never stayed inside the spread band before the timeout
+    UNSETTLED = 2,    // no window stayed inside its stability band before the timeout
     NOCELLS = 3,      // present mask empty: nothing to average
 };
 

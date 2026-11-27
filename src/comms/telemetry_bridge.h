@@ -80,7 +80,7 @@ enum CalAirCode : uint8_t {
     CALAIR_OK = 2,         // air point committed for every fitted cell
     CALAIR_WARMUP = 3,     // refused: cells still polarising (warmupLeftS)
     CALAIR_DIVING = 4,     // aborted: a dive started (CAL AIR is a pre-dive act)
-    CALAIR_UNSETTLED = 5,  // failed: never stayed inside the spread band
+    CALAIR_UNSETTLED = 5,  // failed: no window stayed inside its stability band
     CALAIR_NOCELLS = 6,    // failed: no fitted cells to sample
 };
 

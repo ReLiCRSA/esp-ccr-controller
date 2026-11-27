@@ -114,7 +114,7 @@ AirCalOutput AirCal::update(const AirCalInput& in) {
         st_ = St::IDLE;
         o.running = false;
         o.failed = true;
-        o.why = "timeout: cells never settled in the spread band";
+        o.why = "timeout: no cell window stayed inside its stability band";
         o.whyCode = AirCalWhy::UNSETTLED;
         return o;
     }

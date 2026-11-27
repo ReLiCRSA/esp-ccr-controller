@@ -397,7 +397,7 @@ function state(){
 }
 var CALAIRW=["no calibration since power-up","sampling","calibrated",
              "refused: cells still warming up","aborted: a dive started",
-             "failed: cells never settled inside the spread band","failed: no cells fitted"];
+             "failed: no window stayed inside its stability band","failed: no cells fitted"];
 var PRESTEPW=["warm-up","air","solenoid","depth","battery"];
 function check(){
   if(!PRE) { $("pre").innerHTML='<span class="hint">no check data yet</span>'; return; }

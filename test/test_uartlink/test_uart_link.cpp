@@ -340,6 +340,98 @@ void test_cns_high_gets_its_own_flag_bit_and_stays_out_of_the_fault_aggregate() 
     TEST_ASSERT_EQUAL_UINT32(0xC0u, flagsOf(1500));
 }
 
+// The case above grades CNS. This grades the WHOLE projection, one alarm bit at a
+// time, for two reasons the single-bit cases cannot cover.
+//
+// First: coverage. The FLAGS byte has eight published bits (§4) and the page has
+// eight pills, and a projection that quietly stops naming one of them leaves a
+// pill on the web page that can never light — a fault the diver is told about and
+// never sees, which reads as "the machine never noticed". Every bit 0..7 must be
+// reachable from some input, so each one is asserted here by name.
+//
+// Second: exactly one bit per condition. A condition that sets two bits makes two
+// pills light and the diver acts on the wrong fault; a condition that sets none
+// hides a fault behind a pill the page still lists. `isPowerOfTwo` plus the
+// expected value is what pins that — the expected value also pins WHICH bit,
+// because a projection that moves LOW_PPO2 from bit 0 to bit 4 is a protocol
+// break the field count cannot see.
+void test_every_published_flag_bit_is_reachable_and_names_exactly_one_fault() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+    f.tel.depthM = 18.0f;
+    f.tel.shownPpo2 = 0.70f;
+    for (int i = 0; i < 3; i++) f.tel.cellBar[i] = 0.70f;
+    f.tel.setpointBar = 0.70f;
+    f.tel.vbat = 12.4f;
+    f.tel.haveVote = true;
+    f.tel.autoMode = true;
+    f.tel.cpState = static_cast<uint8_t>(cellproof::State::PASS);
+
+    auto flagsOf = [&](uint32_t tMs) {
+        out.clear();
+        f.pump(tMs);
+        for (const auto& l : out) {
+            const size_t p = l.find("FLAGS0x");
+            if (l.compare(0, 2, "T,") == 0 && p != std::string::npos)
+                return static_cast<uint32_t>(std::strtoul(l.c_str() + p + 7, nullptr, 16));
+        }
+        TEST_FAIL_MESSAGE("no T, line with a FLAGS field");
+        return 0u;
+    };
+
+    struct Case {
+        const char* name;    // the controller's own word, not a nickname
+        uint16_t alarmBit;   // bit index in the 10-bit alarm word
+        uint32_t want;       // the one FLAGS bit §4 publishes it as
+    };
+    const Case cases[] = {
+        {"LOW_PPO2",     alarms::BIT_LOW_PPO2,     1u << 0},
+        {"HIGH_PPO2",    alarms::BIT_HIGH_PPO2,    1u << 1},
+        {"CELL_DRIFT",   alarms::BIT_CELL_DRIFT,   1u << 2},
+        {"SENSOR_FAIL",  alarms::BIT_SENSOR_FAIL,  1u << 3},
+        {"SENSOR_STALE", alarms::BIT_SENSOR_STALE, 1u << 3},
+        {"STUCK_OPEN",   alarms::BIT_STUCK_OPEN,   1u << 3},
+        {"HYPOXIA",      alarms::BIT_HYPOXIA,      1u << 3},
+        {"BATTERY",      alarms::BIT_BATTERY,      1u << 4},
+        {"SP_CLAMP",     alarms::BIT_SP_CLAMP,     1u << 5},
+        {"CNS_HIGH",     alarms::BIT_CNS_HIGH,     1u << 7},
+    };
+    uint32_t reach = 0;
+    uint32_t tMs = 1000;
+    for (const Case& c : cases) {
+        f.tel.alarmBits = 1u << c.alarmBit;
+        f.tel.cpState = static_cast<uint8_t>(cellproof::State::PASS);
+        const uint32_t f_ = flagsOf(tMs += 500);
+        TEST_ASSERT_TRUE_MESSAGE((f_ & (f_ - 1)) == 0 && f_ != 0,
+                                 (std::string(c.name) +
+                                  " projected to something other than exactly one FLAGS bit").c_str());
+        TEST_ASSERT_EQUAL_UINT32_MESSAGE(c.want, f_,
+                                         (std::string(c.name) + " projects to the wrong FLAGS bit: "
+                                          "a pill would name the wrong fault, or the old fault").c_str());
+        reach |= f_;
+    }
+
+    // Bit 6 is not an alarm bit at all — it is the cell-proof state — so it has to
+    // be reached through its own input. If it were only reachable as an alarm bit,
+    // the pill would never light on the rig where cell proof actually fails.
+    f.tel.alarmBits = 0;
+    f.tel.cpState = static_cast<uint8_t>(cellproof::State::FAIL);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(1u << 6, flagsOf(tMs += 500),
+                                     "cell proof FAIL does not reach FLAGS bit 6");
+    reach |= 1u << 6;
+
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0xFFu, reach,
+                                     "a published FLAGS bit is unreachable on the wire: the page has a "
+                                     "pill for it that can never light");
+
+    // And nothing outside the published byte may be invented.
+    f.tel.alarmBits = 0xFFFFu;
+    f.tel.cpState = static_cast<uint8_t>(cellproof::State::FAIL);
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0xFFu, flagsOf(tMs += 500),
+                                     "the projection set a bit outside the byte §4 publishes");
+}
+
 void test_events_reach_the_wire_and_snapshot_the_log() {
     std::vector<std::string> out;
     g_out = &out;
@@ -1083,6 +1175,7 @@ int main() {
     RUN_TEST(test_command_replies_and_hooks_fire);
     RUN_TEST(test_periodic_lines_keep_their_cadence);
     RUN_TEST(test_cns_high_gets_its_own_flag_bit_and_stays_out_of_the_fault_aggregate);
+    RUN_TEST(test_every_published_flag_bit_is_reachable_and_names_exactly_one_fault);
     RUN_TEST(test_events_reach_the_wire_and_snapshot_the_log);
     RUN_TEST(test_event_rows_are_written_into_the_dive_file_beside_their_snapshot);
     RUN_TEST(test_a_staged_batch_is_invisible_until_it_is_committed);

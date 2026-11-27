@@ -8,6 +8,7 @@
 // ============================================================================
 #include "cmd_router.h"
 
+#include "comms/flags.h"
 #include "util/numfmt.h"
 
 #include <cstdio>
@@ -167,30 +168,14 @@ proto::DecoInfo CommandRouter::decoInfoOf(const deco::View& v) {
     return d;
 }
 
-// The protocol flags byte is 8 bits. Alarm bits 3/6/7/9 (sensor fail, stuck
-// open, sensor stale, hypoxia) are reported as one SENSOR bit rather than
-// dropped silently — from a handset's point of view they are all "the loop is
-// not telling you what you need, act". CNS_HIGH is NOT in that aggregate and
-// never was meant to be: it is an oxygen budget, not a sensor fault, and until
-// 2026-11-27 this function silently discarded it while its own comment claimed
-// the aggregate covered it. It gets the free bit 7 instead (see UartLink::emitT
-// for the same reasoning on the other transport — the two mappings are
-// duplicates and must stay equal, so both carry the bit). Append-only: bits
-// 0..6 keep their published meanings, bit 7 is newly named, no renumbering.
+// The flags byte is one projection for both transports (comms/flags.h): the
+// pushed `T,` stream and this `GET T` / web path must not be two mappings of one
+// word that someone has to remember to edit twice. The reasoning — why alarm bits
+// 3/6/7/9 collapse into one SENSOR bit, and why CNS is NOT in that aggregate and
+// got bit 7 instead — is written once, there.
 static uint8_t telemetryFlags(const ctrl::Loop& loop) {
-    const uint16_t a = loop.alarmBits();
-    uint8_t f = 0;
-    if (a & (1u << alarms::BIT_LOW_PPO2))    f |= 1 << 0;
-    if (a & (1u << alarms::BIT_HIGH_PPO2))   f |= 1 << 1;
-    if (a & (1u << alarms::BIT_CELL_DRIFT))  f |= 1 << 2;
-    if (a & ((1u << alarms::BIT_SENSOR_FAIL) | (1u << alarms::BIT_SENSOR_STALE) |
-             (1u << alarms::BIT_STUCK_OPEN) | (1u << alarms::BIT_HYPOXIA)))
-        f |= 1 << 3;
-    if (a & (1u << alarms::BIT_BATTERY))     f |= 1 << 4;
-    if (a & (1u << alarms::BIT_SP_CLAMP))    f |= 1 << 5;
-    if (loop.cellproof().state == cellproof::State::FAIL) f |= 1 << 6;
-    if (a & (1u << alarms::BIT_CNS_HIGH))    f |= 1 << 7;
-    return f;
+    return flagsFromAlarmWord(loop.alarmBits(),
+                              loop.cellproof().state == cellproof::State::FAIL);
 }
 
 // ---- wifi / dive lifecycle ---------------------------------------------------

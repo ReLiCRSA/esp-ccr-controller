@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "comms/flags.h"
 #include "util/wdtfeed.h"
 
 namespace comms {
@@ -129,31 +130,13 @@ void UartLink::emitT(Sink sink, void* ctx) {
     t.setpoint = tel_.setpointBar;
     t.battV = tel_.vbat;
     t.mode = tel_.diveActive ? (tel_.autoMode ? 1 : 2) : 0;
-    uint16_t a = tel_.alarmBits;
-    uint8_t f = 0;
-    if (a & (1u << alarms::BIT_LOW_PPO2))   f |= 1 << 0;
-    if (a & (1u << alarms::BIT_HIGH_PPO2))  f |= 1 << 1;
-    if (a & (1u << alarms::BIT_CELL_DRIFT)) f |= 1 << 2;
-    if (a & ((1u << alarms::BIT_SENSOR_FAIL) | (1u << alarms::BIT_SENSOR_STALE) |
-             (1u << alarms::BIT_STUCK_OPEN) | (1u << alarms::BIT_HYPOXIA)))
-        f |= 1 << 3;
-    if (a & (1u << alarms::BIT_BATTERY))    f |= 1 << 4;
-    if (a & (1u << alarms::BIT_SP_CLAMP))   f |= 1 << 5;
-    if (tel_.cpState == static_cast<uint8_t>(cellproof::State::FAIL)) f |= 1 << 6;
-    // CNS overload gets its OWN bit (7), added 2026-11-27 rather than folded
-    // into bit 3. It used to be dropped here with a comment calling the bits
-    // 6..9 aggregate "sensor/fuel failures", which is true of stuck-open,
-    // sensor stale and hypoxia and false of CNS: a diver over his CNS limit is
-    // not reading a sensor fault, and the handset that only aggregates cannot
-    // tell "your loop is not telling you things" from "you have used up your
-    // oxygen budget" — two different actions. Append-only: bits 0..6 keep the
-    // meanings the protocol publishes (§4's table), bit 7 is newly named, and
-    // nothing moved; a client that ignores the top bit is still correct, exactly
-    // as one that stops at FLAGS is correct about the appended battery field.
-    // The controller's own alarm word is untouched — this is a projection, and
-    // the ids it publishes as E,*,1/2 are the same 10 bits as before.
-    if (a & (1u << alarms::BIT_CNS_HIGH))   f |= 1 << 7;
-    t.flags = f;
+    // The projection is one function for both transports — see comms/flags.h for
+    // why it is not allowed to be two copies, and for why CNS is not in the
+    // sensor aggregate. tel_.cpState is carried as a raw byte across the bridge
+    // wall (telemetry_bridge.h), so the comparison to the cell-proof state is
+    // done here rather than inside the helper.
+    t.flags = flagsFromAlarmWord(tel_.alarmBits,
+                                 tel_.cpState == static_cast<uint8_t>(cellproof::State::FAIL));
     // SAFE is visible on the wire before the diver tries anything: the router
     // knows the machine is locked out, and the snapshot published by a control
     // chain that is not running cannot say it for itself.

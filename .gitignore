@@ -8,3 +8,7 @@ logs/
 # writes lives in logs/, already ignored above; this is the run's console
 # echo — an artifact, re-grown by every 24 h soak, never an input.
 soak_run.out
+
+# graphify's knowledge-graph output: regenerated from the tree on demand, and
+# a rebuild rewrites every file in it. Nothing in the repo reads it.
+graphify-out/

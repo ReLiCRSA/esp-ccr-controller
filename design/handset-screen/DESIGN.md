@@ -498,8 +498,30 @@ alarm the controller has already cleared. Never show a date derived from epoch 0
   (`ACK SILENCES THE BUZZER · THE BIT STAYS SET`), but tone design belongs with
   the firmware and needs its own honesty rule — a silenced buzzer must never
   read as a cleared alarm.
-* `FLAGS` bit 7 (CNS high) is drawn here as shipping because it is being added
-  in `src/control/alarms.h` right now. If it does not land, `alarm-cns-high` is
-  the only screen that changes, and the CNS gauge stays correct regardless.
 * The dive *replay* (`ENTER=OPEN` on a log entry) is reachable in the model but
   not drawn: whatever it shows must obey the same no-graph rule.
+
+**Closed since delivery — `FLAGS` bit 7 (CNS high).** That bullet read: *"drawn
+here as shipping because it is being added in `src/control/alarms.h` right now.
+If it does not land, `alarm-cns-high` is the only screen that changes."* It
+landed, so `alarm-cns-high` is a shipping screen, not a conditional one, and
+the amber treatment is the controller's own severity rather than the handset's
+judgement: `alarms::BIT_CNS_HIGH` is alarm-word bit 8
+(`src/control/alarms.h:49`) at `Level::WARNING` (`src/control/alarms.h:132`),
+raised at `src/control/alarms.cpp:103` when CNS reaches `cnsAlarmPct`, and both
+transports project it into `FLAGS` bit 7 — the 2 Hz `T,` stream
+(`src/comms/uart_link.cpp:155`) and the `GET T` reply
+(`src/comms/cmd_router.cpp:192`). It is an append inside the byte's free top
+bit: bits 0..6 kept the meanings §4 has published since v1, no row format
+moved, so a handset that stops reading at `FLAGS` sees fewer facts, never
+different ones. The two projections are pinned equal by tests, which is also
+what keeps this screen's wire line honest:
+`test/test_uartlink/test_uart_link.cpp:323` asserts CNS alone is exactly
+`FLAGS0x80` — nothing else riding along, in particular not bit 3, a handset's
+"go check the sensors" — and `test/test_router/test_router.cpp:570-593` asserts
+`GET T` answers the same `0x80`, with the cell-proof pill (bit 6) coexisting as
+`0xC0` without either swallowing the other. What remains unguarded is the copy
+inside the SVG: `FLAGS0x80` appears in exactly one of the 41 screens and
+nothing in this folder re-derives it from the firmware, so a renumbering of the
+`alarms.h` ids would make that one `<desc>` stale rather than wrong on the
+panel.

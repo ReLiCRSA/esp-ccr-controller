@@ -67,6 +67,40 @@ constexpr uint32_t FAULT_MAGIC = 0x52424654; // "RBFT"
 
 static FaultRecord g_fault __attribute__((section(".noinit")));
 
+#if defined(TEST_TWDT_PANIC) || defined(TEST_TWDT_MASKED)
+// ---------------------------------------------------------------------------
+// Bench-only TWDT probe record (env:esp32_twdtmeasure / env:esp32_twdtmask).
+//
+// The interval the watchdog review asked about — stall to expiry — cannot be
+// read off the console by subtracting the two lines' stamps: the `E (<ms>)`
+// prefix ESP_LOG prints is NOT on the same epoch as millis() or
+// esp_timer_get_time() in this build (the first version of this probe
+// subtracted them and reported 14 s for a 3 s gap). So the firmware measures it
+// itself, on one clock, and hands the number across the reset the panic causes:
+// the ISR user hook the SDK calls from task_wdt_isr writes the expiry instant
+// into .noinit DRAM, which survives a software reset (the same trick
+// FaultRecord above uses), and setup() prints it on the next boot.
+//
+// The handler runs in interrupt context, so it does two 32-bit stores and
+// nothing else — no printf, no Serial.
+// ---------------------------------------------------------------------------
+struct TwdtProbeRecord {
+    uint32_t magic;
+    uint32_t lastFeedEspMs;   // esp_timer ms of the sensor task's last fed loop
+    uint32_t expiredEspMs;    // esp_timer ms when task_wdt_isr ran
+};
+constexpr uint32_t TWDTPROBE_MAGIC = 0x54574450;  // "TWDP"
+
+static TwdtProbeRecord g_twdtProbe __attribute__((section(".noinit")));
+static volatile uint32_t g_twdtLastFeedEspMs;
+
+extern "C" void esp_task_wdt_isr_user_handler(void) {
+    g_twdtProbe.lastFeedEspMs = g_twdtLastFeedEspMs;
+    g_twdtProbe.expiredEspMs = (uint32_t)(esp_timer_get_time() / 1000);
+    g_twdtProbe.magic = TWDTPROBE_MAGIC;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Heartbeats: written by watched tasks, read by the supervisor.
 // ---------------------------------------------------------------------------
@@ -177,6 +211,14 @@ static ctrl::Config g_sensorRules;      // sensorTask only
 static ctrl::Config g_controlRules;     // controlTask only
 static ctrl::Config g_supervisorRules;  // supervisorTask only
 
+// Which generation ControlTask last read, for the heartbeat's `cfggen=` field.
+// Written only by controlTask and read only by hudTask: a 32-bit load is atomic
+// on this core, the same rule comms/telemetry_bridge.h states for its scalars.
+// It exists because "the chain is running the rules I just set" is a claim, and
+// the box makes it checkable — the pair `<published>/<chain>` on HB says whether
+// the two are the same number without anyone having to reason about task order.
+static volatile uint32_t g_chainCfgGen;
+
 // ---------------------------------------------------------------------------
 // SensorTask — core 0, high priority. Never blocks beyond one Wire timeout.
 // ---------------------------------------------------------------------------
@@ -184,6 +226,10 @@ static void sensorTask(void*) {
     esp_task_wdt_add(NULL); // diagnostics: TWDT dumps backtraces on stall
     vTaskDelay(pdMS_TO_TICKS(200)); // let boot/serial settle
     uint32_t lastBat = 0;
+#if defined(TEST_TWDT_PANIC) || defined(TEST_TWDT_MASKED)
+    bool twdtAnnounced = false;   // one announce line, then stay quiet and unfed
+    uint32_t twdtLastLoop = 0;    // the last iteration that DID feed TWDT
+#endif
     // One generation of the applied rules per sample. Depth is converted with
     // the diver's water density, and that number lives in the published
     // config; reading the field off the shared struct while the settings path
@@ -208,6 +254,64 @@ static void sensorTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+#endif
+#if defined(TEST_TWDT_PANIC) || defined(TEST_TWDT_MASKED)
+        // Bench-only watchdog probe (env:esp32_twdtmeasure / env:esp32_twdtmask).
+        // The difference from TEST_SENSOR_STALL above is the whole point: this
+        // stall does NOT feed TWDT, so the hardware countdown is allowed to run.
+        //
+        //   TEST_TWDT_PANIC  — the hud, control and uart2 tasks are not
+        //       subscribed either (see their sites below). SensorTask is then the
+        //       only subscription, so the ONE hardware timer has nobody re-arming
+        //       it and the expiry is the SDK's own timeout arithmetic. This run
+        //       measures the stall -> panic interval.
+        //   TEST_TWDT_MASKED — every task keeps its subscription, which is what
+        //       the diver's build does. The question this run asks is whether a
+        //       healthy neighbour's esp_task_wdt_reset() re-arms the countdown on
+        //       behalf of the stalled task and hides it. Answered on the bench
+        //       2026-11-27: NO. hud, control and uart2 kept feeding and the timer
+        //       still expired 3059 / 3019 ms after the sensor task's last feed,
+        //       and the panic dump named `- sensor (CPU 0)` alone. A reset sets
+        //       the calling task's bit; the ISR runs on the timer's own period and
+        //       reports the bits that were not set. The masked interval matches the
+        //       single-subscription one (3061 / 3011 ms) to within tens of ms,
+        //       which is the console dump's cost, not a difference in the timeout.
+        //
+        // Both builds also compile out the supervisor's heartbeat-stall restarts
+        // (see supervisorTask), otherwise the supervisor wins the race at 1500 ms
+        // and the measurement is about the supervisor, which is already graded by
+        // env:esp32_stalltest.
+        if (now > 8000 && !twdtAnnounced) {
+            twdtAnnounced = true;
+            // BOTH clocks on one line: the panic line's `E (<ms>)` stamp is
+            // esp_timer milliseconds (the timer starts before the bootloader
+            // hands over), while millis() starts at the app, so the interval is
+            // ONLY comparable across the two lines when this line carries the
+            // esp_timer stamp too. The first version of this probe subtracted
+            // millis() from the panic stamp and got 14 s out of a 3 s gap.
+            const unsigned long espMs = (unsigned long)(esp_timer_get_time() / 1000);
+            Serial.printf("TWDTPROBE: sensor stalled at espMs=%lu (last fed millis=%lu, that loop started %u ms ago), %s\n",
+                          espMs, (unsigned long)twdtLastLoop, (unsigned)(now - twdtLastLoop),
+#ifdef TEST_TWDT_PANIC
+                          "sensor is the ONLY TWDT subscription: expect a task_wdt expiry"
+#else
+                          "ALL tasks still subscribed: expect no expiry if a neighbour's feed re-arms it"
+#endif
+            );
+        }
+        if (now > 8000) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+#endif
+#if defined(TEST_TWDT_PANIC) || defined(TEST_TWDT_MASKED)
+        // Only reached by iterations that go on to feed TWDT at the end of the
+        // loop, so this is the last iteration that fed: the panic line's own
+        // timestamp minus this number is the stall -> expiry interval, with at
+        // most one SENSOR_TASK_PERIOD_MS of quantization (printed in the announce
+        // line so the arithmetic is checkable from the capture).
+        twdtLastLoop = now;
+        g_twdtLastFeedEspMs = (uint32_t)(esp_timer_get_time() / 1000);
 #endif
         g_ads.tick(now);
 
@@ -309,7 +413,13 @@ deco::View g_decoView;
 // that asymmetry is intentional for soak debugging).
 // ---------------------------------------------------------------------------
 static void hudTask(void*) {
+#ifdef TEST_TWDT_PANIC
+    // Bench-only (env:esp32_twdtmeasure): NOT subscribed, so the hud task's
+    // healthy feed cannot re-arm the single hardware timer on behalf of the
+    // stalled sensor task.
+#else
     esp_task_wdt_add(NULL);
+#endif
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_HUD);
         const uint32_t now = millis();
@@ -372,6 +482,16 @@ static void hudTask(void*) {
             //             stale picture, and that has to be visible on the bench
             //             rather than inferred after the fact from the record's
             //             own seq. Cumulative, like the two above.
+            //   cfggen=  the APPLIED rules as a generation pair (control/
+            //             configbox.h): `<published>/<chain>` — how many generations
+            //             the settings path has published since boot, and which one
+            //             ControlTask last read. Equal means the chain is running
+            //             exactly what the last SET produced. `published` ahead of
+            //             `chain` by one is normal and bounded: a SET lands between
+            //             ControlTask's read and the solenoid pin fuse of the next
+            //             100 ms cycle. Ahead by MORE than one means a control cycle
+            //             is not reading, which is the same failure the supervisor
+            //             reboots for — now visible on the beat before it happens.
             const uint32_t worstCycleMs = g_worstCycleMs;
             g_worstCycleMs = 0;  // "since the last HB beat": the bench grades
                                  // per-beat margin, not an ever-climbing max
@@ -379,7 +499,8 @@ static void hudTask(void*) {
                           "smp=%lu i2cerr=%lu rec=%lu vbat=%s "
                           "stale=%d batlow=%d"
                           " vote=%s sp=%s al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d"
-                          " stk=%u u2stk=%u worst=%u logskip=%u surfskip=%u contskip=%u\n",
+                          " stk=%u u2stk=%u worst=%u logskip=%u surfskip=%u contskip=%u"
+                          " cfggen=%u/%u\n",
                           static_cast<int>(g_systemState),
                           g_ads.raw(0), g_ads.raw(1), g_ads.raw(2),
                           g_ads.fresh(0, now), g_ads.fresh(1, now),
@@ -398,7 +519,9 @@ static void hudTask(void*) {
                           (unsigned)worstCycleMs,
                           (unsigned)comms::diveLogSkippedRows(),
                           (unsigned)comms::surfaceSkippedRecords(),
-                          (unsigned)comms::continuitySkipped());
+                          (unsigned)comms::continuitySkipped(),
+                          (unsigned)ctrl::configGeneration(),
+                          (unsigned)g_chainCfgGen);
             // Shout for the machine overall AND for the handset task by name, so
             // a command-path regression is named instead of averaged away.
             if (stackFree != 0 && stackFree < stackwatch::kWarnFreeBytes) {
@@ -635,7 +758,12 @@ static void continuityPublishSnapshot(uint8_t kind, const char* edge) {
 outfuse::SolFuse g_solFuse;
 
 static void controlTask(void*) {
+#ifdef TEST_TWDT_PANIC
+    // Bench-only (env:esp32_twdtmeasure): NOT subscribed, so the control task's
+    // feed cannot re-arm the single hardware timer for the stalled sensor task.
+#else
     esp_task_wdt_add(NULL);
+#endif
     pinMode(PIN_SOLENOID, OUTPUT);  // owned from here on; SAFE mode never gets here
     digitalWrite(PIN_SOLENOID, LOW);
     g_controlRunning = true;
@@ -677,7 +805,9 @@ static void controlTask(void*) {
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_CONTROL);
         const uint32_t now = millis();
-        ctrl::configRead(g_controlRules);   // newest generation; keeps the last on a miss
+        uint32_t cfgGen = 0;
+        if (ctrl::configRead(g_controlRules, &cfgGen))
+            g_chainCfgGen = cfgGen;   // newest generation; keeps the last on a miss
 
         // Worst-cycle tracking (HB `worst=`): the span from one iteration's
         // start to the next is precisely what the supervisor would measure as
@@ -1189,6 +1319,7 @@ static void supervisorTask(void*) {
         if (g_hbHud.seq != lastHud) { lastHud = g_hbHud.seq; lastHudChange = now; }
         if (g_hbControl.seq != lastControl) { lastControl = g_hbControl.seq; lastControlChange = now; }
 
+#if !defined(TEST_TWDT_PANIC) && !defined(TEST_TWDT_MASKED)
         if (now - lastSensorChange >= TASK_STALL_SENSOR_MS) {
             g_fault = {FAULT_MAGIC, 1, now, esp_reset_reason()};
             Serial.println("!! FATAL: SensorTask stalled — restart into SAFE");
@@ -1207,6 +1338,20 @@ static void supervisorTask(void*) {
             Serial.println("!! FATAL: ControlTask stalled — restart into SAFE");
             esp_restart();
         }
+#else
+        // Bench-only watchdog probe: the supervisor's heartbeat reboot is the
+        // SHIPPING answer to a stall, and it wins the race at 1500 ms — which
+        // env:esp32_stalltest already proves on hardware. Compiling it out here
+        // is what lets the watchdog be measured on its own; the detection is
+        // still announced, so a run that shows the supervisor acting anyway is a
+        // void measurement and says so on the console.
+        if (now - lastSensorChange >= TASK_STALL_SENSOR_MS)
+            Serial.println("TWDTPROBE: supervisor sees SensorTask stalled (reboot suppressed)");
+        if (now - lastHudChange >= TASK_STALL_HUD_MS)
+            Serial.println("TWDTPROBE: supervisor sees HudTask stalled (reboot suppressed)");
+        if (g_controlRunning && now - lastControlChange >= TASK_STALL_CONTROL_MS)
+            Serial.println("TWDTPROBE: supervisor sees ControlTask stalled (reboot suppressed)");
+#endif
 
         // H2 output fuse, supervisor half. The pin belongs to ControlTask,
         // but a task that owns a pin must not be the ONLY thing that can let
@@ -1345,6 +1490,17 @@ void setup() {
     Serial.println();
     Serial.println("=== ESP-CCR controller M1 boot ===");
     Serial.printf("reset reason: %s\n", resetReasonName(esp_reset_reason()));
+#if defined(TEST_TWDT_PANIC) || defined(TEST_TWDT_MASKED)
+    // The number the probe exists to produce, carried across the reset in
+    // .noinit (see TwdtProbeRecord). Cleared after printing so a boot that did
+    // NOT re-arm the probe cannot re-report an old interval.
+    if (g_twdtProbe.magic == TWDTPROBE_MAGIC) {
+        Serial.printf("TWDTPROBE: task_wdt expired %lu ms after the last fed loop "
+                      "(stall->expiry interval, one clock, measured on the board)\n",
+                      (unsigned long)(g_twdtProbe.expiredEspMs - g_twdtProbe.lastFeedEspMs));
+        g_twdtProbe.magic = 0;
+    }
+#endif
 
     hudInit();
 
@@ -1385,9 +1541,35 @@ void setup() {
     //     rewriting ctx->timeout and ctx->panic and re-arming the hardware
     //     (wdt_hal_disable/config_stage/enable) instead of returning early, so
     //     a second init RECONFIGURES rather than no-ops.
-    // What the SDK's 5 s therefore decides is the interval the idle task (CPU0,
-    // CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0) is subscribed with; the timeout
-    // every task registered below is checked against is the one raised here.
+    // The stronger claim this bullet used to make — "no archive references
+    // esp_task_wdt_init anywhere" — is too strong and was corrected on
+    // 2026-11-27: libfreertos.a's port_common.c.obj DOES carry it as an
+    // undefined symbol. What is true, and what matters, is about the linked
+    // image: disassembling firmware.elf and searching for calls to
+    // esp_task_wdt_init finds exactly one call site, inside setup(), which is
+    // the line below. Nothing in the SDK's boot path runs first, so whatever
+    // timeout the SDK's config declares, the timeout in force is the one this
+    // call passes.
+    //
+    // What the SDK's 5 s decides is therefore NOTHING at all, and the sentence
+    // this one replaces read the other way. The claim it carried — "5 s is the
+    // interval the idle task (CPU0, CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0) is
+    // subscribed with" — was checked on the tree 2026-11-27 and is wrong twice
+    // over:
+    //   * nothing in this SDK boots a watchdog before the line below, so there
+    //     is no earlier interval for an idle subscription to have used;
+    //   * esp_task_wdt_init in THIS build does not subscribe any idle task. The
+    //     header sets CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 to 1, but the
+    //     prebuilt object that links does not consult it: objdump over the linked
+    //     image's esp_task_wdt_init (0x400fc840..0x400fc957 in
+    //     .pio/build/esp32/firmware.elf) references esp_intr_alloc and
+    //     periph_module_enable and nothing else — no xTaskGetIdleTaskHandleForCPU
+    //     (0x4008deec), no esp_task_wdt_add. The idle-hook machinery is there,
+    //     but esp_task_wdt_add reaches it only when the handle passed IN is an
+    //     idle handle, and every registration below passes NULL for a real task.
+    // So the watchdog watches exactly the tasks that register, and a review
+    // premised "the CPU0 idle task trips it when a pinned task hogs the core"
+    // described a mechanism this firmware does not have.
     // A review premised "the framework already inits it at 5 s, so this call is
     // a no-op" was reading the v5.5 header of the OTHER installed platform
     // (arduino core 4.x, CONFIG_ESP_TASK_WDT_INIT=1, esp_task_wdt_config_t) —
@@ -1408,7 +1590,19 @@ void setup() {
                       " sensor/hud/control/uart2 task will not be caught\n",
                       esp_err_to_name(wdtErr));
     else
-        Serial.println("TWDT: 3 s timeout, panic on  (registered: sensor, hud, control, uart2)");
+        Serial.println(
+#ifdef TEST_TWDT_PANIC
+            // The announce names its subscriptions, so a probe build has to say
+            // what it actually registered rather than repeat the shipping list:
+            // a run that read "sensor, hud, control, uart2" here would be
+            // measuring three tasks that are not watched.
+            "TWDT: 3 s timeout, panic on  (registered: sensor ONLY — twdtmeasure probe)"
+#elif defined(TEST_TWDT_MASKED)
+            "TWDT: 3 s timeout, panic on  (registered: sensor, hud, control, uart2 — twdtmask probe)"
+#else
+            "TWDT: 3 s timeout, panic on  (registered: sensor, hud, control, uart2)"
+#endif
+        );
 
     g_ads.begin();
     g_battery.begin();

@@ -38,7 +38,12 @@ namespace {
 void sinkWrite(const char* line, void*) { Serial2.print(line); }
 
 void uart2Task(void*) {
+#ifdef TEST_TWDT_PANIC
+    // Bench-only (env:esp32_twdtmeasure): NOT subscribed, so the handset task's
+    // feed cannot re-arm the single hardware timer for the stalled sensor task.
+#else
     esp_task_wdt_add(NULL);
+#endif
     Serial2.begin(115200, SERIAL_8N1, PIN_UART_H_RX, PIN_UART_H_TX);
     Serial2.setTimeout(20);   // read() never blocks longer than this
 

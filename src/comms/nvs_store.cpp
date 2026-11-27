@@ -68,6 +68,18 @@ int Store::load(settings::Registry& reg) {
         // Range-checked by the registry: a stale value outside a tightened
         // range falls back to the default rather than loading.
         if (reg.setValueByKey(d.key, text, &err)) loaded++;
+        else if (p.isKey(d.key)) {
+            // Say it out loud, and say it as text. This is the only way a
+            // tightened band shows up on the bench: the value is dropped from
+            // the registry, so nothing after boot can tell you what was
+            // thrown away — and "the stored value outlived the change" is a
+            // failure mode this repo has already been bitten by once. No float
+            // formatting: the stored string IS the number, and this module
+            // runs at boot with no reason to risk the newlib path at all.
+            Serial.printf("settings: NVS %s=\"%s\" refused (%s) - the registry default for "
+                          "that key is used instead\n",
+                          d.key, text, err ? err : "out of range");
+        }
     }
     p.end();
     return loaded;

@@ -416,17 +416,35 @@ static void sensorTask(void*) {
         // same marker: "flat" and "blind" are different things to fix, and HB's
         // number plus `batlow=1` leaves a reader doing arithmetic to find out
         // which. Edges only, like every other console statement here.
+        //
+        // No float format specifier, not even for the two compile-time limits:
+        // this runs on SensorTask, a fixed-stack task, and newlib's float path is
+        // what put this controller into SAFE mode twice (tools/float_audit.py
+        // gates the rule). The chemistry limits are constants, so they render
+        // once through numfmt — which means they still follow VBAT_CELLS rather
+        // than being typed out again here.
         static bool lastBlind = false;
         if (g_battery.implausible() != lastBlind) {
             lastBlind = g_battery.implausible();
+            static char floorTxt[12], ceilTxt[12];
+            static bool limitsRendered = false;
+            if (!limitsRendered) {
+                limitsRendered = true;
+                numfmt::fixed(floorTxt, sizeof floorTxt, VBAT_MIN_V, 2);
+                numfmt::fixed(ceilTxt, sizeof ceilTxt, VBAT_IMPLAUSIBLE_V, 2);
+            }
             char mv[12];
-            Serial.printf("battery: sense %s: %s V cannot be a %u-cell pack of this "
-                          "chemistry (floor %.2f V, ceiling %.2f V). BATTERY stays up: an "
-                          "unreadable pack is not a good pack.\n",
-                          lastBlind ? "IMPLAUSIBLE" : "back inside the plausible band",
-                          numfmt::fixed(mv, sizeof mv, g_battery.volts(), 2),
-                          (unsigned)VBAT_CELLS, (double)VBAT_MIN_V,
-                          (double)VBAT_IMPLAUSIBLE_V);
+            const char* reading = numfmt::fixed(mv, sizeof mv, g_battery.volts(), 2);
+            if (lastBlind) {
+                Serial.printf("battery: sense IMPLAUSIBLE: %s V cannot be a %u-cell pack "
+                              "of this chemistry (floor %s V, ceiling %s V). BATTERY stays "
+                              "up: an unreadable pack is not a good pack.\n",
+                              reading, (unsigned)VBAT_CELLS, floorTxt, ceilTxt);
+            } else {
+                Serial.printf("battery: sense is back inside the plausible band for a "
+                              "%u-cell pack (floor %s V, ceiling %s V)\n",
+                              (unsigned)VBAT_CELLS, floorTxt, ceilTxt);
+            }
         }
         g_hbSensor.seq++;
         esp_task_wdt_reset();

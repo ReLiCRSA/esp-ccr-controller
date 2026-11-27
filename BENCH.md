@@ -27,7 +27,10 @@ pio test -e native -e native_o2   # both levels: 896 cases. The -O2 env is the
 tools/port_id.py --listen 4   # name the ports before trusting any of the below:
                                  # two identical CP2102s swap under the USB stack, and a
                                  # swapped pair makes every check below lie (see C2-g)
-tools/float_audit.py          # no float printf in src/ except marked boot-only sites
+tools/float_audit.py          # no float printf in src/ except marked boot-only sites.
+                                 # `-t upload` runs it by itself since 2026-11-28
+                                 # (tools/upload_gate.py, wired as extra_scripts on
+                                 # env:esp32) — the paragraph below the gate list
 tools/fence_probe_report.py   # occasional, not every flash: counts MEMW barriers in the
                                  # deco view seqlock on the TARGET toolchain. Answers
                                  # "does the optimizer keep view.h's fences" for ESP32
@@ -148,6 +151,25 @@ fails on any float format specifier that is not marked `/*float-ok: why*/`; the
 one marked exception is the settings-schema renderer, which runs once from
 `Session::begin` before the small-stack tasks exist.
 
+**And the flash does it for you.** Listing that audit in the gate list was not
+enough: on 2026-11-28 the battery build was flashed with a `%.2f` in a
+SensorTask `printf` — a violation of a rule written in this file, by someone who
+had that file open, because running the audit was a step I had to remember.
+`tools/upload_gate.py` is now wired into `env:esp32` as
+`extra_scripts = post:tools/upload_gate.py` and registers a pre-action on the
+upload target; it calls `tools/float_audit.py` rather than repeating its rules,
+so hook and check cannot drift. Witnessed in both directions on that date: a
+`Serial.printf("gate probe %.2f\n", 1.0)` planted in `main.cpp` made
+`pio run -e esp32 -t upload --upload-port /dev/ttyUSB0` print
+`*** upload refused: tools/float_audit.py failed` and stop with **no `Wrote` and
+no `Hash of data verified` line** — the board was not touched — while the same
+tree with the same violation still **built** (`pio run -e esp32` SUCCESS), so
+the hook gates the flash and not the compile. Two implementation notes for
+whoever edits it: PlatformIO execs the script text, so `Import("env")` is
+required and there is no `__file__`; and the pre-action is called with
+`source`/`target`/`env` keyword arguments, from which raising is what reliably
+stops the target (`env.Exit` died in the action wrapper).
+
 `hw_accept.py` checks the boot console (fresh boot banner, ≥2 HB lines
 matching the soak_logger contract, no SAFE/FATAL, `settings: N keys from
 NVS`, `control: SP=…`, `web: AP "…"`, `log: LittleFS mounted, N dives,
@@ -169,6 +191,26 @@ boundary value can be refused by a second rule, and the entry passes for the wro
 reason — that is exactly what hid a dive-lock regression for one run), and a
 locked write is graded by **reading the value back while the refusing state still
 holds**, never by trusting the `ERR`.
+
+**A boot line that is easy to read as noise, and is not.** Since 2026-11-28 the
+loader prints the values it refuses out of NVS:
+
+```
+settings: NVS VBAT_MIN="10.500" refused (out of range) - the registry default for that key is used instead
+settings: 35 keys from NVS
+```
+
+That is the tightened `VBAT_MIN` band (2.80–4.50 V, derived from `VBAT_CELLS`)
+doing its job on metal: 10.5 was still sitting in this board's flash, the board
+said so by key name and value, and the number the rest of the firmware used was
+the chemistry default. Same boot, three readings that line up: HB
+`vbat=3.62…3.65 batlow=0 al=0x0000` where the same bench had printed
+`vbat=4.92 batlow=1`, and the handset readout showing `batt 3.64 V` with no
+battery marker on screen. Two things to keep straight about that line: the
+refused value is **not rewritten**, so it is refused at every boot until
+something writes a new one — the stale number is still in NVS on this board; and
+`hw_accept.py` does not grade this line yet, so the sentence above is a hand
+check, not a gate.
 
 The `log:` boot line is a check, not decoration. A LittleFS mount that fails is
 answered with a format, which erases every dive on the partition, and the core

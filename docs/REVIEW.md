@@ -85,6 +85,17 @@ the console. What is **still open is the bench half** — the divider has never 
 `VBAT_CAL` has never been trimmed, and no acceptance leg compares `vbat=` to a meter. The
 evidence below stays exactly as recorded, because it is what the fix was written against.
 
+**The chemistry fix is now on metal (flashed 2026-11-28, this bench).** The board reports
+its own migration: `settings: NVS VBAT_MIN="10.500" refused (out of range) - the registry
+default for that key is used instead`, then `settings: 35 keys from NVS`. HB went from
+`vbat=4.92 batlow=1` to **`vbat=3.62…3.65 batlow=0 al=0x0000`** across seven beats, and the
+handset readout on the same bench showed `batt 3.64 V` with no battery marker on screen
+(it had shown `FLAGS MAJOR BATT` before). Note the shape of that number: it jitters in the
+last digit, where `34.71` was dead flat across six beats — so this boot is not the pinned
+pad, and the pinned-pad condition remains something the bench has produced once and not
+yet re-produced under a meter. Still open, unchanged: metering the divider, and the fact
+that the refused 10.5 is **not written back**, so the board refuses it every boot.
+
 What was seen, on the bench, 2026-11-27:
 
 | observation | value |
@@ -257,6 +268,13 @@ one cell — and `tools/pulse_witness.py`'s own copy of the number was wrong in 
 (it carried `VBAT_MIN = 10.5`) and now reads 3.4 V. What keeps this item open is hardware,
 not arithmetic: a pack **with enough capacity to pulse a valve**, metered, and the metered
 sense path from §1 P1.
+
+**Witnessed on metal, partly (2026-11-28).** With the fix flashed, this bench boots at
+`vbat=3.62…3.65 batlow=0 al=0x0000` and the handset shows no battery marker — the battery
+verdict is no longer what refuses. What has **not** been witnessed is a pre-dive run at
+all: no pressure on the sensor, the cells are uncalibrated (`CELLS UNCALIBRATED: run CAL
+AIR` on the boot line), and `AUTO` still needs the whole PREDIVE sequence, so the remaining
+blockers are the ones named above, not the threshold.
 
 **To close it:** P1's bench half first (the reading has to be trustworthy, and the valve needs its
 real supply), then `~/.platformio/penv/bin/python tools/pulse_witness.py /dev/ttyUSB1`:
@@ -1934,6 +1952,8 @@ who has to catch the next one.
 | "`vbat` is a pack voltage; `batlow=0` means the pack is above `vbatMin`" (implicit in the alarms, predive and the dive snapshot) | the bench drove the sense pad to its clamp and `vbat=34.71` **cleared the dive-blocking battery step on a 5 V feed**. No upper bound or validity check existed anywhere in `src/ include/ test/` at the time it was measured | §1 P1 — the bound exists now (`VBAT_IMPLAUSIBLE_V`, `Battery::implausible()`); the claim is still not safe as a *measurement* until the divider is metered, and `vbat` still says nothing about the 12 V rail (§1 P9) |
 | six citations **this file itself** carried when the five documents were merged — `esp_task_wdt_reconfigure()`, `eventInstant`/`commitEvents`/`abortEvents`, `test_cfgparity`, `__atomic_thread_fence`, "all four fences deleted", and `CONFIG_ESP_TASK_WDT_TIMEOUT_MS=3000` — plus two numbers, "every measured `worst=` sits at 4–9 ms" and "CPU0 idle monitored" (2026-11-27, the audit run after the merge) | none of those identifiers exist in this tree: the real call is `esp_task_wdt_init(3, true)`, the staging pair is `beginTx()`/`commitTx()`, the fences are `std::atomic_thread_fence` and `src/deco/view.h` has **two**, and the parity anchors are in `test_configbox` and `test_settings`. "4–9 ms" described only the storm runs: the repo's 639 `worst=` samples peak at **505 ms**. And "CPU0 idle monitored" repeated, in the very section about verifying claims, the exact premise Round D had disproved. All corrected in place. The finding for the reader: a citation copied out of a summary is not a citation — **grep the identifier before you put it in a sentence** | §1 and §2 as they now stand |
 | a dive-file grader that printed **PASS** while the file contained `M,` total 0, and a pulse witness that would have reported a PASS on a dive that injected nothing | both now say so: `tools/hw_accept.py` prints a vacuity note when the total is 0, and `tools/pulse_witness.py` exits **2** rather than print a vacuous PASS. A check that cannot witness anything must say so | Round E item 2's follow-up |
+| "`tools/float_audit.py` is in the gate" (BENCH.md's gate list, where it has been since the float bug came back the first time) | the list was true and the practice was not: the battery build was flashed on 2026-11-28 carrying `floor %.2f V, ceiling %.2f V` in a **SensorTask** `printf` — a violation of the rule, produced while the rule was open in the same session. The audit was run *after* the flash, when it found the violation; nothing had stopped the flash. `vbat=34.71` on this very bench is the reason that task's stack matters. What closed it is a hook, not a reminder: `tools/upload_gate.py` runs the audit as a pre-action on the upload target, witnessed reddening a planted `%.2f` with **no `Wrote` line** while the same tree still built | C2, "And the flash does it for you" |
+| "the settings table in `docs/HANDSET_PROTOCOL.md` §6 documents the keys the board has" | it documented 30 of 36 keys, and published `VBAT_MIN` as type F with default 10.5 and band 3.0 to 30.0 after that key had been re-derived from the chemistry — a table a handset builder would build against and the parser would refuse. Nothing graded it, even though §4's flags table has had a doc-vs-code join since Round D | `test_the_published_settings_table_matches_the_registry_it_documents`, mutation-checked by editing the doc (old row, drifted registry default, deleted row — each reddens it by key name) |
 
 ---
 

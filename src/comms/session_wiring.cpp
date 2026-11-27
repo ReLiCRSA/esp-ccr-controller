@@ -39,6 +39,7 @@
 #include "comms/wallclock.h"
 #include "comms/web_server.h"
 #include "config/defaults.h"
+#include "control/configbox.h"
 #include "log/contgate.h"
 #include "log/continuity.h"
 #include "log/continuity_store.h"
@@ -48,8 +49,10 @@
 #include "log/surface_store.h"
 
 // The chain, the registry and the bridge belong to main.cpp; the session must
-// drive the very same objects the sensors and the HUD use.
-extern ctrl::Config g_ctrlCfg;
+// drive the very same objects the sensors and the HUD use. The APPLIED
+// configuration is not among them anymore: it is a published generation
+// (control/configbox.h), which is what lets the settings path apply onto a copy
+// instead of writing a global the control chain is reading.
 extern ctrl::Loop* g_loop;
 extern settings::Registry g_settings;
 extern bridge::Telemetry g_bridgeTel;
@@ -303,8 +306,39 @@ void hookSettings(void*) {
     // configuration. postConfig queues the re-tune for the next control tick
     // (engines re-tune in place, never a restart), so a SET from the handset
     // or the browser never mutates the chain while ControlTask is mid-cycle.
-    const uint8_t clamps = applySettings(g_settings, g_ctrlCfg);
-    if (g_loop) g_loop->postConfig(g_ctrlCfg);
+    //
+    // Applied onto a COPY of the published generation, then published as the
+    // next generation (control/configbox.h). Two reasons, and the second is the
+    // one that bites:
+    //   * Readers used to see the update field by field — a new ALLO_HIGH
+    //     beside the old ALLO_CUTOFF, a lowered GF_LOW beside the old GF_HIGH.
+    //     applySettings clamps exactly those pairs, over a complete set, so the
+    //     global handed back a combination the applier guarantees cannot exist.
+    //   * applySettings READS the injection wall, the max-on fuse and the
+    //     proof-window pulse count — fields this pass does not write, carried
+    //     from boot. Applying onto the object it reads meant its decisions were
+    //     made against a config partway through becoming this one.
+    // The four carried fields are why the copy starts from the published
+    // generation rather than from a fresh struct: defaults.h sets them once.
+    //
+    // Publish BEFORE postConfig: ControlTask reads the generation at the top of
+    // its cycle and the chain takes the queued one in step 0, so the solenoid
+    // fuse can see a tighter wall one tick before the engine does — a limiter
+    // is allowed to lead the machine it limits, never to lag it.
+    ctrl::Config cfg{};
+    if (!ctrl::configRead(cfg)) {
+        // setup() publishes the boot config before it creates any task that
+        // could receive a SET, so this is unreachable. It stays because the
+        // alternative is worse: a value-initialised config is presentMask = 0
+        // and maxDutyPct = 0 — a machine that reports no cells fitted and
+        // injects nothing, which is what a half-initialised boot would leave on
+        // a real dive. Say nothing was applied instead.
+        Serial.println("settings: NOT APPLIED — no configuration published yet");
+        return;
+    }
+    const uint8_t clamps = applySettings(g_settings, cfg);
+    ctrl::configPublish(cfg);
+    if (g_loop) g_loop->postConfig(cfg);
     if (clamps != CLAMP_NONE) {
         // `SET` answers OK SAFETY whether or not anything was refused, and the
         // registry keeps the number the diver typed, so the answer alone cannot

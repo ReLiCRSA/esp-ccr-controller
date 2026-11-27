@@ -25,6 +25,7 @@
 #include "config/pins.h"
 #include "config/defaults.h"
 #include "control/calibration.h"
+#include "control/configbox.h"
 #include "control/loop.h"
 #include "sensors/ads1115_bus.h"
 #include "sensors/battery.h"
@@ -86,7 +87,15 @@ static HudState    g_systemState = HudState::STANDBY;
 // these through externs. The linker — not a comment — enforces the wiring;
 // a static here would leave those externs unresolved and the map file would
 // grow a undefined-weak hole nobody notices until a task dereferences NULL.
-ctrl::Config g_ctrlCfg;
+//
+// What is NOT here anymore is the applied configuration. It used to be
+// `ctrl::Config g_ctrlCfg`, written field by field by the settings path while
+// three other tasks read it, so a reader could catch a pair mid-update — a new
+// ALLO_HIGH beside the old ALLO_CUTOFF, a lowered GF_LOW beside the old GF_HIGH
+// — which is a combination settings_apply.cpp guarantees cannot exist, handed
+// back by the global. The applied rules are a published generation now
+// (control/configbox.h); this file reads one per cycle and the settings path
+// publishes one when it has finished applying.
 ctrl::Loop* g_loop = nullptr;   // constructed in setup(): needs config
 static Heartbeat      g_hbControl{0};
 static volatile bool  g_controlRunning = false;
@@ -156,6 +165,18 @@ static void setSystemState(HudState s) {
     hudSetState(s);
 }
 
+// Task-private snapshots of the published generation (control/configbox.h).
+// STATICS, not locals: the payload is 284 bytes, and the supervisor runs on a
+// 3072-byte stack whose measured headroom was exactly the bench's 512-byte
+// warning threshold — putting a generation on that stack failed the acceptance
+// run on its first try (HB stk= fell to 320). What makes a static here a
+// per-task copy rather than the shared global this replaced is that exactly one
+// task writes and reads each of them: the settings path never touches these, it
+// publishes a generation and each task takes its own.
+static ctrl::Config g_sensorRules;      // sensorTask only
+static ctrl::Config g_controlRules;     // controlTask only
+static ctrl::Config g_supervisorRules;  // supervisorTask only
+
 // ---------------------------------------------------------------------------
 // SensorTask — core 0, high priority. Never blocks beyond one Wire timeout.
 // ---------------------------------------------------------------------------
@@ -163,9 +184,21 @@ static void sensorTask(void*) {
     esp_task_wdt_add(NULL); // diagnostics: TWDT dumps backtraces on stall
     vTaskDelay(pdMS_TO_TICKS(200)); // let boot/serial settle
     uint32_t lastBat = 0;
+    // One generation of the applied rules per sample. Depth is converted with
+    // the diver's water density, and that number lives in the published
+    // config; reading the field off the shared struct while the settings path
+    // was mid-update was how a sample could be measured with a ruler the deco
+    // engine was not using (control/configbox.h). setup() publishes the boot
+    // config before it creates this task, so the first read always answers;
+    // the fallback is the compile-time default, kept as the belt rather than
+    // the route — a density of 0.0 divides the conversion to infinity, and an
+    // infinite depth reads as a sensor reading rather than as a bug.
+    if (!ctrl::configRead(g_sensorRules)) g_sensorRules.deco.waterDensity = WATER_DENSITY_KGL;
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_SENSOR);
         const uint32_t now = millis();
+        ctrl::configRead(g_sensorRules);   // newest generation; keeps the last on a miss
+
 #ifdef TEST_SENSOR_STALL
         // Livelock simulation: keeps feeding TWDT (so the diagnostic layer
         // stays quiet) but stops advancing the heartbeat — only the
@@ -195,7 +228,7 @@ static void sensorTask(void*) {
                 // util/depthscale.h for why this line used to be its own
                 // arithmetic and what that cost.
                 g_depthM = static_cast<float>(depthscale::depthFromSensorBar(
-                    p, SURFACE_PRESSURE_BAR, g_ctrlCfg.deco.waterDensity));
+                    p, SURFACE_PRESSURE_BAR, g_sensorRules.deco.waterDensity));
                 g_depthValid = true;
                 depthSane = true;
             }
@@ -609,9 +642,42 @@ static void controlTask(void*) {
 
     int64_t cycleStartUs = (int64_t)esp_timer_get_time();
     uint32_t next = millis() + CONTROL_TASK_PERIOD_MS;
+    // ONE generation of the applied rules per cycle. This iteration's solenoid
+    // fuse, air-calibration window, dive-file row and totals all read
+    // `g_controlRules`, so the numbers a cycle writes describe the rules that
+    // cycle ran under — and those are the same numbers settings_apply.cpp
+    // ordered the pair on. Read off the shared global, the fuse could see this
+    // cycle's max-on while the row beside it reported the previous cycle's duty
+    // (control/configbox.h).
+    //
+    // cycle() applies a queued SET in its step 0, on this thread, so a SET that
+    // lands between the read below and that step reaches the chain this tick and
+    // this iteration's record one tick later: the bound is the 100 ms command
+    // latency loop.h already states, not something new. Which way that bound
+    // cuts matters, and it cuts both ways depending on the SET, so it is worth
+    // naming. A max-on TIGHTENED by a SET can be judged by this iteration's
+    // entry fuse against the looser old value — one extra tick of HIGH, because
+    // the entry fuse is the backstop for a ControlTask that is not reaching
+    // cycle() at all; the fuse inside cycle() runs on the chain's own copy and
+    // cuts under the new number the same tick. A max-on LOOSENED is judged
+    // against the older, stricter value, which cannot miss anything. Either
+    // way the entry fuse is judging the pin this iteration inherited from the
+    // previous one, which is the interval it exists to police.
+    if (!ctrl::configRead(g_controlRules)) {
+        // setup() publishes the boot config before it creates this task, so
+        // this branch is unreachable by construction. It stays because the
+        // alternative is worse than unreachable: a value-initialised config is
+        // `presentMask = 0` and `maxDutyPct = 0` — a chain that injects nothing
+        // on a real dive, and says nothing is fitted. Seed the shipping walls.
+        g_controlRules.presentMask = CELLS_PRESENT_MASK;
+        g_controlRules.inj.maxDutyPct = INJ_MAX_DUTY_PCT;
+        g_controlRules.inj.maxOnMs = INJ_MAX_ON_MS;
+        g_controlRules.deco.waterDensity = WATER_DENSITY_KGL;
+    }
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_CONTROL);
         const uint32_t now = millis();
+        ctrl::configRead(g_controlRules);   // newest generation; keeps the last on a miss
 
         // Worst-cycle tracking (HB `worst=`): the span from one iteration's
         // start to the next is precisely what the supervisor would measure as
@@ -634,7 +700,7 @@ static void controlTask(void*) {
         // this iteration is only now back (a transient stall — the ISR half
         // covers the permanent one), cut BEFORE cycle() gets a chance to ask
         // for more oxygen on top of an abandoned HIGH.
-        if (g_solFuse.shouldCut(now, g_ctrlCfg.inj.maxOnMs)) {
+        if (g_solFuse.shouldCut(now, g_controlRules.inj.maxOnMs)) {
             g_solFuse.cut(now);
             digitalWrite(PIN_SOLENOID, LOW);
             Serial.println("!! SOLFUSE: pin HIGH past max-on at iteration entry — cut "
@@ -723,7 +789,7 @@ static void controlTask(void*) {
             ai.diving = st.diveActive;
             ai.injecting = st.solenoid;
             ai.fresh = sd.cellsFresh;
-            ai.presentMask = g_ctrlCfg.presentMask;
+            ai.presentMask = g_controlRules.presentMask;
             for (int i = 0; i < 3; i++)
                 ai.cellsRaw[i] = static_cast<float>(g_ads.raw(i));
             ai.nowMs = now;
@@ -737,7 +803,7 @@ static void controlTask(void*) {
             if (a.done || a.failed) surfaceCalAir(g_calAirStatus.code, a);
             if (a.done) {
                 for (int i = 0; i < 3; i++)
-                    if (g_ctrlCfg.presentMask & (1u << i)) {
+                    if (g_controlRules.presentMask & (1u << i)) {
                         g_cellCal[i].rawAir = a.rawAvg[i];
                         g_cellCal[i].airBar = CAL_AIR_REF_BAR;
                         g_cellCal[i].hasAir = true;  // slope stays nominal until CAL O2
@@ -761,7 +827,7 @@ static void controlTask(void*) {
         // reshape history with a lie.
         if (sd.cellsFresh)
             for (int i = 0; i < 3; i++)
-                if (g_ctrlCfg.presentMask & (1u << i))
+                if (g_controlRules.presentMask & (1u << i))
                     g_cellHist.sample(i, g_loop->cellBar(i), now);
 
         g_bridgeTel.shownPpo2 = st.shownPpo2;
@@ -912,7 +978,7 @@ static void controlTask(void*) {
         const bool depthSilent = pseq.depthBusSilent();
         if (depthSilent && !prevDepthSilent)
             Serial.printf("pre-dive depth: %s (grace %u s)\n", pseq.depthWhy(),
-                          (unsigned)(g_ctrlCfg.predive.depthGraceMs / 1000u));
+                          (unsigned)(g_controlRules.predive.depthGraceMs / 1000u));
         else if (!depthSilent && prevDepthSilent && !pseq.failed())
             Serial.println("pre-dive depth: bus answering again");
         prevDepthSilent = depthSilent;
@@ -988,15 +1054,15 @@ static void controlTask(void*) {
             // answered, so they must not be one count away from it — which is exactly
             // how the `S,` rows were wrong until 2026-11-24 (the same helper now
             // covers both, and test_numfmt fails if they ever disagree).
-            g_bridgeTotals.gfLow = numfmt::scaledInto<uint8_t>(g_ctrlCfg.deco.gfLow, 0);
-            g_bridgeTotals.gfHigh = numfmt::scaledInto<uint8_t>(g_ctrlCfg.deco.gfHigh, 0);
+            g_bridgeTotals.gfLow = numfmt::scaledInto<uint8_t>(g_controlRules.deco.gfLow, 0);
+            g_bridgeTotals.gfHigh = numfmt::scaledInto<uint8_t>(g_controlRules.deco.gfHigh, 0);
             for (int i = 0; i < 4; i++) {
                 // scaledInto, not a hand-rolled ternary: the columns are
                 // int16 and a value past the column used to wrap into a negative
                 // setpoint in the dive file. The schema will not let a legal
                 // configuration reach the limit, which is exactly why the guard
                 // belongs in the conversion and not in the schema.
-                const int16_t sv = numfmt::scaledInto<int16_t>(g_ctrlCfg.sp.sp[i], 3);
+                const int16_t sv = numfmt::scaledInto<int16_t>(g_controlRules.sp.sp[i], 3);
                 if (i == 0) g_bridgeTotals.sp1X1000 = sv;
                 else if (i == 1) g_bridgeTotals.sp2X1000 = sv;
                 else if (i == 2) g_bridgeTotals.sp3X1000 = sv;
@@ -1104,11 +1170,20 @@ static void controlTask(void*) {
 static void supervisorTask(void*) {
     uint32_t lastSensor = 0, lastHud = 0, lastControl = 0;
     uint32_t lastSensorChange = millis(), lastHudChange = millis(), lastControlChange = millis();
+    // The published generation, read once per check. The fuse decision and the
+    // line that explains it used to read the shared field twice, so a SET
+    // landing between the two printed a max-on that was not the number which
+    // fired the fuse — an incident report disagreeing with its own trigger
+    // (control/configbox.h). setup() publishes before this task exists; the seed
+    // is the belt, and its direction is the compile-time wall rather than a 0
+    // that would cut the pin on the first iteration.
+    if (!ctrl::configRead(g_supervisorRules)) g_supervisorRules.inj.maxOnMs = INJ_MAX_ON_MS;
 
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_SUPERVISOR);
         vTaskDelay(pdMS_TO_TICKS(SUPERVISOR_PERIOD_MS));
         const uint32_t now = millis();
+        ctrl::configRead(g_supervisorRules);   // newest generation; keeps the last on a miss
 
         if (g_hbSensor.seq != lastSensor) { lastSensor = g_hbSensor.seq; lastSensorChange = now; }
         if (g_hbHud.seq != lastHud) { lastHud = g_hbHud.seq; lastHudChange = now; }
@@ -1145,12 +1220,12 @@ static void supervisorTask(void*) {
         // once the latch is up. Normal pulses never reach this: pulseMs is
         // applied strictly below maxOnMs (settings_apply clamps it), so a
         // healthy chain's longest HIGH is a pulse.
-        if (g_controlRunning && g_solFuse.shouldCut(now, g_ctrlCfg.inj.maxOnMs)) {
+        if (g_controlRunning && g_solFuse.shouldCut(now, g_supervisorRules.inj.maxOnMs)) {
             g_solFuse.cut(now);
             digitalWrite(PIN_SOLENOID, LOW);
             Serial.printf("!! SOLFUSE: pin HIGH past %u ms with ControlTask "
                           "not cutting it — supervisor forced LOW, output latched\n",
-                          (unsigned)g_ctrlCfg.inj.maxOnMs);
+                          (unsigned)g_supervisorRules.inj.maxOnMs);
         }
 
         // ERR lamp: while the control chain is running it owns the alarm
@@ -1169,63 +1244,71 @@ static void supervisorTask(void*) {
 // Startup configuration. defaults.h is the source of truth until the NVS-backed
 // settings registry is wired (M5); one function, so what the bench reads out
 // and what the modules run cannot drift apart.
+//
+// Fills a CALLER's struct, not a global: the boot path and the settings path
+// both apply onto a private copy and publish the result (control/configbox.h),
+// so the walls this function sets — highWallBar, maxOnMs, windowMs,
+// pulseTest.pulses — are carried into every later generation by the settings
+// path reading the published config first. Those four are exactly the fields
+// applySettings compares against the ones it writes, which is why applying onto
+// the same object it reads was a decision made against a half-written config.
 // ---------------------------------------------------------------------------
-static void buildControlConfig() {
-    g_ctrlCfg.presentMask = CELLS_PRESENT_MASK;
+static void buildControlConfig(ctrl::Config& cfg) {
+    cfg.presentMask = CELLS_PRESENT_MASK;
 
-    g_ctrlCfg.sp.sp[0] = SP1_BAR;   g_ctrlCfg.sp.sp[1] = SP2_BAR;
-    g_ctrlCfg.sp.sp[2] = SP3_BAR;   g_ctrlCfg.sp.sp[3] = SP4_BAR;
-    g_ctrlCfg.sp.inWaterM = SP_IN_WATER_M;
-    g_ctrlCfg.sp.deep1M = SP_DEEP1_M;
-    g_ctrlCfg.sp.deep2M = SP_DEEP2_M;
-    g_ctrlCfg.sp.hysteresisM = SP_HYST_M;
+    cfg.sp.sp[0] = SP1_BAR;   cfg.sp.sp[1] = SP2_BAR;
+    cfg.sp.sp[2] = SP3_BAR;   cfg.sp.sp[3] = SP4_BAR;
+    cfg.sp.inWaterM = SP_IN_WATER_M;
+    cfg.sp.deep1M = SP_DEEP1_M;
+    cfg.sp.deep2M = SP_DEEP2_M;
+    cfg.sp.hysteresisM = SP_HYST_M;
 
-    g_ctrlCfg.inj.pulseMs = INJ_PULSE_MS;
-    g_ctrlCfg.inj.maxDutyPct = INJ_MAX_DUTY_PCT;
-    g_ctrlCfg.inj.windowMs = INJ_DUTY_WINDOW_MS;
-    g_ctrlCfg.inj.minGapMs = INJ_MIN_GAP_MS;
-    g_ctrlCfg.inj.dbOnBar = INJ_DB_ON_BAR;
-    g_ctrlCfg.inj.dbOffBar = INJ_DB_OFF_BAR;
-    g_ctrlCfg.inj.highWallBar = INJ_HIGH_WALL_BAR;
-    g_ctrlCfg.inj.cutoffBar = INJ_CUTOFF_BAR;
-    g_ctrlCfg.inj.maxOnMs = INJ_MAX_ON_MS;
-    g_ctrlCfg.inj.stuckSlopeBarS = INJ_STUCK_SLOPE_BARS;
-    g_ctrlCfg.inj.stuckRiseBar = INJ_STUCK_RISE_BAR;
-    g_ctrlCfg.inj.stuckEvalMs = INJ_STUCK_EVAL_MS;
-    g_ctrlCfg.inj.stuckHystBar = INJ_STUCK_HYST_BAR;
+    cfg.inj.pulseMs = INJ_PULSE_MS;
+    cfg.inj.maxDutyPct = INJ_MAX_DUTY_PCT;
+    cfg.inj.windowMs = INJ_DUTY_WINDOW_MS;
+    cfg.inj.minGapMs = INJ_MIN_GAP_MS;
+    cfg.inj.dbOnBar = INJ_DB_ON_BAR;
+    cfg.inj.dbOffBar = INJ_DB_OFF_BAR;
+    cfg.inj.highWallBar = INJ_HIGH_WALL_BAR;
+    cfg.inj.cutoffBar = INJ_CUTOFF_BAR;
+    cfg.inj.maxOnMs = INJ_MAX_ON_MS;
+    cfg.inj.stuckSlopeBarS = INJ_STUCK_SLOPE_BARS;
+    cfg.inj.stuckRiseBar = INJ_STUCK_RISE_BAR;
+    cfg.inj.stuckEvalMs = INJ_STUCK_EVAL_MS;
+    cfg.inj.stuckHystBar = INJ_STUCK_HYST_BAR;
 
-    g_ctrlCfg.cellproof.enabled = (CELLPROOF_ENABLED != 0);
-    g_ctrlCfg.cellproof.depthM = CELLPROOF_DEPTH_M;
-    g_ctrlCfg.cellproof.spBar = CELLPROOF_SP_BAR;
-    g_ctrlCfg.cellproof.minPassBar = CELLPROOF_MIN_BAR;
-    g_ctrlCfg.cellproof.timeoutMs = CELLPROOF_TIMEOUT_MS;
-    g_ctrlCfg.cellproof.okMaxSpBar = CELLPROOF_MAXSP_BAR;
-    g_ctrlCfg.cellproof.suspectGapBar = CELLPROOF_SUSPECT_GAP_BAR;
-    g_ctrlCfg.cellproof.suspectMs = CELLPROOF_SUSPECT_MS;
-    g_ctrlCfg.cellproof.rearmCooldownMs = CELLPROOF_REARM_COOLDOWN_MS;
-    g_ctrlCfg.cellproof.maxAttempts = CELLPROOF_MAX_ATTEMPTS;
+    cfg.cellproof.enabled = (CELLPROOF_ENABLED != 0);
+    cfg.cellproof.depthM = CELLPROOF_DEPTH_M;
+    cfg.cellproof.spBar = CELLPROOF_SP_BAR;
+    cfg.cellproof.minPassBar = CELLPROOF_MIN_BAR;
+    cfg.cellproof.timeoutMs = CELLPROOF_TIMEOUT_MS;
+    cfg.cellproof.okMaxSpBar = CELLPROOF_MAXSP_BAR;
+    cfg.cellproof.suspectGapBar = CELLPROOF_SUSPECT_GAP_BAR;
+    cfg.cellproof.suspectMs = CELLPROOF_SUSPECT_MS;
+    cfg.cellproof.rearmCooldownMs = CELLPROOF_REARM_COOLDOWN_MS;
+    cfg.cellproof.maxAttempts = CELLPROOF_MAX_ATTEMPTS;
 
-    g_ctrlCfg.alarms.lowBar = PPO2_LOW_ALARM_BAR;
-    g_ctrlCfg.alarms.highBar = PPO2_HIGH_ALARM_BAR;
-    g_ctrlCfg.alarms.cnsAlarmPct = CNS_ALARM_PCT;
-    g_ctrlCfg.alarms.vbatMin = VBAT_MIN_V;
+    cfg.alarms.lowBar = PPO2_LOW_ALARM_BAR;
+    cfg.alarms.highBar = PPO2_HIGH_ALARM_BAR;
+    cfg.alarms.cnsAlarmPct = CNS_ALARM_PCT;
+    cfg.alarms.vbatMin = VBAT_MIN_V;
 
-    g_ctrlCfg.predive.warmupMs = PREDIVE_WARMUP_MS;
-    g_ctrlCfg.predive.airTargetBar = CAL_AIR_REF_BAR;
-    g_ctrlCfg.predive.airTolPct = PREDIVE_AIR_TOL_PCT;
-    g_ctrlCfg.predive.airStableSamples = PREDIVE_AIR_STABLE;
-    g_ctrlCfg.predive.depthMaxM = PREDIVE_DEPTH_MAX_M;
-    g_ctrlCfg.predive.depthGraceMs = PREDIVE_DEPTH_GRACE_MS;
+    cfg.predive.warmupMs = PREDIVE_WARMUP_MS;
+    cfg.predive.airTargetBar = CAL_AIR_REF_BAR;
+    cfg.predive.airTolPct = PREDIVE_AIR_TOL_PCT;
+    cfg.predive.airStableSamples = PREDIVE_AIR_STABLE;
+    cfg.predive.depthMaxM = PREDIVE_DEPTH_MAX_M;
+    cfg.predive.depthGraceMs = PREDIVE_DEPTH_GRACE_MS;
 
-    g_ctrlCfg.pulseTest.pulses = PREDIVE_TEST_PULSES;
-    g_ctrlCfg.pulseTest.baselineSamples = PREDIVE_TEST_BASELINE;
-    g_ctrlCfg.pulseTest.riseMinBar = PREDIVE_RISE_MIN_BAR;
-    g_ctrlCfg.pulseTest.pulseTimeoutMs = PREDIVE_PULSE_TIMEOUT_MS;
-    g_ctrlCfg.pulseTest.recoverTimeoutMs = PREDIVE_RECOVER_TIMEOUT_MS;
-    g_ctrlCfg.pulseTest.recoverTolBar = PREDIVE_RECOVER_TOL_BAR;
+    cfg.pulseTest.pulses = PREDIVE_TEST_PULSES;
+    cfg.pulseTest.baselineSamples = PREDIVE_TEST_BASELINE;
+    cfg.pulseTest.riseMinBar = PREDIVE_RISE_MIN_BAR;
+    cfg.pulseTest.pulseTimeoutMs = PREDIVE_PULSE_TIMEOUT_MS;
+    cfg.pulseTest.recoverTimeoutMs = PREDIVE_RECOVER_TIMEOUT_MS;
+    cfg.pulseTest.recoverTolBar = PREDIVE_RECOVER_TOL_BAR;
 
-    g_ctrlCfg.deco.pSurfaceBar = SURFACE_PRESSURE_BAR;
-    g_ctrlCfg.deco.waterDensity = WATER_DENSITY_KGL;
+    cfg.deco.pSurfaceBar = SURFACE_PRESSURE_BAR;
+    cfg.deco.waterDensity = WATER_DENSITY_KGL;
 }
 
 // Factory slope so an uncalibrated rig still shows plausible numbers. This is
@@ -1339,8 +1422,15 @@ void setup() {
     // numbers into the chain. A corrupt or schema-old NVS area falls back to
     // defaults silently — the boot log says what was loaded.
     const int loadedKeys = nvs::Store::load(g_settings);
-    buildControlConfig();
-    const uint8_t applyClamps = comms::applySettings(g_settings, g_ctrlCfg);
+    // A private struct: defaults, then the NVS overlay applied onto it, then ONE
+    // publish. Nothing else has seen it during that pass, so the applier's
+    // ordering clamps compare the injection walls the boot just set against the
+    // numbers being written, not against a global another task is reading
+    // (control/configbox.h).
+    ctrl::Config cfg{};
+    buildControlConfig(cfg);
+    const uint8_t applyClamps = comms::applySettings(g_settings, cfg);
+    ctrl::configPublish(cfg);   // before any task that reads it is created
     if (loadedKeys > 0) Serial.printf("settings: %d keys from NVS\n", loadedKeys);
     if (applyClamps != comms::CLAMP_NONE) {
         // A stored combination can be legal per key and inverted together, and
@@ -1354,7 +1444,7 @@ void setup() {
                       names);
     }
     seedCellCal();
-    g_loop = new (std::nothrow) ctrl::Loop(g_ctrlCfg);
+    g_loop = new (std::nothrow) ctrl::Loop(cfg);
     if (g_loop == nullptr) {
         // No control chain, no injection: the pin is never taken over.
         Serial.println("** FATAL: control chain allocation failed — SAFE");
@@ -1371,16 +1461,16 @@ void setup() {
         char bs1[16], bs2[16], bs3[16], bs4[16], bwall[16], bcut[16];
         Serial.printf("control: SP=%s/%s/%s/%s cells=%d%d%d wall=%s cutoff=%s "
                       "duty=%u%% pulse=%ums warmup=%us%s\n",
-                      numfmt::fixed(bs1, sizeof(bs1), g_ctrlCfg.sp.sp[0], 2),
-                      numfmt::fixed(bs2, sizeof(bs2), g_ctrlCfg.sp.sp[1], 2),
-                      numfmt::fixed(bs3, sizeof(bs3), g_ctrlCfg.sp.sp[2], 2),
-                      numfmt::fixed(bs4, sizeof(bs4), g_ctrlCfg.sp.sp[3], 2),
-                      (g_ctrlCfg.presentMask >> 0) & 1, (g_ctrlCfg.presentMask >> 1) & 1,
-                      (g_ctrlCfg.presentMask >> 2) & 1,
-                      numfmt::fixed(bwall, sizeof(bwall), g_ctrlCfg.inj.highWallBar, 2),
-                      numfmt::fixed(bcut, sizeof(bcut), g_ctrlCfg.inj.cutoffBar, 2),
-                      (unsigned)g_ctrlCfg.inj.maxDutyPct, (unsigned)g_ctrlCfg.inj.pulseMs,
-                      (unsigned)(g_ctrlCfg.predive.warmupMs / 1000),
+                      numfmt::fixed(bs1, sizeof(bs1), cfg.sp.sp[0], 2),
+                      numfmt::fixed(bs2, sizeof(bs2), cfg.sp.sp[1], 2),
+                      numfmt::fixed(bs3, sizeof(bs3), cfg.sp.sp[2], 2),
+                      numfmt::fixed(bs4, sizeof(bs4), cfg.sp.sp[3], 2),
+                      (cfg.presentMask >> 0) & 1, (cfg.presentMask >> 1) & 1,
+                      (cfg.presentMask >> 2) & 1,
+                      numfmt::fixed(bwall, sizeof(bwall), cfg.inj.highWallBar, 2),
+                      numfmt::fixed(bcut, sizeof(bcut), cfg.inj.cutoffBar, 2),
+                      (unsigned)cfg.inj.maxDutyPct, (unsigned)cfg.inj.pulseMs,
+                      (unsigned)(cfg.predive.warmupMs / 1000),
                       g_cellCal[0].hasAir ? "" : "  [CELLS UNCALIBRATED: run CAL AIR]");
     }
 

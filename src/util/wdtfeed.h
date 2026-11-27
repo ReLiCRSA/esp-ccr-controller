@@ -41,11 +41,12 @@ namespace util {
 /// Units of work (rows, for the export) between feeds. 16 is a sizing choice,
 /// not a measured one: a snapshot CSV row is ~110 bytes, ~10 ms down a 115200
 /// handset link, so an un-fed stretch of an export is ~0.15 s — comfortably
-/// inside the window at which this build's task watchdog panics (main.cpp
-/// re-initialises the TWDT with panic enabled, and a TASK_WDT reason forces SAFE
-/// at the next boot), while a whole row's worth of work between feeds keeps the
-/// bookkeeping off the per-byte path. Keep it a power of two: the feed test
-/// below is a mask, not a division.
+/// inside the 3 s window this build's task watchdog panics at (main.cpp's
+/// esp_task_wdt_init(3, true) raises that timeout, and a TASK_WDT reason forces
+/// SAFE at the next boot — see the toolchain evidence at that call site), while
+/// a whole row's worth of work between feeds keeps the bookkeeping off the
+/// per-byte path. Keep it a power of two: the feed test below is a mask, not a
+/// division.
 constexpr unsigned kWdtFeedEvery = 16u;
 
 /// Is a feed due after this many COMPLETED units of work? Called with the

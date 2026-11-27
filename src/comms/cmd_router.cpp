@@ -167,8 +167,16 @@ proto::DecoInfo CommandRouter::decoInfoOf(const deco::View& v) {
     return d;
 }
 
-// The protocol flags byte is 8 bits; alarm bits 6..9 are reported as SENSOR
-// trouble rather than dropped silently (they are all sensor/fuel failures).
+// The protocol flags byte is 8 bits. Alarm bits 3/6/7/9 (sensor fail, stuck
+// open, sensor stale, hypoxia) are reported as one SENSOR bit rather than
+// dropped silently — from a handset's point of view they are all "the loop is
+// not telling you what you need, act". CNS_HIGH is NOT in that aggregate and
+// never was meant to be: it is an oxygen budget, not a sensor fault, and until
+// 2026-11-27 this function silently discarded it while its own comment claimed
+// the aggregate covered it. It gets the free bit 7 instead (see UartLink::emitT
+// for the same reasoning on the other transport — the two mappings are
+// duplicates and must stay equal, so both carry the bit). Append-only: bits
+// 0..6 keep their published meanings, bit 7 is newly named, no renumbering.
 static uint8_t telemetryFlags(const ctrl::Loop& loop) {
     const uint16_t a = loop.alarmBits();
     uint8_t f = 0;
@@ -181,6 +189,7 @@ static uint8_t telemetryFlags(const ctrl::Loop& loop) {
     if (a & (1u << alarms::BIT_BATTERY))     f |= 1 << 4;
     if (a & (1u << alarms::BIT_SP_CLAMP))    f |= 1 << 5;
     if (loop.cellproof().state == cellproof::State::FAIL) f |= 1 << 6;
+    if (a & (1u << alarms::BIT_CNS_HIGH))    f |= 1 << 7;
     return f;
 }
 

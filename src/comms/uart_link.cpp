@@ -26,9 +26,11 @@ void emit(UartLink::Sink sink, void* ctx, char* line, size_t n) {
 // byte, no yield inside it — and the task running it is registered with the
 // task watchdog, which it feeds once per pump (uart2_task.cpp). A 6-12 h dive
 // therefore puts thousands of rows between two feeds, and a registered task
-// that blows that budget on this build does not warn, it panics (main.cpp
-// re-initialises the TWDT with panic enabled, and a TASK_WDT reset reason forces
-// SAFE at the next boot). So the answer to a diver's read-only question can
+// that blows that budget on this build does not warn, it panics (main.cpp's
+// esp_task_wdt_init(3, true) is the timeout this task is checked against — the
+// SDK this env builds does not boot the watchdog itself — with panic enabled,
+// and a TASK_WDT reset reason forces SAFE at the next boot). So the answer to a
+// diver's read-only question can
 // reset his own controller mid-dive: an export that takes a long time to write
 // is indistinguishable, to the watchdog, from a task that stopped.
 //
@@ -138,6 +140,19 @@ void UartLink::emitT(Sink sink, void* ctx) {
     if (a & (1u << alarms::BIT_BATTERY))    f |= 1 << 4;
     if (a & (1u << alarms::BIT_SP_CLAMP))   f |= 1 << 5;
     if (tel_.cpState == static_cast<uint8_t>(cellproof::State::FAIL)) f |= 1 << 6;
+    // CNS overload gets its OWN bit (7), added 2026-11-27 rather than folded
+    // into bit 3. It used to be dropped here with a comment calling the bits
+    // 6..9 aggregate "sensor/fuel failures", which is true of stuck-open,
+    // sensor stale and hypoxia and false of CNS: a diver over his CNS limit is
+    // not reading a sensor fault, and the handset that only aggregates cannot
+    // tell "your loop is not telling you things" from "you have used up your
+    // oxygen budget" — two different actions. Append-only: bits 0..6 keep the
+    // meanings the protocol publishes (§4's table), bit 7 is newly named, and
+    // nothing moved; a client that ignores the top bit is still correct, exactly
+    // as one that stops at FLAGS is correct about the appended battery field.
+    // The controller's own alarm word is untouched — this is a projection, and
+    // the ids it publishes as E,*,1/2 are the same 10 bits as before.
+    if (a & (1u << alarms::BIT_CNS_HIGH))   f |= 1 << 7;
     t.flags = f;
     // SAFE is visible on the wire before the diver tries anything: the router
     // knows the machine is locked out, and the snapshot published by a control

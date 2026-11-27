@@ -310,13 +310,3 @@ int DiveStore::exportRaw(int slot, uint8_t* buf, size_t cap) const {
     free(img);
     return (int)n;
 }
-
-void DiveStore::eraseAll() {
-    if (!mounted_) return;
-    if (file_) file_.close();
-    for (int s = 1; s <= kMaxDives; s++) {
-        char p[24];
-        pathFor(s, p, sizeof(p));
-        LittleFS.remove(p);
-    }
-}

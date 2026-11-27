@@ -12,7 +12,9 @@
 #include "settings_apply.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <utility>
 
 namespace comms {
 
@@ -37,6 +39,25 @@ uint8_t applySettings(const settings::Registry& reg, ctrl::Config& cfg) {
     cfg.sp.deep1M = f("D1");
     cfg.sp.deep2M = f("D2");
     cfg.sp.hysteresisM = f("SP_HYST");
+    if (cfg.sp.deep1M > cfg.sp.deep2M) {
+        // The engine reads the edges as one ascending ladder: `d < D1` is the
+        // shallow band, `d > D2` the deep band, and everything between them the
+        // middle. Crossed edges turn that middle band inside out and make every
+        // depth past the deeper edge select band 0, which is the *lowest*
+        // setpoint and the shortest deco — a diver at depth would be told a
+        // shallower target gas than the water demands. Swapping the two
+        // preserves both depths the diver entered and restores the direction the
+        // ladder is supposed to run in.
+        //
+        // What it does not restore is the band's width: if the two numbers are
+        // equal, or closer together than 2*SP_HYST, the middle band collapses to
+        // nothing and the engine steps straight from band 0 to band 2. That is
+        // not a runaway — the hysteresis is measured against the same edges it
+        // switches on, so a single value simply means two bands, not an
+        // oscillation — so nothing is invented here to prop the middle band up.
+        std::swap(cfg.sp.deep1M, cfg.sp.deep2M);
+        clamps |= CLAMP_BAND_ORDER;
+    }
 
     // alarms
     cfg.alarms.lowBar = f("ALLO_LOW");
@@ -92,11 +113,68 @@ uint8_t applySettings(const settings::Registry& reg, ctrl::Config& cfg) {
     // deco
     cfg.deco.gfLow = f("GF_LOW");
     cfg.deco.gfHigh = f("GF_HIGH");
+    if (cfg.deco.gfLow > cfg.deco.gfHigh) {
+        // The gradient factor line interpolates across the tissue set from the
+        // fast compartment down to the slow one, so the two numbers are an
+        // ordered pair, not a range: the low edge is the *strict* ceiling on the
+        // tissues that load and unload quickest, and the high edge is the
+        // permissive one on the tissues that barely move. Crossed edges hand the
+        // permissive factor to the fast tissues, and since the ceiling is taken
+        // over all compartments, the deepest stop a diver is allowed to miss is
+        // whichever compartment ends up most permissive — the ceiling drifts
+        // deeper and deco silently shortens.
+        //
+        // A swap would not fix that: it would put the strict factor on the slow
+        // tissues, where it does almost nothing, while the fast tissues keep the
+        // permissive one. So the low edge follows the high one instead, and both
+        // tissues run on the stricter of the two numbers the diver entered. Both
+        // edges stay inside the per-key registry range, so this is a clamp the
+        // handset can read back rather than a value it never sent.
+        cfg.deco.gfLow = cfg.deco.gfHigh;
+        clamps |= CLAMP_GF_ORDER;
+    }
     cfg.deco.ascentRateM = f("ASC_RATE");
     cfg.deco.ascentRateSlowM = f("ASC_RATE_SLOW");
     cfg.deco.waterDensity = f("WATER_DENSITY");
 
     return clamps;
+}
+
+const char* clampName(uint8_t bit) {
+    switch (bit) {
+        case CLAMP_HIGH_ALARM: return "HIGH_ALARM";
+        case CLAMP_CUTOFF:     return "CUTOFF";
+        case CLAMP_PULSE_MS:   return "PULSE_MS";
+        case CLAMP_DUTY:       return "DUTY";
+        case CLAMP_SP_ORDER:   return "SP_ORDER";
+        // The two ordering clamps read as what they did to the diver's numbers,
+        // not as a generic "clamped": a diver who set GF_LOW=90 over GF_HIGH=50
+        // needs to see that his gradient schedule was the thing refused.
+        case CLAMP_GF_ORDER:   return "GF_ORDER";
+        case CLAMP_BAND_ORDER: return "BAND_ORDER";
+        default:               return nullptr;
+    }
+}
+
+size_t clampList(uint8_t mask, char* out, size_t cap) {
+    if (out == nullptr || cap == 0) return 0;
+    out[0] = '\0';
+    size_t written = 0;
+    size_t used = 0;
+    for (uint8_t bit = 1; bit != 0; bit <<= 1) {
+        if ((mask & bit) == 0) continue;
+        const char* name = clampName(bit);
+        if (name == nullptr) continue;   // a bit with no name has nothing to say
+        // Measure first. snprintf would otherwise write the first two characters
+        // of the next name into a full buffer and leave a dangling comma on the
+        // console — a truncated list has to stop at a whole name.
+        const int need = snprintf(nullptr, 0, written ? ", %s" : "%s", name);
+        if (need < 0 || used + static_cast<size_t>(need) >= cap) break;
+        snprintf(out + used, cap - used, written ? ", %s" : "%s", name);
+        used += static_cast<size_t>(need);
+        written++;
+    }
+    return written;
 }
 
 } // namespace comms

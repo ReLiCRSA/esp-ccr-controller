@@ -131,6 +131,13 @@ struct ViewSlot {
 inline void publishView(ViewSlot& s, const View& fresh) {
     s.seq.fetch_add(1, std::memory_order_acq_rel);      // -> odd
     s.view = fresh;
+    // The payload is an ordinary struct copy: nothing in its own code orders
+    // it against the atomic below it. Without this release fence a compiler is
+    // free to sink the field writes past the even bump, and a reader then sees
+    // "generation stable" over a half-written picture — a valid-looking View
+    // whose stop list belongs to two different generations. The fence is what
+    // makes "even means complete" a guarantee rather than a habit.
+    std::atomic_thread_fence(std::memory_order_release);
     s.seq.fetch_add(1, std::memory_order_acq_rel);      // -> even
 }
 
@@ -141,6 +148,13 @@ inline bool viewSnapshot(const ViewSlot& s, View& out) {
         const int32_t a = s.seq.load(std::memory_order_acquire);
         if (a == 0) return false;
         out = s.view;
+        // Same reasoning on the read side, and the same hazard mirrored: the
+        // payload reads are plain loads, so without this acquire fence the
+        // compiler may hoist them above the recheck (or keep registers from
+        // the first pass), and the recheck then proves nothing about the bytes
+        // actually copied. One fence between the payload and the second seq
+        // read is the whole seqlock contract.
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (s.seq.load(std::memory_order_acquire) == a) return (a & 1) == 0;
     }
     return false;  // never observed a stable generation (pathological)

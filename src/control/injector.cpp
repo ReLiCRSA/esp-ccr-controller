@@ -18,8 +18,22 @@ float Injector::dutyPct(uint32_t nowMs) const {
     uint32_t on = 0;
     for (int i = 0; i < logCount_; ++i) {
         const Pulse& p = log_[i];
-        if (nowMs >= p.startMs && p.startMs + cfg_.windowMs >= nowMs)
-            on += (p.endMs > p.startMs ? p.endMs - p.startMs : 0);
+        // Subtract first, then compare signed — the form the rest of this
+        // codebase already uses (main.cpp's control-loop due checks). The two
+        // unsigned comparisons this replaced (`nowMs >= p.startMs &&
+        // p.startMs + windowMs >= nowMs`) both go false for the first window
+        // after the 32-bit clock wraps, and `p.startMs + windowMs` can wrap
+        // round past `nowMs` on its own. What that means in the water is the
+        // point: duty is a diver-facing number, and the failure direction was
+        // 0% — "the solenoid has not run at all this window" — printed about a
+        // machine that had been injecting normally for the last ten seconds.
+        // Signed differences are exact for any gap under 2^31 ms, which a
+        // 10 s duty window is by four orders of magnitude.
+        const int32_t ageMs = static_cast<int32_t>(nowMs - p.startMs);
+        if (ageMs >= 0 && ageMs < static_cast<int32_t>(cfg_.windowMs)) {
+            const int32_t onMs = static_cast<int32_t>(p.endMs - p.startMs);
+            on += onMs > 0 ? static_cast<uint32_t>(onMs) : 0u;
+        }
     }
     return 100.0f * on / static_cast<float>(cfg_.windowMs);
 }

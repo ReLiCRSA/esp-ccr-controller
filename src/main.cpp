@@ -672,8 +672,19 @@ static void controlTask(void*) {
         const uint32_t calTSec = (now - g_bridgeTel.diveStartMs) / 1000u;
         if (g_calAirRequest) {
             g_calAirRequest = false;
-            if (now < PREDIVE_WARMUP_MS) {
-                const uint32_t left = (PREDIVE_WARMUP_MS - now) / 1000u;
+            // Signed difference, not `now < PREDIVE_WARMUP_MS`. `now` is
+            // millis(), so the unsigned form went true again for the first
+            // 120 s after the 32-bit wrap — 49.7 days of uptime, which a soak
+            // or a bench board nobody power-cycles reaches — and refused a
+            // diver's air calibration with "cells still warming up" on a
+            // machine two months past warm-up. The drift direction is a
+            // refusal, which is at least safe, but it is a refusal with a
+            // wrong reason and no way for the bench to tell it apart from the
+            // honest one. Differences are exact for gaps under 2^31 ms.
+            const int32_t warmupLeftMs =
+                static_cast<int32_t>(PREDIVE_WARMUP_MS - now);
+            if (warmupLeftMs > 0) {
+                const uint32_t left = static_cast<uint32_t>(warmupLeftMs) / 1000u;
                 Serial.printf("cal air: REFUSED - cells still warming up (%u s left)\n",
                               (unsigned)left);
                 bridge::publishCalAirRefused(g_calAirStatus, bridge::CALAIR_WARMUP,
@@ -1244,9 +1255,50 @@ void setup() {
         forceSafe = true;
     }
 
-    // Task watchdog: diagnostic layer (warns+backtraces). The supervisor
-    // provides the deterministic reboot.
-    esp_task_wdt_init(3, true);
+    // Task watchdog: the diagnostic layer. A registered task that stalls gets a
+    // warning dump and, because panic is enabled, a reset whose reason is
+    // TASK_WDT — which the boot path above reads and turns into SAFE mode. The
+    // supervisor provides the deterministic reboot; this is the detector.
+    //
+    // THE 3 s IS THE TIMEOUT THE BOARD RUNS WITH, and that is a toolchain fact
+    // rather than a code fact, so it is written down where the next reader can
+    // check it instead of trusting a comment. The SDK env:esp32 compiles against
+    // (arduino core 2.1.7, ESP-IDF v4.4-style — tools/sdk/esp32) defines
+    // CONFIG_ESP_TASK_WDT, ..._PANIC and ..._TIMEOUT_S 5 in
+    // qio_qspi/include/sdkconfig.h, and does NOT define CONFIG_ESP_TASK_WDT_INIT:
+    // no header in that SDK reads the macro at all, so nothing boots a watchdog
+    // before this line. Two independent checks, run on the tree 2026-11-27:
+    //   * `nm -U` over every archive in tools/sdk/esp32/**/lib finds no
+    //     reference to esp_task_wdt_init anywhere; firmware.map lists THIS
+    //     object as the only puller of task_wdt.c.obj.
+    //   * objdump of task_wdt.c.obj shows the already-initialised branch
+    //     rewriting ctx->timeout and ctx->panic and re-arming the hardware
+    //     (wdt_hal_disable/config_stage/enable) instead of returning early, so
+    //     a second init RECONFIGURES rather than no-ops.
+    // What the SDK's 5 s therefore decides is the interval the idle task (CPU0,
+    // CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0) is subscribed with; the timeout
+    // every task registered below is checked against is the one raised here.
+    // A review premised "the framework already inits it at 5 s, so this call is
+    // a no-op" was reading the v5.5 header of the OTHER installed platform
+    // (arduino core 4.x, CONFIG_ESP_TASK_WDT_INIT=1, esp_task_wdt_config_t) —
+    // not what this env builds. Two consequences of that reading, both avoided:
+    // adding -DCONFIG_ESP_TASK_WDT_INIT=0 to build_flags would be a second
+    // phantom (a macro nothing consults), and "fixing" this call to the v5
+    // esp_task_wdt_config_t signature would not compile here.
+    //
+    // The result is checked, not discarded: an init that failed would leave the
+    // detector off in silence, and then a stalled control task runs forever
+    // instead of resetting into SAFE. It cannot fail today (first call, nothing
+    // registered yet); the check is what stops that from becoming false without
+    // anyone noticing. When this env moves to IDF v5 the call stops compiling —
+    // which is the loud failure a phantom would have hidden.
+    const esp_err_t wdtErr = esp_task_wdt_init(3, true);
+    if (wdtErr != ESP_OK)
+        Serial.printf("** TWDT init FAILED (%s): no task watchdog this boot — a stalled"
+                      " sensor/hud/control/uart2 task will not be caught\n",
+                      esp_err_to_name(wdtErr));
+    else
+        Serial.println("TWDT: 3 s timeout, panic on  (registered: sensor, hud, control, uart2)");
 
     g_ads.begin();
     g_battery.begin();
@@ -1262,9 +1314,18 @@ void setup() {
     const int loadedKeys = nvs::Store::load(g_settings);
     buildControlConfig();
     const uint8_t applyClamps = comms::applySettings(g_settings, g_ctrlCfg);
-    if (loadedKeys > 0)
-        Serial.printf("settings: %d keys from NVS%s\n", loadedKeys,
-                      applyClamps ? "  [SOME VALUES CLAMPED: ordering enforced]" : "");
+    if (loadedKeys > 0) Serial.printf("settings: %d keys from NVS\n", loadedKeys);
+    if (applyClamps != comms::CLAMP_NONE) {
+        // A stored combination can be legal per key and inverted together, and
+        // the registry keeps what the diver typed — so `GET GF_LOW` will answer
+        // the number he set while the chain runs the clamped one. The names are
+        // printed instead of a mask for exactly that reason: a boot log that
+        // says "clamped" without saying which is a boot log nobody acts on.
+        char names[64];
+        comms::clampList(applyClamps, names, sizeof names);
+        Serial.printf("settings: CLAMPED %s — ordering enforced over what was stored\n",
+                      names);
+    }
     seedCellCal();
     g_loop = new (std::nothrow) ctrl::Loop(g_ctrlCfg);
     if (g_loop == nullptr) {

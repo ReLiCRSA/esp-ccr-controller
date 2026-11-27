@@ -76,9 +76,6 @@ public:
     /// empty or absent log), or -1 if the file could not be opened at all.
     int exportCsv(void (*sink)(const char* line, void* ctx), void* ctx) const;
 
-    /// Bench only: deletes the surface history.
-    void eraseAll();
-
 private:
     static constexpr const char* kPath = "/surface.bin";
     static constexpr const char* kTmpPath = "/surface.tmp";

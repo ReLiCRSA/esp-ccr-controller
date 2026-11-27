@@ -79,9 +79,6 @@ public:
     /// silently turned into a fresh dive.
     bool corrupt() const { return present_ && !anyRecord(); }
 
-    /// Bench only.
-    void eraseAll();
-
     static constexpr const char* kPath = "/continuity.bin";
     static constexpr size_t kImageSize = logfmt::ContinuitySlots::kImageSize;
 

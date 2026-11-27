@@ -82,8 +82,6 @@ public:
     /// stops at the first failing record. Returns bytes written, -1 missing.
     int exportRaw(int slot, uint8_t* buf, size_t cap) const;
 
-    void eraseAll();
-
 private:
     /// 1..10, evicting the oldest dive when the FIFO is full. `seqOut` is the
     /// sequence the chosen dive must carry: max on the partition + 1, derived

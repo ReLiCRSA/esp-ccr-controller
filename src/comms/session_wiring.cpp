@@ -289,8 +289,20 @@ void hookSettings(void*) {
     // configuration. postConfig queues the re-tune for the next control tick
     // (engines re-tune in place, never a restart), so a SET from the handset
     // or the browser never mutates the chain while ControlTask is mid-cycle.
-    applySettings(g_settings, g_ctrlCfg);
+    const uint8_t clamps = applySettings(g_settings, g_ctrlCfg);
     if (g_loop) g_loop->postConfig(g_ctrlCfg);
+    if (clamps != CLAMP_NONE) {
+        // `SET` answers OK SAFETY whether or not anything was refused, and the
+        // registry keeps the number the diver typed, so the answer alone cannot
+        // tell him that GF_LOW=90 over GF_HIGH=50 became two 50s. There is no
+        // verdict field on the wire for this (adding one is a protocol change),
+        // so the console is where the refusal is admitted, at the moment it is
+        // made rather than at the next boot.
+        char names[64];
+        clampList(clamps, names, sizeof names);
+        Serial.printf("settings: CLAMPED %s — ordering enforced over what was set\n",
+                      names);
+    }
 }
 
 void hookCalAir(void*) { g_calAirRequest = true; }

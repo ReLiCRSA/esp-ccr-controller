@@ -143,8 +143,3 @@ int SurfaceStore::exportCsv(void (*sink)(const char* line, void* ctx),
     f.close();
     return emitted;
 }
-
-void SurfaceStore::eraseAll() {
-    if (LittleFS.exists(kPath)) LittleFS.remove(kPath);
-    if (LittleFS.exists(kTmpPath)) LittleFS.remove(kTmpPath);
-}

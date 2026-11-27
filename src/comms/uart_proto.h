@@ -118,7 +118,9 @@ struct Telemetry {
     float setpoint;
     uint8_t mode;             // 0 standby 1 auto 2 manual 3 safe
     uint8_t flags;            // alarm bits (bit0 low, bit1 high, bit2 drift,
-                              // bit3 sensor, bit4 battery, bit5 clamp, bit6 cellproof)
+                              // bit3 sensor, bit4 battery, bit5 clamp, bit6
+                              // cellproof, bit7 CNS high — added 2026-11-27,
+                              // append-only: bits 0..6 never moved)
     float battV = 0.0f;       // appended last: a client that stops at FLAGS
                               // is still correct (PLAN 8 downlink)
 };

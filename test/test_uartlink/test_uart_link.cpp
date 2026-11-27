@@ -11,6 +11,7 @@
 #include <unity.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <string>
@@ -18,6 +19,7 @@
 
 #include "comms/telemetry_bridge.h"
 #include "comms/uart_link.h"
+#include "control/cellproof.h"
 #include "util/wdtfeed.h"
 
 using comms::CommandRouter;
@@ -243,6 +245,63 @@ void test_periodic_lines_keep_their_cadence() {
         if (l.compare(0, 2, "T,") == 0 && l.find("0.620,0.630,0.610") != std::string::npos)
             sawCells = true;
     TEST_ASSERT_TRUE_MESSAGE(sawCells, "T, line lost the per-cell readings");
+}
+
+// The `T,` FLAGS byte is a projection of the control chain's alarm word, done
+// twice — once here for the handset link, once in cmd_router.cpp for `GET T` and
+// the web — and the two mappings have to agree. CNS_HIGH is the one condition in
+// the word that is not a machine fault: bit 3 is the aggregate for "the loop is
+// not telling you what you need" (sensor fail/stale, stuck-open, hypoxia), and a
+// diver over his oxygen budget is reading a working sensor. Folding CNS into that
+// aggregate would ask a handset to fix a fault that does not exist, so CNS got a
+// free bit (7) instead of a renumbering. Graded here on the wire, because the
+// alarm word itself is unchanged and nothing else would notice the difference.
+void test_cns_high_gets_its_own_flag_bit_and_stays_out_of_the_fault_aggregate() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+    f.tel.depthM = 18.0f;
+    f.tel.shownPpo2 = 1.30f;
+    for (int i = 0; i < 3; i++) f.tel.cellBar[i] = 1.30f;
+    f.tel.setpointBar = 1.30f;
+    f.tel.vbat = 12.4f;
+    f.tel.haveVote = true;
+    f.tel.diveActive = true;
+    f.tel.autoMode = true;
+    f.tel.cpState = static_cast<uint8_t>(cellproof::State::PASS);
+
+    auto flagsOf = [&](uint32_t tMs) {
+        out.clear();
+        f.pump(tMs);
+        for (const auto& l : out) {
+            const size_t p = l.find("FLAGS0x");
+            if (l.compare(0, 2, "T,") == 0 && p != std::string::npos)
+                return std::strtoul(l.c_str() + p + 7, nullptr, 16);
+        }
+        TEST_FAIL_MESSAGE("no T, line with a FLAGS field");
+        return 0UL;
+    };
+
+    // CNS alone: exactly bit 7. Nothing else may ride along — bit 3 in
+    // particular, because that bit is a handset's "go check the sensors".
+    f.tel.alarmBits = 1u << alarms::BIT_CNS_HIGH;
+    TEST_ASSERT_EQUAL_UINT32(0x80u, flagsOf(0));
+
+    // A real sensor fault: bit 3, and no invented CNS bit beside it. The
+    // aggregate still means what §4 publishes it to mean.
+    f.tel.alarmBits = 1u << alarms::BIT_SENSOR_STALE;
+    TEST_ASSERT_EQUAL_UINT32(0x08u, flagsOf(500));
+
+    // Both: two separate facts, readable separately by a handset that cares
+    // about one of them.
+    f.tel.alarmBits = (1u << alarms::BIT_SENSOR_STALE) | (1u << alarms::BIT_CNS_HIGH);
+    TEST_ASSERT_EQUAL_UINT32(0x88u, flagsOf(1000));
+
+    // The cell-proof FAIL pill (bit 6) is not an alarm bit at all, so it has to
+    // coexist with bit 7 without either swallowing the other.
+    f.tel.alarmBits = 1u << alarms::BIT_CNS_HIGH;
+    f.tel.cpState = static_cast<uint8_t>(cellproof::State::FAIL);
+    TEST_ASSERT_EQUAL_UINT32(0xC0u, flagsOf(1500));
 }
 
 void test_events_reach_the_wire_and_snapshot_the_log() {
@@ -838,6 +897,7 @@ int main() {
     UNITY_BEGIN();
     RUN_TEST(test_command_replies_and_hooks_fire);
     RUN_TEST(test_periodic_lines_keep_their_cadence);
+    RUN_TEST(test_cns_high_gets_its_own_flag_bit_and_stays_out_of_the_fault_aggregate);
     RUN_TEST(test_events_reach_the_wire_and_snapshot_the_log);
     RUN_TEST(test_event_rows_are_written_into_the_dive_file_beside_their_snapshot);
     RUN_TEST(test_dive_summary_states_the_plan_the_dive_ran_on);

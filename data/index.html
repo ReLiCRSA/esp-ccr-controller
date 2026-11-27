@@ -314,7 +314,16 @@ function eventName(id,val){
 }
 
 // ---- rendering ------------------------------------------------------------
-var FLAGNAMES=["LOW pO2","HIGH pO2","CELL DRIFT","SENSOR","BATTERY","SP CLAMP","SOLENOID","PROOF FAIL"];
+// Flags byte names, index = bit position (§4's table). Two corrections made
+// 2026-11-27, when the firmware started emitting bit 7 (CNS overload) instead
+// of dropping it: index 6 was labelled "SOLENOID" while the firmware has put
+// cell-proof FAIL there since the flags byte was written (a stuck-open valve
+// rides in bit 3 with the other sensor-class faults), and index 7 was labelled
+// "PROOF FAIL", which is what bit 6 means. A pill that names the wrong fault is
+// worse than no pill: a diver would act on the fault he was told about.
+// Severity follows the controller's own alarm levels — CNS is a WARNING, so it
+// is a warn pill, not a bad one.
+var FLAGNAMES=["LOW pO2","HIGH pO2","CELL DRIFT","SENSOR","BATTERY","SP CLAMP","PROOF FAIL","CNS HIGH"];
 function flagBits(){ if(!T) return 0; var m=/FLAGS0x([0-9a-fA-F]{2})/.exec(T[8]||""); return m?parseInt(m[1],16):0; }
 
 function state(){
@@ -333,7 +342,7 @@ function state(){
   modePill.textContent=mode; $("flags").appendChild(modePill);
   for(var i=0;i<8;i++) if(bits&(1<<i)){
     var p=document.createElement("span");
-    p.className="pill on "+(i<3||i===6||i===7?"bad":"warn"); p.textContent=FLAGNAMES[i];
+    p.className="pill on "+(i<3||i===6?"bad":"warn"); p.textContent=FLAGNAMES[i];
     $("flags").appendChild(p);
   }
   var cl=$("cells"); cl.innerHTML="";

@@ -375,11 +375,26 @@ alarm flags set, not as `SAFE` on this line. **FLAGS byte bits:**
 | 4 | battery low |
 | 5 | setpoint clamp active (cellproof ban) |
 | 6 | cell proof currently FAIL |
+| 7 | CNS over the diver's alarm limit (added 2026-11-27) |
 
-The full controller alarm word has 10 bits; the handset-visible FLAGS
-aggregates bits 6..9 (stuck open, sensor stale, CNS, hypoxia) into bit 3 —
-they are all "major fault, act now" from a handset's point of view. A handset
-must treat bit 0 and 1 as critical (ppO2 low = act immediately), 3 as major.
+The full controller alarm word has 10 bits, and the FLAGS byte is a
+**projection** of it, not a copy: alarm bits 3, 6, 7 and 9 (sensor fail, stuck
+open, sensor stale, hypoxia) arrive as bit 3 because from a handset's point of
+view they are one fact — *the loop is not telling you what you need, act now*.
+CNS was never in that group, and until 2026-11-27 the firmware **dropped it on
+both transports** while its own comment claimed the aggregate covered bits 6..9.
+That silence was the finding, not the grouping: a diver over his CNS limit is
+not reading a sensor fault, and the two facts ask for different actions. Bit 7
+is therefore **newly named**, not renumbered — bits 0..6 keep the meanings
+published above and have kept them since v1, so this is an append inside the
+byte's free top bit and no client needs to re-validate. A handset that ignores
+bit 7 is exactly as correct as one that stops reading at FLAGS: it sees fewer
+facts, never different ones. The controller's alarm word itself is untouched —
+the `E,*,1/2` alarm rows still carry the same 10 bit ids — and the web page's
+pill table now names bit 6 (proof FAIL) and bit 7 (CNS) for what they are.
+
+A handset must treat bit 0 and 1 as critical (ppO2 low = act immediately), 3 as
+major; bit 7 is a warning, the same level the controller raises it at.
 
 `<voted_ppo2>` is the number the diver is shown, which while the vote has
 **failed** is the last ppO2 the controller believed rather than this cycle's

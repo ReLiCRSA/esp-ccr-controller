@@ -99,10 +99,3 @@ bool ContinuityStore::write(logfmt::ContinuityRecord& r) {
 bool ContinuityStore::newest(logfmt::ContinuityRecord& out) const {
     return slots_.readNewest(out);
 }
-
-void ContinuityStore::eraseAll() {
-    slots_.clear();
-    fileOk_ = false;
-    present_ = false;
-    if (LittleFS.exists(kPath)) LittleFS.remove(kPath);
-}

@@ -81,6 +81,37 @@ void test_duty_cap_limits_pulses() {
     TEST_ASSERT_TRUE(inj.pulsesTotal() <= 2); // ~500 ms budget in 10 s
 }
 
+// millis() is uint32_t: it goes round after 49.7 days, which a board on the bench
+// for a weekend reaches and a boat that never powers down definitely does. Duty
+// used to be computed as two unsigned comparisons against the pulse's start, and
+// both of them go false for the first window after the wrap. The direction that
+// matters is the one a diver reads: the number went to 0% on a machine that had
+// been injecting normally for the last ten seconds, beside a duty cap that stops
+// withholding pulses once the window reads empty. Differences are the fix; the
+// window is 10 s, so a signed difference is exact across the wrap by four orders
+// of magnitude.
+void test_duty_window_is_wrap_safe() {
+    Injector inj{Config{}};                 // 300 ms pulse, 10 s window
+    uint32_t now = 0xFFFFFF00u;             // 256 ms short of the wrap
+    TEST_ASSERT_TRUE_MESSAGE(step(inj, now, 0.30f, 0.70f).pulseStarted,
+                             "the fixture never started a pulse, so nothing is being graded");
+    for (int i = 0; i < 5; ++i) step(inj, now, 0.80f, 0.70f);  // released above sp+db
+    TEST_ASSERT_EQUAL_UINT32(1, inj.pulsesTotal());
+
+    // now is past the wrap here — the pulse started before it and ended across it.
+    const float duty = inj.dutyPct(now);
+    TEST_ASSERT_TRUE_MESSAGE(duty > 0.0f,
+                             "a pulse that ran reads as 0% duty once the clock has wrapped");
+    TEST_ASSERT_TRUE_MESSAGE(duty <= 3.1f, "the wrap made the window count the pulse twice");
+
+    // The same window still has to let go of a pulse that aged out of it. Wrap
+    // safety is not "count everything forever": a duty that never drains is a
+    // solenoid that stops injecting.
+    const uint32_t windowMs = Config{}.windowMs;
+    TEST_ASSERT_EQUAL_UINT32(10000u, windowMs);   // the 10 s the comments above assume
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, inj.dutyPct(now + windowMs + 100u));
+}
+
 void test_test_pulse_works_in_standby_but_walls_apply() {
     Injector inj{Config{}};
     uint32_t now = 0;
@@ -238,6 +269,7 @@ int main() {
     RUN_TEST(test_early_release_above_offband);
     RUN_TEST(test_high_wall_and_cutoff_latch);
     RUN_TEST(test_duty_cap_limits_pulses);
+    RUN_TEST(test_duty_window_is_wrap_safe);
     RUN_TEST(test_test_pulse_works_in_standby_but_walls_apply);
     RUN_TEST(test_test_pulse_requests_are_queued);
     RUN_TEST(test_output_fuse_forces_the_valve_off);

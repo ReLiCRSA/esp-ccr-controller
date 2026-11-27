@@ -8,6 +8,7 @@
 #include <unity.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -534,6 +535,62 @@ void test_set_actually_moves_the_live_chain() {
     b.ticks(0.25f, 0.0f, 5.0f);  // 0.25 bar: above the old 0.18 floor, below the new
     TEST_ASSERT_TRUE_MESSAGE(b.loop.alarmBits() & (1u << alarms::BIT_LOW_PPO2),
                              "SET ALLO_LOW never reached the live alarm engine");
+}
+
+// The applier is the only place an unsafe *combination* can be caught: each key
+// passes its own range, the router answers OK SAFETY for both SETs, and the
+// inversion exists only between them. Graded on the router path because that is
+// the path a handset and the browser share — and the registry is asserted to
+// still hold what the diver typed, which is why the clamp has to be printed
+// rather than assumed: `GET GF_LOW` answers 90 while the chain runs 50.
+void test_cross_key_sets_are_clamped_before_they_reach_the_chain() {
+    Bench b;
+    CommandRouter::Response r;
+
+    b.run("SET GF_LOW=90", r);   // legal per key: GF_LOW tops out at 95
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_SETTINGS);
+    b.run("SET GF_HIGH=50", r);  // legal per key: GF_HIGH starts at 50
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_SETTINGS);
+
+    const uint8_t c = comms::applySettings(b.reg, b.cfg);
+    TEST_ASSERT_TRUE_MESSAGE(c & comms::CLAMP_GF_ORDER,
+                             "an inverted gradient schedule reached the control config unclamped");
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 50.0f, b.cfg.deco.gfLow);   // the stricter edge wins
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 50.0f, b.cfg.deco.gfHigh);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 90.0f, b.reg.getFloat(b.reg.find("GF_LOW")));
+
+    b.run("SET D1=40", r);
+    b.run("SET D2=15", r);
+    TEST_ASSERT_TRUE_MESSAGE(comms::applySettings(b.reg, b.cfg) & comms::CLAMP_BAND_ORDER,
+                             "crossed depth bands reached the control config unclamped");
+    TEST_ASSERT_TRUE(b.cfg.sp.deep1M <= b.cfg.sp.deep2M);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 40.0f, b.cfg.sp.deep2M);    // both depths survive
+}
+
+// `GET T` answers from cmd_router's own copy of the alarm-word -> FLAGS mapping;
+// UartLink::emitT has the other copy. Two mappings of one word is drift waiting
+// to happen, so the same case is graded on both transports and must give the
+// same byte: CNS_HIGH as bit 7, and no fault bit beside it.
+void test_get_t_projects_cns_exactly_as_the_pushed_stream_does() {
+    Bench b;
+    // Raise the band's target gas to the ppO2 being fed, so the only alarm in the
+    // word is the oxygen budget. A HIGH_PPO2 riding along would not prove the bit
+    // is separate — it would only prove something got set.
+    for (int i = 0; i < 4; i++) b.cfg.sp.sp[i] = 1.30f;
+    b.cfg.alarms.cnsAlarmPct = 0.01f;   // seconds of exposure, not a dive's worth
+    b.loop.setConfig(b.cfg);
+    b.loop.startDive(b.now);            // CNS advances only during a dive
+    b.ticks(1.30f, 5.0f, 3.0f);
+    TEST_ASSERT_TRUE_MESSAGE(b.loop.alarmBits() & (1u << alarms::BIT_CNS_HIGH),
+                             "the fixture never raised CNS_HIGH, so nothing is being graded");
+
+    CommandRouter::Response r;
+    b.run("GET T", r);
+    const char* p = std::strstr(r.text, "FLAGS0x");
+    TEST_ASSERT_NOT_NULL_MESSAGE(p, "GET T answered without a FLAGS field");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(
+        0x80u, std::strtoul(p + 7, nullptr, 16),
+        "GET T projects CNS_HIGH differently from the T, stream");
 }
 
 // The clock is a command, not a settings key: a settings key would put the
@@ -1154,6 +1211,8 @@ int main() {
     RUN_TEST(test_deco_answers_err_when_nothing_published_the_picture);
     RUN_TEST(test_deco_and_status_lines_come_from_the_chain);
     RUN_TEST(test_set_actually_moves_the_live_chain);
+    RUN_TEST(test_cross_key_sets_are_clamped_before_they_reach_the_chain);
+    RUN_TEST(test_get_t_projects_cns_exactly_as_the_pushed_stream_does);
     RUN_TEST(test_log_and_calibration_commands_delegations);
     RUN_TEST(test_unimplemented_calibrations_are_refused_not_acked);
     RUN_TEST(test_get_calair_reports_the_verdict_not_the_request);

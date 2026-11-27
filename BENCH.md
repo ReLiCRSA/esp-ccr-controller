@@ -184,6 +184,172 @@ through:
   `PRIOR FAULT` or `reset reason: PANIC` in that window is a named FAIL, and the
   `stk=` / `u2stk=` headroom HB reports must stay at or above 512 bytes.
 
+### The watchdog margin is a measured number, not an assumption
+
+`esp_task_wdt_init(3, true)` means a subscribed task that stops feeding for 3 s
+aborts the rig. The supervisor's heartbeat-stall restart is the shipping answer
+to the same stall, with budgets of `TASK_STALL_CONTROL_MS` 1500 ms for the control
+task and 3000 ms for sensor/hud (`include/config/defaults.h`) — for a stalled
+*sensor* task the two detectors are within a whisker of each other, and nobody had
+measured which one wins or when. `TEST_SENSOR_STALL` cannot measure the watchdog:
+it deliberately keeps calling `esp_task_wdt_reset()` while stalled, because it
+grades the supervisor. A watchdog cannot be measured by a fixture that keeps it fed.
+
+Two bench-only envs do measure it, and the difference between them is the point:
+
+| env | subscription state during the stall | question |
+|---|---|---|
+| `env:esp32_twdtmeasure` | SensorTask **only** | how long the expiry takes with nothing else in the way |
+| `env:esp32_twdtmask` | all four, like the shipping build | whether a healthy neighbour's feed re-arms the one hardware timer and hides the stalled task |
+
+Both compile the supervisor's stall restarts out (so it cannot win the race) and
+print the interval themselves:
+
+```
+pio run -e esp32_twdtmeasure -t upload --upload-port /dev/ttyUSB0
+pio device monitor --port /dev/ttyUSB0 -b 115200      # interactive terminal only
+```
+
+`pio device monitor` refuses piped or redirected stdin — it is a TUI. For a
+scripted capture, talk to the port with pyserial instead (the same lesson
+`hw_accept.py` learned; opening the port resets the board, which is what starts
+the clock here).
+
+Do **not** read the interval off the `E (<ms>)` prefix on the panic line: that
+stamp is not on the same epoch as `millis()` or `esp_timer_get_time()` in this
+build, and subtracting them reports 14 s for a 3 s gap. The probe builds write the
+expiry instant from `esp_task_wdt_isr_user_handler()` into a `.noinit` record and
+print the difference on the next boot:
+
+```
+TWDTPROBE: sensor stalled at espMs=8006 (last fed millis=7995, that loop started 11 ms ago), sensor is the ONLY TWDT subscription: expect a task_wdt expiry
+E (22347) task_wdt: Task watchdog got triggered. … - sensor (CPU 0)
+E (22347) task_wdt: Tasks currently running: CPU 0: IDLE0 / CPU 1: IDLE1
+E (22347) task_wdt: Aborting.
+abort() was called at PC 0x400fc830 on core 0
+reset reason: TASK_WDT
+TWDTPROBE: task_wdt expired 3061 ms after the last fed loop (stall->expiry interval, one clock, measured on the board)
+** SAFE MODE: acknowledge over the handset link (ACK) or power-cycle after fix
+```
+
+Measured on the controller, two boots per build (`logs/twdt_measure_1.log`,
+`logs/twdt_mask_1.log`): **3061** and **3011 ms** with SensorTask the only
+subscription, **3059** and **3019 ms** with all four alive. So:
+
+* the timeout is 3 s plus the console dump — the number `esp_task_wdt_init` asks
+  for is the number the board delivers;
+* **a neighbour's feed does not mask a stalled task.** Keeping hud, control and
+  uart2 subscribed changed the interval by tens of milliseconds, not by seconds.
+  `esp_task_wdt_reset()` sets the calling task's bit; the ISR fires on the timer's
+  own period, names the subscriptions whose bits were not set, and re-arms the
+  counter itself. The dump says exactly that: only `sensor` missed, while both idle
+  tasks were running;
+* the chain the review predicted is real: `abort()` → `rst:0xc (SW_CPU_RESET)` →
+  `reset reason: TASK_WDT` → the next boot forced into **SAFE MODE**.
+
+Two claims this settled:
+
+* **No idle task is subscribed in this build.** `sdkconfig.h` sets
+  `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 1`, but disassembling the linked
+  image shows `esp_task_wdt_init` (0x400fc840) calling `esp_intr_alloc` and
+  `periph_module_enable` only — no `xTaskGetIdleTaskHandleForCPU` (0x4008deec), no
+  `esp_task_wdt_add`. `esp_task_wdt_add` registers the idle hook only when the
+  handle passed *in* is an idle handle, and every registration in `src/` passes
+  `NULL` for a real task. The `IDLE0`/`IDLE1` in the panic dump are what was
+  *running*, not what was subscribed. A review premised "the CPU0 idle task trips
+  the watchdog when a pinned task hogs the core" described a mechanism this
+  firmware does not have.
+* The SDK's 5 s decides nothing: the linked image has exactly one call to
+  `esp_task_wdt_init`, inside `setup()`. (`libfreertos.a` does carry the symbol as
+  an *undefined* reference in `port_common.c.obj` — the older comment here claimed
+  no archive mentioned it at all, which was too strong.)
+
+Do **not** leave either probe build as the flashed image: they stall on purpose.
+Re-flash `env:esp32` and confirm from the boot banner (`reset reason:` + mode),
+not by assuming what is on the chip.
+
+### The web surface under load — the control chain is insulated, the listener is not
+
+`worst=` on HB is the slowest ControlTask cycle-to-cycle span since the last beat.
+Every `worst=` sample this repo keeps (639 of them, across every acceptance and
+soak log) peaks at **505 ms** (`logs/accept_20261127_122109_watch.log`, a `CAL AIR`
+leg; the maximum before that run was 457 ms), and quiet benches beat at 4–300 ms. Against the measured ~3 s expiry that is ~2.5 s of
+margin — not the negative margin a review implied when quoting a 3254 ms figure
+that appears nowhere in this tree.
+
+What had never been measured is the load, so `tools/web_storm.py` exists: it
+floods the HTTP surface the dashboard really uses (`/`, `/style.css`, `/app.js`,
+`/surface.csv`, `/dive/N.csv` — the `.csv` routes are LittleFS reads on the same
+SPI flash the dive log writes to) while reading the console, so the firmware's own
+`worst=` is collected during the flood:
+
+```
+~/.platformio/penv/bin/python tools/web_storm.py --seconds 40 \
+    --console /dev/ttyUSB0 --nmcli-profile ESP-CCR-3828 --log logs/storm.log
+```
+
+Measured on the 2026-11-27 build, 25 s windows, console watched, two passes of each
+configuration (`logs/storm_final_c4.log`, `..._c8.log`, `..._c16.log`,
+`..._c24.log`). The board-side numbers, read out of the controller's own heartbeat,
+are stable:
+
+| clients | held half-open | max `worst=` | max HB gap | `cfggen=` | fatal markers |
+|---|---|---|---|---|---|
+| 4 | 0 | 4–6 ms | ~5.0 s | 3/3 unchanged | none |
+| 8 | 0 | 4–9 ms | ~5.0 s | 3/3 unchanged | none |
+| 16 | 0 | 4 ms | ~5.0 s | 3/3 unchanged | none |
+| 24 | 120 | 4–8 ms | ~5.0 s | 3/3 unchanged | none |
+
+That is the answer to the review's question. In every configuration the control
+cycle's own margin moved by **single-digit milliseconds**, the HB beat kept
+arriving about every 5 s, and no reset, panic or SAFE entry appeared. AsyncTCP and
+the WiFi driver are pinned to core 0; the chain owns core 1. The premise "a web
+backlog could push a control cycle past the 3 s watchdog" is measured now rather
+than argued: the quantity the watchdog measures never moved by even a factor of ten.
+
+The **client-side** counts are a different story and are not credited to the
+controller: at the same 8-client setting, one pass answered 101 requests (60×200,
+23×404, 10×503, 8×302, 636 KB) and the next pass answered none with 38 connects
+timing out. That spread is larger than any effect the board could have, so on this
+bench the HTTP failure rate measures the 2.4 GHz link and the PC's own association
+as much as the server — an earlier run caught NetworkManager keeping
+`ESP-CCR-3828` "activated" while ARP for 192.168.4.1 was `INCOMPLETE`. The tool
+prints every outcome (including the errno of each failed connect) and only grades
+them against `--min-ok`, whose default assumes a wired link.
+
+One client-side count that IS controller-side: the exports answered
+`503 "no memory for export"` (`web_server.cpp:288`) when the file would not fit in
+RAM — 10 of the 101 answers in that pass. The web layer refuses honestly instead of
+truncating a dive export, which is the designed behavior and now has a bench
+observation behind it.
+
+Three honest limits on those numbers: the board was at the **surface** (no dive
+running, so no dive rows were being written while the exports were read — flash
+contention *during* a dive is still unmeasured); the flood is HTTP-only, while the
+live telemetry the page shows arrives over a WebSocket this tool does not speak;
+and everything is counted at the client over 2.4 GHz, so the unanswered connects
+include whatever the radio and the PC's own association contributed.
+
+The tool also refuses the easiest false pass: it polls until the server accepts a
+connection before the window starts, can re-join the access point with
+`--nmcli-profile`, and fails the run with "the flood never reached the controller"
+if it never did. It needs that, because on the first run the console open reset the
+board, NetworkManager kept `ESP-CCR-3828` "activated" while ARP for 192.168.4.1
+went `INCOMPLETE`, and 240 connects answered nothing. A load test that quietly
+loads nothing is the easiest false PASS there is.
+
+### `cfggen=` — the applied rules as a generation pair
+
+HB ends with `cfggen=<published>/<chain>`: how many control-configuration
+generations the settings path has published since boot, and which one ControlTask
+last read (`control/configbox.h`). Equal means the chain is running exactly what
+the last `SET` produced. One apart is normal and bounded; more than that means a
+control cycle stopped reading, which is the failure the supervisor reboots for,
+one beat earlier. The chain half comes from the same read that carried the values,
+never from a later `configGeneration()` query. `hw_accept.py` grades all three
+rules — field present, chain never ahead, chain at most one behind — and
+`--selftest` carries a lying capture for each.
+
 ### The radio drops at DIVE START — stress it, do not trust one clean run
 
 `DIVE START` turns the WiFi off physically (PLAN 9: milliamps and an antenna in

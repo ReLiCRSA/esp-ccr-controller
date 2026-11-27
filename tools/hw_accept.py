@@ -338,6 +338,26 @@ HB_STACK_RE = re.compile(r"stk=(\d+)(?: u2stk=(\d+))?")
 HB_CYCLE_RE = re.compile(r"worst=(\d+) logskip=(\d+) surfskip=(\d+) contskip=(\d+)")
 HB_WORST_CYCLE_MS = 800
 
+# Batch D: the applied-rules generation pair, appended after contskip= (again
+# append-only). `<published>/<chain>` is how many control-configuration
+# generations the settings path has published since boot, and which one
+# ControlTask last read (src/control/configbox.h). The pair is what makes "the
+# chain is running the rules the last SET produced" a bench-visible claim
+# instead of a reasoning exercise.
+HB_CFGGEN_RE = re.compile(r"cfggen=(\d+)/(\d+)")
+
+# The stall -> expiry interval measured on the controller 2026-11-27 with
+# env:esp32_twdtmeasure / env:esp32_twdtmask (BENCH.md): 3061 and 3011 ms with
+# only SensorTask subscribed, 3059 and 3019 ms with all four tasks subscribed.
+# `esp_task_wdt_init(3, true)` asks for 3000 ms, and the excess is the ISR plus
+# the console dump, so the timeout is confirmed rather than assumed — which
+# matters because the 800 ms line above is the alarm threshold and 1500 ms is
+# the supervisor's reboot budget: a control cycle that degrades past 3 s does
+# not get a slow dive, it gets a panic and a SAFE boot. The number is quoted in
+# the check's message so the margin is visible next to the threshold.
+TWDT_MEASURED_MS = 3000
+TWDT_MEASURED_SPREAD_MS = "3011..3061"
+
 
 def grade_depth(lines, expect_depth):
     """The depth announce, graded against the rest of the boot.
@@ -1895,7 +1915,8 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
                        "assumed, not measured"))
     else:
         checks.append((f"worst= cycle margin <= {HB_WORST_CYCLE_MS} ms "
-                       f"(worst {worst_cycle}, reboot budget 1500)",
+                       f"(worst {worst_cycle}, reboot budget 1500, measured TWDT "
+                       f"expiry {TWDT_MEASURED_SPREAD_MS} ms)",
                        worst_cycle <= HB_WORST_CYCLE_MS, "see HB lines"))
     for key, what in (("logskip", "dive-file row"), ("surfskip", "surface record"),
                       ("contskip", "continuity snapshot")):
@@ -1906,6 +1927,37 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
         else:
             checks.append((f"{key}= lost {what}s == 0 (max {lost[key]})",
                            lost[key] == 0, "see HB lines"))
+
+    # Batch D: the config generation pair. Graded like every other HB field —
+    # a missing field is itself the failure, because the claim it carries would
+    # otherwise go back to being a comment. Three lies beyond that, each a
+    # different fault in control/configbox.h's contract:
+    #   * chain > published  — the chain reports a generation no one published,
+    #     which is only possible if something other than the box is deciding it;
+    #   * published - chain > 1 — a control cycle has stopped reading. The bound
+    #     is one because a SET landing between ControlTask's read and the next
+    #     cycle's pin fuse is normal; two behind is a cycle that did not run, and
+    #     that is the failure the supervisor reboots for, one beat earlier;
+    #   * both halves equal to a stale constant on every beat after a SET — the
+    #     counter not moving is the same as the field not being there.
+    cfggen = []
+    for l in list(lines) + list(boot_lines or []):
+        m = HB_CFGGEN_RE.search(l)
+        if m:
+            cfggen.append((int(m.group(1)), int(m.group(2))))
+    if not cfggen:
+        checks.append(("HB reports the config generation pair (cfggen=)", False,
+                       "no cfggen= in any HB line: 'the chain runs the rules the last SET "
+                       "produced' is again an assumption, not a reading"))
+    else:
+        behind = max(p - c for p, c in cfggen)
+        ahead = max(c - p for p, c in cfggen)
+        checks.append((f"cfggen= chain never ahead of published (worst {ahead})",
+                       ahead <= 0, "the chain reported a generation nobody published"))
+        checks.append((f"cfggen= chain at most one generation behind (worst {behind})",
+                       behind <= 1, "a control cycle stopped reading the applied rules: "
+                                    "the supervisor reboot for a stalled cycle, visible here "
+                                    "one beat earlier"))
     return checks
 
 
@@ -1922,15 +1974,16 @@ def selftest_control_margin():
     (one field edited out mid-format, the append-only rule broken in
     silence). Each must redden the check named for it.
     """
-    def hb(worst, lskip, sskip, cont=0, tail="stk=1408 u2stk=1536"):
+    def hb(worst, lskip, sskip, cont=0, tail="stk=1408 u2stk=1536", cfggen="cfggen=4/4"):
         return (f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
                 f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
                 f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 {tail}"
                 + (f" worst={worst} logskip={lskip} surfskip={sskip} contskip={cont}"
-                   if worst is not None else ""))
+                   if worst is not None else "")
+                + (f" {cfggen}" if cfggen else ""))
 
     def new_leg(checks):
-        keep = ("worst=", "logskip=", "surfskip=", "contskip=",
+        keep = ("worst=", "logskip=", "surfskip=", "contskip=", "cfggen=",
                 "(worst=)", "(logskip=)", "(surfskip=)", "(contskip=)")
         return [c for c in checks if any(s in c[0] for s in keep)]
 
@@ -1964,17 +2017,28 @@ def selftest_control_margin():
           f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
           f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 stk=1408 u2stk=1536 worst=45"],
          "(logskip=)"),
+        # Batch D: the config generation pair. Same grading shape — a missing
+        # field fails by itself, then the pair's own arithmetic.
+        ("pre-batch-D firmware: no cfggen=, so the config skew is folklore again",
+         [hb(45, 0, 0, cfggen=None)], "(cfggen=)"),
+        ("one behind is NORMAL: a SET landed between the read and the pin fuse",
+         [hb(45, 0, 0, cfggen="cfggen=5/4")], None),
+        ("two behind: a control cycle stopped reading the applied rules",
+         [hb(45, 0, 0), hb(50, 0, 0, cfggen="cfggen=7/5")], "cfggen= chain at most one"),
+        ("the chain ahead of published: it claims a generation nobody published",
+         [hb(45, 0, 0, cfggen="cfggen=4/9")], "cfggen= chain never ahead"),
     ]
     checks = []
     for name, hb_lines, want in cases:
         got = new_leg(grade_watch(list(hb_lines)))
         failed = [c[0] for c in got if not c[1]]
         if want is None:
-            # An honest capture grades exactly four checks in this leg — the
-            # thresholds; the "HB reports ... (field=)" checks only appear when
-            # a field is missing.
-            checks.append((f"control margin: {name}", len(got) == 4 and not failed,
-                           f"expected the four threshold checks, none failed: {failed}"))
+            # An honest capture grades six checks in this leg — the four
+            # thresholds plus the two cfggen= pair rules; the "HB reports ...
+            # (field=)" checks only appear when a field is missing.
+            checks.append((f"control margin: {name}", len(got) == 6 and not failed,
+                           f"expected the six threshold checks, none failed: "
+                           f"{len(got)} seen, {failed}"))
         else:
             checks.append((f"control margin: {name}",
                            any(want in f for f in failed),

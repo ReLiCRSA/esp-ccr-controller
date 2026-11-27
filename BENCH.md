@@ -4,6 +4,11 @@ Rules that never expire: **never open `/dev/ttyUSB0` while
 `tools/soak_logger.py` runs** (two readers, both blind), and nothing here
 counts as done until it is *watched happening on the bench*.
 
+**The open-item list is `docs/REVIEW.md` §1, not this file.** The C3 checklist below is
+the bench's own view of the same work: ticking a C3 leg and closing the matching §1 item
+are one change, and a leg that ends with a number that contradicts a §1 claim means §1
+gets corrected there, not quietly here.
+
 **Opening the console port resets the board.** pyserial asserts DTR/RTS on
 `open()`; on this board's classic auto-reset circuit DTR=IO0, RTS=EN, so
 the open is a reset pulse (every "mystery POWERON" during the web debugging
@@ -29,7 +34,7 @@ tools/fence_probe_report.py   # occasional, not every flash: counts MEMW barrier
                                  # (it does: 3/2 and 4/3 with and without each fence);
                                  # the x86 answer is the other way round, which is why
                                  # env:native_o2 cannot grade that claim. Review
-                                 # batch E §5; artifact logs/m4_fence_probe_*.txt
+                                 # docs/REVIEW.md Round E item 5; artifact logs/m4_fence_probe_*.txt
 pio run -e esp32 -t upload --upload-port /dev/ttyUSB0   # explicit or never: two
                                  # identical CP2102s exist, auto-select CAN flash the
                                  # controller image into the bridge (it did, 2026-11-26:
@@ -1251,7 +1256,7 @@ task-private static per reader. What to keep from it is that **the check that
 caught it is the one people skip**: a struct added to any local in a bounded-stack
 task moves `stk=`, and the build report says the opposite — the same change moved
 RAM 16.9 % to 17.2 % (stack copy to static), which reads as harmless while the
-stack gate goes red. `docs/REVIEW_BATCH_C_2026-11-27.md` §4.
+stack gate goes red. `docs/REVIEW.md`, Round C item 4.
 
 ## C2-e — phone/web findings (2026-11-22 evening, all closed)
 

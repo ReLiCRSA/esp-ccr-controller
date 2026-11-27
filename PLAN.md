@@ -4,6 +4,14 @@ Rebreather controller on ESP32: 3× R22D galvanic O₂ cells on an ADS1115 (PGA=
 depth sensing, ZHL-16C decomputation, handset over UART, web UI over a private AP,
 and a PC simulator to validate the control/deco logic before hardware trust.
 
+**This file is the product definition — what the machine is and how it behaves.** What
+lives elsewhere: **`docs/REVIEW.md`** is the single source of truth for review findings
+and open items (start at its §1); **`BENCH.md`** is the acceptance and hardware checklist,
+and nothing counts as done until a bench leg watched it happen; **`docs/HANDSET_PROTOCOL.md`**
+is the wire contract a handset is built against; **`design/handset-screen/DESIGN.md`**
+covers the handset design sheet. A change here to §10 or §11 is a change to the product,
+and those documents have to follow it.
+
 ## Decisions locked
 
 | Topic | Decision |

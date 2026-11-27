@@ -558,7 +558,7 @@ No case was removed or weakened.
 
 #### Status of these residuals, as of Round E (same day)
 
-Batch [Round E](#round-e) worked this list. Recorded here so the
+Batch Round E worked this list. Recorded here so the
 list is not read as current:
 
 * **2 — closed.** The clamp verdict is protocol now: `E,<t>,19,<mask>`, mask =
@@ -945,7 +945,7 @@ recorded in `docs/HANDSET_PROTOCOL.md` §6 and unchanged here.
    undecided, and `src/log/continuity.cpp:135,144` still rounds with `+ 0.5` (changes
    stored bytes, wants its own commit).
 
-**Closed by [Round D](#round-d) the same day:** items 2 and 3
+**Closed by Round D the same day:** items 2 and 3
 (`HB` now carries `cfggen=<published>/<chain>`, and `test_configbox` counts publish
 sites and refuses a third), and item 4's first three clauses — the TWDT trip is
 measured on the board at **3011–3061 ms** (and a neighbour's feed does not mask a
@@ -954,7 +954,7 @@ idle handle is ever subscribed here), the flag labels are graded across all four
 places that name them, and the continuity rounding moved to `numfmt::scaled`. Items
 1, the `pulses` column and `LOG EXPORT`'s dive-lock policy are unchanged.
 
-**Closed by [Round E](#round-e) later the same day:** the
+**Closed by Round E later the same day:** the
 `pulses` column (event-driven `S,` rows now subtract the same base the grid rows do,
 and §9 states that the two row kinds' windows OVERLAP — `M,` is the total), and
 `LOG EXPORT`'s dive-lock policy (refused mid-dive with `ERR export locked in dive`;
@@ -966,8 +966,8 @@ verdict this section called console-only is protocol now: `E,<t>,19,<mask>`.
 
 ### Round D — the last five review findings, and one measured premise that was wrong
 
-Batches [Round A](#round-a), [Round B](#round-b) and
-[Round C](#round-c) closed the safety findings. This one closes the
+Batches Round A, Round B and
+Round C closed the safety findings. This one closes the
 remaining five items from that review's "code findings, no new rigging" list.
 Every number below came off the controller or out of the repo's own logs, and
 where a review claim did not survive checking, that is said with the evidence.
@@ -1336,7 +1336,7 @@ minimum count of what it actually graded.
   the depth sensor squeezed, is the unmeasured case behind the review's slow-cycle
   worry. `worst=` peaked at 8 ms at the surface, so the margin question is now
   about that configuration specifically. **Partly closed by
-  [Round E](#round-e) §3:** `LOG EXPORT` is refused mid-dive
+  Round E §3:** `LOG EXPORT` is refused mid-dive
   (`ERR export locked in dive`), so the handset path cannot contend at all; the
   web's `/dive/N.csv` deliberately still can, and remains the unmeasured case.
 - `worst=` is graded against 800 ms; the measured watchdog expiry (3011..3061 ms)
@@ -1352,8 +1352,8 @@ minimum count of what it actually graded.
 
 ### Round E — Round D's "still open" list, and one fix that was itself a bug
 
-Batches [Round A](#round-a), [Round B](#round-b),
-[Round C](#round-c) and [Round D](#round-d) left seven
+Batches Round A, Round B,
+Round C and Round D left seven
 named loose ends. All seven are dealt with here: six are closed with a witness, the
 seventh (the config box's 284-byte payload) is measured and deliberately left alone,
 with the reason written down. Two of the seven turned out to be bigger than the
@@ -1813,7 +1813,9 @@ cited batch letters. Nothing in `test/` read a review document, so no test chang
 the `platformio.ini` comment that was rewritten here), `pio run -e esp32` still builds, and
 `tools/hw_accept.py --selftest` re-run. Then a repo-wide grep for the removed paths:
 `grep -rn 'REVIEW_BATCH' --include='*.md' --include='*.h' --include='*.cpp' --include='*.py' --include='*.ini' .`
-returns nothing.
+returns nothing outside this file. The only mentions of the old filenames anywhere are
+the five in §6 and the one in the header above — prose about the merge, not paths anything
+has to resolve. `grep -rn 'docs/REVIEW'` resolves to this file everywhere it appears.
 
 **Recovered from:** the five documents exist intact in git at the commit before the removal
 (`git log --diff-filter=D --name-only -- 'docs/REVIEW_BATCH_*'` names it), and in

@@ -1,5 +1,5 @@
 // Target-side codegen probe for the deco view's seqlock fences
-// (REVIEW_BATCH_A finding m-4, residual "are the fences load-bearing?").
+// (docs/REVIEW.md, Round A finding m-4, residual "are the fences load-bearing?").
 //
 // Built with the SHIPPING toolchain for env:esp32 and disassembled; the count
 // that matters is MEMW — Xtensa's memory barrier — around the payload accesses:

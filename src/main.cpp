@@ -43,6 +43,7 @@
 #include "util/depthscale.h"
 #include "util/numfmt.h"
 #include "util/stackwatch.h"
+#include "util/warmup.h"
 #include "control/cellhist.h"
 #include "comms/uart2_task.h"
 #include "comms/web_server.h"
@@ -805,6 +806,9 @@ static void controlTask(void*) {
     for (;;) {
         stackwatch::sample(stackwatch::SLOT_CONTROL);
         const uint32_t now = millis();
+        // Latch the warm-up verdict every cycle, while `now` is small and
+        // monotone; the CAL AIR path below then never compares boot epochs.
+        g_warmupGate.update(PREDIVE_WARMUP_MS, now);
         uint32_t cfgGen = 0;
         if (ctrl::configRead(g_controlRules, &cfgGen))
             g_chainCfgGen = cfgGen;   // newest generation; keeps the last on a miss
@@ -885,19 +889,23 @@ static void controlTask(void*) {
         const uint32_t calTSec = (now - g_bridgeTel.diveStartMs) / 1000u;
         if (g_calAirRequest) {
             g_calAirRequest = false;
-            // Signed difference, not `now < PREDIVE_WARMUP_MS`. `now` is
-            // millis(), so the unsigned form went true again for the first
-            // 120 s after the 32-bit wrap — 49.7 days of uptime, which a soak
-            // or a bench board nobody power-cycles reaches — and refused a
-            // diver's air calibration with "cells still warming up" on a
-            // machine two months past warm-up. The drift direction is a
-            // refusal, which is at least safe, but it is a refusal with a
-            // wrong reason and no way for the bench to tell it apart from the
-            // honest one. Differences are exact for gaps under 2^31 ms.
-            const int32_t warmupLeftMs =
-                static_cast<int32_t>(PREDIVE_WARMUP_MS - now);
-            if (warmupLeftMs > 0) {
-                const uint32_t left = static_cast<uint32_t>(warmupLeftMs) / 1000u;
+            // The warm-up verdict is a LATCH, not a clock subtraction. The
+            // original form (`now < PREDIVE_WARMUP_MS`) went true again for
+            // the first 120 s after the 32-bit millis() wrap — 49.7 days of
+            // uptime, which a soak or a bench board nobody power-cycles
+            // reaches — and refused a diver's air calibration with "cells
+            // still warming up" on a machine two months past warm-up. Batch A
+            // "fixed" this with a signed difference, which extraction and a
+            // test showed was ALSO wrong: `int32_t(120000 - now)` wraps
+            // positive once `now` passes ~24.9 days, so the signed form
+            // refused even earlier than the original did, and still refused
+            // after the wrap. util::WarmupGate latches the verdict in the
+            // cycle above, where the clock cannot lie; test/test_warmup pins
+            // all of it and fails this file if it ever compares boot epochs
+            // again.
+            if (!g_warmupGate.elapsed()) {
+                const uint32_t left =
+                    g_warmupGate.remainingSeconds(PREDIVE_WARMUP_MS, now);
                 Serial.printf("cal air: REFUSED - cells still warming up (%u s left)\n",
                               (unsigned)left);
                 bridge::publishCalAirRefused(g_calAirStatus, bridge::CALAIR_WARMUP,

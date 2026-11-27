@@ -340,10 +340,16 @@ which is the global this box was built to remove.
    one mid-dive flash contender; it did not measure the remaining ones.
 4. **`CAL O2` / `CAL DEPTH`** still `ERR not implemented` — unchanged by this batch,
    and `test_designwire` still pins that the design shows the refusal.
-5. **Flag labels in two places** (batch A open item 5): `web_page.h` and
-   `data/index.html`, kept in step by `tools/sync_webdata.py`. This batch regenerated
-   them for id 19 and re-ran the acceptance legs that read them, but nothing yet
-   parses §4's table against the JS array.
+5. **Flag labels in two places** (batch A open item 5) — **WRONG WHEN WRITTEN, not
+    open.** Batch D closed it: `test/test_flaglabels` parses all four places that name
+    a FLAGS bit — `comms/flags.h`, `FLAGNAMES` in `src/comms/web_page.h`, the flashed
+    copy `data/index.html`, and §4's table in this spec — and grades their agreement,
+    asserting §4 publishes exactly bits 0..7 in order and that each row carries the
+    keyword the page's pill is built on. Re-verified on this tree: that case reads
+    `docs/HANDSET_PROTOCOL.md`, asserts the row count and the keywords, and batch D's
+    mutation table shows shortening §4's bit-3 row reddens it. Batch E regenerated the
+    page for id 19 and the suite stayed green. The line is kept with the correction so
+    batch A's item 5 is not read as still open.
 6. **The config box's 284-byte payload** — §7 above: measured, deliberately not done.
 7. C3 bench items unchanged: MS5837 swap/potting, battery measurement, mechanical
    solenoid inhibit, fails-closed rig, and the handset UI itself.

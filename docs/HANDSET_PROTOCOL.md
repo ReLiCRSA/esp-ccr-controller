@@ -459,6 +459,7 @@ the split: only the marked ids are actually published by today's firmware.
 | 14 | controller reset | — | **no** (reserved) |
 | 16 | pre-dive FAIL | the step that failed: 0 warm-up, 1 air, 2 solenoid, 3 depth, 4 battery — the same order as the five `PRE,` fields | **not on the wire**: surface log only (§5.1) |
 | 15 | dive started with no wall clock | 0 | dive **file** only (written into the dive at `DIVE START`; not streamed live) |
+| 19 | settings **clamp verdict**: a `SET` (or a stored pair at boot) was legal per key and clamped between keys on the way to the chain | the clamp bitmask: bit0 `ALLO_HIGH`, bit1 `CUTOFF`, bit2 `PULSE_MS`, bit3 `DUTY`, bit4 `SP_ORDER`, bit5 `GF_ORDER`, bit6 `BAND_ORDER` — the same seven names the console prints | yes: one row per apply that clamped anything, never a row when nothing was clamped; added 2026-11-27 (§6) |
 
 Do not build a "pre-dive passed" *notification* on the remaining reserved ids —
 it never arrives. Learn the same facts from what is live now: `GET PRE` (poll,
@@ -886,12 +887,16 @@ the dangerous combinations are *between* keys, so one applier enforces the
 ordering at the last moment before the numbers steer the valve and reports what
 it changed on the USB console — at boot and at the `SET` that caused it:
 `settings: CLAMPED GF_ORDER — ordering enforced over what was set`. Those words
-are debug output, not protocol (§7 rule 5): there is no clamp field on any line,
-and inventing one would be a protocol change, not a clarification. The registry
-keeps what the diver typed, so **`GET GF_LOW` answers the typed value while the
-chain runs the clamped one**. Client rule: a read-back proves the key was
-*stored*, not that the pair was consistent — a client that displays an ordered
-pair shows both keys, so the operator sees the combination.
+are debug output, not protocol (§7 rule 5); what the protocol carries is the
+verdict as an **event row: `E,<t>,19,<mask>`** (§4, id 19, added 2026-11-27
+for exactly this gap), where `<mask>` is the bit-set of the names the console
+prints. A client that wants "what is the chain actually running beside what I
+stored" reads the event, not the read-back: the registry keeps what the diver
+typed, so **`GET GF_LOW` answers the typed value while the chain runs the
+clamped one** — that sentence is the whole reason id 19 exists. Client rule: a
+read-back proves the key was *stored*, not that the pair was consistent — a
+client that displays an ordered pair shows both keys, so the operator sees the
+combination.
 
 | pair | on inversion | why it does what it does |
 |---|---|---|

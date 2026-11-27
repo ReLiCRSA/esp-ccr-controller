@@ -33,6 +33,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <atomic>
+
 #include "comms/nvs_store.h"
 #include "comms/session.h"
 #include "comms/settings_apply.h"
@@ -63,6 +65,12 @@ extern bridge::DiveTotals g_bridgeTotals;
 // that drops the qualifier lets the compiler treat a flag as loop-invariant, and
 // the linker cannot see the disagreement.
 extern volatile bool g_calAirRequest;
+// Settings clamps that still owe the wire an `E,19` verdict row. Set with
+// fetch_or by the command task (handset and web can both SET), consumed by
+// ControlTask's exchange — the ring is SPSC, so only ControlTask may push
+// (EventRing::push), and the mask must survive two SETs in one control cycle,
+// which is what the OR rather than an assign is for.
+extern std::atomic<uint16_t> g_clampPending;
 
 namespace comms {
 
@@ -342,10 +350,13 @@ void hookSettings(void*) {
     if (clamps != CLAMP_NONE) {
         // `SET` answers OK SAFETY whether or not anything was refused, and the
         // registry keeps the number the diver typed, so the answer alone cannot
-        // tell him that GF_LOW=90 over GF_HIGH=50 became two 50s. There is no
-        // verdict field on the wire for this (adding one is a protocol change),
-        // so the console is where the refusal is admitted, at the moment it is
-        // made rather than at the next boot.
+        // tell him that GF_LOW=90 over GF_HIGH=50 became two 50s. The verdict
+        // now travels two ways: the console line below, at the moment it is
+        // made, and `E,<t>,19,<mask>` — the staged latch ControlTask publishes
+        // in its next cycle (logfmt::EVT_SETTINGS_CLAMPED; the mask bits are
+        // comms::ApplyClamp, and §4's event table says what each one means).
+        // The ring is SPSC, so this task latches instead of pushing.
+        g_clampPending.fetch_or(clamps, std::memory_order_relaxed);
         char names[64];
         clampList(clamps, names, sizeof names);
         Serial.printf("settings: CLAMPED %s — ordering enforced over what was set\n",

@@ -92,6 +92,24 @@ enum EventId : uint16_t {
     // diver was owed a ceiling and was not given one.
     EVT_CONT_RESTORED = 17,
     EVT_CONT_LOST = 18,
+    // 19: the settings applier CLAMPED what the diver stored — a combination
+    // legal per key and unsafe together (GF_LOW above GF_HIGH, an alarm at or
+    // above the injection wall, crossed depth bands...). `value` is the
+    // comms::ApplyClamp bitmask itself (bit0 ALLO_HIGH, bit1 CUTOFF, bit2
+    // PULSE_MS, bit3 DUTY, bit4 SP_ORDER, bit5 GF_ORDER, bit6 BAND_ORDER),
+    // which is exactly the mask clampList() prints on the console: one row per
+    // apply that clamped anything, never a row for CLAMP_NONE.
+    //
+    // This id exists because the verdict used to be console-only: the registry
+    // keeps the number the diver typed, so `GET GF_LOW` answers what was asked
+    // for while the chain runs the clamped one, and the review named that a
+    // protocol hole (2026-11-27). A handset now learns WHICH ordering was
+    // enforced without a new field on any existing line — an event row is the
+    // append-only place for a verdict like this. It is not a surface record:
+    // a SET mid-dive is dive-locked, so a clamp is a live setting change, and
+    // the wire + dive file (for a clamp raised before a dive and still in
+    // force) are where a diver reads it back.
+    EVT_SETTINGS_CLAMPED = 19,
 };
 
 struct Snapshot {

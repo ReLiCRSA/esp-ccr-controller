@@ -19,6 +19,7 @@
 // ============================================================================
 #include <Arduino.h>
 #include <new>
+#include <atomic>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 
@@ -758,6 +759,19 @@ static void continuityPublishSnapshot(uint8_t kind, const char* edge) {
 // this paragraph.
 outfuse::SolFuse g_solFuse;
 
+// Cell-polarisation verdict for CAL AIR, latched by ControlTask every cycle
+// (util/warmup.h says why a latch and not a clock subtraction).
+util::WarmupGate g_warmupGate;
+
+// Settings clamps owed an `E,19` row. The command task ORs the applier's mask
+// in (handset and web both SET); ControlTask exchanges it out inside its
+// staged event batch — the ring's SPSC contract (EventRing::push) says only
+// this task produces, and the OR is what survives two SETs landing inside one
+// control cycle. Boot clamps (NVS holds an inverted pair) feed the same latch
+// in setup(), so the diver's handset sees them on connect instead of finding
+// them only in a boot log nobody scrolls back through.
+std::atomic<uint16_t> g_clampPending{0};
+
 static void controlTask(void*) {
 #ifdef TEST_TWDT_PANIC
     // Bench-only (env:esp32_twdtmeasure): NOT subscribed, so the control task's
@@ -1087,6 +1101,13 @@ static void controlTask(void*) {
         // they exist to prevent.
         if (bridge::publishEvents(st, (now - diveStartMs) / 1000u, g_bridgeEvents, pub) > 0)
             decoPlanDirty = true;
+        // A clamp verdict the command task left in the latch (mid-flight SET,
+        // or a boot clamp from an inverted stored pair) rides this same staged
+        // batch, so the `E,19` row is committed beside a current deco picture
+        // like every other edge (the pair below is what makes that true).
+        if (const uint16_t owed = g_clampPending.exchange(0))
+            bridge::publishClampVerdict(owed, (now - diveStartMs) / 1000u,
+                                        g_bridgeEvents);
         if (decoPlanDirty) {
             deco::viewPlan(g_decoView, g_loop->deco(),
                            g_loop->deco().depthToBar(st.depthSmoothedM));
@@ -1640,6 +1661,11 @@ void setup() {
         // the number he set while the chain runs the clamped one. The names are
         // printed instead of a mask for exactly that reason: a boot log that
         // says "clamped" without saying which is a boot log nobody acts on.
+        // The same mask goes to the handset as `E,<t>,19,<mask>`: ControlTask
+        // drains this latch on its first cycle, so a client that connects to a
+        // board booted from inverted NVS learns it on the wire, not only in a
+        // boot line printed before the port existed.
+        g_clampPending.fetch_or(applyClamps, std::memory_order_relaxed);
         char names[64];
         comms::clampList(applyClamps, names, sizeof names);
         Serial.printf("settings: CLAMPED %s — ordering enforced over what was stored\n",

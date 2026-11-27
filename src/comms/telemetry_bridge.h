@@ -38,7 +38,13 @@ struct Telemetry {
     volatile uint16_t alarmLogBits = 0;
     volatile uint8_t voteMode = 0;
     volatile uint32_t pulses = 0;
-    volatile uint16_t pulsesWindow = 0;   // pulses in the last T, interval
+    /// Pulses since the previous 30 s GRID row — the same base the grid row's
+    /// own `pulses` window uses. Published every cycle so the event-driven
+    /// `S,` row can carry a real window (EdgeSnap::pulsesNow/Prev) without the
+    /// command task touching the chain or the grid's bookkeeping. The name
+    /// predates batch E and once meant "pulses in the last T, interval" as an
+    /// unwritten placeholder; it is now the live quantity its name says.
+    volatile uint32_t pulsesWindow = 0;
     volatile bool solenoid = false;
     volatile bool haveVote = false;
     volatile bool autoMode = false;
@@ -243,6 +249,14 @@ void publishCalAir(CalAir& out, const cal::AirCalOutput& a, uint32_t nowMs,
 void publishCalAirRefused(CalAir& out, uint8_t code, uint32_t warmupLeftS,
                           uint32_t nowMs, uint32_t tSec, EventRing& ring);
 
+// The settings applier's clamp verdict, staged onto the ring by ControlTask
+// (EVT_SETTINGS_CLAMPED, id 19). The applier runs on the COMMAND task — the
+// ring's SPSC contract says only ControlTask may push — so the command task
+// leaves the mask in a latch and ControlTask publishes it in the same staged
+// batch as the rest of the cycle's edges. A mask of 0 publishes nothing: a
+// SET that needed no clamp is not news.
+void publishClampVerdict(uint16_t mask, uint32_t tSec, EventRing& ring);
+
 // The in-force dive totals. Filled by ControlTask while a dive runs, read
 // and written out by the command task on DIVE END. Plain struct: ownership
 // passes at the dive edge, both sides only touch it while it is theirs.
@@ -303,6 +317,18 @@ struct EdgeSnap {
     uint8_t voteMode = 0;
     uint8_t cpState = 0;
     uint8_t cnsPeakPct = 0;     // the dive's running peak, from the totals
+    /// The `S,` row's `pulses` window (batch E, decision 2026-11-27): an
+    /// event-driven row now reports the injections since the previous GRID
+    /// row — the same window the grid row that follows will report, sampled
+    /// at this instant. The ControlTask publishes both numbers as scalars
+    /// (Telemetry::pulses, Telemetry::pulsesWindow), so the capture stays a
+    /// one-instant read of the published view (the drain-batch rule above)
+    /// and the base bookkeeping stays owned by the task that counts. The two
+    /// row kinds' windows OVERLAP by design and §9 says so: what must not
+    /// happen is a client summing the column across both kinds — the dive's
+    /// total is `M,`'s pulses.
+    uint32_t pulsesNow = 0;     // total pulses at this instant
+    uint32_t pulsesPrev = 0;    // total at the previous grid row
 };
 
 /// Copies the published scalars, the dive totals' CNS peak and ONE seqlock

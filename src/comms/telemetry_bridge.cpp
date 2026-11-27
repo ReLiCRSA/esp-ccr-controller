@@ -167,6 +167,13 @@ void publishCalAirRefused(CalAir& out, uint8_t code, uint32_t warmupLeftS,
     if (!ring.push({tSec, logfmt::EVT_CAL_AIR, code})) ring.noteDropped();
 }
 
+void publishClampVerdict(uint16_t mask, uint32_t tSec, EventRing& ring) {
+    // Zero means "the applier changed nothing", which is not an event; the
+    // latch and this function agree that no row is written for it.
+    if (!mask) return;
+    if (!ring.push({tSec, logfmt::EVT_SETTINGS_CLAMPED, mask})) ring.noteDropped();
+}
+
 
 // See telemetry_bridge.h for why these rules are a function rather than five
 // assignments at the SensorTask call site: main.cpp is not compiled for the host
@@ -218,6 +225,11 @@ void captureEdge(const Telemetry& tel, const DiveTotals* totals, uint32_t nowMs,
     out.voteMode = tel.voteMode;
     out.cpState = tel.cpState;
     out.cnsPeakPct = totals ? totals->cnsPeakPct : 0u;
+    // The pulses window, from the same published scalars as everything else in
+    // this capture — one instant, both numbers (EdgeSnap says what the window
+    // means and §9 what a reader may do with it).
+    out.pulsesNow = tel.pulses;
+    out.pulsesPrev = tel.pulses - tel.pulsesWindow;
     // One generation, or none. The seqlock's own retry bound is what makes this
     // copy self-consistent; `hasPic` is the honest answer when ControlTask has
     // not published yet (SAFE boot, or the first cycles of a cold start), and

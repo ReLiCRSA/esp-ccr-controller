@@ -333,9 +333,13 @@ function eventName(id,val){
   if(id===7){var ca=["no calibration yet","sampling","calibrated","refused: cells still warming up",
                      "aborted: a dive started","failed: cells never settled","failed: no cells fitted"];
              return "CAL AIR: "+(ca[val]||("code "+val));}
+  if(id===19){var c=["alarm over wall","cutoff margin","pulse width","duty window",
+                     "setpoint order","GF order","band order"];
+              var s=[];for(var b=0;b<7;b++)if(val&(1<<b))s.push(c[b]);
+              return "settings clamped: "+(s.length?s.join(", "):("mask "+val));}
   var n={3:"mode",4:"setpoint",5:"cell excluded",6:"cell rejoin",7:"CAL AIR",8:"CAL O2",
          9:"cell proof PASS",10:"cell proof FAIL",11:"clamp ON",12:"clamp OFF",
-         13:"pre-dive PASS",14:"RESET",15:"clock unset"};
+         13:"pre-dive PASS",14:"RESET",15:"clock unset",19:"settings clamped"};
   return (n[id]||("event "+id))+" ("+val+")";
 }
 

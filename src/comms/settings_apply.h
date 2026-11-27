@@ -9,11 +9,13 @@
 // reach the chain: the alarm must stay below the injection wall (PLAN 16),
 // whatever the registry ranges allowed. The applier never rewrites the
 // registry — it reports the clamp instead, and clampList() below is how that
-// verdict reaches a human. It matters more than it looks: the registry keeps
-// the number the diver typed, so `GET GF_LOW` answers what was asked for while
-// the chain runs the clamped one. Nothing on the wire carries the mask (the
-// protocol has no verdict field, and inventing an event id is a protocol
-// change), so the console is the only place it is admitted out loud.
+// verdict reaches the console. It matters more than it looks: the registry
+// keeps the number the diver typed, so `GET GF_LOW` answers what was asked
+// for while the chain runs the clamped one. The wire carries the verdict as
+// `E,<t>,19,<mask>` (logfmt::EVT_SETTINGS_CLAMPED, mask = this enum), so a
+// handset learns WHICH ordering was enforced without any existing line
+// growing a field — the event stream is the append-only place for it
+// (docs/HANDSET_PROTOCOL.md §4).
 // ============================================================================
 #pragma once
 

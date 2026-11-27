@@ -277,6 +277,37 @@ consumers, which is a new anchor to maintain for 240 bytes of DRAM that is not
 causing anything. Recorded here so the number is tracked and the decision to not
 spend on it is on the record.
 
+**Scheduled for the next session** (the user's call: record it now, do it next
+session). The facts that session needs, measured on this tree rather than guessed:
+
+* What the three readers actually touch — every field reference to the per-task
+  snapshots in `src/main.cpp`: SensorTask `deco.waterDensity` (1 field);
+  SupervisorTask `inj.maxOnMs` (1); ControlTask `presentMask`, `inj.maxOnMs`,
+  `predive.depthGraceMs`, `deco.gfLow`, `deco.gfHigh`, `sp.sp[4]` (6, of which the
+  GF pair is only read to publish `M,`/`T,` fields — the *applier's* pair coherence
+  lives in the box, not in that reader). ControlTask also seeds
+  `inj.maxDutyPct` in its unreachable-before-first-publish branch.
+* What the writer needs: the whole struct. `hookSettings`
+  (`src/comms/session_wiring.cpp:341`) does read-published → `applySettings` →
+  `configPublish` → `postConfig`, and `applySettings` reads carried fields it never
+  writes (the injection wall, max-on, proof-window pulses). A narrow *published*
+  payload breaks that path; only the three reader snapshots can shrink.
+* The cost either way: one published copy (284 B) + three snapshots (852 B) ≈ 1.1 KB
+  of 327 KB DRAM. Narrowing the snapshots recovers roughly 850 B. `stk=` is unaffected
+  — those copies are statics since batch C §4 precisely so they are not on the
+  supervisor's stack.
+* Three shapes, in increasing diff: per-reader typed accessors under the same mutex
+  (re-lists the fields in `configbox.h`, which is exactly the duplication batch C
+  avoided); one ~40 B `Applied` struct published alongside the `Config` and read by
+  all three (no per-reader duplication, bigger diff: `test_configbox`'s publish-site
+  and `configRead` anchors, `HB cfggen=` semantics, §8's "the applied config"
+  wording); or leave it as measured and stop spending thought on it.
+
+Whichever shape is chosen, the anchor that must come with it is a test that fails when
+a reader consumes a field the published payload does not carry — the failure mode of
+every narrow-payload design is a future reader quietly reaching back for `g_ctrlCfg`,
+which is the global this box was built to remove.
+
 ---
 
 ## Verification, batch E

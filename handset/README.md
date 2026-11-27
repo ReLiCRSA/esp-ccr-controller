@@ -7,7 +7,7 @@ ESP-CCR controller and stays compatible as the controller evolves.
 |---|---|
 | `../docs/HANDSET_PROTOCOL.md` | the contract: framing, every command, every downlink line, refusal strings, compatibility rules, known limits. **Read this first.** |
 | `handset_link.h` | header-only C++17 client library: line assembly, parsers for every record, builders for every command, link-health watchdog. No OS dependency, no allocation on the protocol path. |
-| `example_esp32_handset/` | complete working handset firmware (ESP32 + Arduino): wiring, buttons, buzzer alarm, link-loss alarm. Use it as a starting point or as a reference reading. |
+| `example_esp32_handset/` | complete working handset firmware (ESP32 **and** ESP32-S3 + Arduino, one source, two pin maps): wiring, buttons, buzzer alarm, link-loss alarm. Use it as a starting point or as a reference reading. |
 | `../test/test_handset/test_handset.cpp` | conformance suite: the library's parsers fed the *firmware's* exact wire literals. Run it (`pio test -e native`) to prove the library still matches the controller. |
 
 ## 60-second orientation
@@ -348,3 +348,54 @@ toggle), buzzer patterns per alarm class, a link-loss alarm that outranks
 everything, and a `GET SCHEMA` at boot so the settings picture comes from the
 controller. It is deliberately boring code: no RTOS tricks, no dynamic memory,
 and everything you must not get wrong is in comments.
+
+## The board: ESP32 or ESP32-S3
+
+Both boards build from the same source — `pio run -d handset/example_esp32_handset
+-e handset` and `-e handset_s3` — and the pin map is one `#if` inside the .ino
+rather than two files, because the protocol half is identical and only the metal
+moves. The numbers do **not** port: the S3 has no GPIO22-25 at all, GPIO26-32 are
+its SPI flash bus, GPIO19/20 are its native USB port, and GPIO0/3/45/46 are
+strapping pins. The module the handset is built on now also reported
+`Embedded PSRAM 16MB (AP_1v8)` and 32 MB flash (esptool, 2026-11-27), and 16 MB
+of embedded PSRAM is octal — which spends GPIO33-37 too.
+
+| what | ESP32 | ESP32-S3 | why the S3 number moved |
+|---|---|---|---|
+| link RX, from controller GPIO17 | 13 | 13 | free on both, so the link keeps its numbers |
+| link TX, to controller GPIO16 | 14 | 14 | free on both |
+| ACK / AUTO / MANUAL / CHECK | 25 / 26 / 27 / 32 | 4 / 5 / 6 / 7 | 25 does not exist on the S3; 26-32 are SPI flash |
+| DIVE (two-press START↔END) | 33 | 15 | 33-37 are this module's octal PSRAM |
+| buzzer | 19 | 16 | 19/20 are native USB, and this board has both USB connectors cabled |
+| link LED | 21 | 21 | valid on both |
+
+Buttons are `INPUT_PULLUP` to GND; the buzzer is active-high. 3.3 V logic on the
+link and **common GND is not optional** — the two boards have no other reference
+between them. Nothing on a handset GPIO may see 5 V.
+
+Left free on the S3 on purpose: 8/9 are the core's I2C defaults, which is where a
+display goes, and 10/11/12 are the rest of its default SPI bus. Note that GPIO13
+is that bus's default MISO and the link claims it: an SPI display has to be given
+explicit pins rather than taking the core's defaults.
+
+**An octal module needs `board_build.arduino.memory_type = opi_opi`, and the
+`esp32-s3-devkitc-1` board id does not carry that.** The first image flashed
+here boot looped on `assert failed: do_core_init startup.c:328 (flash_ret ==
+ESP_OK)` while the mask ROM printed `Octal Flash Mode Enabled` — the ROM learns
+that only from eFuses, so this module's flash is wired octal and the core's
+default quad loader could not bring up the flash the image sits on. The board id
+describes an 8 MB quad part. Assume nothing about a module's flash from its
+board id: read it with `esptool flash_id` and believe the ROM banner.
+
+A flashed image says which map it carries, on its own first lines:
+
+```
+ESP-CCR handset up
+pins (ESP32-S3): link rx13 tx14 (controller is tx17 rx16) | btns ack4 auto5 man6 chk7 dive15 | buzzer 16 | led 21
+```
+
+That line is worth reading on a board with two USB connectors, because they are
+not interchangeable: flashing went in through the native USB-Serial-JTAG
+(`/dev/ttyACM0`) while the readout came out of the UART bridge (`/dev/ttyACM1`),
+because with this board profile `Serial` is UART0 on GPIO43/44 — which is also
+why the handset link is not wired to 43/44.

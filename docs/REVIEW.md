@@ -257,8 +257,24 @@ These need hands and parts, not code. They are listed here so they cannot be los
   buttons, buzzer, link-loss alarm — and deliberately has **no display**: it prints its
   readout to its own USB serial and tells the integrator to swap `draw()` for a real one.
   The 320 × 172 OLED UI in `design/handset-screen/` therefore has no implementation, and
-  the design sheet is a handoff. The board has also never been flashed, so the §12
-  handshake is graded only by `test_handset`'s conformance suite, never on metal.
+  the design sheet is a handoff.
+  **The board is no longer unflashed (2026-11-27), because the handset board is now an
+  ESP32-S3.** Measured, not assumed: `esptool` reports `ESP32-S3 (QFN56) revision v0.2`,
+  `Embedded PSRAM 16MB (AP_1v8)`, 32 MB flash, MAC 38:44:be:cc:c1:d0, reachable over both
+  its USB paths. Built with `-e handset_s3` and flashed over `/dev/ttyACM0`, it boots and
+  prints the map it was built with: `pins (ESP32-S3): link rx13 tx14 (controller is tx17
+  rx16) | btns ack4 auto5 man6 chk7 dive15 | buzzer 16 | led 21`. Two facts came out of
+  that and are recorded in `handset/README.md`, because both are the kind of thing that
+  otherwise costs an afternoon: the module's flash is **octal** (the mask ROM says `Octal
+  Flash Mode Enabled`), so the core's default quad loader boot-looped on `assert failed:
+  do_core_init startup.c:328 (flash_ret == ESP_OK)` until `board_build.arduino.memory_type
+  = opi_opi` was set; and the classic handset's pins 25/26/27/32/33 and 19 are flash, USB
+  or non-existent on an S3, so the button/buzzer pins moved. Still un-witnessed on metal,
+  which is what keeps this item open: the **link** — the handset is not wired to the
+  controller's GPIO17/16 yet and prints `*** LINK DOWN ***` — plus the buttons, buzzer and
+  LED (nothing attached) and the screen (still no implementation). Until a wired handset
+  talks to a controller, the §12 handshake rests on `test_handset` alone. The C2 matrix is
+  unaffected: it still runs over the bench bridge on ttyUSB1, which is a different board.
 * One C3-b leg is stale rather than unfinished: it cross-checks depth "vs BMP085 on the
   same standpipe", and the BMP085 was removed from the rig on 2026-11-23 for never ACKing
   (PLAN.md). Retire or re-point that leg; do not tick it.

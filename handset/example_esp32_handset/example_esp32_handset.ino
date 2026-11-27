@@ -3,7 +3,10 @@
 // ESP-CCR controller. Read docs/HANDSET_PROTOCOL.md first; this file is that
 // protocol made physical.
 //
-// Transport: handset UART ↔ controller UART2.
+// Transport: handset UART ↔ controller UART2. The controller's half of that is
+// fixed (GPIO17 TX / GPIO16 RX, spec §1); the handset's half is chosen per
+// board, and the two boards this file builds for do not share numbers. The pin
+// block below carries both maps and says why each number moved.
 //
 //   handset GPIO13 (Serial2 RX) ──▶ controller GPIO17 (controller TX)
 //   handset GPIO14 (Serial2 TX) ──▶ controller GPIO16 (controller RX)
@@ -45,6 +48,52 @@
 #include "../handset_link.h"
 
 // ---- pins -------------------------------------------------------------------
+// Two boards, one protocol, and the numbers are NOT interchangeable. The
+// ESP32-S3 is not a superset of the ESP32: it has no GPIO22-25 at all, GPIO26-32
+// carry the SPI flash bus, GPIO19/20 are the native USB port, and GPIO0/3/45/46
+// are strapping pins. The module this handset is built on measured itself over
+// the wire as `ESP32-S3, WiFi, BLE, Embedded PSRAM 16MB (AP_1v8), flash 32MB,
+// crystal 40MHz` (esptool flash_id, 2026-11-27) — 16 MB of embedded PSRAM is
+// octal, which also spends GPIO33-37. So the classic handset's button pins
+// 25/26/27/32/33 and buzzer 19 would wire into flash, into USB, or into a pin
+// that does not exist.
+//
+// The link keeps its numbers on both boards, because the fixed half of the link
+// is the controller's (GPIO17 TX / GPIO16 RX, spec §1) and the bench wiring
+// notes in BENCH.md are written around it. Only what hangs off the handset
+// moves:
+//
+//   function        ESP32     ESP32-S3
+//   link RX/TX      13 / 14   13 / 14        unchanged
+//   ACK             25        4              25 does not exist on the S3
+//   AUTO            26        5              26-32 = SPI flash
+//   MANUAL          27        6
+//   CHECK           32        7
+//   DIVE            33        15             33-37 = this module's octal PSRAM
+//   buzzer          19        16             19/20 = native USB, both USB
+//                                            connectors on this board are cabled
+//   link LED        21        21             valid on both
+//
+// Left free on the S3 on purpose: GPIO8/9 are the core's I2C defaults, which is
+// where a display goes (see the screen item in docs/REVIEW.md §1 P7), and
+// GPIO10/11/12 are the rest of the core's default SPI bus. Note that GPIO13 is
+// that bus's default MISO: the link claims it, so an SPI display must be given
+// explicit pins rather than taking the core's defaults.
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+static const char HS_BOARD[] = "ESP32-S3";
+static const int H_RX_PIN = 13;      // ← controller GPIO17
+static const int H_TX_PIN = 14;      // → controller GPIO16
+
+static const int BTN_ACK = 4;
+static const int BTN_AUTO = 5;
+static const int BTN_MANUAL = 6;
+static const int BTN_CHECK = 7;
+static const int BTN_DIVE = 15;      // START/END toggle, two presses to confirm
+
+static const int PIN_BUZZER = 16;    // active-high piezo (or transistor drive)
+static const int PIN_LINK_LED = 21;  // steady = link up
+#else
+static const char HS_BOARD[] = "ESP32";
 static const int H_RX_PIN = 13;      // ← controller GPIO17
 static const int H_TX_PIN = 14;      // → controller GPIO16
 
@@ -56,6 +105,7 @@ static const int BTN_DIVE = 33;      // START/END toggle, two presses to confirm
 
 static const int PIN_BUZZER = 19;    // active-high piezo (or transistor drive)
 static const int PIN_LINK_LED = 21;  // steady = link up
+#endif
 
 // ---- link -------------------------------------------------------------------
 // Not called `link`: <unistd.h> (pulled in by Arduino.h) declares
@@ -371,6 +421,14 @@ void setup() {
     hsLink.getDepthSource();      // and which chip is the depth coming from? (spec §4)
     hsLink.getWifiState();        // and is the radio actually up? (spec §4)
     Serial.println("ESP-CCR handset up");
+    // The pin map is printed rather than assumed: one source builds for an ESP32
+    // and an ESP32-S3 with different numbers, and whoever is holding the
+    // screwdriver is entitled to know which map the image they just flashed
+    // actually carries. It also settles, on the console, which branch compiled.
+    Serial.printf("pins (%s): link rx%d tx%d (controller is tx17 rx16) | btns ack%d auto%d "
+                  "man%d chk%d dive%d | buzzer %d | led %d\n",
+                  HS_BOARD, H_RX_PIN, H_TX_PIN, BTN_ACK, BTN_AUTO, BTN_MANUAL, BTN_CHECK,
+                  BTN_DIVE, PIN_BUZZER, PIN_LINK_LED);
     Serial.println("clock unset? type the unix epoch and Enter, e.g. 1795517641");
 }
 

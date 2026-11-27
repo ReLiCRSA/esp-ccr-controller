@@ -1,0 +1,209 @@
+/* ESP-CCR wired handset — design tokens.
+ *
+ * Panel: 320 x 172 px landscape colour OLED, 2 Hz refresh (the `T,` line's own
+ * rate). Three buttons: UP, DOWN, ENTER. No touch, no back key, no home key,
+ * no keyboard.
+ *
+ * Two rules govern every token below:
+ *
+ *  1. Colour is meaning. A meaning colour is never decoration, and decoration
+ *     never uses one. `live` means "the controller reported this now, measured
+ *     this cycle or answered this poll";
+ *     `held` means "this is an old number"; `ok` means "a verdict the controller
+ *     actually passed"; `warn`/`crit` mean a warning-class / critical-class
+ *     FLAGS bit. If a screen needs a colour to be understood, it is broken.
+ *
+ *  2. Every meaning is also a word and a shape. `held` is always paired with the
+ *     literal text `HELD` and an age in seconds; `crit` is always a solid filled
+ *     band with dark text on it; `warn` is a 1 px outline plus a word. Tinting
+ *     the whole panel grey (see index.html's "no colour" toggle) must leave the
+ *     screen readable.
+ *
+ * Contrast was computed against the panel black, WCAG relative-luminance math,
+ * and the AA floor for text this small is 4.5:1 — the weakest meaning colour,
+ * `held`, is 5.11:1 on `bg` and 4.47:1 on `panel`, so `held` is never used for
+ * running text on `panel`; on a raised strip it becomes a fill or an outline
+ * instead. Values are in the comment beside each token.
+ */
+
+:root {
+  /* ---------------------------------------------------------------- surface */
+  --bg:     #05080C;  /* the only background. 1.00:1 — nothing sits on it */
+  --panel:  #101A24;  /* raised strip: reply band, selected row. 1.14:1 on bg */
+  --track:  #16232F;  /* empty gauge / viewport track. 1.26:1 on bg */
+  --line:   #263645;  /* 1 px separators and neutral outlines. 1.62:1 on bg */
+
+  /* ------------------------------------------------------------------- text */
+  --ink:    #EAF1F8;  /* primary text. 17.62:1 on bg, 15.42:1 on panel */
+  --dim:    #8DA2B4;  /* labels, captions, notes. 7.61:1 on bg, 6.66:1 on panel */
+
+  /* ----------------------------------------------------------------- meaning */
+  --live:   #3ED0E6;  /* measured / live / trustworthy. 10.86:1 on bg */
+  --ok:     #35D6A0;  /* a verdict the controller passed. 10.78:1 on bg */
+  --warn:   #FFB020;  /* degraded, not alarming: a warning-class FLAGS bit, or a fault reported without a bit. 10.97:1 on bg */
+  --crit:   #FF4B4B;  /* alarm severity as the controller states it: a critical FLAGS bit, an ERR refusal of something the diver could otherwise do, or a FAIL verdict. ERR unknown key and ERR not implemented are `held`, not red: no word for the request, nothing wrong. 6.08:1 bg, 5.32:1 panel */
+  --held:   #6D8397;  /* NOT this cycle's measurement. 5.11:1 on bg, 4.47:1 on panel */
+  --onfill: #05080C;  /* text drawn on a filled meaning band */
+
+  /* ------------------------------------------------------------ type tokens */
+  /* ONE family for the whole panel, and the reason is a rendered defect, not a
+   * preference. The monospace face on this bench puts a dot inside BOTH its
+   * zero and its capital O, so `CTRL · OK` came back off the renderer reading
+   * `CTRL · 0K` — on a life-support display that is not a typographic nit, it
+   * is a wrong word. This face keeps every digit at one advance width (so a
+   * value re-drawn at 2 Hz cannot shuffle the line beside it) and keeps O and
+   * 0 unmistakable. Any replacement face must satisfy both: uniform digits, and
+   * a zero that cannot be mistaken for the letter O. */
+  --font-ui: 'DejaVu Sans', 'Noto Sans', 'Helvetica Neue', Arial, sans-serif;
+
+  /* Smallest type anywhere on the panel is 11 px. Readable through a wet mask
+   * and gloves means you choose size for the *worst* legibility, not the best. */
+  --size-hero:    44px;  /* depth and ppO2 — the two numbers a diver reads mid-descent */
+  --size-hero-2:  26px;  /* deco ceiling, secondary hero */
+  --size-title:   16px;  /* screen titles, third-tier values */
+  --size-value:   13px;  /* row values, reply line */
+  --size-label:   11px;  /* labels, chips, hints, captions */
+
+  --lh-tight: 1.05;
+  --lh-row:   1.2;
+
+  /* ----------------------------------------------------------- spacing/rhythm */
+  /* 4 px base. Bands are fixed, so the HUD puts DEPTH and ppO2 in the same two
+   * pixels on every screen state and the eye does not have to re-search. */
+  --space-1: 4px;
+  --space-2: 8px;   /* the panel's standard inset from the edge */
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;   /* list row pitch: 6 rows of 20 px between y=30 and y=148 */
+
+  --canvas-w: 320px;
+  --canvas-h: 172px;
+
+  /* HUD band grid, in px from the top. Sum = 172 exactly. */
+  --band-status:  20px;  /* 0..20   mode, battery, clock, link */
+  --band-cond:    24px;  /* 20..44  the condition strip: alarm, warning, or "NO ALARMS" */
+  --band-hero:    74px;  /* 44..118 DEPTH and ppO2, side by side, both 44 px */
+  --band-deco:    24px;  /* 118..142 ceiling, NDL, CNS + gauge */
+  --band-stops:   14px;  /* 142..156 stop list / provenance line */
+  --band-reply:   16px;  /* 156..172 the controller's last reply, and the key hint */
+
+  --stroke-min: 1px;   /* nothing thinner exists on this panel */
+  --radius:     0px;   /* square corners: at 320 px a radius is just lost pixels */
+  --radius-chip: 1px;
+
+  /* ------------------------------------------------------------- motion */
+  /* 2 Hz redraw means any looping animation is a flicker risk. Animation is
+   * allowed only where it cannot strobe: a one-shot transition, or a bar that
+   * grows. Nothing on this panel pulses at a frequency a diver can count. */
+  --t-one: 120ms ease-out;
+  --t-bar: 250ms linear;
+
+  /* -------------------------------------------------- redundancy by shape */
+  /* critical = solid filled band + dark text + a word. Survives a washed-out
+   * panel, survives colour-blindness, survives a glare angle. */
+  --shape-crit-fill: var(--crit);
+  /* warning = 1 px outline + word. Deliberately quieter than critical: a
+   * warning must not compete with a critical for the diver's attention. */
+  --shape-warn-stroke: 1px solid var(--warn);
+  /* held = quiet grey-blue + the literal word HELD + age in seconds. */
+  --shape-held-stroke: 1px solid var(--held);
+}
+
+/* ---------------------------------------------------------------- primitives */
+
+.hud {
+  width: var(--canvas-w);
+  height: var(--canvas-h);
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--size-label);
+  line-height: var(--lh-row);
+  overflow: hidden;
+}
+
+.num { font-family: var(--font-ui); font-variant-numeric: tabular-nums; }
+
+.hero  { font-family: var(--font-ui); font-size: var(--size-hero);   font-weight: 600; letter-spacing: -.5px; line-height: var(--lh-tight); }
+.hero2 { font-family: var(--font-ui); font-size: var(--size-hero-2); font-weight: 600; letter-spacing: -.3px; line-height: var(--lh-tight); }
+.title { font-family: var(--font-ui); font-size: var(--size-title);  font-weight: 700; }
+.value { font-family: var(--font-ui); font-size: var(--size-value);  font-weight: 500; }
+.label { font-family: var(--font-ui); font-size: var(--size-label);  font-weight: 500; letter-spacing: .4px; }
+
+/* Meaning classes. Use one per value, never two on the same number. */
+.m-live  { color: var(--live); }
+.m-ok    { color: var(--ok); }
+.m-warn  { color: var(--warn); }
+.m-crit  { color: var(--crit); }
+.m-held  { color: var(--held); }
+.m-dim   { color: var(--dim); }
+
+/* The condition strip. `crit` fills the whole band and switches its text to
+ * dark: the loudest thing on the panel is the alarm, and it is never a thin
+ * outline that a glare angle can erase. */
+.strip            { height: var(--band-cond); display: flex; align-items: center; padding: 0 var(--space-2); }
+.strip--crit      { background: var(--shape-crit-fill); color: var(--onfill); font-weight: 700; }
+.strip--warn      { background: var(--panel); color: var(--warn); border-top: var(--shape-warn-stroke); border-bottom: var(--shape-warn-stroke); font-weight: 700; }
+.strip--held      { background: var(--panel); color: var(--held); border-top: var(--shape-held-stroke); border-bottom: var(--shape-held-stroke); font-weight: 700; }
+.strip--none      { color: var(--dim); }
+
+/* Chip: the word is mandatory, the colour is the second signal. */
+.chip {
+  font-size: var(--size-label);
+  padding: 2px 5px;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-chip);
+  background: var(--panel);
+}
+.chip--filled      { background: currentColor; color: var(--onfill); border-color: currentColor; }
+.chip--held        { color: var(--held); }
+.chip--warn        { color: var(--warn); }
+.chip--crit        { color: var(--crit); }
+.chip--ok          { color: var(--ok); }
+.chip--live        { color: var(--live); }
+
+/* Reply band: the controller's own last line, verbatim, prefixed by who spoke.
+ * `CTRL ·` is a real reply from the controller; `HANDSET ·` is a local notice
+ * the handset invented, and it is labelled as such so a diver never reads a
+ * local guess as an acknowledgement. */
+.reply {
+  height: var(--band-reply);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--space-2);
+  font-family: var(--font-ui);
+  font-size: var(--size-value);
+}
+.reply--err  { color: var(--crit); }
+.reply--warn { color: var(--warn); }
+.reply--ok   { color: var(--ok); }
+.reply .hint { font-family: var(--font-ui); font-size: var(--size-label); color: var(--dim); }
+
+/* Gauge / viewport track: filled portion uses the meaning colour, track never does. */
+.gauge       { background: var(--track); height: 6px; }
+.gauge > i   { display: block; height: 6px; background: var(--live); transition: width var(--t-bar); }
+.gauge--warn > i { background: var(--warn); }
+.gauge--crit > i { background: var(--crit); }
+
+/* Row list: 6 rows of 20 px. Selection is a filled strip plus a 3 px bar on the
+ * left, so "which one is mine" survives a washed-out panel too. */
+.rows { display: flex; flex-direction: column; }
+.row  { height: var(--space-5); display: flex; align-items: center; gap: var(--space-2); padding: 0 var(--space-2); }
+.row--sel { background: var(--panel); box-shadow: inset 3px 0 0 var(--live), inset 0 0 0 1px var(--live); }
+.row--locked .value, .row--locked .label { color: var(--held); }
+
+/* A dive-locked key stays visible and grey. Hiding it would be a lie: the key
+ * exists, and pressing it produces a real `ERR dive locked`. */
+.row--locked::after { content: "LOCKED"; font-size: var(--size-label); color: var(--held); margin-left: auto; }
+.row--safety::after { content: "SAFETY"; font-size: var(--size-label); color: var(--warn); margin-left: auto; }
+
+/* Focus/press state: the handset has no pointer and no hover. A pressed key is
+ * acknowledged by the reply band, never by an invented animation. */
+.key-ack { transition: background var(--t-one); }
+
+@media (prefers-reduced-motion: reduce) {
+  .gauge > i, .key-ack { transition: none; }
+}

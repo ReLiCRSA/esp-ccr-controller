@@ -407,12 +407,25 @@ statement about copper, and three keys on the handset's own console localise it:
 | `u` | detaches the UART and holds each link pin through a 45 kΩ pull-up then a pull-down for 20 ms, counting highs | follows whichever pull = **floating**: open wire or wrong hole. High against both = a real idle-high driver. Zero against both = shorted low |
 | `a` | the same test on every pin the S3 may legally use (26-37 skipped: flash and PSRAM), and prints what the firmware uses each hole for | finds the wire that is in the wrong hole. A driven pin the table also drives is a **collision** — two outputs on one wire — and the sweep says so |
 
-The sweep found a real instance of that collision on 2026-11-27: the link showed
-zero bytes and both link holes read floating, while **GPIO16 — the buzzer output
-in the S3 map — read as actively driven, with dips consistent with a 115200 bit
-stream.** The controller's TX was in the buzzer hole, so the handset was holding
-the controller's TX down and neither side could read anything. Repeated twice, so
-it was a measurement and not a glance. The fix is one wire: move it to 13.
+The sweep found two real instances of that on 2026-11-27, both copper and not
+firmware, and each reading moved when the wiring did — which is why the sweep is
+run twice rather than once:
+
+1. Zero bytes on the link, both link holes floating, and **GPIO16 — the buzzer
+   output in the S3 map — read as actively driven, with dips consistent with a
+   115200 bit stream** (12096/14347 high under pull-up, 14035/14035 high under
+   pull-down). The controller's TX was in the buzzer hole, so both boards were
+   driving the same copper and neither could read anything.
+2. After a rewiring, **GPIO14 — the handset's own link TX — read as driven from
+   outside**, with GPIO13 floating: the data pair was straight through (handset
+   13 to controller 16, handset 14 to controller 17) instead of crossed. Two
+   outputs on one wire, two inputs wired to each other.
+
+A floating pin and a wrong hole both look like "nothing arrived", and the fix is
+different for each; that is the whole reason `u` and `a` exist. Once the pair was
+crossed the right way, the same keys showed it: GPIO13 driven high with the note
+"correct hole", GPIO14 no longer driven from outside, and 1154 bytes of `T,` and
+`D,` in the self-test's 1.5 s window.
 
 The sweep leaves the pins it borrowed back as `setup()` had them (buttons
 pull-up, buzzer and LED outputs), because a diagnostic that silences the buzzer

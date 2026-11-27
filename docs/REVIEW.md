@@ -269,12 +269,19 @@ These need hands and parts, not code. They are listed here so they cannot be los
   Flash Mode Enabled`), so the core's default quad loader boot-looped on `assert failed:
   do_core_init startup.c:328 (flash_ret == ESP_OK)` until `board_build.arduino.memory_type
   = opi_opi` was set; and the classic handset's pins 25/26/27/32/33 and 19 are flash, USB
-  or non-existent on an S3, so the button/buzzer pins moved. Still un-witnessed on metal,
-  which is what keeps this item open: the **link** — the handset is not wired to the
-  controller's GPIO17/16 yet and prints `*** LINK DOWN ***` — plus the buttons, buzzer and
-  LED (nothing attached) and the screen (still no implementation). Until a wired handset
-  talks to a controller, the §12 handshake rests on `test_handset` alone. The C2 matrix is
-  unaffected: it still runs over the bench bridge on ttyUSB1, which is a different board.
+  or non-existent on an S3, so the button/buzzer pins moved.
+  **The link itself is now witnessed on metal (2026-11-27).** Wired to the controller's
+  GPIO17/16, the S3 handset runs the live protocol: the self-test counted 1154 bytes
+  arrived in 1.5 s, `T,` and `D,` both came back in answer to the handset's `GET T`, and
+  a `TIME SET` typed on the handset console reached the controller and returned as
+  `clock +3s` in the handset's own readout — so both directions carry commands, not just
+  telemetry. Getting there took the pin sweep, because both failures were copper and not
+  firmware: first the controller's TX was in the buzzer hole (16), then the data pair was
+  straight through instead of crossed. `handset/README.md` carries that with the readings.
+  Still un-witnessed on metal, which is what keeps this item open: the **buttons, buzzer
+  and link LED — nothing is attached to 4/5/6/7/15, to 16 or to 21 yet** — and the screen,
+  which still has no implementation. With no buttons on the board, the C2 refusal matrix
+  still runs over the bench bridge on ttyUSB1, which is a different board.
 * One C3-b leg is stale rather than unfinished: it cross-checks depth "vs BMP085 on the
   same standpipe", and the BMP085 was removed from the rig on 2026-11-23 for never ACKing
   (PLAN.md). Retire or re-point that leg; do not tick it.

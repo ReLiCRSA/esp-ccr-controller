@@ -410,9 +410,19 @@ void test_stored_values_go_through_the_helper() {
     // long long, and a cast of a value past the field wraps — the dive file spent a
     // year one count away from the wire through exactly this shape, and a wrapped
     // ceiling reads as "no decompression obligation".
+    //
+    // 2026-11-27 (same day, later): src/log/continuity.cpp joined because it is the
+    // file this scan was always supposed to catch and didn't. Its two stored fields
+    // (16 tissue pressures at 1e4, the CNS clock at 10) were scaled by hand —
+    // `x * SCALE + 0.5` then a truncate — for as long as the surface log has existed,
+    // and the ban on `+ 0.5` never reached it because the file was never in the list.
+    // That is the whole lesson: the rule was right and the list of files it was
+    // applied to was the weak half. The continuity records' own rounding is now
+    // graded by test_continuity, which is host-compiled, so the scan over this file
+    // is the belt and not the whole harness.
     const char* kUsers[] = {"src/main.cpp", "src/log/rowfill.cpp",
                             "src/comms/telemetry_bridge.cpp", "src/control/cellhist.cpp",
-                            "src/deco/view.h"};
+                            "src/deco/view.h", "src/log/continuity.cpp"};
     int calls = 0;
     // Every narrowing that can wrap a scaled value, spelled out. `long long` and
     // `double` are absent on purpose: narrowing those is the helper's own business.

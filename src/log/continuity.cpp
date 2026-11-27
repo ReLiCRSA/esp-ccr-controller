@@ -9,6 +9,9 @@
 #include <cstdio>
 #include <cstring>
 
+#include "util/numfmt.h"   // scaled()/narrow<>(): the repo's one rounding rule
+                           // and the one narrowing that cannot wrap
+
 namespace logfmt {
 
 namespace {
@@ -127,21 +130,36 @@ bool fromTissueState(const deco::Zhl16Ccr::TissueState& st, uint8_t kind,
     r.kind = kind;
     r.ncomp = CONT_NCOMP;
     for (int i = 0; i < CONT_NCOMP; ++i) {
-        // Round to nearest (the repo's rule for every stored number: see
-        // countsFromFloat, which goes through the same formatter for the same
-        // reason). Anything else makes a stored value one count away from the
-        // digits the console printed for it.
-        if (!(st.pt[i] > 0.0) || st.pt[i] > static_cast<double>(CONT_TISSUE_MAX_BAR))
+        // numfmt::scaled is the repo's one rounding rule for a stored number
+        // (nearest, ties to the EVEN side, decided on the exact product) — the
+        // same rule countsFromFloat reaches by rendering through numfmt::fixed
+        // and reading the digits back, and the reason it is one rule is the
+        // identity numfmt.h publishes: fixedScaled(scaled(v, d), d) == fixed(v, d).
+        // These two lines used to hand-roll `* SCALE + 0.5` and truncate, which
+        // agrees with that rule except on an exact tie, where it rounds half UP:
+        // a tissue at 12.34005 bar stored 123401 while the console beside it
+        // printed 12.3400 (nearest-even). One count, and the record is the thing
+        // a diver or an investigator reads afterwards, so "close enough" is the
+        // wrong answer. The layout did not change — the version byte is about
+        // bytes, not about arithmetic — so old records still read; the change is
+        // that a fresh record's value now matches its own printed digits.
+        const long long v = numfmt::scaled(st.pt[i], CONT_TISSUE_DECIMALS);
+        // scaled() answers 0 for a non-finite input, so a NaN or inf tissue
+        // pressure falls out here rather than writing a plausible zero.
+        if (v <= 0 || v > static_cast<long long>(CONT_TISSUE_MAX_BAR) * CONT_TISSUE_SCALE)
             return false;
-        const double scaled = st.pt[i] * CONT_TISSUE_SCALE + 0.5;
-        const long v = static_cast<long>(scaled);
-        if (v <= 0 || v > static_cast<long>(CONT_TISSUE_MAX_BAR) * CONT_TISSUE_SCALE)
-            return false;
-        r.tissueX1e4[i] = static_cast<int32_t>(v);
+        r.tissueX1e4[i] = numfmt::narrow<int32_t>(v);
     }
+    // The float is range-checked BEFORE scaling, not after, because 0 % is a
+    // legal CNS and numfmt::scaled answers 0 for a NaN or an inf — a post-scale
+    // range check cannot tell "no nitrogen load" from "the engine lost the
+    // number", and the difference is exactly what a continuity record is for.
     if (!(st.cnsPct >= 0.0) || st.cnsPct > static_cast<double>(CONT_CNS_MAX_PCT))
+        return false;   // NaN fails `>= 0.0`, so this covers non-finite too
+    const long long cns = numfmt::scaled(st.cnsPct, CONT_CNS_DECIMALS);
+    if (cns < 0 || cns > static_cast<long long>(CONT_CNS_MAX_PCT) * CONT_CNS_SCALE)
         return false;
-    r.cnsX10 = static_cast<uint16_t>(st.cnsPct * CONT_CNS_SCALE + 0.5);
+    r.cnsX10 = numfmt::narrow<uint16_t>(cns);
     out = r;
     return true;
 }

@@ -82,10 +82,30 @@ constexpr int CONT_SLOTS = 2;
 
 // Scales. Tissue pressure in 0.1 mbar counts; CNS in tenths of a percent (the
 // engine caps the clock at 999 %, which fits uint16 at that scale).
+//
+// The decimals on each are not a comment on the scale — they are the argument
+// numfmt::scaled(v, d) takes, and continuity.cpp's fromTissueState is the only
+// writer of these two fields. They are tied to the scales by the static_asserts
+// below because the pair has to stay one fact: store `bar x 10000` while asking
+// numfmt to round at 3 decimals and every stored tissue is one digit off the
+// wire's `S,`/`D,` precision for no reason anyone would recognise later.
 constexpr int32_t CONT_TISSUE_SCALE = 10000;
+constexpr int CONT_TISSUE_DECIMALS = 4;
 constexpr int32_t CONT_TISSUE_MAX_BAR = 100;   // == Zhl16Ccr::kSeedMaxBar
 constexpr int32_t CONT_CNS_SCALE = 10;
+constexpr int CONT_CNS_DECIMALS = 1;
 constexpr int32_t CONT_CNS_MAX_PCT = 999;      // the engine's own cap
+
+constexpr long long contPow10(int d) {
+    long long p = 1;
+    for (int i = 0; i < d; ++i) p *= 10;
+    return p;
+}
+static_assert(contPow10(CONT_TISSUE_DECIMALS) == CONT_TISSUE_SCALE,
+              "CONT_TISSUE_DECIMALS must be the decimals of CONT_TISSUE_SCALE: the rounding "
+              "and the stored scale are one fact");
+static_assert(contPow10(CONT_CNS_DECIMALS) == CONT_CNS_SCALE,
+              "CONT_CNS_DECIMALS must be the decimals of CONT_CNS_SCALE");
 
 /// What kind of moment the record was taken at. It is not decoration: it decides
 /// what the machine may claim about the interval that followed (see

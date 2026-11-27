@@ -34,9 +34,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "log/contgate.h"
 #include "log/continuity.h"
+#include "util/numfmt.h"   // the identity the stored fields are graded against
 
 using namespace logfmt;
 
@@ -204,6 +206,96 @@ void test_scaled_integers_survive_the_round_trip_to_one_part_in_10000() {
     for (int i = 0; i < CONT_NCOMP; ++i)
         TEST_ASSERT_FLOAT_WITHIN(0.0002, st.pt[i], back.pt[i]);   // 2x the quantum
     TEST_ASSERT_FLOAT_WITHIN(0.15, st.cnsPct, back.cnsPct);       // CNS is stored in tenths
+}
+
+// A round-trip tolerance cannot catch a rounding rule: 0.0002 swallows a
+// one-count error at 1e4, which is exactly the error these fields used to carry.
+// So this grades the integer itself, against the digits the machine prints for the
+// same float. The repo's rule is numfmt's: nearest, exact ties to the EVEN side,
+// decided on the exact product. continuity.cpp used to write `x * SCALE + 0.5` and
+// truncate, which agrees except on an exact tie, where it goes UP.
+//
+// The tie cases are chosen so the product is an EXACT binary number — 0.03125 is
+// 1/32, so 0.03125 x 10000 is 312.5 with no representation error at all. That is
+// what makes the case mean something: with an inexact product the two rules can
+// differ for a reason neither of them chose.
+void test_an_exact_tissue_tie_goes_to_the_even_side_like_the_printed_digits() {
+    struct Case {
+        double bar;
+        int32_t want;
+        const char* why;
+    };
+    const Case cases[] = {
+        {0.03125, 312, "exact tie 312.5: the even neighbour is 312, `+0.5` said 313"},
+        {0.09375, 938, "exact tie 937.5: the even neighbour is 938, and `+0.5` agreed by luck"},
+        {1.23456, 12346, "ordinary nearest, no tie involved"},
+        {100.0, 1000000, "the engine's own ceiling, stored exactly"},
+    };
+    for (const Case& c : cases) {
+        deco::Zhl16Ccr::TissueState st{};
+        for (int i = 0; i < CONT_NCOMP; ++i) st.pt[i] = 4.0;
+        st.cnsPct = 42.0;
+        st.pt[7] = c.bar;
+
+        ContinuityRecord r{};
+        TEST_ASSERT_TRUE_MESSAGE(fromTissueState(st, CONT_KIND_DIVE_END, r),
+                                 "a legal tissue state was refused");
+        TEST_ASSERT_EQUAL_INT32_MESSAGE(c.want, r.tissueX1e4[7],
+                                        (std::string("tissue stored at the wrong count: ") + c.why)
+                                            .c_str());
+        // And the published identity, applied to the field as it was actually
+        // stored: rendering what the record holds at its own decimals must produce
+        // the digits numfmt renders of the float it came from. If the two ever
+        // disagree, the surface log contradicts the console it was written beside.
+        char printed[24], fromRecord[24];
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(
+            numfmt::fixed(printed, sizeof printed, c.bar, CONT_TISSUE_DECIMALS),
+            numfmt::fixedScaled(fromRecord, sizeof fromRecord, r.tissueX1e4[7], CONT_TISSUE_DECIMALS),
+            "the stored record and the printed digits disagree for the same number");
+    }
+}
+
+void test_an_exact_cns_tie_goes_to_the_even_side_like_the_printed_digits() {
+    struct Case {
+        double pct;
+        uint16_t want;
+        const char* why;
+    };
+    const Case cases[] = {
+        {0.25, 2, "exact tie 2.5 tenths: the even neighbour is 2, `+0.5` said 3"},
+        {0.75, 8, "exact tie 7.5 tenths: the even neighbour is 8"},
+        {42.7, 427, "ordinary nearest"},
+        {999.0, 9990, "the engine's own cap, and the largest value the field holds"},
+    };
+    for (const Case& c : cases) {
+        deco::Zhl16Ccr::TissueState st{};
+        for (int i = 0; i < CONT_NCOMP; ++i) st.pt[i] = 4.0;
+        st.cnsPct = c.pct;
+
+        ContinuityRecord r{};
+        TEST_ASSERT_TRUE_MESSAGE(fromTissueState(st, CONT_KIND_DIVE_END, r),
+                                 "a legal CNS value was refused");
+        TEST_ASSERT_EQUAL_UINT16_MESSAGE(c.want, r.cnsX10,
+                                         (std::string("CNS stored at the wrong count: ") + c.why).c_str());
+        char printed[24], fromRecord[24];
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(
+            numfmt::fixed(printed, sizeof printed, c.pct, CONT_CNS_DECIMALS),
+            numfmt::fixedScaled(fromRecord, sizeof fromRecord, r.cnsX10, CONT_CNS_DECIMALS),
+            "the stored record and the printed digits disagree for the same CNS");
+    }
+}
+
+// A scale and the decimals the rounding is told to use are one fact. If someone
+// changes CONT_TISSUE_SCALE without changing the decimals argument, every stored
+// tissue lands at the wrong digit count while both the round-trip and the console
+// still look sane — the static_asserts in continuity.h refuse the build, and this
+// case refuses the test run, because a header a test never executes is a header a
+// test never checks.
+void test_the_scale_and_the_rounding_decimals_agree() {
+    TEST_ASSERT_EQUAL_INT_MESSAGE(CONT_TISSUE_SCALE, static_cast<int32_t>(contPow10(CONT_TISSUE_DECIMALS)),
+                                  "CONT_TISSUE_DECIMALS is not the decimals of CONT_TISSUE_SCALE");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(CONT_CNS_SCALE, static_cast<int32_t>(contPow10(CONT_CNS_DECIMALS)),
+                                  "CONT_CNS_DECIMALS is not the decimals of CONT_CNS_SCALE");
 }
 
 // The engine's numbers going OUT of range is a refusal, not a clamp: a clamped
@@ -624,6 +716,9 @@ int main() {
     RUN_TEST(test_erasures_and_foreign_bytes_are_no_record);
     RUN_TEST(test_numbers_no_dive_could_produce_are_refused_even_with_a_good_crc);
     RUN_TEST(test_scaled_integers_survive_the_round_trip_to_one_part_in_10000);
+    RUN_TEST(test_an_exact_tissue_tie_goes_to_the_even_side_like_the_printed_digits);
+    RUN_TEST(test_an_exact_cns_tie_goes_to_the_even_side_like_the_printed_digits);
+    RUN_TEST(test_the_scale_and_the_rounding_decimals_agree);
     RUN_TEST(test_out_of_range_engine_state_writes_no_record);
     RUN_TEST(test_a_slot_write_leaves_the_other_slot_and_the_gaps_untouched);
     RUN_TEST(test_writes_always_replace_the_older_slot);

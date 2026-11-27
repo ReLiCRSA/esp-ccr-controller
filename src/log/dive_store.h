@@ -78,10 +78,6 @@ public:
     /// Returns records emitted, or -1 if the slot does not exist.
     int exportCsv(int slot, void (*sink)(const char* line, void* ctx), void* ctx) const;
 
-    /// Raw record read for the web (binary, CRC-checked): fills up to cap,
-    /// stops at the first failing record. Returns bytes written, -1 missing.
-    int exportRaw(int slot, uint8_t* buf, size_t cap) const;
-
 private:
     /// 1..10, evicting the oldest dive when the FIFO is full. `seqOut` is the
     /// sequence the chosen dive must carry: max on the partition + 1, derived

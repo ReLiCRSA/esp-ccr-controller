@@ -292,21 +292,3 @@ int DiveStore::exportCsv(int slot, void (*sink)(const char*, void*), void* ctx) 
     free(img);
     return sc.headerOk ? sc.snapshots + sc.events : -1;
 }
-
-int DiveStore::exportRaw(int slot, uint8_t* buf, size_t cap) const {
-    if (!mounted_ || slot < 1 || slot > kMaxDives) return -1;
-    char p[24];
-    pathFor(slot, p, sizeof(p));
-    uint8_t* img = nullptr;
-    size_t len = 0;
-    if (!slurp(p, img, len)) return -1;
-
-    const logfmt::ScanResult sc = logfmt::scanRecords(img, len, nullptr, nullptr);
-    if (!sc.headerOk) { free(img); return -1; }
-    // bytesConsumed is exactly "header + every record whose CRC validated":
-    // the torn tail is never copied out.
-    const size_t n = sc.bytesConsumed < cap ? sc.bytesConsumed : cap;
-    memcpy(buf, img, n);
-    free(img);
-    return (int)n;
-}

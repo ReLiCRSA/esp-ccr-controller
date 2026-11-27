@@ -369,7 +369,10 @@ minimum count of what it actually graded.
 - Flash contention **during a dive**: exports read while the dive log writes, with
   the depth sensor squeezed, is the unmeasured case behind the review's slow-cycle
   worry. `worst=` peaked at 8 ms at the surface, so the margin question is now
-  about that configuration specifically.
+  about that configuration specifically. **Partly closed by
+  [batch E](REVIEW_BATCH_E_2026-11-27.md) §3:** `LOG EXPORT` is refused mid-dive
+  (`ERR export locked in dive`), so the handset path cannot contend at all; the
+  web's `/dive/N.csv` deliberately still can, and remains the unmeasured case.
 - `worst=` is graded against 800 ms; the measured watchdog expiry (3011..3061 ms)
   and the supervisor's 1500 ms budget are printed beside it, but nothing yet
   *stress-tests* the control cycle toward those numbers on purpose.

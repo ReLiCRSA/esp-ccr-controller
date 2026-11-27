@@ -256,3 +256,27 @@ No case was removed or weakened.
    concurrently; the report describes the state verified on disk
    (2026-11-27, base `038df54` + the diff in `git status`), not an intermediate
    one. Re-verify with `git diff` before committing anything from it.
+
+## Status of these residuals, as of review batch E (same day)
+
+Batch [E](REVIEW_BATCH_E_2026-11-27.md) worked this list. Recorded here so the
+list is not read as current:
+
+* **2 — closed.** The clamp verdict is protocol now: `E,<t>,19,<mask>`, mask =
+  `comms::ApplyClamp`, appended to §4 without renumbering anything (batch E §1).
+  `GET GF_LOW` still answers the typed value — §6 says so on purpose.
+* **3 — half closed, and the wording here was too optimistic.** `env:native_o2` is
+  in the gates now, and the fence-removal mutation **still passes at `-O0` and
+  `-O2` on x86-64**: this host cannot witness those fences at all (their
+  `fetch_add(acq_rel)` is a `lock xadd` barrier by itself). On the shipping core
+  they are one `memw` instruction each, measured in the linked ELF (batch E §5).
+  Nobody has yet demonstrated the pairing that breaks without them.
+* **4 — closed, with a correction.** The extraction described above was not merely
+  untested: its signed difference `int32_t(120000 - now)` wraps positive once
+  `millis()` passes ~2^31, which pins the calibration refusal on forever. Replaced
+  with a latching `util::WarmupGate` and pinned by `test/test_warmup`, including a
+  scan that bans that arithmetic in `src/main.cpp` (batch E §4).
+* **6 — closed.** `DiveStore::exportRaw` deleted, suite green (`e0c3b25`).
+* **1 — closed by batch D** (measured expiry 3061/3011 ms), **5 — still open**,
+  **7 — as written**.
+

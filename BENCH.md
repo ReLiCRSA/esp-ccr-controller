@@ -15,11 +15,21 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 278 cases
+pio test -e native            # host gate, currently 437 cases
+pio test -e native -e native_o2   # both levels: 874 cases. The -O2 env is the
+                                 # optimizer gate (platformio.ini's comment carries
+                                 # what it has and has not been shown to catch)
 tools/port_id.py --listen 4   # name the ports before trusting any of the below:
                                  # two identical CP2102s swap under the USB stack, and a
                                  # swapped pair makes every check below lie (see C2-g)
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites
+tools/fence_probe_report.py   # occasional, not every flash: counts MEMW barriers in the
+                                 # deco view seqlock on the TARGET toolchain. Answers
+                                 # "does the optimizer keep view.h's fences" for ESP32
+                                 # (it does: 3/2 and 4/3 with and without each fence);
+                                 # the x86 answer is the other way round, which is why
+                                 # env:native_o2 cannot grade that claim. Review
+                                 # batch E §5; artifact logs/m4_fence_probe_*.txt
 pio run -e esp32 -t upload --upload-port /dev/ttyUSB0   # explicit or never: two
                                  # identical CP2102s exist, auto-select CAN flash the
                                  # controller image into the bridge (it did, 2026-11-26:
@@ -29,7 +39,12 @@ pio run -e esp32 -t upload --upload-port /dev/ttyUSB0   # explicit or never: two
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyUSB1 \
                                  --cal-air --predive --dive-persist    # 170 checks
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio graders, no board: 107 cases
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
+                                 --cal-air --dive-persist    # 158 PASS, 0 failures
+                                 # 2026-11-27 (batch E, no --predive: the pack is
+                                 # unplugged so its BATTERY step refuses, and no
+                                 # --expect-depth: no squeeze operator at the bench)
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio graders, no board: 131 cases (2026-11-27)
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 78 checks
 tools/.../python tools/web_probe.py --selftest  # dive-identity + scrub + page graders, no board: 37 cases
 ```
@@ -1057,6 +1072,45 @@ red —
 — and every other surface check stays green, because the one surviving record is
 internally consistent. A log that quietly keeps only its last row is invisible to
 anything that reads the file; only the boot banner's own arithmetic sees it.
+
+### Three legs review batch E added (2026-11-27)
+
+**The settings clamp verdict is on the wire, so the bench reads it unprompted.**
+At the surface (the GF keys are dive-locked, and a *refused* SET clamps nothing):
+
+```
+SET GF_LOW=90  -> OK SET GF_LOW              (the chain runs 85: GF_HIGH x 1.00)
+GET GF_LOW     -> GF_LOW=90                  (the number typed, unchanged — §6)
+console        -> ~ [26.55s] settings: CLAMPED GF_ORDER — ordering enforced over what was set
+handset        -> E,<t>,19,32                (exactly one row, mask bit 16 = GF_ORDER)
+```
+
+`grade_stream` demands exactly one such row. Zero means the verdict went back to
+being console-only while `GET` kept answering the typed number — the exact lie
+this fixes. Two means something publishes for a SET that needed no clamp. A wrong
+mask names an ordering the applier never enforced, and the diver fixes half the
+pair. Five lying captures in `--selftest` cover those shapes.
+
+**`LOG EXPORT` is dive-locked, and the harness proves it mid-dive:** the matrix
+sends `LOG EXPORT 1` while a dive is open and wants
+`ERR export locked in dive` — no export mid-dive, the flash belongs to the live
+dive file. `LOG LIST` deliberately stays open (bounded scan, no file read). The
+web's `/dive/N.csv` is deliberately **not** locked; §2 and §5 of
+`docs/HANDSET_PROTOCOL.md` record that divergence and why.
+
+**The dive file's `pulses` column is real now — and a vacuous pass is a trap.**
+The dive-file grader parses every `S,` window, rejects a wall of zeros beside a
+non-zero total, and rejects any window larger than `M,`'s total. But a dive that
+never injected cannot tell a placeholder from a measurement, so the grader now
+prints a note when `M,` total is 0 instead of letting the PASS imply a witness.
+The run of 2026-11-27 15:18 was exactly that case (`M, total 0`). The reason is a
+gate worth remembering when setting up a pulse witness: **the injector only ever
+wants a pulse in AUTO** (`control/injector.cpp`), AUTO is locked out until PREDIVE
+PASSes, and PREDIVE's BATTERY step refuses below `vbatMin` = 10.5 V
+(`control/predive.h`). A board on USB power alone — HB `vbat=1.56 batlow=1` —
+**cannot produce an injecting dive**. `tools/pulse_witness.py` reads `HB`'s
+`vbat=`/`batlow=`, refuses with exit 2 and says so rather than printing a
+vacuous pass; connect the pack and re-run it for the real witness.
 
 ### When the link is silent: bisect it, do not reflash at it
 

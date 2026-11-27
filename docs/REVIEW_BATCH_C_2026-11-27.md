@@ -183,3 +183,13 @@ stalled task), the idle-task claim turned out to be false in the other direction
 idle handle is ever subscribed here), the flag labels are graded across all four
 places that name them, and the continuity rounding moved to `numfmt::scaled`. Items
 1, the `pulses` column and `LOG EXPORT`'s dive-lock policy are unchanged.
+
+**Closed by [batch E](REVIEW_BATCH_E_2026-11-27.md) later the same day:** the
+`pulses` column (event-driven `S,` rows now subtract the same base the grid rows do,
+and §9 states that the two row kinds' windows OVERLAP — `M,` is the total), and
+`LOG EXPORT`'s dive-lock policy (refused mid-dive with `ERR export locked in dive`;
+`LOG LIST` stays open; the web's `/dive/N.csv` stays unlocked, and §2/§5 say why).
+**Item 1 stays open and is measured:** `sizeof(ctrl::Config)` = **284 B** confirmed on
+the batch E tree, `env:esp32` RAM 56292 B / 17.2 %, and the decision not to narrow it
+is recorded with the numbers in batch E §7 rather than left implied. The clamp
+verdict this section called console-only is protocol now: `E,<t>,19,<mask>`.

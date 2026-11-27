@@ -46,6 +46,7 @@
 #include "log/continuity.h"
 #include "log/continuity_store.h"
 #include "log/dive_store.h"
+#include "sensors/battery.h"
 #include "log/rowfill.h"      // the one snapshot-row fill (grid row and event row)
 #include "log/rowgate.h"      // the ControlTask grid-row deferral policy (H2)
 #include "log/surface_store.h"
@@ -56,6 +57,7 @@
 // (control/configbox.h), which is what lets the settings path apply onto a copy
 // instead of writing a global the control chain is reading.
 extern ctrl::Loop* g_loop;
+extern Battery g_battery;
 extern settings::Registry g_settings;
 extern bridge::Telemetry g_bridgeTel;
 extern bridge::EventRing g_bridgeEvents;
@@ -350,6 +352,9 @@ void hookSettings(void*) {
         return;
     }
     const uint8_t clamps = applySettings(g_settings, cfg);
+    // Same reason as in setup(): the battery floor the instrument warns on must
+    // be the one the diver set, not the one compiled in.
+    g_battery.setMinVolts(cfg.alarms.vbatMin);
     ctrl::configPublish(cfg);
     if (g_loop) g_loop->postConfig(cfg);
     if (clamps != CLAMP_NONE) {

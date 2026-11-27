@@ -5,6 +5,7 @@
 // ============================================================================
 #include "settings.h"
 
+#include "config/defaults.h"
 #include "util/numfmt.h"
 
 #include <cctype>
@@ -63,8 +64,14 @@ const Def kTable[TCOUNT] = {
     // the physical pressure stayed put. Setpoints and alarms are locked for less
     // than that. The refusal is graded on hardware (hw_accept matrix).
     {"WATER_DENSITY", Type::FLOAT, 1.025f, 0.990f, 1.100f, FL_DIVE_LOCK, nullptr},
-    // battery
-    {"VBAT_MIN", Type::FLOAT, 10.5f, 3.0f, 30.0f, FL_SAFETY, nullptr},
+    // battery: the one knob, and its legal band is chemistry-shaped, not the old
+    // 3.0..30.0. Two reasons, and the second one is why a stale value cannot
+    // outlive this change: the NVS on every board here holds the old 10.5, and
+    // nvs_store range-checks on load — a value outside the band falls back to the
+    // default rather than loading. Tightening the band IS the migration. A band
+    // that still admitted 10.5 would keep refusing pre-dive forever on a board
+    // whose pack measures 4.1 V.
+    {"VBAT_MIN", Type::FLOAT, VBAT_MIN_V, VBAT_RANGE_MIN_V, VBAT_RANGE_MAX_V, FL_SAFETY, nullptr},
     // dive lock: everything that steers the gas loop or the sensing verdicts
     // is frozen once a dive starts (the router enforces it for handset AND
     // web). Tuning that only moves the schedule (D1/D2, SP_HYST, drift,

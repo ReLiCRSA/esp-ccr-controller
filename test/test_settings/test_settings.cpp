@@ -1,16 +1,86 @@
 #include <unity.h>
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "comms/settings.h"
+#include "config/defaults.h"
 
 using namespace settings;
 
 void setUp() {}
 void tearDown() {}
+
+// The pack is one 3.7 V Li-ion, and the NVS on every board on this bench holds
+// the 10.5 this project used to assume. nvs_store range-checks what it loads, so
+// the writable band IS the migration: a stored 10.5 falls back to the chemistry
+// default instead of outliving the change and refusing the pre-dive BATTERY step
+// forever on a board whose pack measures 4.1 V. That is why the band is
+// chemistry-shaped rather than the old 3.0..30.0, and why the old rail has to be
+// refused HERE, where a host test can see it, and not only on metal.
+void test_battery_band_is_chemistry_shaped_and_refuses_the_old_rail() {
+    size_t n = 0;
+    const Def* defs = Registry::definitions(n);
+    const Def* vb = nullptr;
+    for (size_t i = 0; i < n; ++i)
+        if (std::strcmp(defs[i].key, "VBAT_MIN") == 0) vb = &defs[i];
+    TEST_ASSERT_NOT_NULL(vb);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_MIN_V, vb->def);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_CELLS * 2.80f, vb->minv);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_CELLS * 4.50f, vb->maxv);
+    TEST_ASSERT_TRUE_MESSAGE(vb->def > vb->minv && vb->def < vb->maxv,
+                             "a default outside its own band is a default nothing can reach");
+
+    // Written as strings because that is what the wire and the console hand in —
+    // and built from the band, not typed, so this leg means the same thing after
+    // VBAT_CELLS moves. The point of the leg is "the band is chemistry-shaped",
+    // not "the band is 2.80..4.50".
+    char atMin[16], atMax[16], belowMin[16];
+    std::snprintf(atMin, sizeof atMin, "%.2f", (double)(VBAT_CELLS * 2.80f));
+    std::snprintf(atMax, sizeof atMax, "%.2f", (double)(VBAT_CELLS * 4.50f));
+    std::snprintf(belowMin, sizeof belowMin, "%.2f", (double)(VBAT_CELLS * 2.80f - 0.10f));
+    Registry r;
+    const char* err = nullptr;
+    TEST_ASSERT_TRUE_MESSAGE(r.setValueByKey("VBAT_MIN", atMin, &err),
+                             "the bottom of the band must be settable");
+    TEST_ASSERT_TRUE_MESSAGE(r.setValueByKey("VBAT_MIN", atMax, &err),
+                             "the top of the band must be settable");
+    TEST_ASSERT_FALSE_MESSAGE(r.setValueByKey("VBAT_MIN", belowMin, &err),
+                              "below a pack worth diving on must be refused");
+
+    // With nothing written, the registry answers the chemistry — not a rail.
+    Registry fresh;
+    fresh.resetToDefaults();
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_MIN_V, fresh.getFloat(fresh.find("VBAT_MIN")));
+}
+
+// The load-behaviour claim, on its own because it is the one that decides
+// whether this change actually reaches a board: the NVS holds 10.5 from the old
+// build, nvs_store range-checks what it loads, and a band that still admits 10.5
+// keeps refusing the pre-dive BATTERY step forever on a rig whose pack measures
+// 4.1 V. Refusing the old rail here is what clears it on the next boot.
+void test_the_old_12v_rail_is_refused_so_a_stored_one_cannot_survive() {
+    Registry r;
+    r.resetToDefaults();      // a bare Registry holds nothing until reset
+    const char* err = nullptr;
+    TEST_ASSERT_FALSE_MESSAGE(r.setValueByKey("VBAT_MIN", "10.5", &err),
+                              "the rail this project used to assume must not load");
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_MIN_V, r.getFloat(r.find("VBAT_MIN")));
+
+    // And a value written inside the band does stick, or the refusal above is
+    // just "this key is broken". Derived from the band so this stays true when
+    // VBAT_CELLS moves; the 10.5 above stays LITERAL on purpose — it is a
+    // specific number that is sitting in a specific NVS on this bench.
+    char inside[16];
+    std::snprintf(inside, sizeof inside, "%.2f", (double)(VBAT_CELLS * 3.60f));
+    TEST_ASSERT_TRUE(r.setValueByKey("VBAT_MIN", inside, &err));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_CELLS * 3.60f, r.getFloat(r.find("VBAT_MIN")));
+}
 
 void test_defaults_load() {
     Registry r;
@@ -203,14 +273,264 @@ void test_every_key_reaches_its_own_declared_bounds() {
                                              "the boundary walk covered too few keys");
 }
 
+// --- §6 of the handset contract against the registry it documents -------------
+//
+// Why this exists: HANDSET_PROTOCOL.md §6 is the table a handset builder reads
+// instead of reading firmware, and it publishes each key's default and legal
+// range. Nothing checked it, and on 2026-11-27 the battery key changed in the
+// firmware (`VBAT_MIN` 10.5 / 3.0–30.0 → 3.40 / 2.80–4.50, derived from
+// `VBAT_CELLS`) while the table still advertised the old numbers. A handset that
+// offers "10.5" or greys out 3.40 is a handset built against a range the board
+// refuses — and this repo has already been burned twice by a published range
+// that the parser did not honour. The fix for "the doc drifted" is not a
+// reminder, it is a check: the same shape test_flaglabels uses for the FLAGS
+// table, applied to the settings table.
+std::string readFile(const char* path) {
+    FILE* f = std::fopen(path, "rb");
+    if (!f) return "";
+    std::string out;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
+// Splits one markdown row into its cells. Returns false unless the row has the
+// settings table's five columns, which is also what keeps the ORDERING table
+// further down §6 (three columns) out of this parser.
+bool splitRow(const std::string& line, std::vector<std::string>& cells) {
+    if (line.size() < 3 || line.compare(0, 2, "| ") != 0) return false;
+    cells.clear();
+    std::string cur;
+    for (char c : line) {
+        if (c == '|') { cells.push_back(cur); cur.clear(); }
+        else cur += c;
+    }
+    // Expect a leading empty cell and NO trailing one: six cells for five columns,
+    // because the text after the last '|' is empty and is never pushed.
+    if (cells.size() != 6) return false;
+    for (size_t k = 1; k <= 5; ++k) {
+        // trim
+        size_t a = cells[k].find_first_not_of(" \t");
+        size_t b = cells[k].find_last_not_of(" \t\r\n");
+        cells[k] = (a == std::string::npos) ? std::string() : cells[k].substr(a, b - a + 1);
+    }
+    return cells[2].size() == 1 && std::string("FIUBS").find(cells[2]) != std::string::npos;
+}
+
+// Pulls the decimal numbers out of a cell in order. The table writes ranges with
+// an EN DASH ("2.80–4.50"), whose UTF-8 bytes are not digits, so scanning for
+// number runs ignores the punctuation entirely — and "len 1–16" yields 1, 16.
+std::vector<float> numbers(const std::string& cell) {
+    std::vector<float> out;
+    size_t i = 0;
+    while (i < cell.size()) {
+        const char c = cell[i];
+        if (std::isdigit(static_cast<unsigned char>(c)) ||
+            (c == '.' && i + 1 < cell.size() &&
+             std::isdigit(static_cast<unsigned char>(cell[i + 1])))) {
+            size_t j = i;
+            bool dot = false;
+            while (j < cell.size() &&
+                   (std::isdigit(static_cast<unsigned char>(cell[j])) ||
+                    (cell[j] == '.' && !dot))) {
+                if (cell[j] == '.') dot = true;
+                ++j;
+            }
+            out.push_back(std::strtof(cell.substr(i, j - i).c_str(), nullptr));
+            i = j;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+struct SpecKey {
+    std::string key;
+    char type = '?';
+    bool hasDefault = false;
+    float def = 0.0f;
+    bool hasRange = false;
+    float minv = 0.0f, maxv = 0.0f;
+    bool diveLock = false, safety = false;
+};
+
+// Expands §6's table into one entry per KEY (the table groups a row when keys
+// share a type and band: `SP1 SP2 SP3 SP4`, and `D1 D2` with one range each).
+std::vector<SpecKey> specKeys(const std::string& doc) {
+    std::vector<SpecKey> out;
+    std::vector<std::string> cells;
+    size_t pos = 0;
+    while (pos < doc.size()) {
+        size_t eol = doc.find('\n', pos);
+        if (eol == std::string::npos) eol = doc.size();
+        const std::string line = doc.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (!splitRow(line, cells)) continue;
+
+        // Grouped keys, in the order the table prints them.
+        std::vector<std::string> keys;
+        {
+            std::string k = cells[1];
+            size_t a = 0;
+            while (a < k.size()) {
+                size_t sp = k.find(' ', a);
+                if (sp == std::string::npos) sp = k.size();
+                if (sp > a) keys.push_back(k.substr(a, sp - a));
+                a = sp + 1;
+            }
+        }
+        if (keys.empty() || keys[0] == "key") continue;
+
+        const std::vector<float> defs = numbers(cells[3]);
+        // A range cell may carry prose in parentheses — `0–240 (**0 = never
+        // off**)`. The band is what comes before the parenthesis; reading the
+        // prose's digits too would make this parser invent a third number and
+        // silently lose the range.
+        std::string rangeCell = cells[4];
+        const size_t par = rangeCell.find('(');
+        if (par != std::string::npos) rangeCell = rangeCell.substr(0, par);
+        const std::vector<float> rng = numbers(rangeCell);
+        const bool oneDef = defs.size() == 1, perKeyDef = defs.size() == keys.size();
+        const bool oneRange = rng.size() == 2, perKeyRange = rng.size() == 2u * keys.size();
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            SpecKey s;
+            s.key = keys[i];
+            s.type = cells[2][0];
+            if (s.type == 'B') {
+                s.hasDefault = true;
+                if (cells[3] == "ON" || cells[3] == "on") s.def = 1.0f;
+                else if (cells[3] == "OFF" || cells[3] == "off") s.def = 0.0f;
+                else s.hasDefault = false;
+            } else if (s.type != 'S' && perKeyDef) {
+                s.hasDefault = true; s.def = defs[i];
+            } else if (s.type != 'S' && oneDef) {
+                s.hasDefault = true; s.def = defs[0];
+            }
+            if (oneRange) { s.hasRange = true; s.minv = rng[0]; s.maxv = rng[1]; }
+            else if (perKeyRange) {
+                s.hasRange = true; s.minv = rng[2 * i]; s.maxv = rng[2 * i + 1];
+            }
+            const std::string fl = cells[5];
+            s.diveLock = fl.find("dive-lock") != std::string::npos;
+            s.safety = fl.find("safety") != std::string::npos;
+            out.push_back(s);
+        }
+    }
+    return out;
+}
+
+const SpecKey* findSpec(const std::vector<SpecKey>& v, const std::string& key) {
+    for (const SpecKey& s : v)
+        if (s.key == key) return &s;
+    return nullptr;
+}
+
+void test_the_published_settings_table_matches_the_registry_it_documents() {
+    const std::string doc = readFile("docs/HANDSET_PROTOCOL.md");
+    TEST_ASSERT_MESSAGE(!doc.empty(), "cannot read docs/HANDSET_PROTOCOL.md");
+    const std::vector<SpecKey> spec = specKeys(doc);
+
+    size_t n = 0;
+    const Def* defs = Registry::definitions(n);
+
+    // The anti-vacuous guard, in both directions: every registry key must be
+    // published, and the table must not publish keys the board does not have.
+    TEST_ASSERT_EQUAL_MESSAGE(static_cast<int>(n), static_cast<int>(spec.size()),
+                              "the settings table and the registry do not hold the same number "
+                              "of keys — a key appeared in one and not the other");
+    TEST_ASSERT_TRUE_MESSAGE(n >= 30, "the registry shrank below the size this guard expects");
+
+    int graded = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const Def& d = defs[i];
+        const SpecKey* s = findSpec(spec, d.key);
+        TEST_ASSERT_NOT_NULL_MESSAGE(s,
+                                     (std::string(d.key) + " is in the registry but not published "
+                                      "in the contract's settings table").c_str());
+        const char tc = d.type == Type::FLOAT ? 'F'
+                      : d.type == Type::INT16 ? 'I'
+                      : d.type == Type::UINT8 ? 'U'
+                      : d.type == Type::BOOL ? 'B' : 'S';
+        TEST_ASSERT_EQUAL_MESSAGE(tc, s->type,
+                                  (std::string(d.key) + ": the table publishes type " + s->type +
+                                   ", the registry says " + tc).c_str());
+        if (d.type != Type::STRING) {
+            TEST_ASSERT_TRUE_MESSAGE(s->hasDefault,
+                                     (std::string(d.key) + ": no default this test can read out of "
+                                      "the table — the row's default cell changed shape").c_str());
+            TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001, d.def, s->def,
+                                             (std::string(d.key) + ": the published default is not "
+                                              "the registry's default").c_str());
+            // A published range the parser refuses is the defect this whole
+            // family exists to stop (13 keys had unreachable endpoints once), so
+            // both endpoints are compared, not just the printed shape. BOOL is
+            // the exception the table is honest about: it prints `—` because the
+            // key takes ON/OFF, and the registry's 0..1 is not a published band.
+            if (d.type != Type::BOOL) {
+                TEST_ASSERT_TRUE_MESSAGE(s->hasRange,
+                                         (std::string(d.key) + ": the table gives no range and the "
+                                          "registry has one").c_str());
+                TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001, d.minv, s->minv,
+                                                 (std::string(d.key) + ": the published MINIMUM is not "
+                                                  "the range the parser accepts").c_str());
+                TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001, d.maxv, s->maxv,
+                                                 (std::string(d.key) + ": the published MAXIMUM is not "
+                                                  "the range the parser accepts").c_str());
+            }
+        } else if (s->hasRange) {
+            // Strings publish their LENGTH band ("len 1–16"), and the registry
+            // puts those same two numbers in minv/maxv. A table that printed
+            // `len 1–31` for a 16-char SSID is the same class of lie.
+            TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001, d.minv, s->minv,
+                                             (std::string(d.key) + ": the published minimum LENGTH "
+                                              "is not what the parser takes").c_str());
+            TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001, d.maxv, s->maxv,
+                                             (std::string(d.key) + ": the published maximum LENGTH "
+                                              "is not what the parser takes").c_str());
+        }
+        TEST_ASSERT_EQUAL_MESSAGE(static_cast<bool>(d.flags & FL_DIVE_LOCK), s->diveLock,
+                                  (std::string(d.key) + ": dive-lock in the table and in the "
+                                   "registry disagree").c_str());
+        TEST_ASSERT_EQUAL_MESSAGE(static_cast<bool>(d.flags & FL_SAFETY), s->safety,
+                                  (std::string(d.key) + ": the safety flag in the table and in the "
+                                   "registry disagree").c_str());
+        ++graded;
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL_MESSAGE(30, graded, "graded too few keys to mean anything");
+}
+
+// The battery row specifically, by name, because it is the one that drifted and
+// the one whose band is not a hand-typed number: it is per-cell times
+// VBAT_CELLS, so the table is only ever right by derivation.
+void test_the_published_battery_band_is_the_chemistry_band() {
+    const std::string doc = readFile("docs/HANDSET_PROTOCOL.md");
+    const std::vector<SpecKey> spec = specKeys(doc);
+    const SpecKey* s = findSpec(spec, "VBAT_MIN");
+    TEST_ASSERT_NOT_NULL(s);
+    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.001, VBAT_MIN_V, s->def,
+                                     "the contract publishes a battery default that is not the "
+                                     "chemistry in defaults.h");
+    TEST_ASSERT_FLOAT_WITHIN(0.001, VBAT_RANGE_MIN_V, s->minv);
+    TEST_ASSERT_FLOAT_WITHIN(0.001, VBAT_RANGE_MAX_V, s->maxv);
+    TEST_ASSERT_TRUE_MESSAGE(s->safety, "VBAT_MIN must stay an event-logged safety key");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_defaults_load);
+    RUN_TEST(test_battery_band_is_chemistry_shaped_and_refuses_the_old_rail);
+    RUN_TEST(test_the_old_12v_rail_is_refused_so_a_stored_one_cannot_survive);
     RUN_TEST(test_valid_and_invalid_sets);
     RUN_TEST(test_string_bounds_and_dive_lock_flags);
     RUN_TEST(test_value_as_string_and_list_all);
     RUN_TEST(test_reset_restores);
     RUN_TEST(test_keys_fit_nvs);
     RUN_TEST(test_every_key_reaches_its_own_declared_bounds);
+    RUN_TEST(test_the_published_settings_table_matches_the_registry_it_documents);
+    RUN_TEST(test_the_published_battery_band_is_the_chemistry_band);
     return UNITY_END();
 }

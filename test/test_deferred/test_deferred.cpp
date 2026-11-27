@@ -58,7 +58,8 @@ void tick(Loop& loop, uint32_t& now, uint32_t n = 1, float depth = 0.0f,
         SensorData sd;
         for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(cell, i, ch);
         sd.depthM = depth;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         loop.cycle(sd, now);
     }
@@ -247,7 +248,8 @@ void test_two_threads_never_split_the_chain() {
             SensorData sd;
             for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(0.55f, cycles.load(), ch);
             sd.depthM = 5.0f;
-            sd.vbat = 12.2f;
+            sd.vbat = VBAT_CELLS * 3.90f;
+            sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
             now += 1;  // faster than the board's 100 ms: more edges per second
             loop.cycle(sd, now);
             cycles.fetch_add(1);

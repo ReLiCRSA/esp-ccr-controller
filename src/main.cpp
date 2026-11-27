@@ -111,7 +111,18 @@ static Heartbeat g_hbSensor{0};
 static Heartbeat g_hbHud{0};
 
 static Ads1115Bus  g_ads;
-static Battery     g_battery;
+// Not static: `VBAT_MIN` is written at runtime, and the apply path lives in
+// session_wiring.cpp — the floor this object warns on has to be the one the
+// diver set, so the applier has to reach it (same reason g_loop/g_settings are
+// plain globals).
+Battery     g_battery;
+// Series packs only, and 0 means "not sensed". The pack sense reads the whole
+// stack, and a whole stack can read fine with one cell in it dead (6.80 V is
+// 4.00 + 2.80), so this is the second half of the pre-dive battery verdict —
+// sampled beside the pack sample so the two numbers come from the same instant.
+// Never read while VBAT_CELLS is 1, which is why it stays 0 there and the
+// pre-dive step skips the comparison instead of judging an unwired pin.
+static float       g_vbatMidV = 0.0f;
 static volatile bool g_sensorStale = false;
 static HudState    g_systemState = HudState::STANDBY;
 
@@ -388,9 +399,35 @@ static void sensorTask(void*) {
             lastBat = now;
             for (int i = 0; i < 8; ++i)
                 g_battery.addSample(analogReadMilliVolts(PIN_VBAT_SENSE));
+#if VBAT_CELLS >= 2
+            // Same divider ratio on the midpoint as on the pack, so the two
+            // numbers are comparable as volts. One sample, not a burst: this
+            // feeds a 0.3 V agreement check, not a spike-sensitive gate, and a
+            // second 8-sample burst in this task would push the sensor cycle's
+            // I2C-free window out for no verdict gain.
+            g_vbatMidV = analogReadMilliVolts(PIN_VBAT_MID_SENSE) * 1e-3f
+                         * VBAT_DIVIDER_RATIO * VBAT_CAL;
+#endif
         }
 
         g_sensorStale = g_ads.anyStale(now);
+
+        // The two battery faults need different words, even though they raise the
+        // same marker: "flat" and "blind" are different things to fix, and HB's
+        // number plus `batlow=1` leaves a reader doing arithmetic to find out
+        // which. Edges only, like every other console statement here.
+        static bool lastBlind = false;
+        if (g_battery.implausible() != lastBlind) {
+            lastBlind = g_battery.implausible();
+            char mv[12];
+            Serial.printf("battery: sense %s: %s V cannot be a %u-cell pack of this "
+                          "chemistry (floor %.2f V, ceiling %.2f V). BATTERY stays up: an "
+                          "unreadable pack is not a good pack.\n",
+                          lastBlind ? "IMPLAUSIBLE" : "back inside the plausible band",
+                          numfmt::fixed(mv, sizeof mv, g_battery.volts(), 2),
+                          (unsigned)VBAT_CELLS, (double)VBAT_MIN_V,
+                          (double)VBAT_IMPLAUSIBLE_V);
+        }
         g_hbSensor.seq++;
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(SENSOR_TASK_PERIOD_MS));
@@ -871,6 +908,10 @@ static void controlTask(void*) {
         sd.pressureValid = g_depthValid;
         sd.cellsFresh = !g_ads.anyStale(now);
         sd.vbat = g_battery.volts();
+        // Carried unconditionally: with VBAT_CELLS == 1 it is a constant 0 the
+        // pre-dive step ignores, and the one place the two pack numbers travel
+        // together is worth more than an #if at the use site.
+        sd.vbatMid = g_vbatMidV;
 
         const ctrl::State st = g_loop->cycle(sd, now);
 
@@ -1477,6 +1518,7 @@ static void buildControlConfig(ctrl::Config& cfg) {
     cfg.alarms.highBar = PPO2_HIGH_ALARM_BAR;
     cfg.alarms.cnsAlarmPct = CNS_ALARM_PCT;
     cfg.alarms.vbatMin = VBAT_MIN_V;
+    cfg.alarms.vbatMax = VBAT_IMPLAUSIBLE_V;
 
     cfg.predive.warmupMs = PREDIVE_WARMUP_MS;
     cfg.predive.airTargetBar = CAL_AIR_REF_BAR;
@@ -1664,6 +1706,12 @@ void setup() {
     ctrl::Config cfg{};
     buildControlConfig(cfg);
     const uint8_t applyClamps = comms::applySettings(g_settings, cfg);
+    // The Battery object's own floor follows the applied value. It has its copy
+    // because it is Arduino-free and host-tested, but two thresholds for one
+    // battery — the compile-time one behind HB's `batlow` and the HUD warning,
+    // and the written one behind the alarm and pre-dive — is two answers to one
+    // question, and a diver's `SET VBAT_MIN` used to move only one of them.
+    g_battery.setMinVolts(cfg.alarms.vbatMin);
     ctrl::configPublish(cfg);   // before any task that reads it is created
     if (loadedKeys > 0) Serial.printf("settings: %d keys from NVS\n", loadedKeys);
     if (applyClamps != comms::CLAMP_NONE) {

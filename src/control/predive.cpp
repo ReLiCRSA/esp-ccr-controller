@@ -150,8 +150,27 @@ void Sequencer::update(const Inputs& in, uint32_t nowMs) {
             // a single cycle — but a pack below vbatMin is a fault to refuse now,
             // and `start()` restarts the sequence in seconds, so there is nothing
             // for a grace to protect here.
-            if (in.vbat >= cfg_.vbatMin) { advance(S_BATTERY); }
-            else fail(S_BATTERY);
+            //
+            // Three questions, and the second one is the one that used to be
+            // missing. Above the floor AND below the plausibility ceiling: a
+            // reading this high is a sense node on its rail, not a charged pack,
+            // and "we cannot read the pack" must never reach a PASS. Then, for a
+            // series pack only, the two halves must agree — one total voltage can
+            // hide one dead cell, and this is the step where that would otherwise
+            // be waved through.
+            if (in.vbat < cfg_.vbatMin) { fail(S_BATTERY); break; }
+            if (in.vbat > cfg_.vbatMax) { fail(S_BATTERY); break; }
+            if (cfg_.vbatCells >= 2) {
+                // Unusable midpoint: 0 is what an unwired or shorted sense node
+                // reads, and on a series pack that is the exact condition the
+                // check exists to be allowed to fail. It is not evidence of
+                // matched cells.
+                if (in.vbatMid <= 0.0f || in.vbatMid >= in.vbat) { fail(S_BATTERY); break; }
+                const float upper = in.vbat - in.vbatMid;
+                const float spread = std::fabs(in.vbatMid - upper);
+                if (spread > cfg_.vbatSpreadMaxV) { fail(S_BATTERY); break; }
+            }
+            advance(S_BATTERY);
             break;
 
         default: break;

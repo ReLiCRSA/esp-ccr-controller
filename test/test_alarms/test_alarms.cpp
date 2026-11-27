@@ -14,7 +14,7 @@ static Inputs base() {
     Inputs in;
     in.haveVote = true;
     in.votedBar = 0.55f;
-    in.vbat = 12.4f;
+    in.vbat = VBAT_CELLS * 3.90f;
     in.vote.mode = voting::Mode::OK_3CELL;
     return in;
 }
@@ -81,7 +81,7 @@ void test_hypoxia_event_latches_until_ack() {
 void test_warning_levels_and_sticky_bits() {
     Manager m{Config{}};
     Inputs in = base();
-    in.vbat = 9.8f;
+    in.vbat = VBAT_CELLS * 3.10f;   // below the 1S floor
     Result rw = m.update(in);
     TEST_ASSERT_TRUE(rw.bits & (1u << alarms::BIT_BATTERY));
     TEST_ASSERT_TRUE(rw.anyWarning);
@@ -92,6 +92,28 @@ void test_warning_levels_and_sticky_bits() {
     TEST_ASSERT_TRUE(r2.bits & (1u << alarms::BIT_SP_CLAMP));
     TEST_ASSERT_TRUE(r2.bits & (1u << alarms::BIT_BATTERY)); // previous persists
     TEST_ASSERT_EQUAL_UINT8(1, r2.edgeCount); // only the new one is an edge
+}
+
+// A voltage this high is not a charged pack, it is the sense node: the divider's
+// top leg open, or the sense pin loose on its header. Before the upper bound the
+// alarm said nothing at all about it — `vbat < vbatMin` is simply false — so the
+// board ran blind and called that healthy.
+void test_battery_alarm_also_raises_on_an_unreadable_pack() {
+    Manager m{Config{}};
+    Inputs in = base();
+    in.vbat = VBAT_IMPLAUSIBLE_V + 3.0f;
+    Result r = m.update(in);
+    TEST_ASSERT_TRUE_MESSAGE(r.bits & (1u << alarms::BIT_BATTERY),
+                             "a pack the board cannot read must not clear the battery marker");
+    TEST_ASSERT_TRUE(r.logBits & (1u << alarms::BIT_BATTERY));
+
+    // Both directions, or the leg proves nothing: inside the band it clears, and
+    // it clears at the top of a real charge as well as in the middle.
+    Inputs mid = base();                     // 3.90 V
+    TEST_ASSERT_FALSE(m.update(mid).bits & (1u << alarms::BIT_BATTERY));
+    Inputs full = base(); full.vbat = VBAT_IMPLAUSIBLE_V;
+    TEST_ASSERT_FALSE_MESSAGE(m.update(full).bits & (1u << alarms::BIT_BATTERY),
+                              "the bound is a fault detector, not a charge limit");
 }
 
 void test_high_alarm_uses_the_honest_cell_veto() {
@@ -293,7 +315,7 @@ void test_the_log_view_keeps_what_an_ack_silences_from_the_live_one() {
 void test_a_warning_is_the_same_in_both_views_across_an_ack() {
     Manager m{Config{}};
     Inputs in = base();
-    in.vbat = 3.0f;  // BATTERY is WARNING
+    in.vbat = VBAT_CELLS * 3.0f;  // BATTERY is WARNING
 
     const Result up = m.update(in);
     TEST_ASSERT_TRUE(up.bits & (1u << alarms::BIT_BATTERY));
@@ -354,6 +376,7 @@ int main() {
     RUN_TEST(test_ack_suppresses_continuous_until_recovery_then_rearms);
     RUN_TEST(test_hypoxia_event_latches_until_ack);
     RUN_TEST(test_warning_levels_and_sticky_bits);
+    RUN_TEST(test_battery_alarm_also_raises_on_an_unreadable_pack);
     RUN_TEST(test_high_alarm_uses_the_honest_cell_veto);
     RUN_TEST(test_no_vote_suppresses_ppo2_alarms);
     RUN_TEST(test_total_vote_failure_raises_sensor_fail);

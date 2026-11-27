@@ -67,7 +67,8 @@ void feed(Loop& loop, uint32_t& now, float bar, float depth, float seconds,
         sd.depthM = depth;
         sd.pressureValid = pressureValid;
         sd.cellsFresh = fresh;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         loop.cycle(sd, now);
     }
@@ -103,7 +104,8 @@ struct Plant {
         sd.depthM = depth;
         sd.pressureValid = pressureValid;
         sd.cellsFresh = fresh;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         loop.cycle(sd, now);
     }
@@ -151,7 +153,8 @@ void test_output_fuse_cuts_a_valve_that_will_not_close() {
         sd.depthM = 0.0f;
         sd.pressureValid = true;
         sd.cellsFresh = true;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         const State st = loop.cycle(sd, now);
         if (st.outputFuse) fuseSeen = true;
@@ -220,7 +223,8 @@ void test_depth_spike_does_not_move_the_setpoint() {
         sd.depthM = (i == 1) ? 45.0f : 25.0f;
         sd.pressureValid = true;
         sd.cellsFresh = true;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         loop.cycle(sd, now);
         TEST_ASSERT_EQUAL_FLOAT_MESSAGE(spStable, loop.setpointBar(),
@@ -259,7 +263,8 @@ void test_dead_depth_bus_holds_depth_and_setpoint() {
         sd.depthM = 0.0f;
         sd.pressureValid = false;
         sd.cellsFresh = true;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         const State st = loop.cycle(sd, now);
         if (st.setpointBar < minSp) minSp = st.setpointBar;
@@ -332,7 +337,8 @@ void test_blind_depth_window_still_clocks_cns_and_loads_tissues() {
         for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(1.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.cellsFresh = true;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         sd.pressureValid = false;
         nb += Loop::kTickMs;
         blind.cycle(sd, nb);
@@ -447,7 +453,8 @@ void test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alar
         for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(1.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.cellsFresh = true;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         sd.pressureValid = false;
         now += Loop::kTickMs;
         const State st = loop.cycle(sd, now);
@@ -478,7 +485,8 @@ void test_cns_freezes_without_a_trustworthy_ppo2_and_that_is_paired_with_an_alar
         for (int ch = 0; ch < 3; ch++) sd.cells[ch] = liveCell(1.30f, static_cast<uint32_t>(i), ch);
         sd.depthM = 0.0f;
         sd.cellsFresh = false;  // the ADC stalled: same number, not a new one
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         sd.pressureValid = false;
         now += Loop::kTickMs;
         loop.cycle(sd, now);
@@ -649,7 +657,8 @@ struct WetConnector {
         sd.depthM = depth;
         sd.pressureValid = true;
         sd.cellsFresh = true;
-        sd.vbat = 12.4f;
+        sd.vbat = VBAT_CELLS * 3.90f;
+        sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
         now += Loop::kTickMs;
         return loop.cycle(sd, now);
     }
@@ -868,7 +877,7 @@ void test_the_row_written_in_a_failed_vote_holds_the_number_and_marks_it() {
     ri.diveActive = true;
     ri.autoMode = st.autoMode;
     ri.alarmLogBits = st.alarms.logBits;
-    ri.vbat = 12.4f;
+    ri.vbat = VBAT_CELLS * 3.90f;
     // The published picture (deco/view.h). haveVote is false, so the picture
     // carries the unknown sentinel — the held ppO2 is what the diver is
     // SHOWN, never what may be TOTALLED into an NDL.

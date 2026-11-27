@@ -54,6 +54,17 @@
 // Divider 100k/10k -> ratio 11.0 (see defaults.h, VBAT_CAL trims it).
 #define PIN_VBAT_SENSE    35
 
+// Series packs only: the midpoint between the two cells. Needed because a pack
+// reading 6.80 V is compatible with 4.00 + 2.80, i.e. a dead cell behind a
+// passing voltage gate (defaults.h, VBAT_CELL_SPREAD_MAX_V). 36/39 are the other
+// ADC1 inputs on this chip, input-only with no internal pull, and nothing else
+// in this file uses them — 36 is also the SEN pin, which is what it is designed
+// in this file uses them — 36 is also the SEN pin, which is what it is designed
+// for. Nothing reads it while VBAT_CELLS is 1: the site that samples it is
+// compiled only when defaults.h says 2 or more, so a single-cell build never
+// judges a pin that has nothing connected to it.
+#define PIN_VBAT_MID_SENSE  36
+
 // --- ADS1115 DRDY/READY (optional) --------------------------------------------
 // Bench has only SDA/SCL wired; set to -1. Wire DRDY to a GPIO for the
 // prototype and change this constant to enable ready-driven reads.

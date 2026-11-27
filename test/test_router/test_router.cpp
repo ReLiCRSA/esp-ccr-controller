@@ -79,7 +79,8 @@ struct Bench {
             SensorData sd;
             for (int ch = 0; ch < 3; ch++) sd.cells[ch] = bar;
             sd.depthM = depth;
-            sd.vbat = 12.4f;
+            sd.vbat = VBAT_CELLS * 3.90f;
+            sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
             now += Loop::kTickMs;
             loop.cycle(sd, now);
             publishDeco();
@@ -112,7 +113,7 @@ struct Plant {
         for (int i = 0; i < 3; i++) bar[i] -= 0.002f;
         SensorData sd;
         sd.cells[0] = bar[0]; sd.cells[1] = bar[1]; sd.cells[2] = bar[2];
-        sd.depthM = 0.0f; sd.vbat = 12.4f;
+        sd.depthM = 0.0f; sd.vbat = VBAT_CELLS * 3.90f;
         now += Loop::kTickMs;
         router.setNowMs(now);
         loop.cycle(sd, now);

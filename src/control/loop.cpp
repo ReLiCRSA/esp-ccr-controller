@@ -207,6 +207,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
         // the step waits for it to stop saying that.
         pi.depthValid = in.pressureValid;
         pi.vbat = in.vbat;
+        pi.vbatMid = in.vbatMid;
         pi.nowMs = nowMs;
         predive_.update(pi, nowMs);
     }

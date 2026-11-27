@@ -661,7 +661,7 @@ void runDive(int id) {
             ri.alarmLogBits = snapAlarm;
             const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
             ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
-            ri.vbat = 12.4f;
+            ri.vbat = VBAT_CELLS * 3.90f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = pulsesLastSnap;
             // The published picture, computed exactly the way ControlTask
@@ -1209,7 +1209,7 @@ void runDepthBusDive() {
             ri.alarmLogBits = rig.alarmLogBits();
             const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
             ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
-            ri.vbat = 12.4f;
+            ri.vbat = VBAT_CELLS * 3.90f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = rowPulseBase;
             // The published picture, computed exactly the way ControlTask
@@ -1734,7 +1734,7 @@ void runWetConnectorDive() {
             ri.alarmLogBits = st.alarms.logBits;
             const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
             ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
-            ri.vbat = 12.4f;
+            ri.vbat = VBAT_CELLS * 3.90f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = rowPulseBase;
             // The published picture, computed exactly the way ControlTask
@@ -2246,7 +2246,7 @@ void runFrozenChannelDive() {
             ri.alarmLogBits = st.alarms.logBits;
             const long long cnsX = numfmt::scaled(rig.cnsPct(), 0);
             ri.cnsPeakPct = static_cast<uint8_t>(cnsX > 254 ? 254 : cnsX);
-            ri.vbat = 12.4f;
+            ri.vbat = VBAT_CELLS * 3.90f;
             ri.pulsesNow = rig.pulseCount();
             ri.pulsesPrev = rowPulseBase;
             // The published picture, computed exactly the way ControlTask

@@ -306,7 +306,7 @@ void test_cns_high_gets_its_own_flag_bit_and_stays_out_of_the_fault_aggregate() 
     f.tel.shownPpo2 = 1.30f;
     for (int i = 0; i < 3; i++) f.tel.cellBar[i] = 1.30f;
     f.tel.setpointBar = 1.30f;
-    f.tel.vbat = 12.4f;
+    f.tel.vbat = VBAT_CELLS * 3.90f;
     f.tel.haveVote = true;
     f.tel.diveActive = true;
     f.tel.autoMode = true;
@@ -369,7 +369,7 @@ void test_every_published_flag_bit_is_reachable_and_names_exactly_one_fault() {
     f.tel.shownPpo2 = 0.70f;
     for (int i = 0; i < 3; i++) f.tel.cellBar[i] = 0.70f;
     f.tel.setpointBar = 0.70f;
-    f.tel.vbat = 12.4f;
+    f.tel.vbat = VBAT_CELLS * 3.90f;
     f.tel.haveVote = true;
     f.tel.autoMode = true;
     f.tel.cpState = static_cast<uint8_t>(cellproof::State::PASS);
@@ -724,7 +724,7 @@ void test_publish_events_from_a_real_chain_cycle() {
     for (int i = 0; i < 100; i++) {
         SensorData sd;
         for (int c = 0; c < 3; c++) sd.cells[c] = 0.10f;   // hypoxic: alarms low
-        sd.depthM = 0.0f; sd.vbat = 12.4f;
+        sd.depthM = 0.0f; sd.vbat = VBAT_CELLS * 3.90f;
         now += Loop::kTickMs;
         const State st = f.loop.cycle(sd, now);
         bridge::publishEvents(st, now / 1000, f.events, ps);
@@ -989,7 +989,8 @@ void test_cellproof_clamp_edges_publish_once() {
 
     SensorData sd{};
     for (int c = 0; c < 3; c++) sd.cells[c] = 0.45f;   // fitted, flat, never reaches 1.00
-    sd.vbat = 12.4f;
+    sd.vbat = VBAT_CELLS * 3.90f;
+    sd.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;  // matched halves: see loop.h SensorData::vbatMid
     sd.depthM = 3.0f;                                  // shallow: the proof arms...
 
     uint32_t now = 0;

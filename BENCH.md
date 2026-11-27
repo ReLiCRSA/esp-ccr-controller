@@ -20,8 +20,8 @@ reboots" from a log that begins with one.
 
 ```
 fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
-pio test -e native            # host gate, currently 437 cases
-pio test -e native -e native_o2   # both levels: 874 cases. The -O2 env is the
+pio test -e native            # host gate, currently 448 cases
+pio test -e native -e native_o2   # both levels: 896 cases. The -O2 env is the
                                  # optimizer gate (platformio.ini's comment carries
                                  # what it has and has not been shown to catch)
 tools/port_id.py --listen 4   # name the ports before trusting any of the below:
@@ -1111,11 +1111,23 @@ prints a note when `M,` total is 0 instead of letting the PASS imply a witness.
 The run of 2026-11-27 15:18 was exactly that case (`M, total 0`). The reason is a
 gate worth remembering when setting up a pulse witness: **the injector only ever
 wants a pulse in AUTO** (`control/injector.cpp`), AUTO is locked out until PREDIVE
-PASSes, and PREDIVE's BATTERY step refuses below `vbatMin` = 10.5 V
-(`control/predive.h`). A board on USB power alone — HB `vbat=1.56 batlow=1` —
+PASSes, and PREDIVE's BATTERY step refuses below `vbatMin` — which since 2026-11-27
+is derived from the chemistry (`VBAT_CELLS * VBAT_CELL_MIN_V` = **3.40 V** for the
+one 3.7 V cell on this rig; it used to be a hardcoded 10.5 V, a 12 V-style floor
+that refused every pre-dive on a 3.7 V pack). It also refuses **above**
+`VBAT_IMPLAUSIBLE_V` (4.60 V): a sense node on its rail is not a charged pack.
+`control/predive.h`, `include/config/defaults.h`. A board on USB power alone — HB
+`vbat=1.56 batlow=1` —
 **cannot produce an injecting dive**. `tools/pulse_witness.py` reads `HB`'s
 `vbat=`/`batlow=`, refuses with exit 2 and says so rather than printing a
-vacuous pass; connect the pack and re-run it for the real witness.
+vacuous pass; connect the pack and re-run it for the real witness. It refuses a
+reading that is too **high** for the chemistry as well — `vbat=34.71` from a pinned
+sense pad clears any floor, and grading a dive whose battery verdict came from a
+number that is not a measurement is the failure mode this tool exists to prevent.
+The gate itself is gradeable with no board: `tools/pulse_witness.py --selftest`
+(7 captured console lines, both directions: 1.56 V and 34.71 V refused, 3.90 V,
+4.60 V and a `T,` row accepted, plus a guard that the captures refuse some readings
+and pass others so a one-sided table cannot pass).
 
 ### When the link is silent: bisect it, do not reflash at it
 
@@ -1828,9 +1840,30 @@ now keeps.
       `include/config/defaults.h` (0x07 = three fitted since 2026-11-22 —
       the dashboard, voting and histograms follow it exactly). Re-check it
       whenever the rig changes, and run CAL AIR after any change.
-- [ ] Battery: HB `vbat=` within 0.1 V of a meter at three loads;
-      `VBAT_MIN` alarm fires with the meter confirming; log the divider
-      trim for the build.
+- [ ] Battery, first half — the reading: HB `vbat=` within 0.1 V of a meter at three
+      loads; `VBAT_MIN` alarm fires with the meter confirming; log the divider
+      trim for the build (`VBAT_CAL` is still `1.00f`, never trimmed). §1 P1 of
+      `docs/REVIEW.md` has the resistance procedure and why `vbat=34.71` was a
+      pinned pad, not a measurement.
+- [ ] Battery, second half — the chemistry matches the machine: `VBAT_CELLS` in
+      `include/config/defaults.h` says **1** and the pack on the bench must be one
+      3.7 V Li-ion. Everything else is derived from it — the alarm floor
+      (3.40 V), the pre-dive floor, the plausibility ceiling (4.60 V), and the
+      writable `VBAT_MIN` band (2.80…4.50 V per cell, which is also what clears a
+      stale 10.5 V out of NVS on the next boot without a schema bump). If the pack
+      becomes two cells in series, `VBAT_CELLS` is the only line to change: witness
+      it by rebuilding at 2 (`pio test -e native -e native_o2` was green at both
+      settings, 2026-11-27) and by wiring the midpoint tap.
+      **A series pack is not free:** the pack voltage alone cannot see one dead
+      cell (6.80 V is 4.00 + 2.80, and a voltage-only gate passes it), so 2S needs
+      the midpoint divider to `PIN_VBAT_MID_SENSE` (GPIO36, ADC1, input-only) and
+      the pre-dive agreement check that reads it. The check refuses when the pin is
+      unwired, so a 2S build without the tap cannot dive — fail closed, on purpose.
+- [ ] Battery, third half — the rail the valve actually runs on: the pack feeds a
+      boost converter to ~12 V for the solenoid, and **nothing in this firmware
+      senses that output**, so `vbat` healthy does not mean the coil has voltage.
+      Meter it at the coil under a pulse and decide what to do with the number
+      (`docs/REVIEW.md` §1 P9). Never 3S: 12.6 V exceeds a 12 V boost output.
 
 ## C3-d — mechanical inhibit (zero firmware cooperation)
 

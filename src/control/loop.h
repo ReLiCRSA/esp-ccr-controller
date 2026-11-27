@@ -70,7 +70,12 @@ struct SensorData {
     /// integrate).
     bool pressureValid = true;            // pressure bus healthy: depthM believed
     bool cellsFresh = true;               // ADC readings are not stale
-    float vbat = 12.0f;
+    // Last on purpose (the same rule as predive::Inputs::vbatMid): 12.0 is not a
+    // plausible 1S pack, and an input left at its default must fail closed.
+    float vbat = VBAT_MIN_V + 0.5f;
+    /// Series packs only: midpoint volts, divider-scaled like `vbat`. 0 = not
+    /// sensed, which with VBAT_CELLS >= 2 is a refusal, not a free pass.
+    float vbatMid = 0.0f;
 };
 
 /// Chain outputs: the valve command plus everything telemetry reads.

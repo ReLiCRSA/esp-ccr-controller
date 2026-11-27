@@ -19,6 +19,8 @@
 
 #include <cstdint>
 
+#include "config/defaults.h"
+
 namespace predive {
 
 enum Step : uint8_t { S_WARMUP = 0, S_AIR, S_SOLENOID, S_DEPTH, S_BATTERY, S_COUNT };
@@ -30,7 +32,7 @@ struct Config {
     float airTolPct = 8.0f;          // all cells within X% of target
     uint8_t airStableSamples = 10;   // held consecutively
     float depthMaxM = 1.0f;          // must be essentially on the surface
-    float vbatMin = 10.5f;
+    float vbatMin = VBAT_MIN_V;
     // How long the DEPTH step will wait for the pressure bus to answer at all,
     // measured from the first silent cycle the STEP sees (last field on purpose:
     // the same reason Inputs::depthValid is last — these structs are filled in
@@ -46,13 +48,30 @@ struct Config {
     // (not the warm-up, not the pulse or recover timeouts), so this one doesn't
     // either. depthGraceMs = 0 is the old single-cycle verdict, and a test pins it.
     uint32_t depthGraceMs = 3000;
+
+    // --- the battery step judges three things, not one (all three last, for
+    // the same reason depthGraceMs and Inputs::depthValid are: these structs are
+    // filled field by field by firmware and by tests alike).
+    //
+    // vbatMax: the reading's plausibility ceiling. A pre-dive gate that asks
+    // only "above the floor?" is PASSED by a sense node sitting on its rail, and
+    // this bench has read vbat=34.71 from exactly that. A pack the board cannot
+    // read is not a pack that is fine.
+    //
+    // vbatCells and vbatSpreadMaxV: series only. With VBAT_CELLS == 1 there is
+    // no midpoint to compare and the check is inert; with 2, one pack voltage can
+    // hide one dead cell (6.80 V total is compatible with 4.00 + 2.80), which is
+    // precisely the failure a voltage-only gate is otherwise built to miss.
+    float vbatMax = VBAT_IMPLAUSIBLE_V;
+    uint8_t vbatCells = VBAT_CELLS;
+    float vbatSpreadMaxV = VBAT_CELL_SPREAD_MAX_V;
 };
 
 struct Inputs {
     float cells[3];
     uint8_t presentMask = 0b111;
     float depthM = 0.0f;
-    float vbat = 12.0f;
+    float vbat = VBAT_MIN_V + 0.5f;
     uint32_t nowMs = 0;
     // Optional (last on purpose — structs here are aggregate-initialised in
     // tests and firmware, and inserting a field in the middle would silently
@@ -62,6 +81,14 @@ struct Inputs {
     // depthM", because a dead bus used to be handed to the DEPTH step as 0.0 m
     // and PASSed it: "no sensor" and "on the surface" arrived as one number.
     bool depthValid = true;
+
+    // Series packs only: the midpoint between the cells, divider-scaled to PACK
+    // volts like `vbat` — i.e. the voltage of the lower half of the stack, so
+    // with two cells the pair disagrees by |2*vbatMid - vbat|. 0 means "not
+    // sensed", and with VBAT_CELLS >= 2 that is a fault, not a free pass: the
+    // one reason a series pack is riskier to judge by voltage is the thing this
+    // input exists to check. With VBAT_CELLS == 1 the value is ignored.
+    float vbatMid = 0.0f;
 };
 
 class Sequencer {

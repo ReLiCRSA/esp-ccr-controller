@@ -384,7 +384,7 @@ alarm flags set, not as `SAFE` on this line. **FLAGS byte bits:**
 | 1 | ppO2 high |
 | 2 | cell drift (voting excluded a cell / disagreement) |
 | 3 | sensor-class failure — aggregates sensor fail, sensor stale, stuck-open valve, hypoxia |
-| 4 | battery low |
+| 4 | battery — the pack is not trustworthy: below `VBAT_MIN`, **or** a reading this chemistry cannot produce (an open divider, a sense pad on its rail). One bit, because what the diver does is the same either way; the console says which of the two it is |
 | 5 | setpoint clamp active (cellproof ban) |
 | 6 | cell proof currently FAIL |
 | 7 | CNS over the diver's alarm limit (added 2026-11-27) |
@@ -691,7 +691,10 @@ than wire errors:
   it by 100. The bytes never changed; the name was wrong.
 * `ceiling_m` stays integer metres (a v1 parser reads it as an integer), which is
   why the exact value is the appended `ceiling_cm` instead of a reformat.
-* `batt` is millivolts (`11840` = 11.84 V), not volts.
+* `batt` is millivolts (`3900` = 3.90 V), not volts. The example follows the pack
+  this firmware is built for — one 3.7 V Li-ion (`VBAT_CELLS` 1 in
+  `include/config/defaults.h`). It is a unit note, not a range: a client must not
+  assume a pack shape, only that the field is millivolts.
 
 Snapshots land on a 30 s grid plus event-driven ones. Handsets can ignore the
 export rows entirely (the web page renders them); the format is documented so
@@ -855,13 +858,28 @@ safety (replies `OK SAFETY`).
 | ASC_RATE | F | 6.0 | 3–18 | safety |
 | ASC_RATE_SLOW | F | 1.0 | 0.5–3.0 | safety |
 | WATER_DENSITY | F | 1.025 | 0.990–1.100 | dive-lock |
-| VBAT_MIN | F | 10.5 | 3.0–30.0 | safety |
+| VBAT_MIN | F | 3.40 | 2.80–4.50 | safety |
 | AP_SSID | S | `ESP-CCR` | len 1–16 | dive-lock |
 | AP_PASS | S | `diveonly` | len 8–31 | dive-lock |
 | WIFI_IDLE_MIN | U | 10 | 0–240 (**0 = never off**) | — |
 | WIFI_OFF_DEPTH | F | 2.0 | 0.5–30 | — |
 | WIFI_ON_DEPTH | F | 1.0 | 0.2–20 | — |
 | WIFI_ON_HOLD_S | U | 60 | 0–240 | — |
+
+**`VBAT_MIN` is one knob, and its band is per-cell.** The default and both
+endpoints come from the chemistry block in `include/config/defaults.h`: the
+floor is `VBAT_CELLS × VBAT_CELL_MIN_V` and the band is `VBAT_CELLS ×`
+2.80…4.50 V. A client must read the numbers from `GET SCHEMA` rather than
+assume them, because they move with the pack and nothing else. The band being
+tight is also a migration: the firmware range-checks what it loads out of NVS,
+so a stored value outside the band falls back to the default instead of
+outliving the change. What it used to publish — 10.5 with a 3.0–30.0 band — was
+a 12 V-style number that a single 3.7 V cell could never satisfy, and it
+refused the pre-dive BATTERY step on a charged pack. The plausibility ceiling
+above which the *reading* is the fault (4.60 V per cell) is deliberately **not**
+a key: a writable ceiling is a knob whose only effect is to re-arm the hole it
+closes. `test_settings`' settings-table join is what keeps this paragraph and
+the registry from drifting apart again.
 
 **The four `WIFI_*` keys tune one state machine** (the radio policy behind
 `GET WIFI`, §4). They are plain writable keys: `SET WIFI_IDLE_MIN=1` takes

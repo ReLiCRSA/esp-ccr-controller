@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 
+#include "config/defaults.h"   // VBAT_CELLS: this fixture's pack volts follow the chemistry
 #include "deco/zhl16c.h"
 #include "log/divelog.h"
 #include "log/rowfill.h"
@@ -947,7 +948,7 @@ logfmt::RowInputs benchRow() {
     ri.autoMode = true;
     ri.alarmLogBits = 0x0010;
     ri.cnsPeakPct = 13;
-    ri.vbat = 11.90f;
+    ri.vbat = VBAT_CELLS * 3.90f;
     ri.pulsesNow = 1000;
     ri.pulsesPrev = 940;
     return ri;
@@ -994,7 +995,9 @@ void test_the_fill_stores_the_count_the_renderer_prints() {
     TEST_ASSERT_EQUAL_INT16(549, s.cellX1000[0]);
     TEST_ASSERT_EQUAL_INT16(551, s.cellX1000[2]);
     TEST_ASSERT_EQUAL_INT16(700, s.setpointX1000);
-    TEST_ASSERT_EQUAL_UINT16(11900, s.battX1000);
+    TEST_ASSERT_EQUAL_UINT16_MESSAGE(VBAT_CELLS * 3900, s.battX1000,
+                                     "a charged pack must store as its millivolts — "
+                                     "the row fill scales, it does not assume the chemistry");
     // Whole seconds since dive start: the row's clock is a millisecond difference
     // divided, not a float the caller rounded.
     TEST_ASSERT_EQUAL_UINT32(1500, s.tSec);

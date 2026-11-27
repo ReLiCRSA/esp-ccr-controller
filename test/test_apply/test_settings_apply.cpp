@@ -60,7 +60,13 @@ void test_defaults_apply_clean_and_complete() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.05f, cfg.voting.driftBar);
     TEST_ASSERT_EQUAL_UINT32(60000u, cfg.cellproof.timeoutMs);     // s -> ms
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 30.0f, cfg.deco.gfLow);
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 10.5f, cfg.predive.vbatMin);  // follows VBAT_MIN
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_MIN_V, cfg.predive.vbatMin);  // follows VBAT_MIN
+    // The plausibility ceiling and the series-cell limits travel with it, so the
+    // gate and the alarm cannot disagree about what a readable pack is.
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_IMPLAUSIBLE_V, cfg.alarms.vbatMax);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_IMPLAUSIBLE_V, cfg.predive.vbatMax);
+    TEST_ASSERT_EQUAL_UINT8(VBAT_CELLS, cfg.predive.vbatCells);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VBAT_CELL_SPREAD_MAX_V, cfg.predive.vbatSpreadMaxV);
 }
 
 void test_cross_key_combos_are_clamped_and_reported() {
@@ -176,7 +182,7 @@ void test_mid_dive_setconfig_keeps_the_chains_memory() {
         for (uint32_t i = 0; i < n; i++) {
             ctrl::SensorData sd;
             for (int c = 0; c < 3; c++) sd.cells[c] = bar;
-            sd.depthM = depth; sd.vbat = 12.4f;
+            sd.depthM = depth; sd.vbat = VBAT_CELLS * 3.90f;
             now += ctrl::Loop::kTickMs;
             loop.cycle(sd, now);
         }

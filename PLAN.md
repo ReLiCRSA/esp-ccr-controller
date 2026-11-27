@@ -84,7 +84,8 @@ espRebController/
 | Solenoid drive | 27 | MOSFET gate; **INPUT_PULLDOWN until ControlTask alive**; monitor LED on same net |
 | HB / ERR / DECO LEDs | 2 / 4 / 5 | active-high |
 | Handset UART TX / RX | 17 / 16 | UART2, 115200 |
-| Battery sense | 35 | **ADC1 only** (ADC2 collides with WiFi); divider 100k/10k, `VBAT_CAL` trims |
+| Battery sense | 35 | **ADC1 only** (ADC2 collides with WiFi); divider 100k/10k, `VBAT_CAL` trims. Top leg on the **pack** rail, so `vbat` says nothing about the 12 V the solenoid runs on |
+| Battery midpoint sense | 36 | series packs only, and compiled only when `VBAT_CELLS >= 2`: the pack voltage alone cannot see one dead cell (6.80 V = 4.00 + 2.80). ADC1, input-only, no internal pull; unwired is a **refusal**, not a pass |
 | ADS1115 DRDY (optional) | 18 | supported by driver; `-1` disables (bench today) |
 
 ## 2. Safety skeleton (cross-cutting)
@@ -239,7 +240,10 @@ IDLE → WARMUP (120 s, cells)
      → SOLENOID TEST (ppO2 rises ≥0.03 within 2 pulses, then falls back;
         per-cell response measured)
      → DEPTH ≈ 0 + sensor-identity check (MS5837 coefficients match NVS copy)
-     → BATTERY ≥ min
+     → BATTERY ≥ min, AND the reading must be plausible for the chemistry
+        (above the floor but above `VBAT_IMPLAUSIBLE_V` is a sense node on its
+        rail, and refuses), AND on a series pack the two halves must agree
+        within `VBAT_CELL_SPREAD_MAX_V` — an unwired midpoint refuses too
      → PASS (enables AUTO)
 ```
 
@@ -410,7 +414,7 @@ and the web Settings page.
 | Calibration | `CAL_O2_FI` 0.99 · `CAL_O2_TARGET` 0.95 · `CAL_O2_MAX_PPO2` 1.0 · `CAL_SLOPE_BAND` 15 · per-cell cal factors |
 | CellProof | `CELLPROOF_EN` on · `CELLPROOF_DEPTH` 10 · `CELLPROOF_SP` 1.10 · `CELLPROOF_MIN` 1.00 · `CELLPROOF_TIMEOUT` 60 · `CELLPROOF_OK_MAXSP` 0.90 |
 | Deco | `GF_LOW` 30 · `GF_HIGH` 85 · `ASC_RATE` 6 · `ASC_RATE_SLOW` 1 · `WATER_DENSITY` 1.025 |
-| Battery | `VBAT_MIN` · `VBAT_CAL` |
+| Battery | `VBAT_MIN` (one knob; band is per-cell × `VBAT_CELLS`, 2.80…4.50 V — tightening it is also what clears a stale 10.5 V from NVS) · `VBAT_CAL`. The floor, the plausibility ceiling and the cell-spread limit are **derived from `VBAT_CELLS`** in `defaults.h`, not keys: a writable ceiling would only re-arm the hole it closes |
 | System | WiFi AP SSID/pass · telemetry rate (depth source is boot auto-detect, not a setting) |
 
 ## 12. HUD (3 LEDs)

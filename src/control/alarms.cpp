@@ -96,7 +96,11 @@ Result Manager::update(const Inputs& in) {
     // moving it out of the gate adds no phantom alarm.
     evaluate(BIT_HYPOXIA, in.vote.hypoxiaSuspect, kLevel[BIT_HYPOXIA], res);
 
-    evaluate(BIT_BATTERY, in.vbat < cfg_.vbatMin, kLevel[BIT_BATTERY], res);
+    // Below the floor, or too high to be a pack of this chemistry. The second
+    // half is not a different alarm: a sense node on its rail is a pack the
+    // machine cannot vouch for, and the honest word for that is the same one.
+    evaluate(BIT_BATTERY, in.vbat < cfg_.vbatMin || in.vbat > cfg_.vbatMax,
+             kLevel[BIT_BATTERY], res);
     evaluate(BIT_SP_CLAMP, in.spClamped, kLevel[BIT_SP_CLAMP], res);
     evaluate(BIT_STUCK_OPEN, in.stuckOpen, kLevel[BIT_STUCK_OPEN], res);
     evaluate(BIT_SENSOR_STALE, in.sensorStale, kLevel[BIT_SENSOR_STALE], res);

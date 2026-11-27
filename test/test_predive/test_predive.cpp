@@ -16,7 +16,10 @@ void tearDown() {}
 static Inputs airGood() {
     Inputs in;
     in.cells[0] = 0.212f; in.cells[1] = 0.208f; in.cells[2] = 0.210f;
-    in.presentMask = 0b111; in.depthM = 0.05f; in.vbat = 12.4f;
+    in.presentMask = 0b111; in.depthM = 0.05f; in.vbat = VBAT_CELLS * 3.90f;
+    // Matched halves, so the series check in the battery step is satisfied by
+    // the fixture and not accidentally the thing under test. Ignored at 1 cell.
+    in.vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;
     return in;
 }
 
@@ -93,12 +96,116 @@ void test_low_battery_fails_depth_gate_blocks() {
 
     // low battery now fails at its step
     Sequencer s2{c};
-    Inputs in2 = airGood(); in2.vbat = 9.0f;
+    Inputs in2 = airGood(); in2.vbat = VBAT_CELLS * 3.10f;   // below the 1S floor (VBAT_CELL_MIN_V)
     t = 0; // fresh clock: runUntil's 900 s guard is per-run
     s2.start(t);
     runUntil(s2, in2, Step::S_COUNT, t);
     TEST_ASSERT_TRUE(s2.failed());
     TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s2.status(Step::S_BATTERY));
+}
+
+// The battery step used to ask one question — "above the floor?" — and a reading
+// from a broken sense node answers it YES. The divider is two resistors on a
+// connector: open the top leg and the ADC pin drifts to its rail. This bench has
+// actually read vbat=34.71 that way, so a pre-dive gate that passed it was
+// passing a pack it could not see.
+void test_battery_step_refuses_an_implausible_reading() {
+    Config c; c.warmupMs = 0;
+    Sequencer s{c};
+    Inputs in = airGood();
+    in.vbat = VBAT_IMPLAUSIBLE_V + 3.0f;              // a 12 V-style rail: not this pack, not readable
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(), "an unreadable pack must not pass the battery step");
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s.status(Step::S_BATTERY));
+
+    // ... and the same sequence passes either side of the fault, so the refusal is
+    // the reading, not the fixture: this is the direction that makes the check
+    // above mean something.
+    Sequencer ok{c};
+    Inputs good = airGood();       // 3.90 V: inside the band
+    t = 0;
+    ok.start(t);
+    runUntil(ok, good, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE(ok.allPassed());
+    TEST_ASSERT_EQUAL_UINT8(Status::PASS, ok.status(Step::S_BATTERY));
+
+    // Right at the ceiling is still a pack. The bound is a fault detector, not a
+    // charge limit, so it must not bite the top of a real charge.
+    Sequencer edge{c};
+    Inputs full = airGood(); full.vbat = VBAT_IMPLAUSIBLE_V;
+    full.vbatMid = VBAT_IMPLAUSIBLE_V / 2.0f;   // at the ceiling, still matched
+    t = 0;
+    edge.start(t);
+    runUntil(edge, full, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE(edge.allPassed());
+}
+
+// Series packs: one total voltage is not two cells. 6.80 V is compatible with
+// 4.00 + 2.80, i.e. a dead cell behind a gate that only reads the stack. The
+// midpoint input exists to make that a refusal, and an unwired midpoint must
+// refuse too — "we cannot compare" is not "the cells agree".
+void test_series_pack_checks_cell_agreement() {
+    Config c; c.warmupMs = 0; c.vbatCells = 2;
+    c.vbatMin = 2 * VBAT_CELL_MIN_V;      // 6.80 V for two cells
+    c.vbatMax = 2 * VBAT_CELL_IMPLAUSIBLE_V;
+
+    // Matched: 3.85 + 3.85 = 7.70 V, midpoint 3.85.
+    Sequencer matched{c};
+    Inputs a = airGood(); a.vbat = 7.70f; a.vbatMid = 3.85f;
+    uint32_t t = 0;
+    matched.start(t);
+    runUntil(matched, a, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE_MESSAGE(matched.allPassed(), "two matched cells must pass on a series pack");
+
+    // One cell flat: 4.00 + 2.80 = 6.80 V, exactly at the floor, so the OLD
+    // single-voltage gate passed it. This is the regression this leg exists for.
+    Sequencer dead{c};
+    Inputs b = airGood(); b.vbat = 6.80f; b.vbatMid = 4.00f;
+    t = 0;
+    dead.start(t);
+    runUntil(dead, b, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE_MESSAGE(dead.failed(), "a series pack with one dead cell must refuse");
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, dead.status(Step::S_BATTERY));
+
+    // Unwired midpoint: not evidence of agreement.
+    Sequencer blind{c};
+    Inputs d = airGood(); d.vbat = 7.70f; d.vbatMid = 0.0f;
+    t = 0;
+    blind.start(t);
+    runUntil(blind, d, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE(blind.failed());
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, blind.status(Step::S_BATTERY));
+
+    // And it refuses because of its own guard, not as a side effect of the spread
+    // arithmetic: widen the bound until the subtraction would have passed, and
+    // the unwired midpoint must still refuse. Without this leg, deleting the
+    // guard changes nothing observable and the check above proves nothing about
+    // it.
+    Config loose = c; loose.vbatSpreadMaxV = 20.0f;
+    Sequencer blind2{loose};
+    Inputs e0 = airGood(); e0.vbat = 7.70f; e0.vbatMid = 0.0f;
+    t = 0;
+    blind2.start(t);
+    runUntil(blind2, e0, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE_MESSAGE(blind2.failed(),
+                             "an unwired midpoint must refuse on its own rule, not by arithmetic luck");
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, blind2.status(Step::S_BATTERY));
+
+    // With ONE cell there is no midpoint to compare, and a zero input must not
+    // become a refusal: the same fixture that fails above has to pass here, or
+    // the check is a trap for the pack the rig actually has. Forced to 1 rather
+    // than left at the default, so this leg means the same thing no matter what
+    // defaults.h currently says the bench pack is.
+    Config one; one.warmupMs = 0; one.vbatCells = 1;
+    one.vbatMin = VBAT_CELL_MIN_V; one.vbatMax = VBAT_CELL_IMPLAUSIBLE_V;
+    Sequencer single{one};
+    Inputs e = airGood(); e.vbat = 3.90f; e.vbatMid = 0.0f;
+    t = 0;
+    single.start(t);
+    runUntil(single, e, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE(single.allPassed());
 }
 
 void test_restart_after_failure() {
@@ -432,6 +539,8 @@ int main() {
     RUN_TEST(test_air_check_needs_stability_and_two_cells);
     RUN_TEST(test_solenoid_failure_aborts);
     RUN_TEST(test_low_battery_fails_depth_gate_blocks);
+    RUN_TEST(test_battery_step_refuses_an_implausible_reading);
+    RUN_TEST(test_series_pack_checks_cell_agreement);
     RUN_TEST(test_restart_after_failure);
     RUN_TEST(test_dead_depth_bus_fails_the_depth_step);
     RUN_TEST(test_invalid_and_wild_depth_both_refused);

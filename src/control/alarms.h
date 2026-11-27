@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdint>
+#include "config/defaults.h"
 #include "voting.h"
 
 // Namespace is `alarms`, not `alarm`: newlib declares POSIX `alarm(int)` in a
@@ -56,7 +57,14 @@ struct Config {
     float lowBar = 0.18f;
     float highBar = 1.40f;  // below the injection wall: tell the diver first
     float cnsAlarmPct = 80.0f;
-    float vbatMin = 10.5f;
+    // The pack floor, and the ceiling above which the READING is the fault rather
+    // than the pack. Both come from the chemistry block in defaults.h, and both
+    // raise the same BATTERY marker on purpose: what the diver can act on is
+    // "do not trust this pack", and the console prints the volts that say which
+    // of the two it is. A battery flag with no upper bound is a flag that a
+    // disconnected sense divider cannot fail.
+    float vbatMin = VBAT_MIN_V;
+    float vbatMax = VBAT_IMPLAUSIBLE_V;
 };
 
 struct Inputs {

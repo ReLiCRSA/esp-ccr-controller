@@ -11,6 +11,8 @@
 // ============================================================================
 #include "settings_apply.h"
 
+#include "config/defaults.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -64,6 +66,11 @@ uint8_t applySettings(const settings::Registry& reg, ctrl::Config& cfg) {
     cfg.alarms.highBar = f("ALLO_HIGH");
     cfg.alarms.cnsAlarmPct = static_cast<float>(reg.getInt(reg.find("CNS_ALARM")));
     cfg.alarms.vbatMin = f("VBAT_MIN");
+    // The plausibility ceiling is deliberately NOT a settings key: it is a fact
+    // about the chemistry and the divider, not a preference. A writable ceiling
+    // is a knob whose only effect is to re-arm the "we cannot read the pack"
+    // hole, which is the one thing this bound exists to close.
+    cfg.alarms.vbatMax = VBAT_IMPLAUSIBLE_V;
 
     // injection
     cfg.inj.pulseMs = static_cast<uint16_t>(reg.getInt(reg.find("INJ_PULSE_MS")));
@@ -107,8 +114,13 @@ uint8_t applySettings(const settings::Registry& reg, ctrl::Config& cfg) {
         static_cast<uint32_t>(reg.getInt(reg.find("CELLPROOF_TMO"))) * 1000u;
     cfg.cellproof.okMaxSpBar = f("CELLPROOF_MAXSP");
 
-    // pre-dive battery floor follows the same VBAT_MIN the alarm uses
+    // pre-dive battery floor follows the same VBAT_MIN the alarm uses, and so do
+    // the ceiling and the series-cell agreement limits: the gate and the alarm
+    // must not disagree about what a readable pack is.
     cfg.predive.vbatMin = cfg.alarms.vbatMin;
+    cfg.predive.vbatMax = cfg.alarms.vbatMax;
+    cfg.predive.vbatCells = VBAT_CELLS;
+    cfg.predive.vbatSpreadMaxV = VBAT_CELL_SPREAD_MAX_V;
 
     // deco
     cfg.deco.gfLow = f("GF_LOW");

@@ -42,9 +42,67 @@
 #define SUPERVISOR_PERIOD_MS        500
 
 // --- Battery ---------------------------------------------------------------------
+// Chemistry is ONE number here, and every battery threshold in the machine is
+// derived from it. That is not tidiness: the pack changed under the firmware
+// (a 12 V-style `VBAT_MIN_V 10.5` sat here while the rig ran on a single 3.7 V
+// Li-ion with a step-up to 12 V for the solenoid), and that one literal was
+// copied into five places — `defaults.h`, `predive.h`'s `Config::vbatMin`,
+// `alarms.h`'s `Config::vbatMin`, the `VBAT_MIN` settings default, and
+// `tools/pulse_witness.py` — with the settings *range* (3.0..30.0) wide enough to
+// keep all of them loaded, and a test fixture asserting 10.5 as the correct
+// answer. Moving them one at a time is how the old value survived: at 10.5 V a
+// charged 1S pack failed the pre-dive BATTERY step permanently (`vbat=4.92
+// batlow=1` on the bench, 2026-11-27), so `AUTO` could never unlock, and nobody
+// had written that down anywhere. If the pack becomes two cells in series, change
+// VBAT_CELLS and nothing else — except the one published row that follows the
+// chemistry, `docs/HANDSET_PROTOCOL.md` §6's `VBAT_MIN` band, and the new
+// settings-table join reddens that by key name if it is left behind. Witnessed
+// both directions on 2026-11-27: at `2` the tree gives 448/448 native, 896/896
+// across both optimisation levels and a clean `env:esp32` link; back at `1`, the
+// same counts and the same clean link.
+//
+//   pack (measured on the bench, 2026-11-27): 1S Li-ion, 3.7 V nominal,
+//   4.2 V full, divider top leg on the PACK rail, so `vbat` says nothing at all
+//   about whether the 12 V the solenoid needs is actually there. That gap is
+//   docs/REVIEW.md 1 P9, not a constant to tune.
 #define VBAT_DIVIDER_RATIO          11.0f   // (100k+10k)/10k
 #define VBAT_CAL                    1.00f   // trim after bench multimeter check
-#define VBAT_MIN_V                  10.5f   // adjust to the real pack chemistry
+
+// --- chemistry ------------------------------------------------------------------
+// The per-cell floor the pack must clear to start a dive. Chosen for the pack,
+// not for the cells' datasheet: 3.40 V under the injection pulse is where a
+// small 1S cell still has margin left, and the whole point of the gate is that
+// a dive must not begin on a pack whose next pulse can brown the board out.
+// The diver's own warning margin is the alarm, which reads the same number.
+#define VBAT_CELLS                          1
+#define VBAT_CELL_MIN_V                     3.40f
+#define VBAT_MIN_V                          (VBAT_CELLS * VBAT_CELL_MIN_V)
+
+// Fail closed on the reading itself, not just on it being low. The divider is
+// two resistors on a connector: it can fall open, and the ADC pin then drifts to
+// its rail and reports a *healthy* pack. `vbat=34.71` was once actually seen on
+// this bench from a pinned sense pin, and a pre-dive gate that only asks "is it
+// above the floor?" passes that. Any reading above this is a broken sense node,
+// and a broken sense node is a refusal, never a pass.
+#define VBAT_CELL_IMPLAUSIBLE_V             4.60f
+#define VBAT_IMPLAUSIBLE_V                  (VBAT_CELLS * VBAT_CELL_IMPLAUSIBLE_V)
+
+// The writable range for VBAT_MIN. Deliberately chemistry-shaped, and tighter
+// than the old 3.0..30.0: a range that admits 10.5 V also *keeps* a stored 10.5,
+// and the NVS on every board on this bench has one. nvs_store range-checks on
+// load, so tightening the range is also the migration that clears the stale
+// value instead of letting it outvote the new default forever.
+#define VBAT_CELL_RANGE_MIN_V               2.80f
+#define VBAT_CELL_RANGE_MAX_V               4.50f
+#define VBAT_RANGE_MIN_V                    (VBAT_CELLS * VBAT_CELL_RANGE_MIN_V)
+#define VBAT_RANGE_MAX_V                    (VBAT_CELLS * VBAT_CELL_RANGE_MAX_V)
+
+// Series only: two cells whose midpoint is not sensed are one number, and one
+// number can be 6.80 V with one cell at 4.00 V and the other at 2.80 V — a pack
+// that passes a voltage gate with a dead cell in it. When VBAT_CELLS goes to 2
+// the midpoint tap becomes a pre-dive input and this is the refusal.
+#define VBAT_CELL_SPREAD_MAX_V              0.30f
+
 #define VBAT_SAMPLE_INTERVAL_MS     1000
 
 // --- Cell calibration (raw -> ppO2) ------------------------------------------

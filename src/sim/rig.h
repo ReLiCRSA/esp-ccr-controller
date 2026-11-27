@@ -24,7 +24,14 @@ namespace sim {
 /// exactly as it reads the firmware's own settings.
 struct RigOpts : ctrl::Config {
     WorldConfig world;
-    float vbat = 12.4f;  // the sim's battery is a fixed rail unless scripted
+    float vbat = VBAT_CELLS * 3.90f;  // the sim's battery is a fixed rail unless scripted.
+    // A charged 1S pack, not the 12.4 this project used to assume: a sim rail
+    // outside the plausible band would now raise BATTERY in every scripted dive,
+    // and a sim that always has a battery alarm cannot script anything else.
+    // Series packs only: the midpoint, divider-scaled like `vbat`. 0 = not
+    // sensed, which with VBAT_CELLS >= 2 refuses the pre-dive battery step —
+    // the sim has to be able to script that case, not only the firmware.
+    float vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;
 
     // ---- dive continuity (review H1) ---------------------------------------
     // The rig runs the REAL record store (logfmt::ContinuitySlots: the same CRC
@@ -214,7 +221,8 @@ private:
     World world_;
     ctrl::Loop loop_;
     ctrl::State lastState_{};
-    float vbat_ = 12.4f;
+    float vbat_ = VBAT_CELLS * 3.90f;
+    float vbatMid_ = 0.0f;
     uint32_t tickMs_ = 0;
     bool lastSolOn_ = false;
 

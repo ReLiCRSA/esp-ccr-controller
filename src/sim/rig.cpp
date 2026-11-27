@@ -10,7 +10,8 @@ constexpr float kTickS = Rig::kTickMs / 1000.0f;
 }
 
 Rig::Rig(const RigOpts& opts)
-    : opts_(opts), world_(opts.world), loop_(opts), vbat_(opts.vbat) {}
+    : opts_(opts), world_(opts.world), loop_(opts), vbat_(opts.vbat),
+      vbatMid_(opts.vbatMid) {}
 
 void Rig::setCellsFitted(uint8_t mask) {
     opts_.presentMask = mask;
@@ -42,6 +43,7 @@ void Rig::tick() {
     sd.pressureValid = world_.depthValid();
     sd.cellsFresh = true;
     sd.vbat = vbat_;
+    sd.vbatMid = vbatMid_;
 
     const ctrl::State st = loop_.cycle(sd, now);
     lastState_ = st;  // published state, for state() — see rig.h

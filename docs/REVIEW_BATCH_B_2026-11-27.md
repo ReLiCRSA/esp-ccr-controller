@@ -137,34 +137,48 @@ the clamped one, because nothing on the wire carries a clamp verdict.
 
 ## Still open, in the order I would take them
 
-1. **The bench has not seen this code.** Re-run `tools/hw_accept.py --expect-web
-   --handset /dev/ttyUSB1 --cal-air` after flashing with an explicit
-   `--upload-port` (two identical CP2102 boards: controller `ttyUSB0`, handset
-   bridge `ttyUSB1` — `tools/port_id.py`).
-2. **Batch C: `g_ctrlCfg` double-buffering.** `postConfig()` copies a struct while
-   ControlTask reads it; the ordering clamps and the settings apply path both touch
-   that one object.
-3. **The 3 s TWDT trip has never been measured**, and
+1. **The 3 s TWDT trip has never been measured**, and
    `CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0` watches an idle task nobody feeds.
    A detector whose trip time is unknown is a claim, not a guarantee.
-4. **The clamp verdict is console-only.** `GET GF_LOW` answers what was typed while
+2. **The clamp verdict is console-only.** `GET GF_LOW` answers what was typed while
    the chain runs the clamped pair. Fixing it properly means a protocol field,
    which is a decision rather than a fix.
-5. **Flag labels are duplicated three times** — `web_page.h`, `data/index.html`,
+3. **Flag labels are duplicated three times** — `web_page.h`, `data/index.html`,
    §4 of the spec — with nothing checking that they agree. The M-3 fix edited all
    three by hand.
-6. **`pulses` on event rows is always 0** (`Telemetry::pulsesWindow` is read and
+4. **`pulses` on event rows is always 0** (`Telemetry::pulsesWindow` is read and
    written nowhere). Making it real moves a byte on an existing column: a protocol
    decision, documented as one in §8 rather than taken as a side effect.
-7. **`LOG EXPORT` dive-lock policy** remains undecided (Batch A left it open).
-8. **`src/log/continuity.cpp:135,144` still rounds with `+ 0.5`** while the repo's
+5. **`LOG EXPORT` dive-lock policy** remains undecided (Batch A left it open).
+6. **`src/log/continuity.cpp:135,144` still rounds with `+ 0.5`** while the repo's
    stored-number rule is `numfmt::scaled` (nearest, ties to even, decided on the
    exact product). Both sites are range-gated so nothing wraps; the residue is that
    a stored CNS or tissue count can sit one count away from the digits
    `numfmt::fixed` printed for the same float, on an exact tie. It changes bytes in
    a stored record, so it wants its own commit.
-9. **`graphify-out/` is untracked tool output** and wants a `.gitignore` entry;
-   nothing in the repo references it.
+
+**Done after this write-up, in `2c4f6fe`:** the stale air-calibration prose —
+`BENCH.md`, the console line, the two enum comments, the web page's verdict
+caption and the bench harness's hint still said "spread band" /
+"spread-limited", the rule `66694f9` replaced. The wire was untouched (code 5 is
+still 5); `BENCH.md`'s dated record keeps the old words with "as it was then",
+because that entry is a measurement made under the old rule.
+
+**Done after this write-up, in `e662b69`:** `graphify-out/` is ignored — regenerated
+tool output, nothing in the repo reads it.
+
+**Done after this write-up, on the bench:** this batch's code was flashed to the
+controller with an explicit `--upload-port /dev/ttyUSB0` (two identical CP2102
+boards: controller `ttyUSB0`, handset bridge `ttyUSB1` — `tools/port_id.py`) and
+`tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 --cal-air` ran green — exit
+0, 126 PASS, `stk=` worst 512, `u2stk=` worst 3088, worst control cycle 443 ms
+against the 1500 ms stall budget. `logs/accept_20261127_075435_*.log`. (`stk=` at
+exactly the 512 threshold is what the next paragraph's stack finding turned on.)
+
+**Done after this write-up, in `896fca8`:** the `g_ctrlCfg` double-buffering item
+above. It became a published generation rather than a double buffer — a reader
+needs one whole config per use, not one of two alternating ones — and the applier's
+carried fields came with it. See `docs/REVIEW_BATCH_C_2026-11-27.md`.
 
 **Done after this write-up, in `2c4f6fe`:** the stale air-calibration prose —
 `BENCH.md`, the console line, the two enum comments, the web page's verdict

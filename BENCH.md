@@ -1009,6 +1009,28 @@ Then by hand, in this order (each mirrors a sim scenario):
    That is the diver's escape route; a SAFE state with no reachable way out is a
    device you cannot recover in the water.
 
+### The headroom gate caught a config copy on the supervisor's stack (2026-11-27)
+
+Batch C replaced the shared `ctrl::Config` global with a published generation
+(`src/control/configbox.h`), and the first version gave each reader task a
+`ctrl::Config cfg{};` local to read into. The acceptance run failed its own check
+before any functional leg did:
+
+```
+[FAIL] stk= headroom >= 512 (worst 320)      # cfg on the stack
+[PASS] stk= headroom >= 512 (worst 608)      # same image, task-private statics
+```
+
+`stk=` is the tightest task's free bytes, and that task is the supervisor on a
+3072-byte stack: it had had exactly 512 to spare, so the gate was sitting on a
+zero-margin number. `sizeof(ctrl::Config)` is 284 (measured on host) — nothing to
+the 1500 ms tick budget, plenty to a stack with no margin. The fix is one
+task-private static per reader. What to keep from it is that **the check that
+caught it is the one people skip**: a struct added to any local in a bounded-stack
+task moves `stk=`, and the build report says the opposite — the same change moved
+RAM 16.9 % to 17.2 % (stack copy to static), which reads as harmless while the
+stack gate goes red. `docs/REVIEW_BATCH_C_2026-11-27.md` §4.
+
 ## C2-e — phone/web findings (2026-11-22 evening, all closed)
 
 * "Password incorrect" **was not the password**: wpa_supplicant completed the

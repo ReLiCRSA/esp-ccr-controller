@@ -174,3 +174,12 @@ recorded in `docs/HANDSET_PROTOCOL.md` §6 and unchanged here.
    rows' `pulses` column is 0 by protocol decision, `LOG EXPORT`'s dive-lock policy is
    undecided, and `src/log/continuity.cpp:135,144` still rounds with `+ 0.5` (changes
    stored bytes, wants its own commit).
+
+**Closed by [batch D](REVIEW_BATCH_D_2026-11-27.md) the same day:** items 2 and 3
+(`HB` now carries `cfggen=<published>/<chain>`, and `test_configbox` counts publish
+sites and refuses a third), and item 4's first three clauses — the TWDT trip is
+measured on the board at **3011–3061 ms** (and a neighbour's feed does not mask a
+stalled task), the idle-task claim turned out to be false in the other direction (no
+idle handle is ever subscribed here), the flag labels are graded across all four
+places that name them, and the continuity rounding moved to `numfmt::scaled`. Items
+1, the `pulses` column and `LOG EXPORT`'s dive-lock policy are unchanged.

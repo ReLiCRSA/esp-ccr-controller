@@ -756,6 +756,20 @@ void CommandRouter::exec(const char* line, Response& r) {
             replyOk(r);
             break;
         case Kind::LOG_EXPORT:
+            // Dive-locked (decision 2026-11-27, review batch E): an export
+            // streams a whole dive off the SAME LittleFS flash the live dive
+            // file is being written to, on the one task that must keep pumping
+            // the handset link. util/wdtfeed.h exists because that stream once
+            // reset a controller mid-dive; the rows were made cheap, and this
+            // decision makes the configuration the review could not measure
+            // (exports racing a dive's row writes) unreachable by policy:
+            // a closed dive can be exported, a live one cannot. `LOG LIST`
+            // stays open — ten slot headers are one bounded scan, not a stream.
+            // The web's /dive/N.csv route is deliberately NOT locked: that
+            // export never touches the handset pump, async_tcp is unregistered
+            // from the watchdog by design (PLAN 9), and the route already
+            // refuses honestly (503 "no memory for export") under load.
+            if (loop_.diveActive()) { replyErr(r, "export locked in dive"); break; }
             logExportIdx_ = cmd.logIndex;
             r.actions |= ACT_LOG_EXPORT;
             replyOk(r);

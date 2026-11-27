@@ -320,7 +320,7 @@ WebSocket opens, so a phone at the surface is normally the one setting it.
 | Command | Answer |
 |---|---|
 | `LOG LIST` | `OK` then zero or more `L,<slot>,<epoch>,<seq>` lines, **newest-written first** (by `<seq>`; unsequenced legacy dives list last, slot-descending) |
-| `LOG EXPORT n` (n = 1..10) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<codec_version>,<row_format>,<iso_utc>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5) |
+| `LOG EXPORT n` (n = 1..10) | `OK` then the dive as lines: `DIVE,<slot>,<startEpoch>,<codec_version>,<row_format>,<iso_utc>` followed by `S,` snapshot rows, `E,` event rows and one `M,` totals row (format §5). **Refused mid-dive**: `ERR export locked in dive` (decision 2026-11-27 — an export streams off the same flash the live dive file is being written to; see §5). `LOG LIST` stays open, and the web's `/dive/N.csv` is not locked (§5) |
 
 The fourth `L,` field, `<seq>`, is the dive sequence: the order dives were
 written, 1 upward, `0` = unknown (files written before 2026-11-24). Without
@@ -755,6 +755,19 @@ same vocabulary as `T,`'s held-ppO2 rule, §2). A row written while the chain
 **held** a ppO2 across a failed vote says FAILED here, beside a `voted` column
 showing the held number and an alarm word marking it: three bytes, one fact.
 No format change; the bits and columns already existed.
+
+**`LOG EXPORT` is dive-locked** (decision 2026-11-27): while a dive is open the
+command answers `ERR export locked in dive`. An export streams a whole dive off
+the same LittleFS flash the live dive file is being written to, on the task that
+keeps the handset link pumped — `util/wdtfeed.h` carries the history of that
+stream resetting a mid-dive controller once. The review asked how slow the
+control cycle gets when exports race a dive's row writes; the answer chosen is
+policy rather than a measured number: **that configuration is unreachable** —
+a closed dive can be exported, a live one cannot. `LOG LIST` stays open (ten
+slot headers, one bounded scan). The web's `/dive/N.csv` route is deliberately
+not locked: that transport never blocks the handset pump, `async_tcp` is
+unregistered from the watchdog by design (PLAN 9), and the route already
+refuses honestly under load (`503 "no memory for export"`).
 
 **`E,` rows are ambiguous inside an export, on purpose and by shape.** An
 exported event row is `E,<t_s>,<id>,<value>` — byte-identical to the live event

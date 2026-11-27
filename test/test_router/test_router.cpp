@@ -675,6 +675,40 @@ void test_log_and_calibration_commands_delegations() {
     TEST_ASSERT_TRUE(has(r, "ERR"));
 }
 
+void test_log_export_is_refused_mid_dive() {
+    // Decision 2026-11-27 (review batch E): an export streams a whole dive off
+    // the same LittleFS flash the LIVE dive file is being written to, on the one
+    // task that keeps the handset link pumped. The review asked how slow the
+    // control cycle gets when the two race; the answer chosen is policy, so this
+    // test is what makes that policy a fact rather than a comment.
+    Bench b;
+    CommandRouter::Response r;
+
+    b.run("DIVE START");
+    TEST_ASSERT_TRUE(b.loop.diveActive());
+
+    b.run("LOG EXPORT 3", r);
+    TEST_ASSERT_TRUE_MESSAGE(has(r, "ERR export locked in dive"),
+                             "a mid-dive export was accepted: the live dive file "
+                             "and a whole-dive stream would share the flash");
+    TEST_ASSERT_FALSE_MESSAGE(r.actions & CommandRouter::ACT_LOG_EXPORT,
+                              "the refusal still asked main.cpp to stream rows");
+
+    // LOG LIST stays open on purpose: ten slot headers is one bounded scan, not
+    // a stream, and a diver checking what is there must not be refused.
+    b.run("LOG LIST", r);
+    TEST_ASSERT_TRUE(has(r, "OK"));
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_LOG_LIST);
+
+    // And the command works again the moment the dive closes: this is a dive
+    // lock, not a removal.
+    b.run("DIVE END");
+    TEST_ASSERT_FALSE(b.loop.diveActive());
+    b.run("LOG EXPORT 3", r);
+    TEST_ASSERT_TRUE(r.actions & CommandRouter::ACT_LOG_EXPORT);
+    TEST_ASSERT_EQUAL_UINT16(3, b.router.logExportIndex());
+}
+
 // Refusals are a safety surface. CAL O2 armed a two-step handshake whose
 // consumer (cal::O2Sequencer) was never instantiated on the board, and CAL
 // DEPTH raised a request flag nothing reads; both answered OK, which on a
@@ -1214,6 +1248,7 @@ int main() {
     RUN_TEST(test_cross_key_sets_are_clamped_before_they_reach_the_chain);
     RUN_TEST(test_get_t_projects_cns_exactly_as_the_pushed_stream_does);
     RUN_TEST(test_log_and_calibration_commands_delegations);
+    RUN_TEST(test_log_export_is_refused_mid_dive);
     RUN_TEST(test_unimplemented_calibrations_are_refused_not_acked);
     RUN_TEST(test_get_calair_reports_the_verdict_not_the_request);
     RUN_TEST(test_time_set_is_range_checked_and_delegated);

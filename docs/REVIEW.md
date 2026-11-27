@@ -1808,10 +1808,16 @@ pointer), `platformio.ini` (the `native_o2` gate comment), `tools/fence_probe.cp
 m-4 residual citation), and the `hw_accept.py` / `pulse_witness.py` header comments that
 cited batch letters. Nothing in `test/` read a review document, so no test changed.
 
-**Verified after the merge, on this tree:** the native suites re-run
-(`pio test -e native`, and `env:native` + `env:native_o2` together — the fence gate reads
-the `platformio.ini` comment that was rewritten here), `pio run -e esp32` still builds, and
-`tools/hw_accept.py --selftest` re-run. Then a repo-wide grep for the removed paths:
+**Re-run after the merge, on this tree, 2026-11-27:** `pio test -e native` **437/437**;
+`pio test -e native -e native_o2` **874/874** — the two suites that read a *document*
+(`test_flaglabels` parses §4 of the spec, `test_designwire` parses the design sheet) stayed
+green, which is what shows nothing in `test/` depended on a removed review file;
+`pio run -e esp32` SUCCESS at **RAM 56292 B (17.2 %)** and **Flash 1037513 B (79.2 %)**,
+byte-identical to the pre-merge build, as expected when the only source change is a
+comment; `pio run -e esp32_stalltest` SUCCESS; `tools/hw_accept.py --selftest` **131 legs,
+0 failures**; and `tools/fence_probe.cpp`, whose citation was rewritten, recompiles clean.
+
+Then a repo-wide grep for the removed paths:
 `grep -rn 'REVIEW_BATCH' --include='*.md' --include='*.h' --include='*.cpp' --include='*.py' --include='*.ini' .`
 returns nothing outside this file. The only mentions of the old filenames anywhere are
 the five in §6 and the one in the header above — prose about the merge, not paths anything

@@ -1126,6 +1126,64 @@ void test_cal_air_verdicts_reach_the_wire_once_each() {
 
 // ---- the depth-source snapshot (what `GET DS` answers from) -----------------
 
+// The settings clamp used to be console-only: the applier enforced an ordering
+// and the wire said nothing, while `GET GF_LOW` went on answering the number the
+// diver typed. id 19 carries the verdict, and this pins the publication the way
+// the diver's client sees it — a row per apply that clamped anything, no row for
+// a SET that needed none, and the applier's mask intact (each bit names one
+// ordering, §4's table).
+void test_a_settings_clamp_verdict_reaches_the_wire_as_id_19() {
+    std::vector<std::string> out;
+    g_out = &out;
+    Fixture f;
+    bridge::EventRing ring;
+    bridge::Event e;
+
+    // Nothing clamped: not news, and a row per SET would bury the dive in rows
+    // for a fact that did not happen (the same rule CAL AIR progress follows).
+    bridge::publishClampVerdict(0, 5, ring);
+    TEST_ASSERT_FALSE_MESSAGE(ring.pop(e),
+                              "CLAMP_NONE must not publish a row");
+
+    // One ordering enforced: GF_LOW set above GF_HIGH.
+    bridge::publishClampVerdict(0x20, 7, ring);
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT16(logfmt::EVT_SETTINGS_CLAMPED, e.id);
+    TEST_ASSERT_EQUAL_UINT16(0x20u, e.value);
+    TEST_ASSERT_EQUAL_UINT32(7u, e.tSec);
+    TEST_ASSERT_FALSE(ring.pop(e));
+
+    // Several orderings from one apply: one row, every bit intact. A mask that
+    // lost a bit would name a rule the applier enforced while hiding one it
+    // enforced as well — the diver would fix half the pair.
+    bridge::publishClampVerdict(0x21, 9, ring);
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT16(0x21u, e.value);
+
+    // And through the session's downlink, as the bytes a handset parses.
+    bridge::publishClampVerdict(0x20, 7, f.events);
+    f.pump(8000);
+    TEST_ASSERT_TRUE_MESSAGE(hasLineStarting("E,7,19,32"),
+                             "the clamp verdict did not reach the handset downlink");
+    // Like every other edge, the verdict grabs a snapshot row beside it in the
+    // dive file: the setting that changed is one fact, the picture it changed is
+    // the other, and the two are read together.
+    TEST_ASSERT_EQUAL(1, f.hooks.snaps);
+}
+
+void test_the_clamp_verdict_is_a_wire_row_and_no_more() {
+    // 19 is an event on the WIRE and in the dive file, not a surface record:
+    // the surface log holds calibration and pre-dive records, and a settings
+    // clamp is neither. Graded here so the id cannot quietly grow a third home
+    // that nothing reads.
+    bridge::EventRing ring;
+    bridge::publishClampVerdict(0x40, 3, ring);
+    bridge::Event e;
+    TEST_ASSERT_TRUE(ring.pop(e));
+    TEST_ASSERT_EQUAL_UINT16(logfmt::EVT_SETTINGS_CLAMPED, e.id);
+    TEST_ASSERT_EQUAL_UINT16(0x40u, e.value);   // BAND_ORDER alone
+}
+
 void test_the_depth_source_publisher_leaves_nothing_to_interpret() {
     // bridge::publishDepthSource exists so the rules are testable at all: the
     // call site is in main.cpp, which the native build excludes, so rules written
@@ -1211,6 +1269,8 @@ int main() {
     RUN_TEST(test_log_list_and_export_stream_over_the_session);
     RUN_TEST(test_publish_state_is_not_static_between_dives);
     RUN_TEST(test_cellproof_clamp_edges_publish_once);
+    RUN_TEST(test_a_settings_clamp_verdict_reaches_the_wire_as_id_19);
+    RUN_TEST(test_the_clamp_verdict_is_a_wire_row_and_no_more);
     RUN_TEST(test_cal_air_verdicts_reach_the_wire_once_each);
     RUN_TEST(test_an_export_hands_the_callers_sink_context_back);
     RUN_TEST(test_a_long_export_streams_every_row_once);

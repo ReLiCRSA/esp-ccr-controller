@@ -191,6 +191,21 @@ PROTOCOL_CHECKS = [
     ("SET SP2=0.55", r"^OK", "surface write lands"),
     ("GET SP2", r"^SP2=0\.550", "registry read-back"),
     ("SET SP2=2.5", r"^ERR", "range refusal"),
+    # The clamp verdict as a protocol event (id 19, added 2026-11-27). GF_LOW
+    # is legal per key at 90 (range 10..95) and inverts the pair against
+    # GF_HIGH, so the applier clamps it — while the registry keeps 90, which
+    # is exactly the gap id 19 closes. The read-back below PROVES the gap
+    # exists on the wire; grade_stream grades the `E,<t>,19,<mask>` row that
+    # names it, mask bit5 (GF_ORDER) alone: one clamp, one name. At the
+    # SURFACE, because GF keys are dive-locked and a refused SET clamps
+    # nothing. The dwell gives the row its control cycle.
+    ("SET GF_LOW=90", r"^OK",
+     "legal per key and inverted as a pair: accepted at the registry", "dwell:1.0"),
+    ("GET GF_LOW", r"^GF_LOW=90$",
+     "the registry keeps what was typed — the reason the verdict needs its own row"),
+    ("SET GF_LOW=30", r"^OK", "the pair restored to the default: exactly one clamp row "
+                              "for the whole run, and every later phase sees the plan "
+                              "DIVE_WANT states", "dwell:1.0"),
     # Value caps on the wire (2026-11-24, see grade_value_caps): the parser's value
     # field used to be 23 characters while `AP_PASS` publishes 8..31, so a longer
     # passphrase answered OK and was stored short. Both writes here are REFUSED, so
@@ -234,6 +249,15 @@ PROTOCOL_CHECKS = [
     # dive is minutes, so the dwell is what makes the check mean what it says.
     ("DIVE START", r"^OK DIVE", "dive opens", "dwell:2.0"),
     ("SET SP2=0.40", r"^ERR dive locked", "diver outranks the client"),
+    # `LOG EXPORT` is dive-locked (decision 2026-11-27, §2/§5): the export
+    # streams a whole dive off the same LittleFS flash the LIVE dive file is
+    # being written to, on the task that keeps the handset pumped — the
+    # configuration the review could not measure is made unreachable instead
+    # of measured. The refused probe uses slot 1: with the matrix's own dive
+    # the newest, a regression that removed the lock would stream rows here,
+    # and the regex fails on the first of them.
+    ("LOG EXPORT 1", r"^ERR export locked in dive",
+     "no export mid-dive: the flash belongs to the live dive file"),
     # The depth ruler. `WATER_DENSITY` is the single density behind the metres in
     # the `T,` row, the setpoint tiers those metres select, the cellproof arm
     # depth and the deco engine's ambient pressures (see grade_depth_scale below),
@@ -1890,7 +1914,71 @@ def grade_stream(stream):
     lie = next((l for l in stream if re.match(r"^E,\d+,7,2$", l)), None)
     checks.append(("no CALAIR_OK row for a calibration that was refused",
                    lie is None, lie or ""))
+
+    # The clamp verdict (id 19). The matrix inverts the GF pair at the surface
+    # and restores it, so the honest board streams EXACTLY one `E,<t>,19,32`:
+    # GF_ORDER alone. Zero rows means the verdict is console-only again — the
+    # hole the id exists to close. More than one means the applier or the
+    # latch is publishing for SETs that needed no clamp. A wrong mask is the
+    # loudest failure: it names an ordering the applier never enforced.
+    clamp_rows = [l for l in stream if re.match(r"^E,\d+,19,\d+$", l)]
+    checks.append(("the clamp verdict arrived unprompted as E,<t>,19,<mask>",
+                   len(clamp_rows) == 1,
+                   f"{len(clamp_rows)} id-19 rows in the stream "
+                   f"{clamp_rows[:4]} — want exactly 1: the matrix clamps exactly once"
+                   if len(clamp_rows) != 1 else clamp_rows[0]))
+    if len(clamp_rows) == 1:
+        mask = int(clamp_rows[0].split(",")[3])
+        named = [nm for bit, nm in CLAMP_BITS if mask & bit]
+        checks.append(("the clamp row names GF_ORDER and nothing else",
+                       mask == 0x20,
+                       f"mask {mask} names {named or 'nothing'}, want exactly "
+                       f"[GF_ORDER]: the matrix inverts the GF pair and nothing else"))
     return checks
+
+
+# ApplyClamp's bits, in one place: the grader and its lying captures both
+# read this, so a mask named here and a mask printed there cannot drift.
+CLAMP_BITS = [(1, "ALLO_HIGH"), (2, "CUTOFF"), (4, "PULSE_MS"), (8, "DUTY"),
+              (16, "SP_ORDER"), (32, "GF_ORDER"), (64, "BAND_ORDER")]
+
+
+def selftest_stream():
+    """The event-stream grader, proven on lying captures.
+
+    The honest capture is the exact shape the matrix produces: one warm-up
+    refusal (E,*,7,3), no false OK, and exactly one clamp verdict naming
+    GF_ORDER. Each lie below is a regression that already happened somewhere
+    in this repo's history — a verdict admitted only on the console."""
+    honest = ["T,0.05,0.212,0.208,0.210,0.210,0.400,STANDBY,FLAGS0x00,12.40",
+              "E,12,7,3",
+              "E,31,19,32"]
+    out = []
+    res = grade_stream(honest)
+    out.append(("honest stream passes", all(ok for _, ok, _ in res),
+                [d for _, ok, d in res if not ok]))
+
+    # The verdict back to being console-only: the SET succeeds, nothing arrives.
+    res = grade_stream([l for l in honest if not l.startswith("E,31,19")])
+    out.append(("a stream WITHOUT the clamp row is refused",
+                any(not ok for _, ok, _ in res), ""))
+
+    # A second row: the latch publishing for un-clamped SETs, or the applier
+    # clamping a pair that was never inverted.
+    res = grade_stream(honest + ["E,44,19,0", "E,58,19,32"])
+    out.append(("two clamp rows (one for a SET that clamped nothing) is refused",
+                any(not ok for _, ok, _ in res), ""))
+
+    # The mask lying: naming SP_ORDER while the GF pair was the inversion.
+    res = grade_stream(["E,12,7,3", "E,31,19,16"])
+    out.append(("a clamp row naming the WRONG ordering is refused",
+                any(not ok for _, ok, _ in res), ""))
+
+    # The mask lying quietly: GF_ORDER plus a bit the applier never set.
+    res = grade_stream(["E,12,7,3", "E,31,19,33"])
+    out.append(("a clamp row with an extra invented bit is refused",
+                any(not ok for _, ok, _ in res), ""))
+    return out
 
 
 def grade_watch(lines, boot_lines=None, cal_lines=None):

@@ -388,14 +388,23 @@ static void pinSweep() {
         const char* role = hsRole(p);
         Serial.printf("   gpio %-2d up %5d/%5d  dn %5d/%5d  %-28s %s\n",
                       p, hiUp, totUp, hiDn, totDn, role, verdict);
+        if (verdict[0] == 'D' && p == H_TX_PIN)
+            Serial.println("        ^ COLLISION: the controller's TX is landing in the "
+                           "handset's link TX hole. The two data wires are straight "
+                           "through, not crossed: controller GPIO17 belongs on handset 13, "
+                           "and handset 14 belongs on controller GPIO16. Both ends are "
+                           "outputs on one wire until they are swapped.");
         if (verdict[0] == 'D' && p == PIN_BUZZER)
             Serial.println("        ^ COLLISION: that pin is this handset's buzzer output, "
                            "and something outside is driving it too. Two outputs on one "
                            "wire: neither side can read the other, and the handset is "
                            "holding the controller's TX down.");
+        if (verdict[0] == 'D' && p == PIN_LINK_LED)
+            Serial.println("        ^ COLLISION: this handset drives the link LED here, "
+                           "and something outside is driving it too.");
         if (verdict[0] == 'D' && p == H_RX_PIN)
-            Serial.println("        ^ that is the controller's TX arriving on the link RX. "
-                           "Correct hole.");
+            Serial.println("        ^ that is the controller's TX arriving in the link RX "
+                           "hole. Correct: that wire is where it belongs.");
     }
     Serial2.begin(115200, SERIAL_8N1, H_RX_PIN, H_TX_PIN);
     restoreOwnPins();

@@ -23,9 +23,14 @@ void configPublish(const Config& cfg) {
 }
 
 bool configRead(Config& out) {
+    return configRead(out, nullptr);
+}
+
+bool configRead(Config& out, uint32_t* generation) {
     std::lock_guard<std::mutex> g(g_mux);
     if (g_generation == 0) return false;   // nothing published: leave `out` alone
     out = g_current;
+    if (generation) *generation = g_generation;
     return true;
 }
 

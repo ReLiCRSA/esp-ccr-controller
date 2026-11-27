@@ -62,6 +62,14 @@ void configPublish(const Config& cfg);
 /// generation, never a blend of two.
 bool configRead(Config& out);
 
+/// The same read, and the NUMBER of the generation it copied. A reader that wants
+/// to say "these are the rules this cycle ran under" needs the pair — the number
+/// belongs to the values, and asking for `configGeneration()` afterwards reports
+/// whatever the settings path published in the meantime, which is the same class
+/// of lie the box exists to remove. `*generation` is written only when the read
+/// succeeds, for the same reason `out` is left alone.
+bool configRead(Config& out, uint32_t* generation);
+
 /// How many generations have been published (0 = nothing yet). Debug output and
 /// tests use it to say which rules a surface was produced under.
 uint32_t configGeneration();

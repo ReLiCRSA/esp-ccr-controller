@@ -264,6 +264,108 @@ void test_boot_publishes_before_any_reader_task_exists() {
                              "publishing after the tasks exist lets a task run on its seed value");
 }
 
+void test_a_reader_can_say_which_generation_it_holds() {
+    // The box fixes coherence; this fixes the CLAIM about coherence. A reader that
+    // wants to report "the rules this cycle ran under" cannot ask
+    // configGeneration() afterwards — that answers whatever the settings path
+    // published in the meantime, which is the same half-pair problem the box was
+    // built to remove. The number has to come out of the same read as the values.
+    ctrl::configPublish(fromSeed(77));
+    ctrl::Config c{};
+    uint32_t gen = 0;
+    TEST_ASSERT_TRUE(ctrl::configRead(c, &gen));
+    const uint32_t readGen = gen;
+    TEST_ASSERT_EQUAL_INT(77, seedOf(c));
+
+    // Publish again: the number the earlier read reported must still be the number
+    // that describes THOSE values.
+    ctrl::configPublish(fromSeed(78));
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(readGen, gen,
+                                     "the generation a read reported moved under it: the pair is not "
+                                     "a pair");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(readGen + 1, ctrl::configGeneration(),
+                                     "configGeneration() no longer counts publishes");
+
+    // The "nothing published yet" half of the overload — leaving BOTH the caller's
+    // struct and its generation variable alone — is graded by the first case in
+    // this file, which is the only place that state exists: the box is
+    // process-global, one boot per binary, and by here it has been published.
+}
+
+void test_only_the_boot_and_the_settings_path_publish() {
+    // configbox.h says the settings path is the only mid-flight writer, and the
+    // file's whole argument depends on that: two mid-flight writers means last
+    // writer wins, and the pairs settings_apply orders stop meaning anything. A
+    // comment can be ignored; a count in the source cannot. Every call site of
+    // configPublish in src/ is enumerated here, and a new one fails this test with
+    // a message that says what the new writer must do instead — read the current
+    // generation, apply onto that copy, publish the result — rather than letting a
+    // second writer in through an exception nobody reviews.
+    const char* files[] = {"src/main.cpp", "src/comms/session_wiring.cpp",
+                           "src/comms/telemetry_bridge.cpp", "src/comms/cmd_router.cpp",
+                           "src/comms/web_server.cpp", "src/control/configbox.cpp"};
+    int sites = 0;
+    for (const char* f : files) {
+        const std::string src = stripComments(readFile(f));
+        if (f == std::string("src/control/configbox.cpp")) continue;   // the definition
+        TEST_ASSERT_TRUE_MESSAGE(!src.empty(), f);
+        for (size_t at = src.find("configPublish("); at != std::string::npos;
+             at = src.find("configPublish(", at + 1)) {
+            // The declaration in configbox.h is not a call; nothing here includes
+            // a header that declares it, so every hit in these files is a call.
+            ++sites;
+            TEST_ASSERT_TRUE_MESSAGE(f == std::string("src/main.cpp") ||
+                                     f == std::string("src/comms/session_wiring.cpp"),
+                                     (std::string(f) +
+                                      " publishes a configuration generation. The only mid-flight "
+                                      "writer is the settings path: read the published generation, "
+                                      "apply onto that copy, then publish — and add this file here "
+                                      "only if that shape is what it does.").c_str());
+        }
+    }
+    // Two, not one and not three: setup()'s boot publish and hookSettings'.
+    TEST_ASSERT_EQUAL_INT_MESSAGE(2, sites,
+                                  "the number of configPublish call sites moved: the single-writer "
+                                  "rule is the box's contract");
+
+    // And the boot publisher must be a publisher of an APPLIED config, not of a
+    // struct nobody clamped — graded on setup()'s own text (see the boot test).
+}
+
+void test_the_heartbeat_states_the_generation_pair() {
+    // The claim "the chain is running the rules the last SET produced" is now a
+    // bench-visible number, so the bench has to be able to lose it. HB carries
+    // `cfggen=<published>/<chain>`; the chain half must come from the read that
+    // carried the values, never from configGeneration(), which would report what
+    // the settings path published by now rather than what the chain is running.
+    const std::string mainCpp = stripComments(readFile("src/main.cpp"));
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(mainCpp.c_str(), "cfggen=%u/%u"),
+                                 "HB no longer reports the config generation pair");
+    const size_t at = mainCpp.find("cfggen=%u/%u");
+    // The format string and its argument list are one printf statement: the
+    // arguments sit below the format, so the window has to cover them.
+    const std::string tail = mainCpp.substr(at, 1400);
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(tail.c_str(), "ctrl::configGeneration()"),
+                                 "HB's published half is not the box's count");
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(tail.c_str(), "g_chainCfgGen"),
+                                 "HB's chain half is not the generation ControlTask read");
+
+    const size_t ctrl = mainCpp.find("static void controlTask");
+    TEST_ASSERT_TRUE(ctrl != std::string::npos);
+    const std::string body = mainCpp.substr(ctrl, mainCpp.find("\nstatic ", ctrl + 1) - ctrl);
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(body.c_str(), "configRead(g_controlRules, &cfgGen)"),
+                                 "controlTask no longer takes the generation WITH the values");
+    TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(body.c_str(), "g_chainCfgGen = cfgGen"),
+                                 "controlTask no longer records which generation it applied");
+    // Appended, never reordered: soak_logger.py and hw_accept.py anchor on the
+    // leading HB fields, so the new field must sit after contskip=.
+    const size_t hb = mainCpp.find("HB st=");
+    const std::string fmt = mainCpp.substr(hb, mainCpp.find("\\n", hb) - hb);
+    const size_t skip = fmt.find("contskip="), cfg = fmt.find("cfggen=");
+    TEST_ASSERT_TRUE_MESSAGE(cfg != std::string::npos && skip != std::string::npos && cfg > skip,
+                             "cfggen= is not appended after contskip=: HB fields are append-only");
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_nothing_published_leaves_the_callers_value_alone);
@@ -272,5 +374,8 @@ int main() {
     RUN_TEST(test_the_settings_path_applies_onto_a_copy_and_publishes_once);
     RUN_TEST(test_no_task_reads_the_old_global);
     RUN_TEST(test_boot_publishes_before_any_reader_task_exists);
+    RUN_TEST(test_a_reader_can_say_which_generation_it_holds);
+    RUN_TEST(test_only_the_boot_and_the_settings_path_publish);
+    RUN_TEST(test_the_heartbeat_states_the_generation_pair);
     return UNITY_END();
 }

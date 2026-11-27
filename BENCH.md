@@ -1895,12 +1895,33 @@ now keeps.
       stale 10.5 V out of NVS on the next boot without a schema bump). If the pack
       becomes two cells in series, `VBAT_CELLS` is the only line to change: witness
       it by rebuilding at 2 (`pio test -e native -e native_o2` was green at both
-      settings, 2026-11-27) and by wiring the midpoint tap.
+      settings — 2026-11-27, and again 2026-11-28 when the published band joined
+      landed; at 2 the only legs that move are the two grading
+      `docs/HANDSET_PROTOCOL.md` §6's `VBAT_MIN` row, which is the point) and by
+      wiring the midpoint tap. Witnessed on metal 2026-11-28 at **1**: the board
+      reports the migration itself — `settings: NVS VBAT_MIN="10.500" refused
+      (out of range) - the registry default for that key is used instead` — and
+      the battery verdict changed: before the change the same bench printed
+      `vbat=4.92 batlow=1`; after it, `vbat=3.62…3.65 batlow=0 al=0x0000`, with
+      the handset readout showing `batt 3.64 V` and no battery marker. The
+      refused 10.5 is **not** written back, so that line repeats every boot
+      until a `SET VBAT_MIN` replaces it.
       **A series pack is not free:** the pack voltage alone cannot see one dead
       cell (6.80 V is 4.00 + 2.80, and a voltage-only gate passes it), so 2S needs
       the midpoint divider to `PIN_VBAT_MID_SENSE` (GPIO36, ADC1, input-only) and
       the pre-dive agreement check that reads it. The check refuses when the pin is
       unwired, so a 2S build without the tap cannot dive — fail closed, on purpose.
+- [ ] Battery, the blind half, still never witnessed on metal. The firmware
+      refuses a reading this chemistry cannot produce, and the host tests cover
+      it, but no run of this image has ever produced the fault: driving the
+      sense pad to 5 V (what produced §1 P1's `vbat=34.71`) should print
+      `battery: sense IMPLAUSIBLE: 34.71 V cannot be a 1-cell pack of this
+      chemistry (floor 3.40 V, ceiling 4.60 V)`, take HB to `batlow=1` with
+      `al=0x0010`, light the handset's battery marker, and make the pre-dive
+      BATTERY step refuse — then removing the drive should print the clearing
+      sentence, which is a different sentence on purpose (the old single printf
+      said "cannot be a 1-cell pack" on the clearing edge too). Until that is
+      seen, the claim on this path is "host-tested", not "bench-tested".
 - [ ] Battery, third half — the rail the valve actually runs on: the pack feeds a
       boost converter to ~12 V for the solenoid, and **nothing in this firmware
       senses that output**, so `vbat` healthy does not mean the coil has voltage.

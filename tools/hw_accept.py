@@ -173,21 +173,28 @@ PROTOCOL_CHECKS = [
     ("DIVE END", r"^(OK|ERR no dive)", "clean slate before the sequence"),
     ("GET T", r"^T,", "telemetry line parses", "burst"),
     ("GET D", r"^D,", "deco picture on request", "burst"),
-    ("GET *", r"^[A-Z0-9_]+=", "full settings listing", "collect"),
-    # `collect`, and not by taste: GET SCHEMA answers one LINE PER KEY (36 of
-    # them), and first-match semantics stop after the first `K,` row and leave
-    # the other 35 in the buffer to smear into the NEXT check's window — the
-    # same amputation that `GET *` had and got fixed for. The NVS-migration leg
-    # below grades the band of the refused key from these rows, so it needs them
-    # whole, and the following checks need them gone.
-    ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server", "collect"),
+    # `family:` = the reply is one write() of many lines: drain the family,
+    # don't stop at its first line. See ReplyWindow for the rule and for why
+    # a first-match window here grades the NEXT command's answer.
+    ("GET *", r"^[A-Z0-9_]+=", "full settings listing", "family:^[A-Z0-9_]+="),
+    # One line per key (36), so the family is `K,`. The NVS-migration leg grades
+    # the refused key's band from these rows and needs them WHOLE; the checks
+    # that follow need them GONE, which is what the pushback is for.
+    ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server",
+     "family:^K,"),
     # The chemistry migration of 1 P1, read back instead of taken on trust: the
     # boot refuses a stored VBAT_MIN the tightened band cannot hold and promises
     # the registry default runs instead. grade_nvs_migration joins that promise
     # against this reply. Never probe a refusal with a schema endpoint (bench
     # rule from 2026-11-24), so the value asked for here is read, never written.
     ("GET VBAT_MIN", r"^VBAT_MIN=[\d.]+$", "the migrated key's live value, on request"),
-    ("GET HIST", r"^(HIST,|ERR no histogram)", "histogram answer, or the truth"),
+    # One `HIST,` line PER CELL (`src/control/cellhist.h:62`), all of it in one
+    # reply, so stopping at the first match leaves two lines to answer the NEXT
+    # command. A refused histogram is a single `ERR` line: the family only needs
+    # to match the continuation, so `^HIST,` is enough and the ERR reply ends the
+    # window on the next non-family line.
+    ("GET HIST", r"^(HIST,|ERR no histogram)", "histogram answer, or the truth",
+     "family:^HIST,"),
     ("GET FAULT", r"^FAULT,", "fuse/stuck-open/duty on request"),
     # Which chip owns depth, and whether the control path is using it (2026-11-25).
     # The matrix only asks for the SHAPE; the meaning is graded against the boot
@@ -2158,6 +2165,144 @@ def selftest_nvs_migration():
                    "but no acceptance run reaches it"))
     return checks
 
+def selftest_port_hygiene():
+    """A replay must never reach a port. Graded as a subprocess, because the
+    point is what the process DOES, not what one function returns.
+
+    `--replay` with a bad path used to be falsy, fell through to the live branch
+    and opened the console port — whose CP2102 reset reboots the controller. The
+    bench found that by losing a boot mid-session, so the guard is graded here
+    rather than trusted.
+
+    The subprocess case deliberately passes a NON-EXISTENT path, not `""`: an
+    empty one is the shape that reaches the live branch, and a selftest must not
+    be able to open `/dev/ttyUSB0` if the guard ever regresses. That shape is
+    covered by the source scan instead, which cannot touch a port.
+    """
+    import subprocess
+
+    checks = []
+    me = str(Path(__file__).resolve())
+    out = subprocess.run([sys.executable, me, "--replay", "/nonexistent/accept.log"],
+                         capture_output=True, text=True, timeout=30)
+    checks.append(("a replay it cannot read exits instead of opening a port",
+                   out.returncode == 2 and "Refusing to fall back" in out.stderr,
+                   f"rc={out.returncode} stderr={out.stderr.strip()[:200]}"))
+    src = inspect.getsource(main)
+    live = src.split("import serial")[0] if "import serial" in src else src
+    checks.append(("the replay branch is taken before pyserial is imported",
+                   "if args.replay is not None" in live,
+                   "the replay test sits after the serial import: a bad argument "
+                   "then reaches the wire"))
+    checks.append(("an empty --replay is not silently treated as 'no replay'",
+                   "if args.replay is not None:" in src and "if args.replay:" not in src,
+                   "truthiness on a path argument: `--replay \"\"` means 'live'"))
+    return checks
+
+
+def selftest_matrix_window():
+    """The reply-window rule, proven on scripted transcripts. No port, no board.
+
+    The defect is not that a multi-line answer is long — it is that a window
+    which stops at the first match leaves the rest of ONE write() in the buffer,
+    and those lines then answer the NEXT command. So every case here grades two
+    consecutive windows: what the first consumed, and what the second found. A
+    case that passes with only the first window graded would be decoration.
+    """
+    hist3 = ["HIST,0,60,10,25,3,40,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,"
+             "19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37",
+             "HIST,1,60,10,25,3,41,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,"
+             "19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37",
+             "HIST,2,60,10,25,3,39,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,"
+             "19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37"]
+    next_answer = "SP2=0.550"
+    stream = []
+
+    def src(lines):
+        it = iter(lines)
+        return lambda: next(it, "")
+
+    def run(transcript, family_pat, next_pat):
+        win = ReplyWindow(src(transcript))
+        noop = lambda l: stream.append(l)
+        ok1, seen1 = win.read(re.compile(family_pat[0]), family_pat[1], noop,
+                              time.monotonic() + 5.0)
+        ok2, seen2 = win.read(re.compile(next_pat), None, noop, time.monotonic() + 5.0)
+        return ok1, seen1, ok2, seen2
+
+    checks = []
+    hist_pat = r"^(HIST,|ERR no histogram)"
+    hist_fam = re.compile(r"^HIST,")
+
+    # 1. The fix: all three cells, telemetry stepped over, the next command's
+    #    line pushed back and handed on intact.
+    t1 = hist3 + ["T,172,0.00,0.40", next_answer]
+    ok1, seen1, ok2, seen2 = run(t1, (hist_pat, hist_fam), r"^[A-Z0-9_]+=")
+    checks.append(("the histogram answer is taken WHOLE: three cells, not one",
+                   sum(1 for l in seen1 if l.startswith("HIST,")) == 3,
+                   f"{len(seen1)} lines seen: {[l.split(',')[0] for l in seen1]}"))
+    checks.append(("the next command's own line is not swallowed by the drain",
+                   ok2 and seen2[:1] == [next_answer], f"second window saw {seen2}"))
+    checks.append(("nothing is lost or doubled across the two windows",
+                   seen1 + seen2 == t1,
+                   f"first {len(seen1)} + second {len(seen2)} != {len(t1)} sent"))
+
+    # 2. The defect, reproduced on purpose, so the fix is shown to change
+    #    behaviour: with no family the window stops at line 1 and the next
+    #    command is answered by a HIST row.
+    ok1, seen1, ok2, seen2 = run(hist3 + [next_answer], (hist_pat, None), r"^[A-Z0-9_]+=")
+    smeared = bool(seen2) and seen2[0].startswith("HIST,")
+    checks.append(("a first-match window DOES smear HIST lines into the next "
+                   "command — the thing the family marker exists to stop",
+                   smeared and sum(1 for l in seen1 if l.startswith("HIST,")) == 1,
+                   f"first window {[l.split(',')[0] for l in seen1]}, second window "
+                   f"{[l.split(',')[0] for l in seen2]}"))
+
+    # 3. A refused histogram is one line: the window must end, and the following
+    #    answer must arrive untouched.
+    ok1, seen1, ok2, seen2 = run(["ERR no histogram", next_answer],
+                                 (hist_pat, hist_fam), r"^[A-Z0-9_]+=")
+    checks.append(("a refused histogram is one line, and ends the window",
+                   ok1 and seen1 == ["ERR no histogram"] and seen2[:1] == [next_answer],
+                   f"{seen1} / {seen2}"))
+
+    # 4. An over-broad family is its own bug: it eats the next command's reply.
+    ok1, seen1, ok2, seen2 = run(hist3 + [next_answer], (hist_pat, re.compile(r".*")),
+                                 r"^[A-Z0-9_]+=")
+    checks.append(("a family that matches everything leaves the next command nothing",
+                   not seen2 and not ok2,
+                   f"second window saw {seen2}: a drain with no boundary is the same "
+                   "defect pointing the other way"))
+
+    # 5. The row table itself: the firmware names its in-place listing
+    #    formatters (src/comms/cmd_router.h:244-246: `GET *`, `GET D`, `GET HIST`,
+    #    SCHEMA). Three of them are asked as one question by this matrix; all
+    #    three must carry a family. `GET T`/`GET D` are burst-mode by design and
+    #    are deliberately not in this list.
+    listings = {"GET *": r"^[A-Z0-9_]+=", "GET SCHEMA": r"^K,", "GET HIST": r"^HIST,"}
+    rows = {c[0].strip(): c[3] for c in PROTOCOL_CHECKS if len(c) > 3}
+    for cmd, want in listings.items():
+        marker = rows.get(cmd, "")
+        checks.append((f"{cmd} declares a reply family",
+                       str(marker).startswith("family:"),
+                       f"row marker: {marker!r}: a multi-line answer without a family "
+                       "leaves its tail to answer the next command"))
+        if str(marker).startswith("family:"):
+            fam = marker.split(":", 1)[1]
+            sample = {"GET *": "SP2=0.550",
+                      "GET SCHEMA": "K,SP2,F,0.2,4,0,0.21",
+                      "GET HIST": "HIST,0,60,10,25,3,40"}[cmd]
+            checks.append((f"{cmd}'s family matches a line {cmd} really answers",
+                           re.compile(fam).match(sample) is not None,
+                           f"family {fam!r} does not match {sample!r}"))
+    # 6. No row still asks for the old semantics by name: `collect` drained to
+    #    silence and cost a window each, and it could not push back.
+    stale = [c[0] for c in PROTOCOL_CHECKS if len(c) > 3 and c[3] == "collect"]
+    checks.append(("no row still uses the retired 'collect' marker", not stale,
+                   f"still marked collect: {stale}"))
+    return checks
+
+
 def selftest():
     """Proves the surface-log graders can fail.
 
@@ -2728,6 +2873,73 @@ def _await_burst(ser, pat, seen, log, send, t0):
     return False
 
 
+# Lines the controller volunteers without being asked — the telemetry rows the
+# stream graders live on, and the heartbeat. They are evidence, but they are
+# never the tail of a reply, so a reply reader may step over them.
+UNSOLICITED = re.compile(r"^(?:[TDE],|HB )")
+
+
+class ReplyWindow:
+    """One command's answer, read from a line source, with the multi-line rule
+    stated HERE instead of in a per-row comment.
+
+    Three listing formatters answer with MANY lines written by ONE `write()`:
+    `GET *` (one `KEY=` per setting), `GET SCHEMA` (one `K,` per key) and
+    `GET HIST` (one `HIST,` per cell — `src/control/cellhist.h:62`). A window
+    that stops at the first match leaves the rest of that single reply sitting
+    in the port's buffer; the next command is sent, and those leftover lines
+    arrive inside the NEXT command's window and are graded as its answer. That
+    is not a theoretical risk: it was found once on `GET *` (the `WIFI_*` keys
+    sit at the end of the table, and the ruler grader was reading an amputated
+    line list), and `GET HIST` had the same exposure today.
+
+    So: a row may declare a `family:` regex. The window keeps draining while the
+    family continues, steps over volunteered telemetry, and PUSHES BACK the first
+    line that belongs to neither — pushback is what makes draining safe, because
+    without it the drain would eat the next command's first line. Rows with no
+    family keep first-match semantics: for them, everything after the match IS
+    the next command's answer.
+
+    `GET T`/`GET D` are deliberately not family-driven: they are asked in burst
+    mode, where the continuous `T,`/`D,` stream is the cadence anchor and its
+    "leftovers" are the point. See _await_burst.
+    """
+
+    def __init__(self, source):
+        self.source = source          # callable -> line, "" for silence
+        self.pushed = []              # read-too-early, owed to the next window
+
+    def _line(self):
+        return self.pushed.pop(0) if self.pushed else self.source()
+
+    def read(self, pat, family, on_line, deadline):
+        """Returns (matched, lines). `lines` excludes anything pushed back."""
+        seen = []
+        ok = False
+        while time.monotonic() < deadline:
+            line = self._line()
+            if not line:
+                break
+            seen.append(line)
+            on_line(line)
+            if not pat.match(line):
+                continue
+            ok = True
+            if family is None:
+                break
+            while True:
+                nxt = self._line()
+                if not nxt:
+                    return ok, seen
+                if family.match(nxt) or UNSOLICITED.match(nxt):
+                    seen.append(nxt)
+                    on_line(nxt)
+                    continue
+                self.pushed.append(nxt)   # not ours: hand it to the next window
+                return ok, seen
+        return ok, seen
+
+
 def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
     """Open the handset adapter and run PROTOCOL_CHECKS. No pyserial import
     at module level: the boot/replay path must work without a handset.
@@ -2752,6 +2964,9 @@ def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
     import serial  # pipx platformio venv has it
 
     ser = serial.Serial(port, baud, timeout=1.0)
+    # ONE window reader for the whole run, so a line read early by one check is
+    # handed to the next instead of being re-read, re-graded or lost.
+    window = ReplyWindow(lambda: ser.readline().decode(errors="replace").strip())
     results = []
     # Both logs are stamped from the same wall clock: the handset log says what
     # was sent and when, the console watch says what the board printed and when.
@@ -2786,16 +3001,12 @@ def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
         for check in PROTOCOL_CHECKS:
             cmd, want, why = check[0], check[1], check[2]
             burst = len(check) > 3 and check[3] == "burst"
-            # "collect": a multi-line answer must be captured WHOLE, so the
-            # window does not stop at the first match. GET * grew from 32 to 36
-            # lines and the WIFI_* keys sit at the END of the table — a
-            # first-match window provably cannot see them, and a grader that
-            # reads the ruler from GET * (grade_wifi does) was reading a line
-            # list that had been amputated at the first key. (The single-line
-            # entries keep first-match semantics: for them the rest of the
-            # window is the NEXT command's answer, and draining it early used
-            # to smear tails across neighbouring windows.)
-            collect = len(check) > 3 and check[3] == "collect"
+            # `family:<regex>`: the reply is many lines from one write(); drain
+            # the family and push back what follows it. Rows without one are
+            # single-line answers and keep first-match semantics.
+            family = None
+            if len(check) > 3 and check[3].startswith("family:"):
+                family = re.compile(check[3].split(":", 1)[1])
             dwell = 0.0
             if len(check) > 3 and check[3].startswith("dwell:"):
                 dwell = float(check[3].split(":", 1)[1])
@@ -2813,19 +3024,11 @@ def run_protocol(port, baud, log, settle=1.5, stream=None, pairs=None):
                     if stream is not None:
                         stream.extend(seen)
                 else:
-                    deadline = time.time() + 3.0
-                    while time.time() < deadline:
-                        line = ser.readline().decode(errors="replace").strip()
-                        if not line:
-                            break
-                        seen.append(line)
-                        if stream is not None:
-                            stream.append(line)
-                        log.append(f"[{time.time() - t0:7.2f}s] << {line}")
-                        if pat.match(line):
-                            ok = True
-                            if not collect:
-                                break
+                    ok, seen = window.read(
+                        pat, family,
+                        lambda l: (stream.append(l) if stream is not None else None,
+                                   log.append(f"[{time.time() - t0:7.2f}s] << {l}")),
+                        time.monotonic() + 3000.0)
                 if ok or seen:
                     break
                 log.append(f"[{time.time() - t0:7.2f}s] (no line at all for "
@@ -3993,6 +4196,8 @@ def main() -> int:
                                   *selftest_control_margin(),
                                   *selftest_soak_contract(), *selftest_stream(),
                                   *selftest_stall_budget(),
+                                  *selftest_matrix_window(),
+                                  *selftest_port_hygiene(),
                                   *selftest_nvs_migration(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
@@ -4003,7 +4208,17 @@ def main() -> int:
     lines = []
     watch = []          # console lines from the protocol phase, see grade_watch
     watch_stamps = []   # (seconds since the watch started, line) for the log copy
-    if args.replay:
+    # `is not None`, not truthiness: `--replay ""` used to fall through into the
+    # live branch and OPEN THE CONSOLE PORT, whose CP2102 reset pulse reboots the
+    # controller. Happened on this bench 2026-11-28 with an empty shell variable.
+    # A replay that was asked for but cannot be read must exit, never go looking
+    # for a board.
+    if args.replay is not None and not Path(args.replay).is_file():
+        print(f"--replay: {args.replay!r} is not a readable file. Refusing to fall "
+              f"back to the live path: that opens a port, and opening the controller "
+              f"console resets the board.", file=sys.stderr)
+        return 2
+    if args.replay is not None:
         lines = Path(args.replay).read_text(errors="replace").splitlines()
         print(f"replaying {args.replay} ({len(lines)} lines)")
     else:

@@ -52,7 +52,7 @@ tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
                                  # 2026-11-27 (batch E, no --predive: the pack is
                                  # unplugged so its BATTERY step refuses, and no
                                  # --expect-depth: no squeeze operator at the bench)
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join/stall-budget/NVS-migration graders, no board: 161 cases (re-counted 2026-11-28: batch E's `vrail=`/`railstate=` legs and the soak_logger regex join, then the stall-budget join that reads `TASK_STALL_CONTROL_MS` out of `defaults.h` and the NVS refusal-vs-live-value leg)
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join/stall-budget/NVS-migration/reply-window graders, no board: 177 cases (re-counted 2026-11-28: batch E's `vrail=`/`railstate=` legs and the soak_logger regex join, the stall-budget join that reads `TASK_STALL_CONTROL_MS` out of `defaults.h`, the NVS refusal-vs-live-value leg, and the reply-window rule — a multi-line answer is drained by `family:` and the next command's line is pushed back, not re-read — plus the replay guard, which exits instead of opening a port when `--replay` names a file it cannot read
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 78 checks
 tools/.../python tools/web_probe.py --selftest  # dive-identity + scrub + page graders, no board: 37 cases
 tools/.../python tools/soak_logger.py --selftest  # the soak's HB counting — per-railstate counters and the straddled-reflash behaviour — no port opened, safe beside a live bench: 5 fixtures

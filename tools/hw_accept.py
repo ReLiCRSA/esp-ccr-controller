@@ -2303,6 +2303,32 @@ def selftest_matrix_window():
     stale = [c[0] for c in PROTOCOL_CHECKS if len(c) > 3 and c[3] == "collect"]
     checks.append(("no row still uses the retired 'collect' marker", not stale,
                    f"still marked collect: {stale}"))
+
+    # 7. The live bench never goes silent: `T,` arrives at 2 Hz forever, so a
+    #    drain whose only exit is a quiet line never exits. Found on the first
+    #    matrix run over the S3 bridge, 2026-11-28: `GET *` was ANSWERED, the
+    #    drain then consumed volunteered telemetry forever, and the matrix sent
+    #    no further command for 38 minutes — bytes flowing, process alive, no
+    #    phase log ever closed. Every fixture above runs out and answers `""`,
+    #    which is exactly the silence a bench does not do; this one keeps
+    #    talking. The flood is finite only so the suite cannot hang: the bound
+    #    under test must stop the drain long before it runs out.
+    flood = ["SP1=0.300", "SP2=0.550"] + ["T,172,0.00,0.40"] * 4000 + [next_answer]
+    ok1, seen1, ok2, seen2 = run(flood, (r"^[A-Z0-9_]+=", re.compile(r"^[A-Z0-9_]+=")),
+                                 r"^[A-Z0-9_]+=")
+    over = sum(1 for l in seen1 if UNSOLICITED.match(l))
+    checks.append(("a family drain ends on a stream that never goes quiet — the "
+                   "S3-bench livelock",
+                   # 10 is a literal on purpose: asserting against the class's own
+                   # constant would let a mutation just widen the constant and stay
+                   # green. The bound itself is the contract.
+                   ok1 and over <= 10,
+                   f"the drain stepped over {over} volunteered lines: only the skip "
+                   "budget or the deadline can end a family on a live bench"))
+    checks.append(("and the command after that flood is still answered",
+                   ok2 and seen2[-1] == next_answer and seen1 + seen2 == flood,
+                   f"second window saw {len(seen2)} lines, last "
+                   f"{seen2[-1:] }: nothing may be lost or doubled"))
     return checks
 
 
@@ -2903,10 +2929,25 @@ class ReplyWindow:
     family keep first-match semantics: for them, everything after the match IS
     the next command's answer.
 
+    The drain must be bounded TWICE, because "no more family lines" and "no more
+    lines" are not the same test on a live bench. That was not theory: the first
+    matrix run over the S3 bridge (2026-11-28) livelocked on `GET *` — the drain
+    looped on `T,`/`D,` arriving at 2 Hz, which never produce the silence gap
+    that was its only exit, and the phase never ended. Host fixtures cannot
+    reproduce that: a fixture runs out and answers `""`. So:
+      * the drain obeys the window's deadline, and
+      * it steps over at most FAMILY_SKIP_MAX consecutive non-family lines.
+    A family is one `write()` — microsecond gaps on the wire; at 2 Hz telemetry
+    a real family can interleave at most a line or two. Ten consecutive
+    volunteered lines mean the family is over and the stream is just talking;
+    stop, and the stop-line goes to pushback like any other non-family line.
+
     `GET T`/`GET D` are deliberately not family-driven: they are asked in burst
     mode, where the continuous `T,`/`D,` stream is the cadence anchor and its
     "leftovers" are the point. See _await_burst.
     """
+
+    FAMILY_SKIP_MAX = 10
 
     def __init__(self, source):
         self.source = source          # callable -> line, "" for silence
@@ -2930,16 +2971,25 @@ class ReplyWindow:
             ok = True
             if family is None:
                 break
-            while True:
+            skipped = 0
+            while time.monotonic() < deadline:
                 nxt = self._line()
                 if not nxt:
                     return ok, seen
-                if family.match(nxt) or UNSOLICITED.match(nxt):
+                if family.match(nxt):
                     seen.append(nxt)
                     on_line(nxt)
+                    skipped = 0
+                    continue
+                if UNSOLICITED.match(nxt) and skipped < self.FAMILY_SKIP_MAX:
+                    seen.append(nxt)
+                    on_line(nxt)
+                    skipped += 1
                     continue
                 self.pushed.append(nxt)   # not ours: hand it to the next window
                 return ok, seen
+            return ok, seen            # deadline inside the drain: the family
+                                       # was never going to end. Take what we have.
         return ok, seen
 
 

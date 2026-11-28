@@ -287,30 +287,47 @@ refusals, which are the part that must not be implemented twice and drift:
 
 ```
 /home/wernervg/.local/share/pipx/venvs/platformio/bin/python \
-    tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
+    tools/hw_accept.py --expect-web --handset /dev/ttyACM1
 ```
 
-(`--handset` is a USB-UART adapter on the controller's GPIO16/17; omit it to
+(`--handset` is a USB-UART adapter on the controller's GPIO17/16 — on the S3
+bench bridge that is `/dev/ttyACM1`; omit it to
 run only the boot checks. Exit 0 = every check passed.)
 
-**No adapter in the drawer?** A second classic ESP32 dev module *is* one — its
-USB connector's bridge chip has its data lines on GPIO3/GPIO1. Either jumper
-that module's EN to GND and use the chip directly, or flash the ready bridge:
+**No adapter in the drawer?** A second ESP32 *is* one. Since 2026-11-28 the
+bench bridge runs on the spare ESP32-S3 (the same board the example handset
+runs), standing in for the classic dev module the bridge used to live on. One
+sketch, one file, per-board pin map chosen by the board define — never edit
+the sketch to switch boards:
 
 ```
-pio run -d handset/bridge_esp32 -t upload      # PC ↔ controller UART2 pipe
+pio run -d handset/bridge_esp32 -e bridge_s3 -t upload --upload-port /dev/ttyACM0
 ```
 
-Wiring is the same as the example handset (bridge GPIO16 ← controller GPIO17,
-GPIO17 → GPIO16, GND common). The bridge also runs this library as a
-passive observer, so its two LEDs are the link's real state. Full recipe,
-including why opening that port cannot reset the controller: `../BENCH.md`,
-"The handset link on the bench".
+On the S3 the PC side is the board's 1a86 UART bridge (`/dev/ttyACM1`) — a
+plain UART, which is what `hw_accept`'s timing is built against — and the
+controller wire stays exactly where the handset had it: bridge GPIO13 ←
+controller GPIO17, bridge GPIO14 → controller GPIO16, GND common. Do not put
+the pipe on `/dev/ttyACM0`: that is native USB-Serial-JTAG, for flashing and
+ROM logs only. Then `--handset /dev/ttyACM1`. Opening that port resets the
+S3 through its auto-reset circuit the same way it did the classic bridge, so
+keep the 1.5 s settle.
+
+The S3 build differs in one visible way: **no status LEDs**. 25/26 do not
+exist on the S3 and the onboard RGB (GPIO48) has no driver in this platform's
+core (2.0.17, no `rgbLedWrite`). So the S3 pipe build prints its boot-time
+uart2 self-test verdict on the PC port instead of blinking it: two boot lines
+only, arriving right after the port opens — which is exactly the window
+`hw_accept`'s settle and flush already exists for. Steady-state pipe output
+would corrupt the stream being graded, then as now. Tap mode is unchanged and
+works on both boards: an observe-only console (`-DBRIDGE_TAP=1`), never to be
+driven by `hw_accept`.
 
 **Silent link?** Pipe mode is silent by design, so don't guess — bisect with
-`tools/port_id.py`: `--loopback <port>` with a jumper on the bridge's own D16 ↔
-D17 answers "is the bridge itself working?" with the controller completely out
-of the picture, and the tap build prints a boot-time UART2 self-test verdict.
+`tools/port_id.py`: `--loopback <port>` with a jumper on the bridge's own link
+pins (classic: D16 ↔ D17; S3: D13 ↔ D14) answers "is the bridge itself
+working?" with the controller completely out of the picture. The tap build
+also prints the uart2 verdict in words.
 The firmware always streams `T,` (first pump, then every 500 ms, no handshake),
 so a missing downlink is a wiring question: controller end must be **GPIO17**,
 not the silkscreen `TX` pin.

@@ -36,7 +36,8 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 from hw_accept import grade_dive_file, split_dive_rows  # noqa: E402
 
 _ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
-PORT = _ARGS[0] if _ARGS else "/dev/ttyUSB1"
+# Default is the S3 bench bridge (2026-11-28); the classic bridge answered ttyUSB1.
+PORT = _ARGS[0] if _ARGS else "/dev/ttyACM1"
 BAUD = 115200
 RUN_S = 70.0          # two 30 s grid rows, plus the one written at dive start
 # The pre-dive battery floor, derived from VBAT_CELLS in include/config/defaults.h

@@ -12,11 +12,14 @@ NEVER run this while tools/soak_logger.py is running: a second reader on
 
 Usage (after the soak ends and the new build is flashed):
   /home/wernervg/.local/share/pipx/venvs/platformio/bin/python \
-      tools/hw_accept.py --expect-web --handset /dev/ttyUSB1
+      tools/hw_accept.py --expect-web --handset /dev/ttyACM1
 
   --boot-port PORT   USB-CDC console (default /dev/ttyUSB0)
   --handset PORT     USB-UART adapter (or a second ESP32 running
-                     handset/bridge_esp32) wired to UART2 16/17. Omit to skip
+                     handset/bridge_esp32: on the classic board that port was
+                     /dev/ttyUSB1, on the S3 bench it is /dev/ttyACM1 — the
+                     board's UART bridge side, never the ACM0 native-USB side)
+                     wired to the controller's UART2 17/16. Omit to skip
                      the protocol checks — boot checks still run.
   --handset-settle S seconds to wait after opening the handset port: that open
                      resets the board behind it (1.5 is enough for an ESP32

@@ -52,7 +52,7 @@ WebSocket to --host, and only ever SCANs the air (read-only) to confirm the AP i
 broadcasting. If the station is not joined, the checks that need it report
 themselves as not evaluated rather than failing the firmware for it.
 
-    tools/web_probe.py [--host 192.168.4.1] [--handset /dev/ttyUSB1]
+    tools/web_probe.py [--host 192.168.4.1] [--handset /dev/ttyACM1]
                        [--dive-cycle] [--no-dns] [--selftest]
 
 Exit 0 = every claim held. 1 = one did not. --handset is optional; without it the

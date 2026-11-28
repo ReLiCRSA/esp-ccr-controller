@@ -19,14 +19,16 @@ reboots" from a log that begins with one.
 ## C2 — flash + acceptance (run first, every flash)
 
 ```
-fuser /dev/ttyUSB0 /dev/ttyUSB1   # must be empty; a reader here corrupts the run
+fuser /dev/ttyUSB0 /dev/ttyACM1 # must be empty; a reader here corrupts the run
 pio test -e native            # host gate, currently 448 cases
 pio test -e native -e native_o2   # both levels: 896 cases. The -O2 env is the
                                  # optimizer gate (platformio.ini's comment carries
                                  # what it has and has not been shown to catch)
 tools/port_id.py --listen 4   # name the ports before trusting any of the below:
-                                 # two identical CP2102s swap under the USB stack, and a
-                                 # swapped pair makes every check below lie (see C2-g)
+                                 # the two identical CP2102s used to swap under the USB
+                                 # stack, and a swapped pair makes every check below lie
+                                 # (see C2-g); the S3 bridge now adds two more ports,
+                                 # one of which (ACM0, native USB-JTAG) is NOT a console
 tools/float_audit.py          # no float printf in src/ except marked boot-only sites.
                                  # `-t upload` runs it by itself since 2026-11-28
                                  # (tools/upload_gate.py, wired as extra_scripts on
@@ -45,15 +47,15 @@ pio run -e esp32 -t upload --upload-port /dev/ttyUSB0   # explicit or never: two
                                  # controller-flashed spare's console as the handset
                                  # port). tools/port_id.py settles which is which.
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
-                                 --handset /dev/ttyUSB1 \
+                                 --handset /dev/ttyACM1 \
                                  --cal-air --predive --dive-persist    # 170 checks
-tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyACM1 \
                                  --cal-air --dive-persist    # 158 PASS, 0 failures
                                  # 2026-11-27 (batch E, no --predive: the pack is
                                  # unplugged so its BATTERY step refuses, and no
                                  # --expect-depth: no squeeze operator at the bench)
 tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join/stall-budget/NVS-migration/reply-window graders, no board: 177 cases (re-counted 2026-11-28: batch E's `vrail=`/`railstate=` legs and the soak_logger regex join, the stall-budget join that reads `TASK_STALL_CONTROL_MS` out of `defaults.h`, the NVS refusal-vs-live-value leg, and the reply-window rule — a multi-line answer is drained by `family:` and the next command's line is pushed back, not re-read — plus the replay guard, which exits instead of opening a port when `--replay` names a file it cannot read
-tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 78 checks
+tools/.../python tools/web_probe.py --handset /dev/ttyACM1 --dive-cycle  # 78 checks
 tools/.../python tools/web_probe.py --selftest  # dive-identity + scrub + page graders, no board: 37 cases
 tools/.../python tools/soak_logger.py --selftest  # the soak's HB counting — per-railstate counters and the straddled-reflash behaviour — no port opened, safe beside a live bench: 5 fixtures
 ```
@@ -542,7 +544,7 @@ look", which is not a check anyone can run twice and compare.
 
 ```
 tools/.../python tools/web_probe.py --host 192.168.4.1 \
-    --handset /dev/ttyUSB1 --dive-cycle
+    --handset /dev/ttyACM1 --dive-cycle
 ```
 
 It needs a station already joined to the controller's AP (SSID `ESP-CCR-XXXX`,
@@ -589,9 +591,13 @@ firmware faults — worth re-reading before adding a check:
 
 ### The handset link on the bench (no USB-UART adapter in the drawer)
 
-A second **classic ESP32 dev module is a USB-UART adapter** — its USB socket is
-a CP210x/CH340 whose data lines are the module's GPIO3/GPIO1. Two ways to use
-it; both land on `/dev/ttyUSB1` at 115200 8N1 for `--handset`.
+A second ESP32 **is a USB-UART adapter**: on a classic dev module the USB
+socket is a CP210x/CH340 whose data lines are the module's GPIO3/GPIO1; the
+ESP32-S3 devkit carries its own 1a86 UART bridge on GPIO43/44. Two ways to use
+one; name the port with `tools/port_id.py` after any re-plug — the classic
+bridge answered `/dev/ttyUSB1` until 2026-11-28, the S3 bridge answers
+`/dev/ttyACM1` (never `/dev/ttyACM0`: that is the native USB-Serial-JTAG,
+flash and ROM logs only). Both at 115200 8N1 for `--handset`.
 
 **A. Dead-module bridge (no firmware, no code).** Jumper the spare module's
 **EN to GND** so the ESP32 never runs and only its bridge chip lives:
@@ -609,7 +615,9 @@ controller junk it dutifully answers `ERR unknown command` about. Remove the
 jumper to flash that board again.
 
 **Bridge firmware (option B) has a side effect every harness must handle.**
-Opening `/dev/ttyUSB1` resets the spare ESP32, and the boot banner it prints goes
+Opening the bridge port (`/dev/ttyACM1` on the S3; `/dev/ttyUSB1` when the
+bridge was the spare classic ESP32) resets the bridge, and the boot banner it
+prints goes
 out its TX straight into the controller's RX. Those bytes have no line terminator
 of their own, and the controller **keeps un-terminated bytes in its line buffer
 and parses them together with the next line**: verified on the bench 2026-11-23
@@ -642,27 +650,34 @@ only means something if it can fail — flashing the pre-fix semantics made the
 bench reproduce the 2026 observation exactly (`ERR unknown command` from the
 line's own tail, then `OK SAFETY` and `SP2=0.310` written in the muted window).
 
-**B. Bridge firmware (`handset/bridge_esp32`, recommended).** The spare board
-runs a byte-for-byte pipe PC↔controller and *observes* the stream with the
-handset client library:
+**B. Bridge firmware (`handset/bridge_esp32`, recommended).** The board runs a
+byte-for-byte pipe PC↔controller and *observes* the stream with the handset
+client library. Per-board env — the pin map is in the sketch, chosen by the
+board define; never edit it by hand:
 
 ```
-pio run -d handset/bridge_esp32 -t upload
+pio run -d handset/bridge_esp32 -t upload                              # classic
+pio run -d handset/bridge_esp32 -e bridge_s3 -t upload --upload-port /dev/ttyACM0   # S3
 ```
 
 ```
-bridge GPIO16 (U2RXD) ← controller GPIO17   (controller TX)
-bridge GPIO17 (U2TXD) → controller GPIO16   (controller RX)
-bridge GND ───────────── controller GND     (power the bridge from its own USB)
-bridge GPIO25 → LED link up        bridge GPIO26 → LED traffic
+classic: bridge GPIO16 (U2RXD) ← controller GPIO17    bridge GPIO17 (U2TXD) → controller GPIO16
+S3:      bridge GPIO13 (U2RX)  ← controller GPIO17    bridge GPIO14 (U2TX) → controller GPIO16
+GND ─────────────────────────── controller GND        (power the bridge from its own USB)
+classic only: bridge GPIO25 → LED link up             bridge GPIO26 → LED traffic
 ```
 
-No pin contention, because the PC side stays on the module's own UART0
-(GPIO3/GPIO1) and the controller sits on UART2 — the bridge's ROM boot log goes
-to the PC, never into the controller. The traffic LED blinks at the `T,` rate
-and the link LED is the **library's** verdict (3 s silence = down), so link
-health is visible at a glance without touching the data stream. Build it as a
-tap instead with
+The S3 pair is not a new wiring job: those are the holes the handset image
+already uses, and that pairing is witnessed metal (link self-test, 1154 B in
+1.5 s). No pin contention on either board: the PC side is the board's own
+UART0 and the controller sits on UART2 — the bridge's ROM boot log goes to
+the PC, never into the controller. On the classic board the traffic LED
+blinks at the `T,` rate and the link LED is the **library's** verdict (3 s
+silence = down), so link health is visible at a glance without touching the
+data stream. The S3 has no such LEDs (25/26 do not exist, and the onboard RGB
+on 48 has no driver in this platform's core 2.0.17), so its pipe build prints
+the uart2 self-test verdict **at boot only** — the boot window every harness
+already settles and flushes. Build it as a tap instead with
 
 ```
 PLATFORMIO_BUILD_FLAGS="-DBRIDGE_TAP=1" pio run -d handset/bridge_esp32 -t upload
@@ -1006,7 +1021,7 @@ point of the change.
 The full verdict leg costs about two minutes and is opt-in:
 
 ```
-tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 --cal-air
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyACM1 --cal-air
 ```
 
 It does not guess the 120 s warm-up clock: it asks inside the gate, reads
@@ -1041,7 +1056,7 @@ spec §5.1 and §8 state the cost rather than hiding it). So the bench has to ch
 the flash, not just the wire.
 
 ```
-tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 --cal-air --predive
+tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyACM1 --cal-air --predive
 ```
 
 `--cal-air` ends by reading `/surface.csv` back and requiring that the newest
@@ -1179,11 +1194,12 @@ a deaf one. Three tests, cheapest first, each answering a different question:
 
 ```
 tools/port_id.py --listen 8                  # what is each port, really?
-tools/port_id.py --loopback /dev/ttyUSB1     # bridge's own UART2, controller out of the picture
+tools/port_id.py --loopback /dev/ttyACM1     # S3 bridge's own UART2, controller out of the picture
 ```
 
-`--loopback` needs one jumper: **D16 ↔ D17 on the bridge board itself** (pins
-labelled D16/D17, never TX0/RX0 — those are GPIO1/GPIO3, the console path).
+`--loopback` needs one jumper: **the bridge's own link pins — D16 ↔ D17 on a
+classic board, D13 ↔ D14 on the S3** (the labelled pins, never TX0/RX0 —
+those are the console path).
 Pipe mode hands back byte-for-byte what the PC sends, so an echo proves the PC
 path, the sketch and the board's UART2 are fine and the fault is in the two
 signal wires or the controller end. Remove the jumper afterwards: left in, the

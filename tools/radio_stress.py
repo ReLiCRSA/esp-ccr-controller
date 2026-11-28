@@ -76,7 +76,7 @@ OFF_RE = re.compile(r"^web: radio off")
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--console", default="/dev/ttyUSB0")
-    ap.add_argument("--handset", default="/dev/ttyUSB1")
+    ap.add_argument("--handset", default="/dev/ttyACM1")  # S3 bench bridge; classic was ttyUSB1
     ap.add_argument("--log", default=None,
                     help="write the console capture here (timestamped). Debugging "
                          "a deferred action without a saved timeline costs time.")

@@ -43,7 +43,7 @@ both blind.
 
 Usage:
   python3 tools/port_id.py [--listen SECS] [--ports /dev/ttyUSB0 ...]
-  python3 tools/port_id.py --loopback /dev/ttyUSB1 [--repeat 5]
+  python3 tools/port_id.py --loopback /dev/ttyACM1 [--repeat 5]   # S3 bridge; classic ttyUSB1
 """
 import argparse
 import glob

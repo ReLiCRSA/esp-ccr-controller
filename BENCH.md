@@ -48,13 +48,40 @@ pio run -e esp32 -t upload --upload-port /dev/ttyUSB0   # explicit or never: two
                                  # port). tools/port_id.py settles which is which.
 tools/.../python tools/hw_accept.py --expect-web --expect-depth \
                                  --handset /dev/ttyACM1 \
-                                 --cal-air --predive --dive-persist    # 170 checks
+                                 --cal-air --predive --dive-persist    # 181 checks, 0 failures
+                                 # 2026-11-28 (first full battery over the S3
+                                 # bridge, logs/accept_20261128_185837_*: NVS
+                                 # migration leg and --predive driven for real,
+                                 # the pack plugged in so the BATTERY step runs.
+                                 # Two defects fell out of driving it: the
+                                 # ReplyWindow family drain livelocked on the
+                                 # 2 Hz stream (fixed + flood fixture), and
+                                 # M,'s pulses total charged the dive with the
+                                 # pre-dive test's pulses (base at the dive
+                                 # edge). Both reddened on hardware first.)
+                                 # One bench-prep fact the 11/27 green had been
+                                 # hiding: the HTTP legs (GET /surface.csv) need
+                                 # this PC joined to the AP — `nmcli device wifi
+                                 # connect ESP-CCR-<MAC tail>`, passphrase from
+                                 # `GET AP_PASS`. Unjoined, they time out and
+                                 # the battery reddens for the network, not the
+                                 # firmware.
+tools/.../python tools/hw_accept.py --expect-web --expect-depth \
+                                  --handset /dev/ttyACM1       # 118 checks, 0 failures
+                                  # 2026-11-28 (the short pass: matrix + web + depth
+                                  # + framing, without the ~5 min of cal-air/predive
+                                  # waiting. Run this after a flash or a bench seed to
+                                  # prove the board is sane. It is also the NVS-
+                                  # migration leg's clean baseline: the same call with
+                                  # a refusal on the boot answers 123, and that
+                                  # 5-check difference IS the join — seed recipe in the
+                                  # battery item of the checklist below.)
 tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyACM1 \
                                  --cal-air --dive-persist    # 158 PASS, 0 failures
                                  # 2026-11-27 (batch E, no --predive: the pack is
                                  # unplugged so its BATTERY step refuses, and no
                                  # --expect-depth: no squeeze operator at the bench)
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join/stall-budget/NVS-migration/reply-window graders, no board: 177 cases (re-counted 2026-11-28: batch E's `vrail=`/`railstate=` legs and the soak_logger regex join, the stall-budget join that reads `TASK_STALL_CONTROL_MS` out of `defaults.h`, the NVS refusal-vs-live-value leg, and the reply-window rule — a multi-line answer is drained by `family:` and the next command's line is pushed back, not re-read — plus the replay guard, which exits instead of opening a port when `--replay` names a file it cannot read
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join/stall-budget/NVS-migration/reply-window graders, no board: 179 cases (re-counted 2026-11-28: batch E's `vrail=`/`railstate=` legs and the soak_logger regex join, the stall-budget join that reads `TASK_STALL_CONTROL_MS` out of `defaults.h`, the NVS refusal-vs-live-value leg, and the reply-window rule — a multi-line answer is drained by `family:` and the next command's line is pushed back, not re-read, now bounded twice (deadline + 10-line skip budget) because the first live S3-bridge run proved a bench never offers the silence gap that was the drain's only exit — plus the replay guard, which exits instead of opening a port when `--replay` names a file it cannot read
 tools/.../python tools/web_probe.py --handset /dev/ttyACM1 --dive-cycle  # 78 checks
 tools/.../python tools/web_probe.py --selftest  # dive-identity + scrub + page graders, no board: 37 cases
 tools/.../python tools/soak_logger.py --selftest  # the soak's HB counting — per-railstate counters and the straddled-reflash behaviour — no port opened, safe beside a live bench: 5 fixtures
@@ -1925,8 +1952,17 @@ now keeps.
       the battery verdict changed: before the change the same bench printed
       `vbat=4.92 batlow=1`; after it, `vbat=3.62…3.65 batlow=0 al=0x0000`, with
       the handset readout showing `batt 3.64 V` and no battery marker. The
-      refused 10.5 is **not** written back, so that line repeats every boot
-      until a `SET VBAT_MIN` replaces it. That repetition is now a graded leg and
+      refused 10.5 is **not** written back by the refusal path — `nvs_store.cpp`
+      `load()` only drops it from the registry — and that is not the same thing as
+      "the line repeats every boot until a `SET VBAT_MIN` replaces it", which the
+      bench disproved on 2026-11-28: `Store::save` rewrites **every** key from the
+      in-force registry, so the first settings write of **any** key buries the
+      stale string. The seed run below showed it end to end — boot read
+      `settings: 35 keys from NVS` beside the refusal, the matrix's own
+      `SET SP2`/`SET GF_LOW` saved the registry, and the next boot read
+      `settings: 36 keys from NVS` with no refusal, with `GET VBAT_MIN` answering
+      `3.400` before anyone had written that key by name. That repetition is now a
+      graded leg and
       not an observation: the matrix reads the key back (`GET VBAT_MIN`) and joins
       three answers taken seconds apart — the boot's refusal, the key's band and
       default from the board's own `GET SCHEMA`, and the live value — so "the
@@ -1936,9 +1972,22 @@ now keeps.
       loses the tail that says what runs instead, and — the direction the boot
       line alone could never show — if an out-of-band value is live with **no**
       refusal printed at all. Eight host fixtures cover exactly those cases
-      (`hw_accept.py --selftest`), each proven able to fail. The metal half is
-      owed: this leg has never been driven, and it wants the handset bridge back
-      on ttyUSB1.
+      (`hw_accept.py --selftest`), each proven able to fail. **The metal half is
+      driven, 2026-11-28**, over the S3 bridge at `/dev/ttyACM1`, seeded on purpose
+      because this bench's NVS is clean: `SET VBAT_MIN=4.400` (legal inside the
+      real 2.80…4.50 band), rebuild with `VBAT_CELL_RANGE_MAX_V` temporarily at
+      `4.30f` — a bench seed, reverted the same day and never committed — flash,
+      and the boot refuses the stored value. The join then runs on real numbers:
+      the phase prints **seven** checks and **five of them exist only because a
+      refusal did** — the same matrix on a clean NVS, run the same evening after the
+      seed was gone, is **118 checks** (`logs/accept_20261128_after_seed_clean_118p_0f.log`),
+      and 123 − 118 = 5. The five: the key present in `GET SCHEMA`,
+      `the refused value 4.400 is NOT live`, `the live value sits inside the band
+      the board publishes`, `the live value is the published default`, and the
+      finding row itself — **123 checks, 0 failures**
+      (`logs/accept_20261128_nvs_migration_seed_123p_0f.log`). What stays host-only
+      is the red direction — refused *and still running* — because that is a
+      firmware mutation, not a bench state; the eight fixtures are its witness.
       **A series pack is not free:** the pack voltage alone cannot see one dead
       cell (6.80 V is 4.00 + 2.80, and a voltage-only gate passes it), so 2S needs
       the midpoint divider to `PIN_VBAT_MID_SENSE` (GPIO36, ADC1, input-only) and

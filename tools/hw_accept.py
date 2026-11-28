@@ -2100,7 +2100,11 @@ def grade_nvs_migration(boot_lines, schema_rows, readback):
         first = next(l for l in boot_lines if NVS_REFUSAL_RE.match(l.strip()))
         checks.append((f"NVS holds a value the current band rejects — {first} — run "
                        "`SET <KEY>` to replace it: the refusal repeats every boot "
-                       "until then", True,
+                       "until the stale string is written back — and one settings "
+                       "save rewrites EVERY key from the in-force registry, so a "
+                       "write to any other key clears it without touching this one "
+                       "(bench-seeded 2026-11-28: 35 keys + refusal, then 36 keys "
+                       "and no refusal, with no `SET` to that key)", True,
                        "a bench condition, recorded as a finding, not a firmware fault"))
     return checks
 

@@ -397,6 +397,41 @@ cheaper bench-only answer: meter it under a pulse and record the margin in BENCH
 list. What is not acceptable is leaving `vbat` healthy standing in for "the valve has
 power", which is what the current docs implicitly do by never mentioning the gap.
 
+**Status 2026-11-28 — the decision half is done; the metal half is not.** The builder
+answered the architecture questions (protected 18650; pack → its own 5 V regulator feeds
+the board, the boost feeds only the coil; boost module marked "TEAYUEW mini boost module
+0260508", chip unidentified; valve Heschen 2V025-08 = AirTAC 2V family, DC12 coil) and
+PLAN.md §1 "Power architecture" is the written form, with the coil resistance and the
+minimum working differential pressure recorded as **explicit unknowns** rather than
+estimates. The chosen direction was the first option above, mirrored on `vbat`:
+
+- `PIN_VRAIL_SENSE` 39 (the last free ADC1 input), divider 100k/10k — the pack's ratio —
+  gated by `VRAIL_SENSE` in `defaults.h`, **0 until the divider is fitted**;
+- band from ONE rated number (`VRAIL_NOMINAL_V` + the family's ±15% permitted variation):
+  floor, plausibility ceiling, the pre-dive question and the alarm all derive from it, and
+  a host test pins the derivation the same way the chemistry block's does;
+- the verdict is inside the pre-dive BATTERY step as a fourth question — the `PRE,` line's
+  passed bit is read by field position (`handset/handset_link.h` `parsePre`), so a sixth
+  step could not be appended after it — with a settle deadline in the shape the DEPTH
+  grace already uses, and `railWhy()`/`railWaiting()` saying on the console what the wire
+  cannot;
+- `BIT_BATTERY` for the fault (one marker; "do not trust this power" is one action, and
+  the console names which rail), HB `vrail=`/`railstate=` appended after `cfggen=`;
+- LOW is debounced by *sweeps*, not ADC reads or control cycles — a 300 ms pulse lands on
+  about one 1 Hz sweep in seven, and a nuisance battery alarm teaches a diver to ignore
+  the one marker that means the power is untrustworthy;
+- the not-sensed build is loud: boot line, `rail:` console edge, HB `vrail=0.00
+  railstate=3`, and a host test pins each sentence so the absence is never re-read as a
+  pass. The `hw_accept.py` batch-E legs grade shape and the coherence rule ("not sensed"
+  must not report a voltage) but **not** the value.
+
+What remains for P9 is metal, and it is written as BENCH.md C3-c legs: fit the divider,
+meter the rail at the coil (standing and under a pulse), measure the 2V025-08 coil's DC
+resistance, and settle whether it opens at ambient differential pressure at all. The
+±15% band is a documented rating used as a placeholder verdict until that measurement
+replaces it, and `T,`/dive-file publication of the rail stays deferred until the rail is
+metered — publishing an unmetered number is how `vbat` became P1.
+
 
 ---
 
@@ -434,7 +469,7 @@ column: **§A … §E are the five round sections in §3**, and §D1 means Round
 | this bench, 2026-11-27 | `vbat=34.71` on a 5 V feed, and no bound anywhere to notice | **firmware half closed (2026-11-27); the metering half open, §1 P1** | `VBAT_IMPLAUSIBLE_V` + `Battery::implausible()` raise `BIT_BATTERY`, refuse the pre-dive BATTERY step and print which fault it is; `tools/pulse_witness.py` refuses above the ceiling too (7 captures, `--selftest`). What is NOT closed: no acceptance leg compares `vbat=` to a meter, and `VBAT_CAL` has never been trimmed | new |
 | the pack chemistry was frozen into six places, and one of them was wrong | a 12 V-style `VBAT_MIN` 10.5 V sat in `defaults.h` while the rig ran a single 3.7 V cell: it refused the pre-dive BATTERY step permanently (HB `vbat=4.92 batlow=1` on a charged pack), so `AUTO` could never unlock, and the same 10.5 was copied into `predive.h`, `alarms.h`, the settings default/range, the test fixtures and `pulse_witness.py` | **closed** (2026-11-27) | one number — `VBAT_CELLS` in `include/config/defaults.h` — derives the floor, the ceiling, the settings band and the sim rail; witnesses: `VBAT_CELLS` 1 → 2 reddens only the published-band legs, and with `docs/HANDSET_PROTOCOL.md` §6's one row updated gives 448/448 native, 896/896 both levels and a clean `env:esp32` link; a new settings-table join (`test_the_published_settings_table_matches_the_registry_it_documents`) now grades all 36 keys of §6 against the registry in both directions, and the tightened band is what clears the stale 10.5 out of NVS on load without a schema bump | new |
 | a series pack would have been judged by one number | 6.80 V is compatible with 4.00 + 2.80 — one dead cell behind a passing voltage gate — and nothing in the tree could see the difference | **closed as far as the bench allows** (2026-11-27) | `PIN_VBAT_MID_SENSE` (GPIO36) plus the pre-dive agreement step (`VBAT_CELL_SPREAD_MAX_V`), which refuses an unwired midpoint rather than passing it; the wiring itself is a C3-c leg with nothing attached yet | new |
-| the rail the solenoid actually runs on is sensed by nothing | `vbat` is the 3.7 V pack; the valve runs at ~12 V off a boost stage nothing measures, so "battery healthy" was standing in for "the coil has voltage" — and no document mentioned the boost converter at all | **open, §1 P9** | documented as an open item with the metering leg in BENCH.md C3-c; the architecture (module, input range, what feeds 3V3/5V, coil resistance) is still unwritten, which is what makes every runtime number uncomputable | new |
+| the rail the solenoid actually runs on is sensed by nothing | `vbat` is the 3.7 V pack; the valve runs at ~12 V off a boost stage nothing measures, so "battery healthy" was standing in for "the coil has voltage" — and no document mentioned the boost converter at all | **decision done, metal open, §1 P9** | architecture written (PLAN.md §1 "Power architecture", with coil resistance and minimum working differential pressure as named unknowns); the sense path is implemented — GPIO39, band derived from the coil's rated 12 V ±15%, fourth question inside the pre-dive BATTERY step, `BIT_BATTERY`, HB `vrail=/railstate=` — and compiled behind `VRAIL_SENSE=0` until the divider is fitted, loudly announced while off. Fitting + metering legs are BENCH.md C3-c | new |
 
 
 ---
@@ -1949,7 +1984,7 @@ who has to catch the next one.
 | "the warm-up extraction was implemented but did not survive concurrent edits" (Round A residual 4) | the code **was** on disk, and its arithmetic wrapped: a signed `120000 - millis()` turns positive past ~24.9 days, so the gate refused calibration forever and printed an unrelated countdown. Wrong once in the review's framing, wrong twice in the fix | Round E item 4 |
 | "nothing tests that the doc table and the JS array agree" (Round A residual 5, repeated verbatim into Round E's open list) | false when Round E wrote it: Round D had landed `test/test_flaglabels`, which parses `comms/flags.h`, `FLAGNAMES` in `src/comms/web_page.h`, the flashed `data/index.html` **and** §4's table in `docs/HANDSET_PROTOCOL.md`, asserting §4 publishes exactly bits 0..7 in order with each pill's keyword. Batch D's mutation table shows shortening §4's bit-3 row reddens it | Round E item 1's follow-up; commit `b9922fd` |
 | "the fences are compiler-level guarantees, unobservable natively; only an ARM compiler at `-O2` could show the difference" (Round A residual 3) | the honest version is narrower and worse: an `env:native_o2` gate on **x86-64** shows **874/874 green with both fences commented out**, at `-O0` and `-O2`. So this host cannot witness them at all; on the target each fence is one `memw` | Round E item 5, `tools/fence_probe.cpp` |
-| "`vbat` is a pack voltage; `batlow=0` means the pack is above `vbatMin`" (implicit in the alarms, predive and the dive snapshot) | the bench drove the sense pad to its clamp and `vbat=34.71` **cleared the dive-blocking battery step on a 5 V feed**. No upper bound or validity check existed anywhere in `src/ include/ test/` at the time it was measured | §1 P1 — the bound exists now (`VBAT_IMPLAUSIBLE_V`, `Battery::implausible()`); the claim is still not safe as a *measurement* until the divider is metered, and `vbat` still says nothing about the 12 V rail (§1 P9) |
+| "`vbat` is a pack voltage; `batlow=0` means the pack is above `vbatMin`" (implicit in the alarms, predive and the dive snapshot) | the bench drove the sense pad to its clamp and `vbat=34.71` **cleared the dive-blocking battery step on a 5 V feed**. No upper bound or validity check existed anywhere in `src/ include/ test/` at the time it was measured | §1 P1 — the bound exists now (`VBAT_IMPLAUSIBLE_V`, `Battery::implausible()`); the claim is still not safe as a *measurement* until the divider is metered, and `vbat` still says nothing about the 12 V rail — that rail now has its own sense input and verdict, compiled off until fitted (§1 P9) |
 | six citations **this file itself** carried when the five documents were merged — `esp_task_wdt_reconfigure()`, `eventInstant`/`commitEvents`/`abortEvents`, `test_cfgparity`, `__atomic_thread_fence`, "all four fences deleted", and `CONFIG_ESP_TASK_WDT_TIMEOUT_MS=3000` — plus two numbers, "every measured `worst=` sits at 4–9 ms" and "CPU0 idle monitored" (2026-11-27, the audit run after the merge) | none of those identifiers exist in this tree: the real call is `esp_task_wdt_init(3, true)`, the staging pair is `beginTx()`/`commitTx()`, the fences are `std::atomic_thread_fence` and `src/deco/view.h` has **two**, and the parity anchors are in `test_configbox` and `test_settings`. "4–9 ms" described only the storm runs: the repo's 639 `worst=` samples peak at **505 ms**. And "CPU0 idle monitored" repeated, in the very section about verifying claims, the exact premise Round D had disproved. All corrected in place. The finding for the reader: a citation copied out of a summary is not a citation — **grep the identifier before you put it in a sentence** | §1 and §2 as they now stand |
 | a dive-file grader that printed **PASS** while the file contained `M,` total 0, and a pulse witness that would have reported a PASS on a dive that injected nothing | both now say so: `tools/hw_accept.py` prints a vacuity note when the total is 0, and `tools/pulse_witness.py` exits **2** rather than print a vacuous PASS. A check that cannot witness anything must say so | Round E item 2's follow-up |
 | "`tools/float_audit.py` is in the gate" (BENCH.md's gate list, where it has been since the float bug came back the first time) | the list was true and the practice was not: the battery build was flashed on 2026-11-28 carrying `floor %.2f V, ceiling %.2f V` in a **SensorTask** `printf` — a violation of the rule, produced while the rule was open in the same session. The audit was run *after* the flash, when it found the violation; nothing had stopped the flash. `vbat=34.71` on this very bench is the reason that task's stack matters. What closed it is a hook, not a reminder: `tools/upload_gate.py` runs the audit as a pre-action on the upload target, witnessed reddening a planted `%.2f` with **no `Wrote` line** while the same tree still built | C2, "And the flash does it for you" |

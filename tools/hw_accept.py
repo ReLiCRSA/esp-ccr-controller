@@ -370,6 +370,18 @@ HB_WORST_CYCLE_MS = 800
 # instead of a reasoning exercise.
 HB_CFGGEN_RE = re.compile(r"cfggen=(\d+)/(\d+)")
 
+# Batch E (docs/REVIEW.md 1 P9): the coil rail, appended after cfggen= under the
+# same append-only rule. `vrail` is the divider-scaled rail volts and `railstate`
+# the firmware's verdict: 0 sensed/in-band, 1 low for VRAIL_LOW_SAMPLES sweeps,
+# 2 implausible, 3 NOT SENSED (VRAIL_SENSE=0 on today's bench, or an input that
+# has never produced a reading). What this leg deliberately does NOT grade is
+# whether the rail is IN BAND: those numbers are unmetered until the BENCH.md
+# C3-c legs put a meter on the divider, and grading a calibration that does not
+# exist yet is how vbat became P1. Shape and coherence are gradeable now, and
+# the coherence rule is the one that keeps `railstate=3` honest: an input that
+# says "there is no reading" must not also report a voltage.
+HB_RAIL_RE = re.compile(r"vrail=([\d.]+) railstate=(\d)")
+
 # The stall -> expiry interval measured on the controller 2026-11-27 with
 # env:esp32_twdtmeasure / env:esp32_twdtmask (BENCH.md): 3061 and 3011 ms with
 # only SensorTask subscribed, 3059 and 3019 ms with all four tasks subscribed.
@@ -2170,6 +2182,28 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
                        behind <= 1, "a control cycle stopped reading the applied rules: "
                                     "the supervisor reboot for a stalled cycle, visible here "
                                     "one beat earlier"))
+
+    # Batch E: the coil rail (see HB_RAIL_RE for why the VALUE is not graded).
+    rail = []
+    for l in list(lines) + list(boot_lines or []):
+        m = HB_RAIL_RE.search(l)
+        if m:
+            rail.append((float(m.group(1)), int(m.group(2))))
+    if not rail:
+        checks.append(("HB reports the coil rail (vrail=)", False,
+                       "no vrail= in any HB line: the 12 V the valve actually runs "
+                       "on is again invisible on the bench"))
+    else:
+        worst_rs = max(rs for _, rs in rail)
+        checks.append((f"railstate= within the published 0-3 (worst {worst_rs})",
+                       worst_rs <= 3,
+                       "railstate outside 0-3: HB is reporting a verdict this "
+                       "firmware cannot produce"))
+        liars = [v for v, rs in rail if rs == 3 and v > 0.004]
+        checks.append((f"not-sensed rail reports no voltage ({len(liars)} lying lines)",
+                       not liars,
+                       "railstate=3 says 'there is no reading' while vrail= carries "
+                       "a number: the two halves of one field contradict each other"))
     return checks
 
 
@@ -2186,17 +2220,20 @@ def selftest_control_margin():
     (one field edited out mid-format, the append-only rule broken in
     silence). Each must redden the check named for it.
     """
-    def hb(worst, lskip, sskip, cont=0, tail="stk=1408 u2stk=1536", cfggen="cfggen=4/4"):
+    def hb(worst, lskip, sskip, cont=0, tail="stk=1408 u2stk=1536", cfggen="cfggen=4/4",
+           rail="vrail=0.00 railstate=3"):
         return (f"HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
                 f"rec=0 vbat=12.40 stale=0 batlow=0 vote=1.320 sp=1.30 "
                 f"al=0x0000 mode=0 pulses=4 sol=0 ctrl=1 {tail}"
                 + (f" worst={worst} logskip={lskip} surfskip={sskip} contskip={cont}"
                    if worst is not None else "")
-                + (f" {cfggen}" if cfggen else ""))
+                + (f" {cfggen}" if cfggen else "")
+                + (f" {rail}" if rail else ""))
 
     def new_leg(checks):
         keep = ("worst=", "logskip=", "surfskip=", "contskip=", "cfggen=",
-                "(worst=)", "(logskip=)", "(surfskip=)", "(contskip=)")
+                "(worst=)", "(logskip=)", "(surfskip=)", "(contskip=)",
+                "vrail=", "railstate=", "not-sensed")
         return [c for c in checks if any(s in c[0] for s in keep)]
 
     cases = [
@@ -2239,17 +2276,28 @@ def selftest_control_margin():
          [hb(45, 0, 0), hb(50, 0, 0, cfggen="cfggen=7/5")], "cfggen= chain at most one"),
         ("the chain ahead of published: it claims a generation nobody published",
          [hb(45, 0, 0, cfggen="cfggen=4/9")], "cfggen= chain never ahead"),
+        # Batch E: the coil rail. Default fixture is today's flashed truth —
+        # vrail=0.00 railstate=3, the review item (1 P9) as a number.
+        ("pre-batch-E firmware: no vrail=, the coil rail is invisible again",
+         [hb(45, 0, 0, rail=None)], "(vrail=)"),
+        ("a sensed, in-band rail: the honest post-fit line must pass too",
+         [hb(45, 0, 0, rail="vrail=11.90 railstate=0")], None),
+        ("railstate outside the published range: a verdict the firmware cannot produce",
+         [hb(45, 0, 0, rail="vrail=11.90 railstate=9")], "railstate= within the published"),
+        ("railstate=3 says 'no reading' while vrail= reports 12.10: one field lies",
+         [hb(45, 0, 0, rail="vrail=12.10 railstate=3")], "not-sensed rail reports no voltage"),
     ]
     checks = []
     for name, hb_lines, want in cases:
         got = new_leg(grade_watch(list(hb_lines)))
         failed = [c[0] for c in got if not c[1]]
         if want is None:
-            # An honest capture grades six checks in this leg — the four
-            # thresholds plus the two cfggen= pair rules; the "HB reports ...
-            # (field=)" checks only appear when a field is missing.
-            checks.append((f"control margin: {name}", len(got) == 6 and not failed,
-                           f"expected the six threshold checks, none failed: "
+            # An honest capture grades eight checks in this leg — the four
+            # thresholds, the two cfggen= pair rules and the two rail shape/
+            # coherence rules; the "HB reports ... (field=)" checks only appear
+            # when a field is missing.
+            checks.append((f"control margin: {name}", len(got) == 8 and not failed,
+                           f"expected the eight threshold checks, none failed: "
                            f"{len(got)} seen, {failed}"))
         else:
             checks.append((f"control margin: {name}",

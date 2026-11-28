@@ -96,10 +96,14 @@ Result Manager::update(const Inputs& in) {
     // moving it out of the gate adds no phantom alarm.
     evaluate(BIT_HYPOXIA, in.vote.hypoxiaSuspect, kLevel[BIT_HYPOXIA], res);
 
-    // Below the floor, or too high to be a pack of this chemistry. The second
-    // half is not a different alarm: a sense node on its rail is a pack the
-    // machine cannot vouch for, and the honest word for that is the same one.
-    evaluate(BIT_BATTERY, in.vbat < cfg_.vbatMin || in.vbat > cfg_.vbatMax,
+    // Below the pack floor, above what this chemistry can produce, or the rail the
+    // valve runs on is not there. Three conditions, one marker: the diver's action
+    // is the same ("do not trust this power"), and the console names which one it
+    // is. The third is the one that used to be missing entirely — see
+    // sensors/rail.h and docs/REVIEW.md 1 P9 — and it arrives pre-debounced
+    // because a rail droops when the coil is energised.
+    evaluate(BIT_BATTERY, in.vbat < cfg_.vbatMin || in.vbat > cfg_.vbatMax ||
+                         in.railUntrusted,
              kLevel[BIT_BATTERY], res);
     evaluate(BIT_SP_CLAMP, in.spClamped, kLevel[BIT_SP_CLAMP], res);
     evaluate(BIT_STUCK_OPEN, in.stuckOpen, kLevel[BIT_STUCK_OPEN], res);

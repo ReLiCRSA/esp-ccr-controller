@@ -105,6 +105,91 @@
 
 #define VBAT_SAMPLE_INTERVAL_MS     1000
 
+// --- The coil rail (docs/REVIEW.md 1 P9) --------------------------------------
+// `vbat` is the PACK. The valve does not run on the pack: it runs on a boost
+// stage off the pack, and until this block existed nothing in the machine could
+// see that second rail at all. The one battery number in `T,`, in HB, in the dive
+// file, behind BIT_BATTERY and behind the pre-dive BATTERY step was a verdict
+// about a cell — and a pack reading 3.9 V with a dead boost stage passes every
+// check this firmware has, starts the dive, and injects nothing.
+//
+// The rig as the builder described it on 2026-11-28 (PLAN.md 1 "Power
+// architecture" is the written form; these constants come from that):
+//
+//   pack     one protected 18650 (protection board visible on the bench)
+//   logic    pack -> its OWN 5 V regulator -> the board. Not from the boost, so a
+//            dead boost leaves the controller alive and the coil dead. That is the
+//            whole reason a rail sense is worth adding: the failure is silent in
+//            `vbat` and invisible in `pulses=`, which counts what the firmware
+//            commanded, not what the valve did.
+//   coil     boost module marked "TEAYUEW mini boost module 0260508" (Amazon
+//            generic), ~12 V out, feeding the valve coil only
+//   valve    Heschen 2V025-08, DC 12 V coil = the AirTAC 2V family's `F` voltage
+//            code. Family figures from the catalogue page cited in PLAN.md: direct
+//            acting, normally closed, 2.5 mm orifice, Cv 0.25, working pressure
+//            0-1.0 MPa, activating time <= 0.05 s, permitted coil voltage
+//            variation +/-15%.
+//
+// UNMEASURED, and each one is a BENCH.md C3-c leg rather than a constant to tune:
+// the coil's DC resistance (the page publishes 7.0 VA for the AC110 coil option,
+// which says nothing about the DC12 coil on this bench), the boost module's input
+// range and switch-current limit, its no-load output, and how far the rail sags
+// during a 300 ms pulse. Dive-length margin, boost input current at the pulse and
+// expected sag stay uncomputable until those are written down; that is P9's first
+// step and it has not been done by adding this block.
+//
+// Same discipline as VBAT_CELLS: ONE rated number, everything else derived.
+#define VRAIL_NOMINAL_V                     12.0f   // the coil's rated voltage
+
+// The trusted band. The family's published +/-15% permitted voltage variation is
+// the only bound this coil has, so it is the bound the verdict uses — and that is
+// all it is: a bound taken from the coil's supply tolerance, NOT a measured
+// pull-in voltage for this valve (that measurement is C3-c, and when it exists it
+// replaces this fraction). Below the band the boost is not giving the coil what it
+// is rated for; above it, the coil is outside its rating or the divider has fallen
+// open — an open bottom leg drifts the pin to its rail and reads tens of volts
+// through an 11:1 divider, which is the exact failure `vbat=34.71` was on the pack
+// side (1 P1).
+#define VRAIL_TOLERANCE_PCT                 15.0f
+#define VRAIL_MIN_V                         (VRAIL_NOMINAL_V * (100.0f - VRAIL_TOLERANCE_PCT) * 0.01f)
+#define VRAIL_IMPLAUSIBLE_V                 (VRAIL_NOMINAL_V * (100.0f + VRAIL_TOLERANCE_PCT) * 0.01f)
+
+// Is the rail sensed at all? 0 = no divider fitted on this board yet. This is the
+// same switch shape as VBAT_CELLS guarding the midpoint tap: a check that reads a
+// pin with nothing on it is a check that judges an artifact, and the answer must
+// not be "PASS". With 0 the rail is not judged anywhere in the machine, the boot
+// line says so out loud, HB reports `vrail=0.00` as "not sensed", and a host test
+// pins both of those sentences so nobody later reads the absence of a complaint as
+// evidence the rail was checked. Flip to 1 when the divider goes on GPIO39.
+#define VRAIL_SENSE                         0
+
+// 100k/10k: the same pair, and the same ratio, as the pack sense — so the two
+// numbers arrive with the same scale error and the same ~9.1k Thevenin, and one
+// metering procedure covers both. 12 V at 11:1 is 1.09 V at the pin, against the
+// ~3.1 V usable top of the default 11 dB attenuation: a 12 V rail occupies the
+// middle of the range instead of its edge, which is where a sense node that has
+// fallen open can still be told apart from a rail that has really over-volted.
+#define VRAIL_DIVIDER_RATIO                 11.0f   // (100k+10k)/10k
+#define VRAIL_CAL                           1.00f   // trim with the pack divider, on the meter
+
+// The rail moves when the valve moves; the pack does not. SensorTask sweeps the
+// ADC once a second in an 8-sample burst, and a 300 ms pulse under a <=5% duty
+// limit will be caught by roughly one burst in seven, so a LOW rail has to be seen
+// repeatedly before it is an alarm — one sag-shaped sample becomes a mid-dive
+// nuisance alarm, and a nuisance alarm on the battery marker is how a diver
+// learns to ignore the one bit that means "do not trust this power". The HIGH
+// (implausible) side has no debounce: an open divider is steady, and a steady
+// fault needs no patience.
+#define VRAIL_LOW_SAMPLES                   3
+
+// The pre-dive settle. The SOLENOID step pulses the valve and runs BEFORE the
+// battery step, so the rail can be genuinely recovery-limited at the moment the
+// battery step looks at it. The step therefore gets this much patience, in the
+// same shape the DEPTH step already uses: wait, say why while waiting, FAIL at the
+// end rather than hang. The number is one second of the 1 Hz sweep plus margin,
+// not a measured recovery time.
+#define VRAIL_SETTLE_MS                     3000
+
 // --- Cell calibration (raw -> ppO2) ------------------------------------------
 // Factory-fallback slope so an uncalibrated rig still shows plausible numbers;
 // it is NOT a substitute for CAL AIR, which the pre-dive/AUTO path requires.

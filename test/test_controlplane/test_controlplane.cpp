@@ -352,6 +352,17 @@ void test_the_seqlock_publishes_generations_never_torn_pairs() {
                                       v.ndlMin * 100, "torn generation: stop depth from another write");
     }
     writer.join();
+    // join() happens-after every publish, so one snapshot here is guaranteed to
+    // see the last generation even if the reader never got a turn while the
+    // writer ran — on a loaded machine a 2000-write thread can finish before
+    // the main thread reaches the loop, and `seen > 0` would then be measuring
+    // thread scheduling instead of whether the slot works. (Seen live in the
+    // full-suite run once, 2026-11-28, exactly that shape: "the slot is dead"
+    // with 18/18 passing in isolation.)
+    {
+        deco::View v{};
+        if (deco::viewSnapshot(slot, v)) ++seen;
+    }
     TEST_ASSERT_TRUE_MESSAGE(seen > 0, "the reader never got a generation: the slot is dead");
     printf("  controlplane: seqlock reader took %d generations, none torn\n", seen);
 }

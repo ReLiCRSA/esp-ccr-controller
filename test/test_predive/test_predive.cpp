@@ -533,6 +533,147 @@ void test_depth_grace_clocks_from_the_step_not_from_the_bus() {
                                      "step never saw");
 }
 
+// ---------------------------------------------------------------------------
+// The rail question inside the BATTERY step (docs/REVIEW.md 1 P9). Every test
+// above runs with the default vrailSensed = VRAIL_SENSE = 0 — the honest answer
+// for today's bench — and passes on the pack alone. These tests set
+// vrailSensed = 1 and ask what a build that READS the pin decides, so the
+// default-0 pass above can never be read as "the rail was checked and passed".
+// ---------------------------------------------------------------------------
+
+// Fail-closed default: a caller that forgot to fill Inputs::vrail leaves 0, and
+// on a sensed build "0 V on a 12 V coil rail" is a refusal, not a free pass.
+void test_sensed_build_refuses_a_rail_that_was_never_measured() {
+    Config c; c.warmupMs = 0; c.vrailSensed = 1;
+    Sequencer s{c};
+    Inputs in = airGood();                 // vrail left at its 0 default
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(),
+                             "a sensed build passed the battery step with no rail "
+                             "reading at all");
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s.status(Step::S_BATTERY));
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("coil rail never sensed: the sense input reads 0",
+                                     s.railWhy(),
+                                     "no number and a wrong number are different faults "
+                                     "to repair and must not share one sentence");
+
+    // Mutation direction: the identical fixture with the question NOT asked
+    // passes — so the refusal above is the sense flag, not the fixture.
+    Config c0; c0.warmupMs = 0;             // vrailSensed defaults to VRAIL_SENSE = 0
+    Sequencer off{c0};
+    t = 0;
+    off.start(t);
+    runUntil(off, in, Step::S_COUNT, t);
+    TEST_ASSERT_TRUE_MESSAGE(off.allPassed(),
+                             "the un-sensed build must still pass on the pack alone, "
+                             "or these tests cannot tell the two builds apart");
+}
+
+// Both edges of the band judge, and the middle passes. Right AT the limits is
+// inside: the band is the coil's published supply tolerance, and a rail sitting
+// at the edge of its tolerance is still a rail inside its tolerance.
+void test_rail_band_edges_pass_and_both_sides_refuse() {
+    Config c; c.warmupMs = 0; c.vrailSensed = 1;
+
+    struct { float v; const char* what; } cases[] = {
+        { VRAIL_MIN_V, "at the low edge: inside" },
+        { VRAIL_IMPLAUSIBLE_V, "at the high edge: inside" },
+    };
+    for (auto& k : cases) {
+        Sequencer s{c};
+        Inputs in = airGood(); in.vrail = k.v;
+        uint32_t t = 0;
+        s.start(t);
+        runUntil(s, in, Step::S_COUNT, t);
+        TEST_ASSERT_TRUE_MESSAGE(s.allPassed(), k.what);
+        TEST_ASSERT_EQUAL_STRING("", s.railWhy());
+    }
+}
+
+// LOW is a wait, not an instant verdict — the SOLENOID step pulses the valve
+// seconds earlier and SensorTask's 1 Hz sweep can land on a pulse at random.
+// The wait has a deadline; a supply that is simply gone still ends in FAIL.
+void test_low_rail_waits_then_fails_at_the_settle_deadline() {
+    Config c; c.warmupMs = 0; c.vrailSensed = 1;
+    Sequencer s{c};
+    Inputs in = airGood(); in.vrail = 8.0f;          // sagging, but sensed
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_BATTERY, t);
+    const uint32_t tArm = t;
+
+    // The step should be RUNNING, saying it waits, until the deadline — and the
+    // FAIL must land at the deadline, not before it (no patience) and not never
+    // (a sequence that never returns a verdict).
+    while (s.status(Step::S_BATTERY) == Status::RUNNING && t < 900000)
+        s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(), "a rail that never came back must FAIL");
+    TEST_ASSERT_TRUE_MESSAGE(t >= tArm + c.vrailSettleMs,
+                             "the rail FAILed before its settle deadline: one "
+                             "pulse-shaped sweep is not evidence about the supply");
+    TEST_ASSERT_TRUE_MESSAGE(t <= tArm + c.vrailSettleMs + 200u,
+                             "the rail step hung past its deadline instead of failing");
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("coil rail never settled back inside its band",
+                                     s.railWhy(),
+                                     "the deadline FAIL must name itself on the console");
+}
+
+// Mid-wait the step must SAY it is waiting: on the `PRE,` line a wait is
+// byte-for-byte indistinguishable from an ordinary RUNNING step, and railWaiting()
+// is the only surface that tells them apart — the same deal depthBusSilent() makes.
+void test_rail_wait_is_visible_while_it_is_happening() {
+    Config c; c.warmupMs = 0; c.vrailSensed = 1;
+    Sequencer s{c};
+    Inputs in = airGood(); in.vrail = 8.0f;
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_BATTERY, t);
+    s.update(in, t += 100);                       // first out-of-band sweep
+    TEST_ASSERT_TRUE_MESSAGE(s.railWaiting(), "the step waited without saying so");
+    TEST_ASSERT_EQUAL_STRING("coil rail outside its band, waiting for it to settle",
+                             s.railWhy());
+    TEST_ASSERT_FALSE_MESSAGE(s.failed(), "waiting is not failing yet");
+}
+
+// A rail that comes back inside the band during the wait PASSES: the wait exists
+// precisely because one low sweep can be the pulse, not the supply.
+void test_rail_that_recovers_during_the_wait_passes() {
+    Config c; c.warmupMs = 0; c.vrailSensed = 1;
+    Sequencer s{c};
+    Inputs in = airGood(); in.vrail = 8.0f;
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_BATTERY, t);
+    s.update(in, t += 100);                       // arms the wait
+    TEST_ASSERT_TRUE(s.railWaiting());
+    in.vrail = VRAIL_NOMINAL_V;                   // boost recovered
+    s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.allPassed(),
+                             "a recovered rail must pass: the wait exists to let it");
+    TEST_ASSERT_FALSE(s.railWaiting());
+    TEST_ASSERT_EQUAL_STRING("", s.railWhy());
+}
+
+// The implausible side is judged too: a sense node on its rail is not "a healthy
+// coil supply". It waits like LOW does — a steady fault costs the deadline and
+// still ends in FAIL.
+void test_high_rail_fails_too() {
+    Config c; c.warmupMs = 0; c.vrailSensed = 1;
+    Sequencer s{c};
+    Inputs in = airGood(); in.vrail = VRAIL_IMPLAUSIBLE_V + 3.0f;
+    uint32_t t = 0;
+    s.start(t);
+    runUntil(s, in, Step::S_BATTERY, t);
+    while (s.status(Step::S_BATTERY) == Status::RUNNING && t < 900000)
+        s.update(in, t += 100);
+    TEST_ASSERT_TRUE_MESSAGE(s.failed(),
+                             "a rail above its band passed: an open divider must not "
+                             "look like a healthy coil supply");
+    TEST_ASSERT_EQUAL_UINT8(Status::FAIL, s.status(Step::S_BATTERY));
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_full_pass_sequence);
@@ -549,5 +690,11 @@ int main() {
     RUN_TEST(test_depth_bus_silent_longer_than_the_grace_fails_when_the_grace_expires);
     RUN_TEST(test_depth_grace_boundary_judges_a_sample_and_condemns_silence);
     RUN_TEST(test_depth_grace_clocks_from_the_step_not_from_the_bus);
+    RUN_TEST(test_sensed_build_refuses_a_rail_that_was_never_measured);
+    RUN_TEST(test_rail_band_edges_pass_and_both_sides_refuse);
+    RUN_TEST(test_low_rail_waits_then_fails_at_the_settle_deadline);
+    RUN_TEST(test_rail_wait_is_visible_while_it_is_happening);
+    RUN_TEST(test_rail_that_recovers_during_the_wait_passes);
+    RUN_TEST(test_high_rail_fails_too);
     return UNITY_END();
 }

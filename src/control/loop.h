@@ -76,6 +76,20 @@ struct SensorData {
     /// Series packs only: midpoint volts, divider-scaled like `vbat`. 0 = not
     /// sensed, which with VBAT_CELLS >= 2 is a refusal, not a free pass.
     float vbatMid = 0.0f;
+    /// The coil rail (the ~12 V the valve actually runs on), in rail volts.
+    /// 0 = not sensed, and with VRAIL_SENSE set that is a refusal rather than a
+    /// free pass: the whole reason this field exists is that the machine used to
+    /// decide "the power is fine" from a number that only ever described the cell
+    /// (docs/REVIEW.md 1 P9).
+    float vrail = 0.0f;
+    /// The rail's own verdict, computed once where the sampling rate is known
+    /// (sensors/rail.h, on SensorTask's 1 Hz sweeps — not here, where this struct
+    /// arrives every control cycle and counting cycles would be counting the wrong
+    /// thing). Two judgements of one input exist on purpose and they answer
+    /// different questions: the pre-dive step asks "is the rail in band, allowing
+    /// it time to settle after the solenoid step pulsed the valve", the alarm asks
+    /// "has this been wrong for several sweeps in a row".
+    bool railUntrusted = false;
 };
 
 /// Chain outputs: the valve command plus everything telemetry reads.

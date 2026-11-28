@@ -1922,11 +1922,54 @@ now keeps.
       sentence, which is a different sentence on purpose (the old single printf
       said "cannot be a 1-cell pack" on the clearing edge too). Until that is
       seen, the claim on this path is "host-tested", not "bench-tested".
-- [ ] Battery, third half — the rail the valve actually runs on: the pack feeds a
-      boost converter to ~12 V for the solenoid, and **nothing in this firmware
-      senses that output**, so `vbat` healthy does not mean the coil has voltage.
-      Meter it at the coil under a pulse and decide what to do with the number
-      (`docs/REVIEW.md` §1 P9). Never 3S: 12.6 V exceeds a 12 V boost output.
+- [ ] Rail, first half — **today's truth, no build change**: boot the flashed image
+      and the console must contain `rail: coil rail NOT SENSED (VRAIL_SENSE=0, no
+      divider fitted): no check here has looked at the 12 V the valve runs on`, and
+      every HB line must end `vrail=0.00 railstate=3`. Those sentences are the point
+      of this leg: the gap is now a stated fact on the bench instead of an absence,
+      and `tools/hw_accept.py`'s batch-E legs redden a missing `vrail=` or a
+      `railstate=3` line that carries a voltage. Graded with the board as-is, this
+      half can be closed without touching the hardware.
+- [ ] Rail, second half — fit and meter the sense path (the metal part of §1 P9).
+      Divider 100k/10k from the boost output to GPIO39 (`PIN_VRAIL_SENSE`, ADC1,
+      input-only, same ratio as the pack), then the same metering procedure the pack
+      divider needs: 12.00 V in at the coil should read ~1.09 V at the pin; trim
+      `VRAIL_CAL` (still `1.00f`, never trimmed) so HB's `vrail=` matches the meter
+      within 0.05 V standing. Flip `VRAIL_SENSE` to 1 only after the meter agrees —
+      the constant exists so a divider and a verdict move together, and a fitted pin
+      the firmware ignores is a decoration.
+- [ ] Rail, third half — the numbers the boost answer needs, none of which exist
+      yet: the 2V025-08 coil's **DC resistance** (meter across the coil; the AirTAC
+      catalogue's 7.0 VA is the AC110 option and says nothing about this DC12 coil),
+      the boost module's actual chip, input range and switch-current limit (the
+      module is marked "TEAYUEW mini boost module 0260508", an Amazon generic whose
+      chip no search has identified), its **no-load output**, and how far the rail
+      **sags during a 300 ms pulse** — meter across the coil while `tools/pulse_witness.py`
+      drives pulses and watch HB's `vrail=` drop and recover. Those four numbers make
+      the dive-length margin, boost input current and expected sag computable; until
+      they exist, the ±15% band around `VRAIL_NOMINAL_V` is a **documented rating used
+      as a placeholder verdict**, not a measured pull-in figure, and this bullet is
+      what replaces it.
+- [ ] Rail, fourth half — the valve question no firmware check can answer: does the
+      2V025-08 open at **ambient differential pressure** at all? It is a 2V-family
+      part with a 0–1.0 MPa working range; if it is pilot-operated and needs ~1 bar
+      across the seat, it will not open on a loop at a metre of water, and that is a
+      design fault the pre-dive SOLENOID step would catch only via a ppO₂ rise this
+      bench has never produced. Energise the coil off the bench supply at 12.00 V,
+      listen/feel for the click, and record the answer here either way before any
+      document claims the valve works.
+- [ ] Rail, fifth half — with `VRAIL_SENSE=1` fitted and metered, witness the fault
+      path on metal like the battery halves demand: pulling the boost input should
+      print `[RAIL]`/`rail:` LOW after the sweep debounce (`below 10.20 V for 3
+      sweeps in a row`), take HB to `railstate=1` and raise `BIT_BATTERY` with the
+      pack still reading good — this is the exact scenario §1 P9 says the old
+      firmware was blind to, and seeing the marker come up while `vbat` stays
+      healthy is the witness. Lifting the sense wire off the divider should print
+      the implausible sentence (`check the divider at GPIO39`), and a pre-dive run
+      taken during a held-down rail should fail the BATTERY step with the console
+      saying `coil rail never settled back inside its band`, not `battery` alone.
+      Publishing the rail on `T,`/dive-file stays deferred until here is green:
+      publishing an unmetered number on the wire is how `vbat` became §1 P1.
 
 ## C3-d — mechanical inhibit (zero firmware cooperation)
 

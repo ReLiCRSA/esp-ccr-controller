@@ -208,6 +208,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
         pi.depthValid = in.pressureValid;
         pi.vbat = in.vbat;
         pi.vbatMid = in.vbatMid;
+        pi.vrail = in.vrail;
         pi.nowMs = nowMs;
         predive_.update(pi, nowMs);
     }
@@ -344,6 +345,7 @@ State Loop::cycle(const SensorData& in, uint32_t nowMs) {
     ai.highVetoBar = ii.highVetoBar;
     ai.cnsPct = static_cast<float>(deco_.cnsPct());
     ai.vbat = in.vbat;
+    ai.railUntrusted = in.railUntrusted;
     ai.sensorStale = !in.cellsFresh || !in.pressureValid;
     ai.spClamped = cpOut_.clampActive;
     ai.stuckOpen = injOut_.stuckOpenLatched;

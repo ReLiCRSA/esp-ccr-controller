@@ -13,6 +13,10 @@ void Sequencer::reset() {
     depthSilentSinceMs_ = 0;
     depthSilent_ = false;
     depthGraceExpired_ = false;
+    railWaitStart_ = 0;
+    railWaiting_ = false;
+    railSettleExpired_ = false;
+    railUnwired_ = false;
 }
 
 void Sequencer::start(uint32_t nowMs) {
@@ -146,18 +150,21 @@ void Sequencer::update(const Inputs& in, uint32_t nowMs) {
             break;
 
         case S_BATTERY:
-            // AUDIT (grace window): vbat only, no depth anywhere. It does judge on
-            // a single cycle — but a pack below vbatMin is a fault to refuse now,
-            // and `start()` restarts the sequence in seconds, so there is nothing
-            // for a grace to protect here.
+            // AUDIT (grace window): vbat, vbatMid and vrail; no depth anywhere.
+            // The pack side judges on a single cycle — a pack below vbatMin is a
+            // fault to refuse now, and `start()` restarts the sequence in seconds,
+            // so there is nothing for a grace to protect there. The rail side does
+            // carry a wait, and why it has to is written at cfg_.vrailSettleMs.
             //
-            // Three questions, and the second one is the one that used to be
-            // missing. Above the floor AND below the plausibility ceiling: a
+            // Four questions, and the second and fourth are the ones that used not
+            // to exist. Pack above the floor AND below the plausibility ceiling: a
             // reading this high is a sense node on its rail, not a charged pack,
             // and "we cannot read the pack" must never reach a PASS. Then, for a
             // series pack only, the two halves must agree — one total voltage can
             // hide one dead cell, and this is the step where that would otherwise
-            // be waved through.
+            // be waved through. Then the rail the valve actually runs on, which is
+            // the question whose absence made a dead boost stage invisible
+            // (docs/REVIEW.md 1 P9).
             if (in.vbat < cfg_.vbatMin) { fail(S_BATTERY); break; }
             if (in.vbat > cfg_.vbatMax) { fail(S_BATTERY); break; }
             if (cfg_.vbatCells >= 2) {
@@ -169,6 +176,37 @@ void Sequencer::update(const Inputs& in, uint32_t nowMs) {
                 const float upper = in.vbat - in.vbatMid;
                 const float spread = std::fabs(in.vbatMid - upper);
                 if (spread > cfg_.vbatSpreadMaxV) { fail(S_BATTERY); break; }
+            }
+            if (cfg_.vrailSensed) {
+                // Never sensed. Deliberately not merged into the band test: with
+                // an input-only pin a floating reader can land inside a band by
+                // accident, and "0 V on a 12 V rail" is a different fault with a
+                // different repair. No patience here either — a rail that has
+                // never produced a reading is not going to produce one while the
+                // sequence watches.
+                if (in.vrail <= 0.0f) {
+                    railUnwired_ = true;
+                    railWaiting_ = false;
+                    fail(S_BATTERY);
+                    break;
+                }
+                if (in.vrail >= cfg_.vrailMin && in.vrail <= cfg_.vrailMax) {
+                    railWaiting_ = false;
+                    advance(S_BATTERY);
+                    break;
+                }
+                // Out of band, but sensed: wait the settle out, saying so, and
+                // fail at the deadline. The two reasons this can be transient are
+                // the pulse the sweep landed on and the boost recovering from the
+                // solenoid step's own pulses; both settle in far less than the
+                // deadline, and a supply that is simply gone never settles at all.
+                if (!railWaiting_) { railWaiting_ = true; railWaitStart_ = nowMs; }
+                if (nowMs - railWaitStart_ >= cfg_.vrailSettleMs) {
+                    railWaiting_ = false;
+                    railSettleExpired_ = true;
+                    fail(S_BATTERY);
+                }
+                break;
             }
             advance(S_BATTERY);
             break;

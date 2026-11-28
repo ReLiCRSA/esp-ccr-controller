@@ -116,6 +116,30 @@ void test_battery_alarm_also_raises_on_an_unreadable_pack() {
                               "the bound is a fault detector, not a charge limit");
 }
 
+// The rail flag rides the same marker (docs/REVIEW.md 1 P9): the diver's action
+// for "the pack is unreadable" and "the coil has no voltage" is one action — do
+// not trust this power — and the console names which of them it is. What this
+// test pins is that a HEALTHY PACK no longer silences the marker: a vbat inside
+// both pack bounds must still raise BIT_BATTERY when the rail flag is set,
+// because "vbat is fine" is exactly what a dead boost stage looks like. The
+// flag arrives pre-debounced from sensors/rail.h, which counts SWEEPS — the rate
+// the rail is observed at — not these per-cycle calls.
+void test_a_good_pack_with_an_untrusted_rail_still_alarms() {
+    Manager m{Config{}};
+    Inputs in = base();                    // 3.90 V: inside both pack bounds
+    in.railUntrusted = true;
+    Result r = m.update(in);
+    TEST_ASSERT_TRUE_MESSAGE(r.bits & (1u << alarms::BIT_BATTERY),
+                             "a good pack with an untrusted rail cleared the battery marker");
+    TEST_ASSERT_TRUE(r.logBits & (1u << alarms::BIT_BATTERY));
+
+    // Both directions: the same input with the flag clear stays quiet, so the
+    // raise above is the flag and not the fixture.
+    Inputs ok = base();
+    TEST_ASSERT_FALSE_MESSAGE(m.update(ok).bits & (1u << alarms::BIT_BATTERY),
+                              "a good pack with a good rail must not alarm");
+}
+
 void test_high_alarm_uses_the_honest_cell_veto() {
     // The vote lies (two poisoned cells agree at 0.50) while a third cell sees
     // 1.60: HIGH_PPO2 must still fire. The veto is a safety rule, not a detail.
@@ -377,6 +401,7 @@ int main() {
     RUN_TEST(test_hypoxia_event_latches_until_ack);
     RUN_TEST(test_warning_levels_and_sticky_bits);
     RUN_TEST(test_battery_alarm_also_raises_on_an_unreadable_pack);
+    RUN_TEST(test_a_good_pack_with_an_untrusted_rail_still_alarms);
     RUN_TEST(test_high_alarm_uses_the_honest_cell_veto);
     RUN_TEST(test_no_vote_suppresses_ppo2_alarms);
     RUN_TEST(test_total_vote_failure_raises_sensor_fail);

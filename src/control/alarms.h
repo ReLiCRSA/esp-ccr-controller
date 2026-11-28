@@ -73,7 +73,13 @@ struct Inputs {
     /// haveVote is true. A held number reaching here must not raise them.
     float votedBar = 0.5f;
     float cnsPct = 0.0f;
-    float vbat = 12.0f;
+    // Chemistry-derived on purpose, and deliberately OUT of band: 12.0 used to sit
+    // here as a pack voltage, which is the exact stale 12 V-style number that
+    // refused a charged 3.7 V cell for a month (docs/REVIEW.md 1 P1). A caller
+    // that forgets to fill this field must fail closed, so the default is a
+    // reading this chemistry cannot produce — an alarm nobody asked for is the
+    // survivable direction, a healthy-looking default is not.
+    float vbat = VBAT_IMPLAUSIBLE_V + 1.0f;
     bool sensorStale = false;
     bool spClamped = false;
     bool stuckOpen = false;
@@ -89,6 +95,15 @@ struct Inputs {
     // agree on 0.50 bar in a loop that is really at 1.6; the honest third must
     // still be able to raise the high alarm.
     float highVetoBar = 0.0f;
+    // Optional (last on purpose — see inj::Input). "We cannot vouch for the rail
+    // the valve runs on": computed by sensors/rail.h, which is where the patience
+    // lives (a rail droops when the coil is energised, and this evaluator runs
+    // every control cycle while the rail is swept once a second — counting cycles
+    // here would be counting the wrong thing). One marker, BIT_BATTERY, for both
+    // rails: what the diver can do about "the pack is flat", "the pack is
+    // unreadable" and "the coil has no voltage" is the same action, and the
+    // console says which of the three it is. See docs/HANDSET_PROTOCOL.md 4 bit 4.
+    bool railUntrusted = false;
 };
 
 struct Edge { uint8_t id; bool raised; };

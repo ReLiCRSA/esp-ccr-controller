@@ -343,8 +343,12 @@ void test_the_heartbeat_states_the_generation_pair() {
                                  "HB no longer reports the config generation pair");
     const size_t at = mainCpp.find("cfggen=%u/%u");
     // The format string and its argument list are one printf statement: the
-    // arguments sit below the format, so the window has to cover them.
-    const std::string tail = mainCpp.substr(at, 1400);
+    // arguments sit below the format, so the window has to cover them. The
+    // window is measured from cfggen=, which is no longer the LAST field —
+    // vrail=/railstate= were appended after it (append-only, as always) — so
+    // this has to reach past one more format segment and two more arguments.
+    // If HB grows again and this reddens, grow the window; do not reorder HB.
+    const std::string tail = mainCpp.substr(at, 1700);
     TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(tail.c_str(), "ctrl::configGeneration()"),
                                  "HB's published half is not the box's count");
     TEST_ASSERT_NOT_NULL_MESSAGE(std::strstr(tail.c_str(), "g_chainCfgGen"),

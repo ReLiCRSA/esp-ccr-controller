@@ -30,6 +30,7 @@
 #include "control/loop.h"
 #include "sensors/ads1115_bus.h"
 #include "sensors/battery.h"
+#include "sensors/rail.h"
 #include "sensors/depth_announce.h"
 #include "sensors/depth_manager.h"
 #include "sensors/lps28.h"
@@ -123,6 +124,13 @@ Battery     g_battery;
 // Never read while VBAT_CELLS is 1, which is why it stays 0 there and the
 // pre-dive step skips the comparison instead of judging an unwired pin.
 static float       g_vbatMidV = 0.0f;
+// The ~12 V the valve actually runs on. Whether this pin is read at all is a
+// build decision (VRAIL_SENSE in defaults.h) and today the answer is no: the
+// divider is not fitted. What must not happen is the silent version of that —
+// the boot line, HB's `vrail=0.00` and the pre-dive step all say the rail is not
+// judged, because "no number" is exactly how a dead boost stage used to look
+// healthy (docs/REVIEW.md 1 P9).
+static Rail        g_rail;
 static volatile bool g_sensorStale = false;
 static HudState    g_systemState = HudState::STANDBY;
 
@@ -408,6 +416,13 @@ static void sensorTask(void*) {
             g_vbatMidV = analogReadMilliVolts(PIN_VBAT_MID_SENSE) * 1e-3f
                          * VBAT_DIVIDER_RATIO * VBAT_CAL;
 #endif
+#if VRAIL_SENSE
+            // Same sweep, same instant, same ratio: the pack and the rail are two
+            // halves of one power chain, and comparing a pack from t with a rail
+            // from t+1s is how a sag gets blamed on the cell or a flat cell
+            // blamed on the boost.
+            g_rail.addSample(analogReadMilliVolts(PIN_VRAIL_SENSE));
+#endif
         }
 
         g_sensorStale = g_ads.anyStale(now);
@@ -444,6 +459,39 @@ static void sensorTask(void*) {
                 Serial.printf("battery: sense is back inside the plausible band for a "
                               "%u-cell pack (floor %s V, ceiling %s V)\n",
                               (unsigned)VBAT_CELLS, floorTxt, ceilTxt);
+            }
+        }
+
+        // The coil rail gets the same treatment and its own words: a rail that has
+        // never been sensed and a rail that left its band are different faults for
+        // different hands, and neither is useful described as a battery complaint.
+        // Edges only, and numfmt only — same reason as the block above.
+        //   0 sensed and in band, 1 low, 2 implausible, 3 not sensed at all
+        static int lastRailState = -1;
+        const int railState = !VRAIL_SENSE ? 3
+                              : g_rail.implausible() ? 2
+                              : g_rail.low() ? 1
+                              : (g_rail.sensed() ? 0 : 3);
+        if (railState != lastRailState) {
+            lastRailState = railState;
+            static char loTxt[12], hiTxt[12], rvTxt[12];
+            numfmt::fixed(loTxt, sizeof loTxt, VRAIL_MIN_V, 2);
+            numfmt::fixed(hiTxt, sizeof hiTxt, VRAIL_IMPLAUSIBLE_V, 2);
+            numfmt::fixed(rvTxt, sizeof rvTxt, g_rail.volts(), 2);
+            if (railState == 3) {
+                Serial.println("rail: coil rail NOT SENSED - no divider on this board "
+                               "(VRAIL_SENSE=0), so no check in this firmware has ever "
+                               "looked at the 12 V the valve actually runs on");
+            } else if (railState == 2) {
+                Serial.printf("rail: %s V is outside this coil's band (%s-%s V). Check "
+                              "the divider at GPIO39, not the boost.\n",
+                              rvTxt, loTxt, hiTxt);
+            } else if (railState == 1) {
+                Serial.printf("rail: below %s V for %d sweeps in a row (reading %s V). "
+                              "The boost is not giving the valve what it is rated for.\n",
+                              loTxt, VRAIL_LOW_SAMPLES, rvTxt);
+            } else {
+                Serial.printf("rail: back inside its band (reading %s V)\n", rvTxt);
             }
         }
         g_hbSensor.seq++;
@@ -506,7 +554,7 @@ static void hudTask(void*) {
         if (now - lastStatus >= 5000) {
             lastStatus = now;
             const auto& st = g_ads.stats();
-            char vb[16], vt[16], sp[16];
+            char vb[16], vt[16], sp[16], rl[16];
             uint8_t stackSlot = 0;
             const uint32_t stackFree = stackwatch::worstFree(&stackSlot);
             // uart2 gets its own field rather than being folded into the
@@ -549,6 +597,16 @@ static void hudTask(void*) {
             //             100 ms cycle. Ahead by MORE than one means a control cycle
             //             is not reading, which is the same failure the supervisor
             //             reboots for — now visible on the beat before it happens.
+            //
+            // Batch E (docs/REVIEW.md 1 P9): `vrail=<volts> railstate=<n>` appended
+            // after cfggen= under the same append-only rule. The rail the valve
+            // actually runs on, and its verdict: 0 sensed and in band, 1 low for
+            // VRAIL_LOW_SAMPLES sweeps in a row, 2 implausible (a sense node on its
+            // rail), 3 NOT SENSED — either this build does not read the pin
+            // (VRAIL_SENSE=0, today's bench) or the input has never produced a
+            // reading. `vrail=0.00 railstate=3` on the bench today is the review
+            // item written as a number: the pack reads fine and nothing here has
+            // ever looked at the boost.
             const uint32_t worstCycleMs = g_worstCycleMs;
             g_worstCycleMs = 0;  // "since the last HB beat": the bench grades
                                  // per-beat margin, not an ever-climbing max
@@ -557,7 +615,8 @@ static void hudTask(void*) {
                           "stale=%d batlow=%d"
                           " vote=%s sp=%s al=0x%04x mode=%d pulses=%lu sol=%d ctrl=%d"
                           " stk=%u u2stk=%u worst=%u logskip=%u surfskip=%u contskip=%u"
-                          " cfggen=%u/%u\n",
+                          " cfggen=%u/%u"
+                          " vrail=%s railstate=%d\n",
                           static_cast<int>(g_systemState),
                           g_ads.raw(0), g_ads.raw(1), g_ads.raw(2),
                           g_ads.fresh(0, now), g_ads.fresh(1, now),
@@ -578,7 +637,10 @@ static void hudTask(void*) {
                           (unsigned)comms::surfaceSkippedRecords(),
                           (unsigned)comms::continuitySkipped(),
                           (unsigned)ctrl::configGeneration(),
-                          (unsigned)g_chainCfgGen);
+                          (unsigned)g_chainCfgGen,
+                          numfmt::fixed(rl, sizeof(rl), g_rail.volts(), 2),
+                          !VRAIL_SENSE ? 3 : (g_rail.implausible() ? 2
+                                              : (g_rail.low() ? 1 : (g_rail.sensed() ? 0 : 3))));
             // Shout for the machine overall AND for the handset task by name, so
             // a command-path regression is named instead of averaged away.
             if (stackFree != 0 && stackFree < stackwatch::kWarnFreeBytes) {
@@ -930,6 +992,19 @@ static void controlTask(void*) {
         // pre-dive step ignores, and the one place the two pack numbers travel
         // together is worth more than an #if at the use site.
         sd.vbatMid = g_vbatMidV;
+        // The coil rail and its verdict, both published by SensorTask's sweep.
+        // `railUntrusted` is computed there (sensors/rail.h counts SWEEPS, which is
+        // the rate the rail is actually observed at) and merely carried here:
+        // ControlTask sees this struct every 100 ms, and a debounce that counted
+        // cycles would call one 300 ms pulse three consecutive faults.
+        sd.vrail = g_rail.volts();
+        // VRAIL_SENSE gates the ALARM, not just the sampling: on a build with no
+        // divider the input was never read, and `untrustworthy()` answers "never
+        // read" with true — correct for a fitted-but-dead input, and a phantom
+        // BIT_BATTERY on every dive for an input this board never had. The
+        // not-sensed build says so at boot and in HB instead of raising an alarm
+        // the diver cannot clear.
+        sd.railUntrusted = VRAIL_SENSE && g_rail.untrustworthy();
 
         const ctrl::State st = g_loop->cycle(sd, now);
 
@@ -1212,6 +1287,20 @@ static void controlTask(void*) {
             Serial.println("pre-dive depth: bus answering again");
         prevDepthSilent = depthSilent;
 
+        // The rail side of the same step, said the same way (docs/REVIEW.md 1 P9):
+        // on `PRE,` a battery step waiting for the coil rail to settle is
+        // indistinguishable from one that has already decided, and the wire may
+        // not change to tell them apart. Rising edge, and the clearing edge, so
+        // the wait is visible while it is happening, not only after it fails.
+        static bool prevRailWaiting = false;
+        const bool railWaiting = pseq.railWaiting();
+        if (railWaiting && !prevRailWaiting)
+            Serial.printf("pre-dive battery: %s (deadline %u s)\n", pseq.railWhy(),
+                          (unsigned)(g_controlRules.predive.vrailSettleMs / 1000u));
+        else if (!railWaiting && prevRailWaiting && !pseq.failed())
+            Serial.println("pre-dive battery: coil rail back inside its band");
+        prevRailWaiting = railWaiting;
+
         if (preFail && !prevPreFail) {
             uint16_t step = static_cast<uint16_t>(g_loop->prediveSeq().current());
             for (int s = 0; s < predive::S_COUNT; ++s)
@@ -1225,8 +1314,11 @@ static void controlTask(void*) {
             // answered — which is a repair, not something the diver can fix by
             // surfacing and retrying. The `PRE,` status word cannot say that, so
             // the console does. (Only the depth step has a reason to give today;
-            // the other steps are already named by their number.)
+            // the other steps are already named by their number — except the
+            // BATTERY step, which since P9 can fail on either rail, so both
+            // reasons are asked in order and a rail failure says which rail.)
             const char* why = g_loop->prediveSeq().depthWhy();
+            if (!why[0]) why = g_loop->prediveSeq().railWhy();
             if (why[0]) Serial.printf("pre-dive: FAIL step %u: %s\n", (unsigned)step, why);
         } else if (prePass && !prevPrePass) {
             surfacePredive(true, 0);
@@ -1478,7 +1570,7 @@ static void supervisorTask(void*) {
         // raw sensor signals.
         if (g_controlRunning) continue;
         if (g_sensorStale) hudSetError(ErrLevel::ALARM);
-        else if (g_battery.low()) hudSetError(ErrLevel::WARNING);
+        else if (g_battery.low() || g_rail.low()) hudSetError(ErrLevel::WARNING);
         else if (g_ads.stats().recoveries > ADS_RECOVERY_WARN_PER_MIN) hudSetError(ErrLevel::WARNING);
         else hudSetError(ErrLevel::NONE);
     }
@@ -1706,6 +1798,7 @@ void setup() {
 
     g_ads.begin();
     g_battery.begin();
+    g_rail.begin();
 #if PRESSURE_ENABLE
     g_pBus.begin();                // Wire1: 100 kHz, 50 ms cap, own pin pair
     g_depth.begin(millis());       // non-blocking; SensorTask keeps retrying
@@ -1778,6 +1871,18 @@ void setup() {
                       (unsigned)(cfg.predive.warmupMs / 1000),
                       g_cellCal[0].hasAir ? "" : "  [CELLS UNCALIBRATED: run CAL AIR]");
     }
+
+    // The rail verdict announced at every boot, in plain words, because the
+    // absence of a complaint about the 12 V the valve runs on must never be read
+    // as evidence it was checked (docs/REVIEW.md 1 P9). One line either way: the
+    // judged build says what it judges, the un-judged build says that out loud.
+#if VRAIL_SENSE
+    Serial.println("rail: coil rail IS sensed at GPIO39: the pre-dive BATTERY step "
+                   "and BIT_BATTERY judge it against the coil's rated band");
+#else
+    Serial.println("rail: coil rail NOT SENSED (VRAIL_SENSE=0, no divider fitted): "
+                   "no check here has looked at the 12 V the valve runs on");
+#endif
 
     xTaskCreatePinnedToCore(sensorTask,    "sensor",     4096, nullptr, 24, nullptr, 0);
     xTaskCreatePinnedToCore(hudTask,       "hud",        4096, nullptr, 10, nullptr, 1);

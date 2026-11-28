@@ -65,6 +65,35 @@ struct Config {
     float vbatMax = VBAT_IMPLAUSIBLE_V;
     uint8_t vbatCells = VBAT_CELLS;
     float vbatSpreadMaxV = VBAT_CELL_SPREAD_MAX_V;
+
+    // --- the coil rail: the fourth question this step asks, and the one that
+    // used not to exist (docs/REVIEW.md 1 P9). All of it last, for the same
+    // reason as everything else optional here.
+    //
+    // Why the rail is a question inside the BATTERY step rather than a sixth
+    // step: the `PRE,` line is one status field per step followed by the passed
+    // bit, and the handset's parser reads that bit by position —
+    // `handset/handset_link.h`'s parsePre() takes field 6 as "passed". A sixth
+    // step inserted BEFORE it would hand a handset the new step's status as
+    // "this dive passed", and there is no way to append a step AFTER the passed
+    // bit. So the step count stays five and the step that already asks "is the
+    // power this machine runs on trustworthy" asks it about both rails. What the
+    // diver loses is a step number in the surface record; what the console gains
+    // is railWhy(), which says which rail and why.
+    float vrailMin = VRAIL_MIN_V;
+    float vrailMax = VRAIL_IMPLAUSIBLE_V;
+    // Whether this build reads the pin at all. 0 is today's truth (no divider
+    // fitted): the question is then not asked, and defaults.h plus the boot
+    // announce are what keep that from being mistaken for a PASS.
+    uint8_t vrailSensed = VRAIL_SENSE;
+    // Patience the pack does not need. The SOLENOID step pulses the valve and
+    // runs BEFORE this step, and SensorTask's sweep can also land on a pulse at
+    // random, so one out-of-band sweep is not evidence about the power supply —
+    // and it is not evidence about it being fine either, which is why this is a
+    // wait with a deadline rather than a retry that never ends. Same shape as
+    // depthGraceMs, including that 0 is the old single-cycle verdict and a test
+    // pins it.
+    uint32_t vrailSettleMs = VRAIL_SETTLE_MS;
 };
 
 struct Inputs {
@@ -89,6 +118,14 @@ struct Inputs {
     // one reason a series pack is riskier to judge by voltage is the thing this
     // input exists to check. With VBAT_CELLS == 1 the value is ignored.
     float vbatMid = 0.0f;
+
+    // The coil rail (the ~12 V the valve runs on), divider-scaled to rail volts.
+    // 0 means "not sensed", and when vrailSensed is set that is a refusal: the
+    // defect this input exists to close is precisely the one where the machine
+    // has no number for the coil's supply and decides anyway. Default 0 rather
+    // than a plausible 12.0 on purpose — an input a caller forgot to fill must
+    // fail closed, not read as healthy.
+    float vrail = 0.0f;
 };
 
 class Sequencer {
@@ -129,6 +166,28 @@ public:
         return "";
     }
 
+    /// The BATTERY step is waiting for the coil rail to come back inside its
+    /// band: RUNNING, and within cfg_.vrailSettleMs of the first out-of-band
+    /// sweep. This exists for the same reason depthBusSilent() does — on the
+    /// `PRE,` line a wait looks exactly like an ordinary pending step, and no
+    /// wire field may change to tell them apart.
+    bool railWaiting() const { return railWaiting_ && st_[S_BATTERY] == RUNNING; }
+
+    /// Why the BATTERY step is waiting on the rail, or why it failed there; ""
+    /// when the rail is not involved. It deliberately says nothing about the pack
+    /// side of the step: that fault has never been ambiguous (HB's vbat and
+    /// batlow name it), and a step that can fail two ways should not describe one
+    /// of them in words that could be read as the other.
+    const char* railWhy() const {
+        if (st_[S_BATTERY] == FAIL) {
+            if (railUnwired_) return "coil rail never sensed: the sense input reads 0";
+            if (railSettleExpired_) return "coil rail never settled back inside its band";
+            return "";
+        }
+        if (railWaiting_) return "coil rail outside its band, waiting for it to settle";
+        return "";
+    }
+
 private:
     void reset();
     void advance(Step done);
@@ -145,6 +204,14 @@ private:
     // eventually failed it.
     uint32_t depthSilentSinceMs_ = 0;
     bool depthSilent_ = false, depthGraceExpired_ = false;
+    // The BATTERY step's rail wait (see cfg_.vrailSettleMs): when the first
+    // out-of-band sweep was seen, whether the step is in that wait, whether the
+    // wait is what failed it, and whether the rail was never sensed at all. The
+    // last one is kept separate because "there is no reading" and "the reading is
+    // wrong" are different things for a diver to fix, and the console has to say
+    // which one it is reporting.
+    uint32_t railWaitStart_ = 0;
+    bool railWaiting_ = false, railSettleExpired_ = false, railUnwired_ = false;
 };
 
 } // namespace predive

@@ -28,7 +28,7 @@ and those documents have to follow it.
 | Setpoints | 4 configurable with depth crossover + hysteresis (defaults 0.40 / 0.70 / 1.00 / 1.30) |
 | Deco | Bühlmann ZHL-16C + gradient factors, GF low/high configurable; UART exposes NDL, total deco time, stop ladder (next stop depth+time) |
 | Handset | ASCII line protocol, defined from scratch, UART2 @ 115200 |
-| Battery | Full support: divider sense on ADC1, alarms, pre-dive check, per-snapshot logging |
+| Battery | Full support: divider sense on ADC1, alarms, pre-dive check, per-snapshot logging. The coil rail is the second rail and now has its own sense input, band and verdict (§1 "Power architecture"); it is compiled off (`VRAIL_SENSE=0`) until the divider is fitted, and says so out loud while off |
 | Dives | 10-dive FIFO, 30 s snapshots + event-driven snapshots, CSV export |
 | Validation | PC simulator + unit tests vs published deco tables before hardware trust |
 | Web UI | Mobile-first, clean, responsive (phone portrait → single column; desktop → dashboard grid); no framework, no CDN |
@@ -46,7 +46,9 @@ espRebController/
 │   ├── sensors/
 │   │   ├── ads1115_bus.cpp   # custom hang-proof ADS1115 driver (no stock lib)
 │   │   ├── depth_sensor.*    # interface; bmp085.cpp, ms5837.cpp
-│   │   └── battery.cpp       # ESP32 ADC1 + divider, smoothed, calibratable
+│   │   ├── dividersense.*    # shared divider DSP: median-of-8 → ratio → EMA
+│   │   ├── battery.h         # pack input; chemistry band (Battery : DividerSense)
+│   │   └── rail.h            # coil rail input; two-sided band, LOW debounced by sweeps
 │   ├── control/
 │   │   ├── voting.cpp        # median-of-N, disagreement, health scores
 │   │   ├── setpoints.cpp     # SP table, crossovers, clamp machinery
@@ -84,9 +86,37 @@ espRebController/
 | Solenoid drive | 27 | MOSFET gate; **INPUT_PULLDOWN until ControlTask alive**; monitor LED on same net |
 | HB / ERR / DECO LEDs | 2 / 4 / 5 | active-high |
 | Handset UART TX / RX | 17 / 16 | UART2, 115200 |
-| Battery sense | 35 | **ADC1 only** (ADC2 collides with WiFi); divider 100k/10k, `VBAT_CAL` trims. Top leg on the **pack** rail, so `vbat` says nothing about the 12 V the solenoid runs on |
+| Battery sense | 35 | **ADC1 only** (ADC2 collides with WiFi); divider 100k/10k, `VBAT_CAL` trims. Top leg on the **pack** rail, so `vbat` is the cell and says nothing about the 12 V the solenoid runs on — that second number is the row below |
+| Coil rail sense | 39 | the ~12 V boost rail the valve coil actually runs on (§1 "Power architecture"). ADC1, input-only, same 100k/10k ratio as the pack so the two numbers share one metering procedure. **`VRAIL_SENSE=0` today: the divider is not fitted**, and the firmware then says so out loud at boot and in HB (`vrail=0.00 railstate=3`) instead of leaving the silence to be read as a pass. BENCH.md C3-c is the fitting-and-metering leg |
 | Battery midpoint sense | 36 | series packs only, and compiled only when `VBAT_CELLS >= 2`: the pack voltage alone cannot see one dead cell (6.80 V = 4.00 + 2.80). ADC1, input-only, no internal pull; unwired is a **refusal**, not a pass |
 | ADS1115 DRDY (optional) | 18 | supported by driver; `-1` disables (bench today) |
+
+### Power architecture (what feeds what — docs/REVIEW.md 1 P9)
+
+Written down 2026-11-28 because P9's whole diagnosis was that this existed only in
+the builder's head: every runtime number the project quotes (dive-length margin,
+boost input current at a pulse, expected sag) is uncomputable while the chain is
+undocumented. Facts as the builder described them, each marked with what it is.
+
+| Stage | Fact | Status |
+|---|---|---|
+| Pack | **one protected 18650** (protection board visible on the bench). `VBAT_CELLS 1` follows | builder statement 2026-11-28 |
+| Logic supply | pack → **its own 5 V regulator** → the board's 5V/3V3 side. **Not** fed from the boost | builder statement 2026-11-28; the reason a dead boost leaves the brain alive and the coil dead — the split that makes rail sensing worth a pin |
+| Coil rail | boost module marked **"TEAYUEW mini boost module 0260508"** (Amazon generic), ~12 V out, feeding **the valve coil only** | marking recorded; the chip on the module is **unidentified** — a generic clone family, and no search of the marking resolved it. Treat part, input range and switch-current limit as unknowns |
+| Valve | **Heschen 2V025-08**, DC 12 V coil — the AirTAC 2V family's `F` voltage code. Family catalogue figures: direct acting, normally closed, 2.5 mm orifice, Cv 0.25, working pressure 0–1.0 MPa, activating time ≤ 0.05 s, permitted coil-voltage variation ±15% | family figures from the catalogue page for the 2V025-08 (airtacs.com product page, fetched 2026-11-28); **not** a per-unit datasheet for the part on this bench |
+| Coil DC resistance | **unknown.** The catalogue publishes 7.0 VA for the AC110 coil option, which says nothing about this DC12 coil. A meter across the coil is BENCH.md C3-c | unknown, deliberately not guessed |
+| Minimum working differential pressure | **unknown and load-bearing.** A pilot-operated 2V025 needing ~1 bar differential would not open at ambient loop pressure, and that would be a design fault no firmware check can paper over. The pre-dive SOLENOID step's ppO₂ rise is the only evidence this project has ever had that the valve opens, and the bench has never gotten past that step | unknown; C3-c leg before any claim either way |
+
+The sense decision that follows from this table: the boost output gets a divider on
+**GPIO39** (`PIN_VRAIL_SENSE`), same 100k/10k ratio as the pack, and its verdict
+rides the pre-dive BATTERY step (fourth question, appended inside the step — the
+`PRE,` wire shape cannot gain a sixth field), `BIT_BATTERY` (one marker, the
+console says which rail), and HB (`vrail=`/`railstate=`). Publication on the
+dive-file/`T,` surface is **deliberately deferred until the rail is metered** —
+publishing an unmetered number on the wire is exactly how `vbat` became P1.
+Until the divider is fitted, `VRAIL_SENSE=0`: nothing judges the rail, and boot,
+the `[RAIL]` console line and HB `vrail=0.00 railstate=3` all say so, because a
+silent absence is what got read as a pass before.
 
 ## 2. Safety skeleton (cross-cutting)
 
@@ -243,7 +273,11 @@ IDLE → WARMUP (120 s, cells)
      → BATTERY ≥ min, AND the reading must be plausible for the chemistry
         (above the floor but above `VBAT_IMPLAUSIBLE_V` is a sense node on its
         rail, and refuses), AND on a series pack the two halves must agree
-        within `VBAT_CELL_SPREAD_MAX_V` — an unwired midpoint refuses too
+        within `VBAT_CELL_SPREAD_MAX_V` — an unwired midpoint refuses too,
+        AND (when `VRAIL_SENSE=1`) the coil rail is inside its band — never
+        sensed refuses outright, out-of-band waits `VRAIL_SETTLE_MS` and
+        then fails; the step count stays five because `PRE,`'s passed bit is
+        positional (see §1 "Power architecture" and docs/REVIEW.md §1 P9)
      → PASS (enables AUTO)
 ```
 

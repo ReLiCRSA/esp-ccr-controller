@@ -65,6 +65,21 @@
 // judges a pin that has nothing connected to it.
 #define PIN_VBAT_MID_SENSE  36
 
+// --- Coil rail sense (the 12 V the valve actually runs on) --------------------
+// The gap this pin exists to close is docs/REVIEW.md 1 P9: `vbat` is the pack, and
+// a pack at 3.9 V with a dead boost stage passes every battery check this firmware
+// has while the coil gets nothing. MUST be ADC1 for the same reason as the pack
+// sense (ADC2 is unusable while WiFi runs). 39 is the remaining ADC1 input on this
+// chip — 35 is the pack, 36 is the series midpoint, and 34 is the fallback if 39
+// ever gets claimed; 37/38 are not broken out on a WROOM-32 at all. Input-only, no
+// internal pull, and nothing else in this file uses it.
+//
+// NOT FITTED YET. `VRAIL_SENSE` in defaults.h is 0, so the firmware does not read
+// this pin, does not judge the rail, and says so on the boot line and in HB
+// (`vrail=0.00` = not sensed). Fitting the divider without flipping that constant
+// is how a sense input becomes a decoration.
+#define PIN_VRAIL_SENSE   39
+
 // --- ADS1115 DRDY/READY (optional) --------------------------------------------
 // Bench has only SDA/SCL wired; set to -1. Wire DRDY to a GPIO for the
 // prototype and change this constant to enable ready-driven reads.

@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "sensors/battery.h"
+#include "sensors/rail.h"
 
 void setUp() {}
 void tearDown() {}
@@ -159,6 +160,124 @@ void test_chemistry_derived_fixtures_still_mean_the_same_thing() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The rail input (sensors/rail.h) — the ~12 V the valve actually runs on.
+// Same divider DSP as the pack (sensors/dividersense.h, graded above through
+// Battery), different verdicts: LOW needs patience, HIGH does not, and an input
+// that was never read is neither healthy nor condemned until a build decision
+// says it exists at all.
+// ---------------------------------------------------------------------------
+
+static constexpr int railPinMv(float railVolts) {
+    return static_cast<int>(std::lround(railVolts * 1000.0f / VRAIL_DIVIDER_RATIO));
+}
+
+static void railBurst(Rail& r, int mv) {
+    for (int i = 0; i < 8; ++i) r.addSample(mv);
+}
+
+// One sweep below the band is a measurement of a pulse, not of the supply:
+// SensorTask's 1 Hz burst lands on a 300 ms pulse roughly one sweep in seven,
+// and a mid-dive nuisance alarm on BIT_BATTERY is how a diver learns to ignore
+// the marker that means "do not trust this power". So LOW is a RUN COUNT, and
+// the run only counts sweeps whose processed reading is genuinely out of band —
+// the EMA lag means a single sag-shaped sweep does not even start the count.
+void test_rail_low_needs_consecutive_low_sweeps() {
+    Rail r;
+    for (int i = 0; i < 3; ++i) railBurst(r, railPinMv(VRAIL_NOMINAL_V));
+    TEST_ASSERT_FALSE(r.low());
+    TEST_ASSERT_TRUE(r.sensed());
+
+    // A supply held below the band. The assertion is an equivalence, checked on
+    // EVERY sweep: the alarm is up exactly when the processed reading has been
+    // out of band for VRAIL_LOW_SAMPLES sweeps in a row. That pins the run
+    // counter itself — a test that only asked "does it eventually alarm, and
+    // not on sweep 1?" survived the debounce being deleted outright, because
+    // the EMA alone takes two or three sweeps to cross a band, which mimics
+    // the count well enough to fool a loose window.
+    int belowRun = 0;
+    for (int sweep = 1; sweep <= 20; ++sweep) {
+        railBurst(r, railPinMv(VRAIL_MIN_V - 1.0f));
+        if (r.volts() < VRAIL_MIN_V) ++belowRun; else belowRun = 0;
+        TEST_ASSERT_EQUAL_INT_MESSAGE(belowRun >= VRAIL_LOW_SAMPLES, r.low(),
+                                      "the alarm left the rule 'out of band for "
+                                      "VRAIL_LOW_SAMPLES sweeps in a row' on some sweep");
+    }
+    TEST_ASSERT_TRUE(r.low());
+    TEST_ASSERT_TRUE_MESSAGE(belowRun >= VRAIL_LOW_SAMPLES,
+                             "the fixture must actually drive the reading out of band");
+
+    // And recovery releases it. The same equivalence, run backwards: the run
+    // counter zeroes on the first PROCESSED sweep back inside the band — which
+    // is not the first burst fed, because the EMA takes a sweep or two to come
+    // back — and the alarm must leave exactly when the rule says it does, not
+    // after an extra grace and not still lingering.
+    for (int sweep = 1; sweep <= 12; ++sweep) {
+        railBurst(r, railPinMv(VRAIL_NOMINAL_V));
+        if (r.volts() < VRAIL_MIN_V) ++belowRun; else belowRun = 0;
+        TEST_ASSERT_EQUAL_INT_MESSAGE(belowRun >= VRAIL_LOW_SAMPLES, r.low(),
+                                      "the release left the same rule the raise used");
+    }
+    TEST_ASSERT_FALSE(r.low());
+}
+
+// HIGH has no run counter — an open bottom leg parks the pin on its rail and
+// that is steady, and a steady fault needs no patience. The EMA still kills one
+// spurious burst, which is a spike filter, not a debounce.
+void test_rail_high_needs_no_run_counter() {
+    Rail r;
+    railBurst(r, railPinMv(VRAIL_NOMINAL_V));
+    TEST_ASSERT_FALSE(r.implausible());
+
+    // Open divider: the pin sits on its ~3.3 V rail, which through 11:1 is
+    // tens of rail volts — one processed sweep puts the reading past the ceiling.
+    railBurst(r, railPinMv(VRAIL_IMPLAUSIBLE_V + 20.0f));
+    TEST_ASSERT_TRUE_MESSAGE(r.implausible(),
+                             "a sense node on its rail must be implausible at once");
+    TEST_ASSERT_TRUE(r.untrustworthy());
+
+    // One clean sweep back does not clear it instantly — that is the EMA, not a
+    // debounce — but it does not need a run either: the same number of bursts
+    // that took LOW off the band take this one back inside.
+    for (int i = 0; i < 12; ++i) railBurst(r, railPinMv(VRAIL_NOMINAL_V));
+    TEST_ASSERT_FALSE(r.implausible());
+}
+
+// Never-sensed is its own state, and it is untrustworthy without being "low":
+// with VRAIL_SENSE=0 nothing feeds this object, and "no reading" must not
+// silently mean "healthy" — HB's vrail=0.00 railstate=3 is the honest answer.
+void test_rail_never_sensed_is_untrustworthy_but_not_low() {
+    Rail r;
+    TEST_ASSERT_FALSE_MESSAGE(r.low(), "no reading is not a LOW reading: the alarm "
+                                       "path is gated by VRAIL_SENSE, not by faking a level");
+    TEST_ASSERT_FALSE(r.implausible());
+    TEST_ASSERT_FALSE(r.sensed());
+    TEST_ASSERT_TRUE(r.untrustworthy());
+}
+
+// The band follows the coil's rated voltage and its published supply tolerance,
+// exactly the way the pack band follows VBAT_CELLS: one rated number, the rest
+// derived. If anyone hardcodes 10.2 or 13.8 somewhere, this leg reddens.
+void test_rail_band_follows_the_rated_voltage() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VRAIL_NOMINAL_V * 0.85f, VRAIL_MIN_V);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, VRAIL_NOMINAL_V * 1.15f, VRAIL_IMPLAUSIBLE_V);
+    TEST_ASSERT_TRUE(VRAIL_MIN_V < VRAIL_IMPLAUSIBLE_V);
+
+    // Inside near both edges, outside past them — derived from the same two
+    // numbers, so a change to VRAIL_NOMINAL_V or the tolerance moves the
+    // fixtures with it and this still means the same thing.
+    Rail inLo, inHi, outHi;
+    for (int i = 0; i < 12; ++i) {
+        railBurst(inLo, railPinMv(VRAIL_MIN_V + 0.05f));
+        railBurst(inHi, railPinMv(VRAIL_IMPLAUSIBLE_V - 0.05f));
+    }
+    TEST_ASSERT_FALSE(inLo.low());
+    TEST_ASSERT_FALSE(inHi.implausible());
+    TEST_ASSERT_FALSE(inHi.low());
+    for (int i = 0; i < 12; ++i) railBurst(outHi, railPinMv(VRAIL_IMPLAUSIBLE_V + 0.05f));
+    TEST_ASSERT_TRUE(outHi.implausible());
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_divider_scaling_and_gate);
@@ -168,5 +287,9 @@ int main() {
     RUN_TEST(test_ema_converges_monotonically);
     RUN_TEST(test_uninitialised_is_not_low);
     RUN_TEST(test_chemistry_derived_fixtures_still_mean_the_same_thing);
+    RUN_TEST(test_rail_low_needs_consecutive_low_sweeps);
+    RUN_TEST(test_rail_high_needs_no_run_counter);
+    RUN_TEST(test_rail_never_sensed_is_untrustworthy_but_not_low);
+    RUN_TEST(test_rail_band_follows_the_rated_voltage);
     return UNITY_END();
 }

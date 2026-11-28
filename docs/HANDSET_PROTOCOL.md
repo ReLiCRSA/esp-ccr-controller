@@ -384,7 +384,7 @@ alarm flags set, not as `SAFE` on this line. **FLAGS byte bits:**
 | 1 | ppO2 high |
 | 2 | cell drift (voting excluded a cell / disagreement) |
 | 3 | sensor-class failure — aggregates sensor fail, sensor stale, stuck-open valve, hypoxia |
-| 4 | battery — the pack is not trustworthy: below `VBAT_MIN`, **or** a reading this chemistry cannot produce (an open divider, a sense pad on its rail). One bit, because what the diver does is the same either way; the console says which of the two it is |
+| 4 | battery — the power this machine runs on is not trustworthy: the pack below `VBAT_MIN`, **or** a pack reading this chemistry cannot produce (an open divider, a sense pad on its rail), **or** the coil rail untrusted (the ~12 V the valve runs on out of its band — only judged on builds with the rail sense fitted, `VRAIL_SENSE=1`; today's build does not judge it and says so on boot and in HB). One bit, because what the diver does is the same in every case; the console says which one it is |
 | 5 | setpoint clamp active (cellproof ban) |
 | 6 | cell proof currently FAIL |
 | 7 | CNS over the diver's alarm limit (added 2026-11-27) |

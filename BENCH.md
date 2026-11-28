@@ -52,9 +52,10 @@ tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
                                  # 2026-11-27 (batch E, no --predive: the pack is
                                  # unplugged so its BATTERY step refuses, and no
                                  # --expect-depth: no squeeze operator at the bench)
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio graders, no board: 131 cases (2026-11-27)
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join graders, no board: 141 cases (re-counted 2026-11-29, batch E: the vrail=/railstate= legs and the soak_logger regex join)
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 78 checks
 tools/.../python tools/web_probe.py --selftest  # dive-identity + scrub + page graders, no board: 37 cases
+tools/.../python tools/soak_logger.py --selftest  # the soak's HB counting — per-railstate counters and the straddled-reflash behaviour — no port opened, safe beside a live bench: 5 fixtures
 ```
 
 Two radio-policy legs are opt-in on top of the run above: `--wifi-idle

@@ -2306,6 +2306,58 @@ def selftest_control_margin():
     return checks
 
 
+def selftest_soak_contract():
+    """Pin the two copies of the HB status-line regex against each other.
+
+    soak_logger.py (24 h captures) and hw_accept.py (acceptance grading) each
+    carry their own HB_RE; the comment in each names the other as the same
+    contract, and until now that was only a comment. If they drift — one
+    learns the batch-E rail tail, the other does not; one mis-anchors the
+    appended fields — the soak keeps logging and the grader keeps PASSing
+    lines the logger never counted, and nobody finds out until a soak's
+    summary is read. Both lines below are the CURRENT firmware format:
+    everything before vrail= is the pre-batch-E line, byte-identical.
+    """
+    checks = []
+    try:
+        import soak_logger
+    except Exception as exc:  # the join itself must not be skippable silently
+        return [("soak_logger HB_RE is importable for the join", False,
+                 f"import failed: {exc}")]
+    line_e = ("HB st=1 c0=2050 c1=2049 c2=2051 fresh=111 smp=120 i2cerr=0 "
+              "rec=0 vbat=3.64 stale=0 batlow=0 vote=1.320 sp=1.30 "
+              "al=0x0010 mode=0 pulses=4 sol=0 ctrl=1 stk=1408 u2stk=1536 "
+              "worst=45 logskip=0 surfskip=0 contskip=0 cfggen=4/4 "
+              "vrail=11.90 railstate=0")
+    line_pre = line_e.split(" vrail=")[0]
+    for name, line in (("batch-E line (rail tail present)", line_e),
+                       ("pre-batch-E line (no rail tail)", line_pre)):
+        mh, ms = HB_RE.match(line), soak_logger.HB_RE.match(line)
+        checks.append((f"both HB_RE copies parse the {name}",
+                       bool(mh and ms),
+                       f"hw_accept={'ok' if mh else 'MISS'} "
+                       f"soak_logger={'ok' if ms else 'MISS'}"))
+        if mh and ms:
+            checks.append((f"shared fields agree on the {name}",
+                           mh.groups()[:13] == ms.groups()[:13],
+                           f"{mh.groups()} vs {ms.groups()[:13]}"))
+    # The rail tail specifically: soak_logger must EXTRACT it, not merely
+    # match past it — the tail is appended at the end of a long line, so a
+    # regex that only tolerates `vrail=` right after `batlow=` matches the
+    # line and still reports no rail, which is a silent data loss exactly
+    # the size of §1 P9. The pre-batch-E line must report no tail instead
+    # of failing the line.
+    m = soak_logger.HB_RE.match(line_e)
+    checks.append(("soak_logger extracts vrail/railstate from the batch-E line",
+                   bool(m) and m.group(14) == "11.90" and m.group(15) == "0",
+                   "the appended tail matched but was not captured"))
+    m2 = soak_logger.HB_RE.match(line_pre)
+    checks.append(("soak_logger reports no rail tail on a pre-batch-E line",
+                   bool(m2) and m2.group(14) is None,
+                   "a pre-batch-E line parsed with a phantom rail value"))
+    return checks
+
+
 def _read_line(ser, seen, log, t0):
     line = ser.readline().decode(errors="replace").strip()
     if line:
@@ -3613,7 +3665,8 @@ def main() -> int:
                                   *selftest_density_lock(),
                                   *selftest_value_caps(),
                                   *selftest_dive_file(), *selftest_wifi_legs(),
-                                  *selftest_control_margin(), *selftest_stream(),
+                                  *selftest_control_margin(),
+                                  *selftest_soak_contract(), *selftest_stream(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1

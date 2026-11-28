@@ -432,6 +432,21 @@ resistance, and settle whether it opens at ambient differential pressure at all.
 replaces it, and `T,`/dive-file publication of the rail stays deferred until the rail is
 metered — publishing an unmetered number is how `vbat` became P1.
 
+**Update the same day — the chain is sim-witnessed.** The PC rig (`src/sim/rig.*`,
+graded by `test_sim`) now feeds a scripted coil rail through the **real**
+`sensors/rail.h` at SensorTask's own 1 Hz sweep rate, scripted with
+`Rig::setRail()` — `0` is a dead boost, and pulse-sag is deliberately **not**
+simulated because its figure is one of the C3-c measurements the bench owes. Three
+scenarios: a judged rig kills its boost mid-dive and `BIT_BATTERY` rises **while the
+pack number stays healthy and pulses keep counting** (the exact §1 P9 failure, now
+a runnable demo); pre-dive BATTERY refuses and names the reason
+(`coil rail never settled back inside its band` — the assertion on the words is what
+makes the leg mutation-sensitive: breaking the feed changes the sentence, not just
+the verdict); and the un-judged build — today's board, mirrored — sees none of it,
+never even sampling the pin. All three mutation-checked (feed removed, alarm flag
+removed, sweep gate removed — each reddened its named leg). C3-c leg 5's metal run
+is now a rehearsal with the exact sentences to watch for, not a first sighting.
+
 
 ---
 

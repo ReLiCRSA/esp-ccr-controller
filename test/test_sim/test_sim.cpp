@@ -315,6 +315,98 @@ void test_stuck_open_valve() {
     rig.endDive();
 }
 
+// ---------------------------------------------------------------------------
+// S8 — the coil rail (docs/REVIEW.md 1 P9). The scenario this item was written
+// for: a charged pack, a diving machine, and a boost stage that has died. The
+// rig feeds the scripted rail through the REAL sensors/rail.h at the board's
+// 1 Hz sweep — the sim witnesses the designed detection chain, not a rerun of
+// it. What is NOT modelled is sag during a pulse: that figure is a C3-c
+// measurement this bench still owes, and the rig does not invent it.
+// ---------------------------------------------------------------------------
+void test_dead_boost_alarms_mid_dive_while_the_pack_is_fine() {
+    RigOpts o = simOpts();
+    o.predive.vrailSensed = 1;           // the fitted-divider build
+    Rig rig(o);
+    prediveHealthy(rig);
+    TEST_ASSERT_TRUE_MESSAGE(rig.predivePassed(),
+                             "a healthy judged rig must pass pre-dive — otherwise "
+                             "the FAIL below proves nothing");
+    startAtSurface(rig);
+    descend(rig, 10.0f);
+    rig.run(20);
+    TEST_ASSERT_FALSE_MESSAGE(rig.alarmOn(alarms::BIT_BATTERY),
+                              "battery marker up before the boost was even killed");
+    TEST_ASSERT_TRUE(rig.railSwept());
+    TEST_ASSERT_TRUE_MESSAGE(rig.pulseCount() > 0, "no baseline pulses to compare against");
+
+    // Kill the boost. The pack stays at its charged 3.9 V: this is exactly the
+    // fault the old firmware could not see, and the point of the leg is that
+    // the pack numbers stay quiet while the marker comes up.
+    rig.setRail(0.0f);
+    rig.run(1);   // one more sweep: not enough. LOW is counted in sweeps
+                  // (VRAIL_LOW_SAMPLES) precisely so one pulse-shaped dip is
+                  // not an alarm, and the sim has to honour that too.
+    TEST_ASSERT_FALSE_MESSAGE(rig.alarmOn(alarms::BIT_BATTERY),
+                              "the marker fired with less than the sweep debounce");
+    rig.run(10);
+    TEST_ASSERT_TRUE_MESSAGE(rig.alarmOn(alarms::BIT_BATTERY),
+                             "a dead boost with a healthy pack cleared the battery "
+                             "marker — the exact §1 P9 failure");
+    TEST_ASSERT_TRUE(rig.railUntrusted());
+    TEST_ASSERT_TRUE(rig.railSensed() < VRAIL_MIN_V);
+
+    // And the machine keeps diving while it says so: pulses keep counting, the
+    // dive stays active. `pulses=` counts commands, not flow — this is the
+    // sentence that keeps that fact from going folklore again.
+    TEST_ASSERT_TRUE(rig.diveActive());
+    TEST_ASSERT_TRUE_MESSAGE(rig.pulseCount() > 0, "the dive stopped on the alarm");
+}
+
+// The same fault caught BEFORE the dive: pre-dive BATTERY must refuse, name
+// which rail, and the refusal must come from the settle deadline expiring —
+// the message matters: with the sim's sd.vrail feed broken it would read
+// "never sensed" instead, and the test would still see a FAIL. Asserting the
+// words is what makes this leg mutation-sensitive.
+void test_predive_refuses_a_dead_boost() {
+    RigOpts o = simOpts();
+    o.predive.vrailSensed = 1;
+    Rig rig(o);
+    rig.run(5);                          // boot with a live boost: the sense chain
+    rig.setRail(0.0f);                   // has a nominal reading to lose
+    prediveHealthy(rig);
+    TEST_ASSERT_TRUE_MESSAGE(rig.prediveFailed(),
+                             "pre-dive passed with a 0 V coil rail");
+    TEST_ASSERT_EQUAL_UINT8(predive::FAIL, rig.prediveStatus(predive::S_BATTERY));
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("coil rail never settled back inside its band",
+                                     rig.prediveSeq().railWhy(),
+                                     "the BATTERY FAIL did not name the rail and the reason");
+    TEST_ASSERT_FALSE_MESSAGE(rig.requestAuto(true),
+                              "AUTO unlocked on a dive the pre-dive refused");
+}
+
+// The pair that makes the two tests above mean something: TODAY's build —
+// rail not judged (VRAIL_SENSE=0, mirrored by predive.vrailSensed defaulting
+// to it) — must behave exactly as it did before the rail existed. Same dead
+// boost, same scenario: pre-dive passes, no marker. The sim that mirrors the
+// flashed board is also the only way to rehearse C3-c leg 5 before the
+// divider goes on.
+void test_unjudged_sim_sees_nothing_of_a_dead_boost() {
+    RigOpts o = simOpts();               // vrailSensed stays VRAIL_SENSE = 0
+    Rig rig(o);
+    rig.setRail(0.0f);
+    prediveHealthy(rig);
+    TEST_ASSERT_TRUE_MESSAGE(rig.predivePassed(),
+                             "the un-judged build must still pass on the pack alone, "
+                             "exactly as today's board does — that is the bug, stated");
+    startAtSurface(rig);
+    descend(rig, 10.0f);
+    rig.run(20);
+    TEST_ASSERT_FALSE_MESSAGE(rig.alarmOn(alarms::BIT_BATTERY),
+                              "the un-judged build raised a rail alarm: the flag "
+                              "gates the alarm in sim too, as VRAIL_SENSE does on metal");
+    TEST_ASSERT_FALSE(rig.railSwept());  // never even sampled: nothing reads that pin
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_clean_dive);
@@ -324,5 +416,8 @@ int main() {
     RUN_TEST(test_diluent_flush_hypoxia);
     RUN_TEST(test_predive_catches_poisoned_cell);
     RUN_TEST(test_stuck_open_valve);
+    RUN_TEST(test_dead_boost_alarms_mid_dive_while_the_pack_is_fine);
+    RUN_TEST(test_predive_refuses_a_dead_boost);
+    RUN_TEST(test_unjudged_sim_sees_nothing_of_a_dead_boost);
     return UNITY_END();
 }

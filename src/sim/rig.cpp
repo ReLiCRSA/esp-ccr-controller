@@ -11,7 +11,7 @@ constexpr float kTickS = Rig::kTickMs / 1000.0f;
 
 Rig::Rig(const RigOpts& opts)
     : opts_(opts), world_(opts.world), loop_(opts), vbat_(opts.vbat),
-      vbatMid_(opts.vbatMid) {}
+      vbatMid_(opts.vbatMid), vrail_(opts.vrail) {}
 
 void Rig::setCellsFitted(uint8_t mask) {
     opts_.presentMask = mask;
@@ -44,6 +44,21 @@ void Rig::tick() {
     sd.cellsFresh = true;
     sd.vbat = vbat_;
     sd.vbatMid = vbatMid_;
+
+    // The coil rail (P9), sampled the way the board samples it: SensorTask's
+    // 1 Hz eight-sample burst into the real sensors/rail.h. Only a build that
+    // judges the rail sweeps at all — with the flag off (today's board, and
+    // every pre-existing scenario) the rail is never read here either, and
+    // sd.vrail stays 0 with railUntrusted false, exactly what main.cpp's
+    // VRAIL_SENSE gate produces.
+    if (opts_.predive.vrailSensed && now >= railSweepAtMs_) {
+        railSweepAtMs_ = now + 1000;
+        const int pinMv = static_cast<int>(
+            vrail_ * 1000.0f / VRAIL_DIVIDER_RATIO + 0.5f);
+        for (int i = 0; i < 8; ++i) rail_.addSample(pinMv);
+    }
+    sd.vrail = rail_.volts();
+    sd.railUntrusted = opts_.predive.vrailSensed && rail_.untrustworthy();
 
     const ctrl::State st = loop_.cycle(sd, now);
     lastState_ = st;  // published state, for state() — see rig.h

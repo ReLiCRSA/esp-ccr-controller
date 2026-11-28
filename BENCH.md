@@ -1968,6 +1968,15 @@ now keeps.
       the implausible sentence (`check the divider at GPIO39`), and a pre-dive run
       taken during a held-down rail should fail the BATTERY step with the console
       saying `coil rail never settled back inside its band`, not `battery` alone.
+      **The chain is sim-witnessed already** (2026-11-29, `test_sim` S8): the rig
+      feeds a scripted rail through the real `sensors/rail.h` at the board's 1 Hz
+      sweep, and the three scenarios — dead boost alarming mid-dive while the pack
+      stays fine, pre-dive BATTERY refusing and naming the reason, and the
+      un-judged build seeing none of it — all pass, each mutation-checked. What
+      this leg still demands is the **metal** witness (and it rehearses the exact
+      sentences to look for). Pulse-sag is NOT simulated: that figure is a
+      third-half measurement this bench still owes, and the rig does not invent
+      it.
       Publishing the rail on `T,`/dive-file stays deferred until here is green:
       publishing an unmetered number on the wire is how `vbat` became §1 P1.
 

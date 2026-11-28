@@ -512,10 +512,15 @@ PC build of the **real** firmware logic — voting, setpoints, injector,
 calibration, cellproof, ZHL-16C, logging, UART protocol — with the hardware
 layer (ADS1115, I2C, GPIO, NVS, WiFi) stubbed. Not a re-implementation.
 
-**Status: built and green (`src/sim/`, `test/test_sim/`, 7 scenarios).**
+**Status: built and green (`src/sim/`, `test/test_sim/`, 10 scenarios).**
 The chain itself moved into `ctrl::Loop` (`src/control/loop.{h,cpp}`), which the
 firmware `ControlTask` instantiates unchanged — `sim/rig` is now only the bolt
-between that chain and the gas model. `test/test_loop/` covers what only exists
+between that chain and the gas model. The coil rail (P9) is scripted through
+`Rig::setRail()` and processed by the **real** `sensors/rail.h` at the board's
+1 Hz sweep rate, so the "charged pack, dead boost" failure — the one the old
+firmware was blind to — is a runnable sim scenario with its alarm, its pre-dive
+refusal and its un-judged-build twin; pulse-sag is not modelled (unmeasured,
+see BENCH.md C3-c). `test/test_loop/` covers what only exists
 between the modules (staleness gating the valve, the output fuse, the AUTO
 lockout, a spiked depth sample vs the bands). `test/test_divesoak/` is the M6
 exit criterion: **50 seeded dives** (7 of them pre-dive lockouts) with faults

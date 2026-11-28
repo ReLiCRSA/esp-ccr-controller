@@ -15,6 +15,7 @@
 #include "config/defaults.h"   // CONTINUITY_SNAPSHOT_MS / CONTINUITY_SEED_REFRESH_MS
 #include "control/loop.h"
 #include "log/continuity.h"    // H1: the rig runs the REAL record store
+#include "sensors/rail.h"      // P9: the rig runs the REAL rail debounce too
 #include "sim/world.h"
 
 namespace sim {
@@ -32,6 +33,26 @@ struct RigOpts : ctrl::Config {
     // sensed, which with VBAT_CELLS >= 2 refuses the pre-dive battery step —
     // the sim has to be able to script that case, not only the firmware.
     float vbatMid = (VBAT_CELLS * 3.90f) / 2.0f;
+
+    // ---- the coil rail (docs/REVIEW.md 1 P9) -------------------------------
+    // The true rail volts at the coil as the sim's world reports them: nominal
+    // until scripted. The rig feeds this through the REAL sensors/rail.h at the
+    // board's own 1 Hz sweep rate — the same median/EMA/debounce the fitted
+    // divider will run — so a scenario witnesses the detection chain, not a
+    // rig-side re-implementation of it. `setRail(0.0f)` is a dead boost;
+    // `setRail(9.0f)` is a supply sagging under the coil. What is deliberately
+    // NOT modelled: sag *during* a pulse — the real figure is one of C3-c's
+    // unmeasured unknowns, and the rig does not invent numbers the bench owes.
+    //
+    // Whether the rail is judged at all follows `predive.vrailSensed` (inherited
+    // from ctrl::Config): the firmware's one build decision is VRAIL_SENSE, and
+    // the sim's scenario-side equivalent is this flag. Default is VRAIL_SENSE
+    // exactly as defaults.h sets it — today 0 — so every pre-existing soak
+    // witness runs the same rig the board currently is, and a scenario that
+    // wants the judged build says `o.predive.vrailSensed = 1` and gets it.
+    // (Setting RigOpts::vrail while the flag is off changes nothing observable:
+    // an un-judged rail is an un-judged rail in sim as on metal.)
+    float vrail = VRAIL_NOMINAL_V;
 
     // ---- dive continuity (review H1) ---------------------------------------
     // The rig runs the REAL record store (logfmt::ContinuitySlots: the same CRC
@@ -134,6 +155,19 @@ public:
     /// Commanded OR physically flowing (a stuck valve flows without a command).
     bool solenoidOn() const { return lastSolOn_; }
 
+    // ---- the coil rail (docs/REVIEW.md 1 P9) --------------------------------
+    /// Script the TRUE rail volts at the coil: 0 = boost dead, 9 = sagging,
+    /// VRAIL_NOMINAL_V = healthy. The scenario sees what the divider+DSP chain
+    /// makes of it, never the scripted number — that is the whole point of
+    /// running the real Rail object here.
+    void setRail(float volts) { vrail_ = volts; }
+    /// What the sense chain has PROCESSED, the number sd.vrail carries and HB
+    /// would print: deliberately not the true value.
+    float railSensed() const { return rail_.volts(); }
+    /// The rail's own verdict, same object the alarm flag comes from.
+    bool railUntrusted() const { return rail_.untrustworthy(); }
+    bool railSwept() const { return rail_.sensed(); }
+
     // ---- dive continuity (review H1) ---------------------------------------
     // The rig's stand-in for the board's LittleFS store: the REAL two-slot store
     // object (logfmt::ContinuitySlots — same CRC gate, same slot choice, same
@@ -223,6 +257,11 @@ private:
     ctrl::State lastState_{};
     float vbat_ = VBAT_CELLS * 3.90f;
     float vbatMid_ = 0.0f;
+    // The rail (P9): the scripted true volts, the real sense chain that
+    // processes them, and the 1 Hz sweep boundary SensorTask defines.
+    float vrail_ = VRAIL_NOMINAL_V;
+    Rail rail_;
+    uint32_t railSweepAtMs_ = 0;
     uint32_t tickMs_ = 0;
     bool lastSolOn_ = false;
 

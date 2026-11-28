@@ -1133,6 +1133,16 @@ static void controlTask(void*) {
         static bool prevDive = false;
         static bridge::PublisherState pub;
         static uint32_t diveStartMs = 0, lastSnapMs = 0, lastPulseBase = 0;
+        // The dive's own pulse total needs its OWN base (2026-11-28, bench-
+        // witnessed): `totalPulses` was assigned the boot-cumulative injector
+        // count with no base at all, so the first dive of a boot carried every
+        // pulse that came before it — the pre-dive solenoid test's 3 pulses
+        // landed in the dive file (M, said 3 while every S, window said 0).
+        // A second base cannot ride on `lastPulseBase`: that one advances
+        // every cycle to feed the T,/event-row window. The pack being plugged
+        // in for the battery leg is what finally moved the counter off zero
+        // and made the shape visible.
+        static uint32_t divePulseBase = 0;
 
         g_bridgeTel.alarmLogBits = st.alarms.logBits;
         g_bridgeTel.voteMode = static_cast<uint8_t>(st.vote.mode);
@@ -1180,6 +1190,7 @@ static void controlTask(void*) {
             diveStartMs = now;
             lastSnapMs = now;
             lastPulseBase = g_loop->pulseCount();
+            divePulseBase = lastPulseBase;
             g_bridgeTel.diveStartMs = now;
             // The pin fuse latches until accounted for: a board that cut its
             // output mid-dive rebooted (or will), and the dive-start edge is
@@ -1357,7 +1368,7 @@ static void controlTask(void*) {
                 if (v < g_bridgeTotals.minVotedX1000) g_bridgeTotals.minVotedX1000 = v;
                 if (v > g_bridgeTotals.maxVotedX1000) g_bridgeTotals.maxVotedX1000 = v;
             }
-            g_bridgeTotals.totalPulses = g_loop->pulseCount();
+            g_bridgeTotals.totalPulses = g_loop->pulseCount() - divePulseBase;
             const float cns = g_loop->cnsPct();
             const long long cnsPct = numfmt::scaled(cns, 0);   // rounded: 12.9% is 13%
             g_bridgeTotals.cnsPeakPct = cnsPct > 254 ? 254 : static_cast<uint8_t>(cnsPct);

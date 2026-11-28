@@ -96,6 +96,28 @@ pad, and the pinned-pad condition remains something the bench has produced once 
 yet re-produced under a meter. Still open, unchanged: metering the divider, and the fact
 that the refused 10.5 is **not written back**, so the board refuses it every boot.
 
+**That refusal sentence became a graded leg on 2026-11-28, and it grades the part the
+sentence is really claiming.** The boot line alone proves only that the firmware *said*
+something: a board that prints the refusal and **still runs the refused number** passes
+every check the harness had, and so does one that accepts the stale value in silence and
+prints nothing. The acceptance matrix now reads the key back (`GET VBAT_MIN`) and joins
+three answers taken seconds apart — the boot's refusal, the key's band and default from
+the board's own `GET SCHEMA`, and the live value — so "the registry default is used
+instead" is a compared fact, not a quoted one. No number is copied into the tool: the
+band and the default come off the same schema row, which keeps this join board-to-board.
+Eight host fixtures, each proven to be able to fail: refuse-and-still-run, refuse-and-run
+-something-that-is-neither, the sentence losing its tail (the half that says what runs
+instead), a refusal naming a key absent from the published table, acceptance in silence
+with an out-of-band value live, and a refused key never read back — plus the honest boot
+and a genuinely clean NVS, which must stay green. Wiring is graded too: a selftest case
+fails if no acceptance run reaches the grader, because a check that exists and never runs
+is this bench's oldest failure mode. Fixing the leg also exposed a window bug in the
+matrix itself: `GET SCHEMA` answers one line per key (36), and first-match semantics
+stopped after the first `K,` row and let the other 35 smear into the next check's window —
+the same amputation `GET *` had and was fixed for. **The live run of this leg is owed**:
+it needs the handset bridge back on ttyUSB1, and the count of matrix checks will move when
+it is next driven.
+
 What was seen, on the bench, 2026-11-27:
 
 | observation | value |
@@ -203,15 +225,32 @@ watches exactly the tasks that register.
 
 What has not been done is driving the control cycle *toward* that number on purpose.
 `worst=` is graded at 800 ms and the supervisor reboots at `TASK_STALL_CONTROL_MS = 1500`
-ms (`src/main.cpp:1373`). Across the 639 `worst=` samples this repo keeps, the maximum is
+ms (`include/config/defaults.h:223`, enforced at `src/main.cpp:1524` and `:1543` — the
+citation this entry carried, `src/main.cpp:1373`, had drifted and pointed at a comment).
+Across the 639 `worst=` samples this repo keeps, the maximum is
 **505 ms** — a `CAL AIR` leg, `logs/accept_20261127_122109_watch.log`; the previous
 maximum was 457 ms — and quiet benches beat at 4–300 ms while the storm configurations sit
 at 4–9 ms. So the trip time is known, the largest cycle ever observed is known, and the
 gap between them has never been pushed on purpose.
 
+**The 800-versus-1500 choice is now an executable, not a comment (2026-11-28).** It was
+three numbers in two files: the constant in `tools/hw_accept.py`, the define in
+`defaults.h`, and a third literal `1500` inside the bench check's own words. That last
+copy is gone — `grade_watch` now prints the budget **it read out of `defaults.h`** at
+import time, and `hw_accept.py --selftest`'s stall-budget cases pin the relationship in
+both directions: a grade at or above the reboot budget reddens (a board would reboot
+before the console said anything), a grade below 30% of it reddens (it would stop being
+about stalling and start failing a healthy bench — the floor comes from this board's own
+505 ms record, not from taste), renaming the define reddens the join rather than letting
+the tool borrow a look-alike `#define`, and putting the literal back reddens a source
+check. Proven in both directions: moving the grade to 2000 ms reddens four cases including
+the two pre-existing control-margin ones, moving it to 100 ms reddens the floor, flipping
+the comparison from `<=` to `<` reddens the exactly-at-grade fixture.
+
 **To close it:** a bench leg that lengthens the control cycle deliberately (a flash storm
 during a dive is the obvious lever, which is also P2) and reports `worst=` against the
-1500 ms budget rather than the 800 ms grade.
+1500 ms budget rather than the 800 ms grade. That metal half is unchanged by the above:
+pinning the decision makes the margin auditable, it does not narrow it.
 
 
 ### P4 — m-4: the fences are measured, and still unjustified
@@ -332,9 +371,17 @@ These need hands and parts, not code. They are listed here so they cannot be los
   and link LED — nothing is attached to 4/5/6/7/15, to 16 or to 21 yet** — and the screen,
   which still has no implementation. With no buttons on the board, the C2 refusal matrix
   still runs over the bench bridge on ttyUSB1, which is a different board.
-* One C3-b leg is stale rather than unfinished: it cross-checks depth "vs BMP085 on the
-  same standpipe", and the BMP085 was removed from the rig on 2026-11-23 for never ACKing
-  (PLAN.md). Retire or re-point that leg; do not tick it.
+* One C3-b leg was stale rather than unfinished: it cross-checked depth "vs BMP085 on the
+  same standpipe", and that chip left the rig on 2026-11-23 for never ACKing. **Closed
+  2026-11-28**: the leg is re-pointed at what this bench can actually compare against —
+  marks on the standpipe read with a tape, each `T,` depth within 0.3 m — with the
+  hysteresis half (up and back down through 3 m) kept intact, and BENCH.md now says out
+  loud that a second-sensor comparison is not a leg this rig can run. The other live
+  references to that part are gone too: PLAN.md's src tree named `depth_sensor.*` and
+  `bmp085.cpp`, and **neither file has existed since `1e1e15a`** — the tree now lists the
+  seven files that are really in `src/sensors/`. What stays: the dated 2026-11-23 entries
+  in PLAN.md and BENCH.md's C3-a paragraph, because those are the record of why depth is
+  claimed by identity at boot, and deleting them would delete the reason the gate exists.
 
 **To close them:** BENCH.md's C3 checklist, one leg at a time, each with a measured
 number in the log rather than a tick.
@@ -448,6 +495,38 @@ removed, sweep gate removed — each reddened its named leg). C3-c leg 5's metal
 is now a rehearsal with the exact sentences to watch for, not a first sighting.
 
 
+### P10 — a bus error line the bench cannot attribute, and an observation that does not exist
+
+The console prints `requestFrom(): i2cWriteReadNonStop returned Error -1`. The line names
+**no bus and no address**, so the bench cannot tell a probe NACK from a fault NACK — which
+is how a real intermittent I²C fault gets tuned out on a bench that has learned to ignore
+that line.
+
+**Counted, not reasoned, 2026-11-28.** Every copy of this line in this repo's logs, and
+what each one is:
+
+| where | how often | what it is |
+|---|---|---|
+| `logs/accept_20261127_122109_console.log`, `_151346_console.log`, `_151848_console.log`, `accept_20261128_095753_console.log` | **exactly once per boot**, immediately before `depth: LPS28DFW @0x5D ready` | the two-address identity probe at `src/sensors/lps28.cpp:15` walking `{ADDR, ADDR_ALT}`: this board's XSA pad is high, so `0x5C` NACKs and `0x5D` answers. Expected, benign, and the price of a probe that decides the address instead of assuming it |
+| `logs/soak_20261122_094738.log` | **pairs, 17 ms apart, every ~25 s**, at uptime 29 573 s — eight hours in | the depth arbiter recirculating (`src/sensors/depth_manager.cpp:26-30`: `RECIRCULATE_MS`) with **no depth chip fitted**: that soak is 2026-11-22, one day before the LPS28DFW went on the bench. Two NACKs per cycle is the MS5837 pair. Working as designed |
+| a line said to recur "every ~6 s while `i2cerr=0 fresh=111`" | **not in any log here** | an observation from a console tail that was never captured. The cadence does not appear in the four acceptance captures or the 24 h soak; the repo cannot check what it did not keep |
+
+So the two things that were guessed about this line are both closed by the log: it is not
+the depth chip that used to hold this bench slot (**absent from `lib_deps`, absent from
+`~/.platformio/lib`, and `grep -c BMP085 .pio/build/esp32/firmware.map` is 0**), and on a
+bench with a fitted sensor it is a boot-time probe, not a heartbeat.
+
+**What is still owed, and it is not the same item:** an un-captured console observation
+cannot be closed or kept, so the bench half is to run `tools/soak_logger.py` over a healthy
+24 h and count the line with its timestamps. If it recurs on a locked source, that is a new
+finding and the arbiter, not the probe, is where to look. The tooling half stands on its
+own: the message comes from the Arduino core (`Wire.cpp:499` in this core), which cannot be
+made to name our bus, while the two `requestFrom` call sites in this repo are
+`src/sensors/wire_transport.h:64` (every depth read on both buses) and
+`src/sensors/ads1115_bus.cpp:57` (the ADS1115). Naming bus + address at the transport turns
+"that line again" into an attributable event. A host test can pin the sentence; whether it
+ever fires needs the console.
+
 ---
 
 ## 2. The finding index
@@ -485,6 +564,10 @@ column: **§A … §E are the five round sections in §3**, and §D1 means Round
 | the pack chemistry was frozen into six places, and one of them was wrong | a 12 V-style `VBAT_MIN` 10.5 V sat in `defaults.h` while the rig ran a single 3.7 V cell: it refused the pre-dive BATTERY step permanently (HB `vbat=4.92 batlow=1` on a charged pack), so `AUTO` could never unlock, and the same 10.5 was copied into `predive.h`, `alarms.h`, the settings default/range, the test fixtures and `pulse_witness.py` | **closed** (2026-11-27) | one number — `VBAT_CELLS` in `include/config/defaults.h` — derives the floor, the ceiling, the settings band and the sim rail; witnesses: `VBAT_CELLS` 1 → 2 reddens only the published-band legs, and with `docs/HANDSET_PROTOCOL.md` §6's one row updated gives 448/448 native, 896/896 both levels and a clean `env:esp32` link; a new settings-table join (`test_the_published_settings_table_matches_the_registry_it_documents`) now grades all 36 keys of §6 against the registry in both directions, and the tightened band is what clears the stale 10.5 out of NVS on load without a schema bump | new |
 | a series pack would have been judged by one number | 6.80 V is compatible with 4.00 + 2.80 — one dead cell behind a passing voltage gate — and nothing in the tree could see the difference | **closed as far as the bench allows** (2026-11-27) | `PIN_VBAT_MID_SENSE` (GPIO36) plus the pre-dive agreement step (`VBAT_CELL_SPREAD_MAX_V`), which refuses an unwired midpoint rather than passing it; the wiring itself is a C3-c leg with nothing attached yet | new |
 | the rail the solenoid actually runs on is sensed by nothing | `vbat` is the 3.7 V pack; the valve runs at ~12 V off a boost stage nothing measures, so "battery healthy" was standing in for "the coil has voltage" — and no document mentioned the boost converter at all | **decision done, metal open, §1 P9** | architecture written (PLAN.md §1 "Power architecture", with coil resistance and minimum working differential pressure as named unknowns); the sense path is implemented — GPIO39, band derived from the coil's rated 12 V ±15%, fourth question inside the pre-dive BATTERY step, `BIT_BATTERY`, HB `vrail=/railstate=` — and compiled behind `VRAIL_SENSE=0` until the divider is fitted, loudly announced while off. Fitting + metering legs are BENCH.md C3-c | new |
+| the stall warning and the stall reboot were the same number written three times | `HB_WORST_CYCLE_MS = 800` in the bench tool, `TASK_STALL_CONTROL_MS 1500` in `defaults.h`, and a literal `1500` inside the bench check's own output text — a comment claimed the first two were related and nothing enforced it, so a firmware budget change would have left the console grading an unrelated threshold in silence | **closed as a decision; the metal half still open, §1 P3** | the tool reads the budget out of the header at import (and warns on stderr if it cannot), the check's words print what it read, and `--selftest` pins the relationship both ways: grade ≥ budget reddens, grade < 30% of budget reddens (floor from this board's own 505 ms record), a renamed define reddens the join, a look-alike define is refused, and the literal coming back reddens a source check. Mutations: 800→2000 reddens 4 cases, 800→100 reddens 2, rename reddens 1, literal back reddens 1, `<=`→`<` reddens the exactly-at-grade fixture | new |
+| the boot leg accepted the NVS migration sentence as the whole witness | `settings: NVS VBAT_MIN="10.500" refused … the registry default for that key is used instead` was graded as "the boot is clean". A board that prints that refusal **and still runs 10.5** passed; a board that accepts the out-of-band value **in silence** also passed. Both are the failure the sentence exists to prevent | **closed host-side; the live drive is owed, §1 P1** | the matrix reads the key back (`GET VBAT_MIN`) and joins the refusal against the band and default on the board's own `GET SCHEMA` row — no number copied into the tool — over eight fixtures (refuse-and-still-run, refuse-and-run-a-third-value, the sentence losing its tail, a refusal naming an unpublished key, acceptance in silence, a refused key never read back, plus honest and clean boots that must stay green), and one case fails if no acceptance run reaches the grader. Driving the leg out also found that `GET SCHEMA` answers 36 lines and the matrix's first-match window stopped after the first, letting 35 smear into the next check's window — the `GET *` amputation again, now `collect` | new |
+| a C3-b leg and PLAN.md's src tree still named depth parts that are not on the bench | the leg told the next operator to cross-check depth "vs BMP085 on the same standpipe" — a comparison this rig cannot run since 2026-11-23 — and the plan's tree listed `depth_sensor.*` and `bmp085.cpp`, **neither of which has existed since `1e1e15a`** | **closed** (2026-11-28) | the leg is re-pointed at the reference the bench actually has (tape marks at 0.0/2.0/5.0 m, each `T,` depth within 0.3 m, hysteresis through 3 m kept) and says out loud that a second-sensor comparison is not runnable here; the tree line now lists the seven files really in `src/sensors/`; the dated 2026-11-23 records in PLAN.md and BENCH.md's C3-a paragraph stay, because they are the reason depth is identity-gated at boot | new |
+| a bus error line the bench cannot attribute, plus an observation that was never captured | `requestFrom(): i2cWriteReadNonStop returned Error -1` names no bus and no address, so a probe NACK and a fault NACK look identical — and the "every ~6 s on a healthy bench" version of it, repeated in this session's own notes, is **not in any log the repo keeps** | **open (the tooling half), §1 P10**; both guesses about the line closed by counting | every copy in the repo's logs identified: once per boot in all four acceptance captures, immediately before the depth announce — the two-address identity probe (`src/sensors/lps28.cpp:15`) on a board whose XSA pad puts the chip at `0x5D`, so `0x5C` NACKs by design; and pairs 17 ms apart every ~25 s in `logs/soak_20261122_094738.log` at uptime 29 573 s, which is the arbiter recirculating one day **before** the LPS28DFW was fitted. Not the removed chip: absent from `lib_deps`, from `~/.platformio/lib`, and **0** `BMP085` symbols in `firmware.map`. Owed: a timestamped soak count, and a transport-level message that names bus + address (the core's line at `Wire.cpp:499` cannot) | new |
 
 
 ---
@@ -2004,6 +2087,9 @@ who has to catch the next one.
 | a dive-file grader that printed **PASS** while the file contained `M,` total 0, and a pulse witness that would have reported a PASS on a dive that injected nothing | both now say so: `tools/hw_accept.py` prints a vacuity note when the total is 0, and `tools/pulse_witness.py` exits **2** rather than print a vacuous PASS. A check that cannot witness anything must say so | Round E item 2's follow-up |
 | "`tools/float_audit.py` is in the gate" (BENCH.md's gate list, where it has been since the float bug came back the first time) | the list was true and the practice was not: the battery build was flashed on 2026-11-28 carrying `floor %.2f V, ceiling %.2f V` in a **SensorTask** `printf` — a violation of the rule, produced while the rule was open in the same session. The audit was run *after* the flash, when it found the violation; nothing had stopped the flash. `vbat=34.71` on this very bench is the reason that task's stack matters. What closed it is a hook, not a reminder: `tools/upload_gate.py` runs the audit as a pre-action on the upload target, witnessed reddening a planted `%.2f` with **no `Wrote` line** while the same tree still built | C2, "And the flash does it for you" |
 | "the settings table in `docs/HANDSET_PROTOCOL.md` §6 documents the keys the board has" | it documented 30 of 36 keys, and published `VBAT_MIN` as type F with default 10.5 and band 3.0 to 30.0 after that key had been re-derived from the chemistry — a table a handset builder would build against and the parser would refuse. Nothing graded it, even though §4's flags table has had a doc-vs-code join since Round D | `test_the_published_settings_table_matches_the_registry_it_documents`, mutation-checked by editing the doc (old row, drifted registry default, deleted row — each reddens it by key name) |
+| a date the bench's own clock contradicts | six doc lines written today — four in REVIEW.md, two in BENCH.md — read **2026-11-29**. `date` here says 2026-11-28, and so do all three commits those lines describe (`702067e`, `666b852`, `56256ab`). Nothing checks a date, so the error would have outlived the session that made it — the same family as the `src/main.cpp:1373` citation that had drifted onto a comment while the constant it named lives at `include/config/defaults.h:223` | corrected in place: all six dates to 2026-11-28, and the drifted citation replaced with the two lines that actually enforce the budget (`defaults.h:223`, `main.cpp:1524`/`:1543`). Found by running `date` before quoting the notes, which is the rule in §1 applied to my own working memory |
+| "the console cries `requestFrom(): … Error -1` every ~6 s on a healthy bench" — said in this session, and nearly repeated into a doc draft | counted instead of reasoned: the repo's four acceptance captures carry the line **once per boot** (the LPS28 two-address probe, `src/sensors/lps28.cpp:15`, on a board whose chip sits at `0x5D`), and the only recurrence anywhere is pairs every ~25 s in `logs/soak_20261122_094738.log` — a run from the day before the LPS28DFW was fitted, where an unlocked arbiter recirculating is correct behaviour. No log shows a ~6 s cadence, and the `i2cerr=0 fresh=111` half of the sentence came from a tail that was never captured | §1 P10 rewritten around the counts, and the claim marked as an observation the bench owes a capture for rather than a finding it owes a fix for. Two other attributions fell out of the same count: the line is not the removed depth chip (`firmware.map` has 0 `BMP085` symbols), and `Wire.cpp:532` was the wrong core line — this core logs it at `Wire.cpp:499` |
+
 
 ---
 

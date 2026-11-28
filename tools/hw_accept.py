@@ -32,6 +32,7 @@ lines are listed. Raw console capture is kept under logs/.
 """
 import argparse
 import threading
+import inspect
 import re
 import sys
 import time
@@ -173,7 +174,19 @@ PROTOCOL_CHECKS = [
     ("GET T", r"^T,", "telemetry line parses", "burst"),
     ("GET D", r"^D,", "deco picture on request", "burst"),
     ("GET *", r"^[A-Z0-9_]+=", "full settings listing", "collect"),
-    ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server"),
+    # `collect`, and not by taste: GET SCHEMA answers one LINE PER KEY (36 of
+    # them), and first-match semantics stop after the first `K,` row and leave
+    # the other 35 in the buffer to smear into the NEXT check's window — the
+    # same amputation that `GET *` had and got fixed for. The NVS-migration leg
+    # below grades the band of the refused key from these rows, so it needs them
+    # whole, and the following checks need them gone.
+    ("GET SCHEMA", r"^K,SP2,F,", "the pages' ranges come from the server", "collect"),
+    # The chemistry migration of 1 P1, read back instead of taken on trust: the
+    # boot refuses a stored VBAT_MIN the tightened band cannot hold and promises
+    # the registry default runs instead. grade_nvs_migration joins that promise
+    # against this reply. Never probe a refusal with a schema endpoint (bench
+    # rule from 2026-11-24), so the value asked for here is read, never written.
+    ("GET VBAT_MIN", r"^VBAT_MIN=[\d.]+$", "the migrated key's live value, on request"),
     ("GET HIST", r"^(HIST,|ERR no histogram)", "histogram answer, or the truth"),
     ("GET FAULT", r"^FAULT,", "fuse/stuck-open/duty on request"),
     # Which chip owns depth, and whether the control path is using it (2026-11-25).
@@ -360,6 +373,16 @@ HB_STACK_RE = re.compile(r"stk=(\d+)(?: u2stk=(\d+))?")
 # A healthy bench run loses nothing: a nonzero is a real hole in a dive file
 # and is graded like one.
 HB_CYCLE_RE = re.compile(r"worst=(\d+) logskip=(\d+) surfskip=(\d+) contskip=(\d+)")
+# The grade is DELIBERATELY stricter than the reboot, and the decision is
+# pinned by selftest_stall_budget(): it reads TASK_STALL_CONTROL_MS out of
+# include/config/defaults.h and asserts this line stays below the budget it
+# is a warning FOR. A board beating at 900 ms is not rebooting — the gap
+# between "we warn" and "we restart" existing at all is the point, because
+# the warning fires while there is still margin to act in. If the firmware
+# budget ever moves, this constant has to be re-chosen on purpose, and the
+# selftest is what says so in red instead of in prose.
+# The measured record on this board is 505 ms (BENCH.md gate 5, 639 samples),
+# so 800 ms sits well above every legitimate cost and well below the reboot.
 HB_WORST_CYCLE_MS = 800
 
 # Batch D: the applied-rules generation pair, appended after contskip= (again
@@ -1835,6 +1858,306 @@ def selftest_dive_file():
     return checks
 
 
+
+# --------------------------------------------------------------------------------
+# The stall budget: the console warning and the supervisor reboot are one quantity,
+# measured twice. A comment that says "800 is below 1500" is prose; this join makes
+# the relationship a gate, so moving TASK_STALL_CONTROL_MS without re-choosing the
+# grade reddens the run instead of silently widening the margin.
+#
+# The two numbers live in two files ON PURPOSE: the firmware owns the reboot budget,
+# this tool owns the warning that precedes it. selftest_stall_budget() is what keeps
+# them honest to each other.
+# --------------------------------------------------------------------------------
+FIRMWARE_DEFAULTS_H = Path(__file__).resolve().parent.parent / "include/config/defaults.h"
+
+# How far below the reboot the warning may drift and still be about STALLING. The
+# floor comes from this board's own record, not from taste: the worst ControlTask
+# cycle ever measured on a healthy bench is 505 ms (BENCH.md gate 5, 639 samples),
+# so a grade below ~500 ms stops meaning "stalling" and starts failing a board
+# that is fine.
+STALL_BUDGET_MIN_FRACTION = 0.30
+
+
+def stall_budget_from(text):
+    """Pulls TASK_STALL_CONTROL_MS out of header TEXT, not a path: the fixture
+    case is a string, and a file read inside the grader would make that case a
+    statement about the filesystem instead of about the join."""
+    m = re.search(r"^\s*#define\s+TASK_STALL_CONTROL_MS\s+(\d+)", text, re.M)
+    if not m:
+        raise ValueError("no `#define TASK_STALL_CONTROL_MS <n>` in the firmware "
+                         "header: the stall budget moved or was renamed, and the "
+                         "tool's grade is now an unanchored number")
+    return int(m.group(1))
+
+
+def firmware_stall_budget(path=FIRMWARE_DEFAULTS_H):
+    return stall_budget_from(Path(path).read_text(encoding="utf-8"))
+
+
+# Read ONCE at import, and say so loudly if the header cannot answer: a tool that
+# quietly falls back to a remembered number is the failure mode this join exists
+# to prevent. selftest_stall_budget() reddens on the same condition.
+try:
+    FIRMWARE_STALL_BUDGET_MS = firmware_stall_budget()
+except Exception as _budget_err:  # noqa: BLE001 - the message IS the finding
+    FIRMWARE_STALL_BUDGET_MS = None
+    print(f"hw_accept: WARNING: cannot read the stall budget: {_budget_err}",
+          file=sys.stderr)
+
+
+def selftest_stall_budget():
+    """Records the 800-vs-1500 decision as an executable, not a comment.
+
+    Nothing here claims 800 ms is right forever. It claims 800 is chosen AGAINST
+    the firmware's reboot budget, in both directions: a warning above the reboot
+    is useless, and a warning absurdly far below it is grading a different
+    problem. If either number moves, this stops being green and forces the
+    choice to be made again on purpose.
+    """
+    checks = []
+    budget = None
+    try:
+        budget = firmware_stall_budget()
+    except Exception as e:  # an unreadable header IS the finding
+        checks.append(("the stall budget is readable from the firmware header",
+                       False, str(e)))
+    if budget is not None:
+        checks.append((f"the stall budget reads as a plausible number (got {budget} ms)",
+                       100 <= budget <= 60_000,
+                       f"TASK_STALL_CONTROL_MS = {budget} in {FIRMWARE_DEFAULTS_H}"))
+        checks.append((f"the worst= grade ({HB_WORST_CYCLE_MS} ms) is stricter than the "
+                       f"{budget} ms supervisor reboot it warns about",
+                       HB_WORST_CYCLE_MS < budget,
+                       f"HB_WORST_CYCLE_MS = {HB_WORST_CYCLE_MS}, budget = {budget}: a "
+                       "board can reboot before the console ever says anything"))
+        checks.append((f"the worst= grade is at least {STALL_BUDGET_MIN_FRACTION:.0%} of "
+                       "the reboot budget, so it grades stalling and not ordinary noise",
+                       HB_WORST_CYCLE_MS >= STALL_BUDGET_MIN_FRACTION * budget,
+                       f"HB_WORST_CYCLE_MS = {HB_WORST_CYCLE_MS} vs budget {budget}"))
+        # The number being pinned must be the number the pass/fail turns on, AND
+        # the reboot budget in the check's own words must come from the header:
+        # the old name printed a literal 1500, a third copy of a number the tool
+        # had no business owning.
+        src = inspect.getsource(grade_watch)
+        checks.append(("the live grader compares against the pinned constant",
+                       "worst_cycle <= HB_WORST_CYCLE_MS" in src,
+                       "grade_watch compares a literal: re-choosing the constant "
+                       "would change nothing on the bench"))
+        checks.append(("the grader names the budget it read, not a literal 1500",
+                       "FIRMWARE_STALL_BUDGET_MS" in src and "reboot budget 1500" not in src,
+                       "the check text carries its own copy of the firmware's number"))
+    # The join itself, both directions: a header with the define is read, a header
+    # with only a LOOK-ALIKE define raises instead of quietly borrowing someone
+    # else's number.
+    good = "#define TASK_STALL_CONTROL_MS       1500\n"
+    lookalike = "#define TASK_STALL_CONTROL_MS_OTHER 999\n#define TASK_WATCHDOG_MS 1\n"
+    checks.append(("the reader finds the define in a synthetic header",
+                   stall_budget_from(good) == 1500, ""))
+    try:
+        got = stall_budget_from(lookalike)
+        checks.append(("the reader refuses a header without the exact define",
+                       False, f"it read {got} from a header that has no such define"))
+    except ValueError:
+        checks.append(("the reader refuses a header without the exact define", True, ""))
+    # And the boundary of the grade, so the pinned constant is shown to be live:
+    # one under passes, one over fails, and a cycle at the reboot budget fails
+    # loudly — a board that stalled to the reboot point must not grade clean.
+    beat = ("HB seq=1 open=0 depth=0.00 sp=0.00 d=0.00 valve=0 cons=0 rem=0 bails=0 "
+            "i2cerr=0 fresh=113 bat=3.87 batadc=3.87 batadcstate=0 batinv=0 "
+            "batraw=1512 batrawstate=1 caloff=0 cfggen=0 vrail=0.00 railstate=3 ")
+    for worst, should_fail in ((HB_WORST_CYCLE_MS - 1, False),
+                               (HB_WORST_CYCLE_MS, False),
+                               (HB_WORST_CYCLE_MS + 1, True),
+                               (budget or 1500, True)):
+        line = beat + f"worst={worst} logskip=0 surfskip=0 contskip=0"
+        ch = grade_watch([line])
+        bad = [c for c in ch if c[0].startswith("worst= cycle margin") and not c[1]]
+        checks.append((f"worst={worst} is graded "
+                       f"{'a cycle-time failure' if should_fail else 'clean'}",
+                       bool(bad) == should_fail,
+                       bad[0][2] if bad else next(c[2] for c in ch
+                                                  if c[0].startswith("worst= cycle margin"))))
+    return checks
+
+
+# --------------------------------------------------------------------------------
+# The NVS migration leg: "a stored value the new band cannot hold is refused, the
+# refusal is said out loud, and the registry default is what actually runs."
+#
+# REVIEW.md (1 P1) carries that as a prose claim: the boot line repeats every boot
+# until a diver writes a legal value. The boot leg graded only that the boot is
+# clean, so a board that printed the refusal AND STILL USED the stale number — and
+# a board that accepted the stale number in silence — both passed. Both are graded
+# here, and neither grade copies a firmware number into this tool: the key's band
+# and its default come from the board's own `GET SCHEMA`, so the join is
+# board-to-board.
+# --------------------------------------------------------------------------------
+NVS_REFUSAL_RE = re.compile(
+    r'^settings: NVS (?P<key>[A-Z0-9_]+)="(?P<val>[^"]*)" refused \((?P<why>[^)]+)\)'
+    r' - the registry default for that key is used instead$')
+
+# `K,<key>,<type>,<min>,<max>,<flags>,<default>` — the board's own published table
+# (src/comms/cmd_router.cpp renderSchema). Field order is the wire contract.
+SCHEMA_ROW_RE = re.compile(
+    r"^K,(?P<key>[A-Z0-9_]+),(?P<type>[A-Z]),(?P<min>-?[\d.]+),(?P<max>-?[\d.]+),"
+    r"(?P<flags>\d+),(?P<def>-?[\d.]+)$")
+
+
+def parse_schema(rows):
+    """{key: (type, min, max, default)} from the `K,` lines of `GET SCHEMA`."""
+    out = {}
+    for l in rows:
+        m = SCHEMA_ROW_RE.match(l.strip())
+        if m:
+            out[m.group("key")] = (m.group("type"), float(m.group("min")),
+                                   float(m.group("max")), float(m.group("def")))
+    return out
+
+
+def grade_nvs_migration(boot_lines, schema_rows, readback):
+    """boot_lines: the captured boot. schema_rows: this session's `K,` lines.
+    readback: {key: value} answered by `GET <key>` AFTER that boot.
+
+    A refusal that is merely PRESENT is reported as a finding with its remedy, not
+    as a firmware failure: an old value in NVS is the diver's business, and the
+    open item closes the day the refusal stops appearing.
+    """
+    checks = []
+    schema = parse_schema(schema_rows)
+    refs = [m for m in (NVS_REFUSAL_RE.match(l.strip()) for l in boot_lines) if m]
+    # The refusal sentence is a contract: key, the stored text quoted verbatim, the
+    # reason, and the consequence. A truncated tail is the interesting failure,
+    # because the tail is the only part that says WHAT RUNS INSTEAD.
+    loose = [l for l in boot_lines if "settings: NVS" in l and "refused" in l]
+    checks.append(("every NVS refusal states the key, the stored value, the reason "
+                   "and what is used instead",
+                   len(loose) == len(refs),
+                   next((l for l in loose if not NVS_REFUSAL_RE.match(l.strip())), "")))
+    for m in refs:
+        key, stored = m.group("key"), m.group("val")
+        row = schema.get(key)
+        checks.append((f"the refused key {key} is one the board publishes a schema row for",
+                       row is not None,
+                       f"{key} refused at boot but absent from GET SCHEMA: the refusal "
+                       "names a key the handset cannot even write to"))
+        live = readback.get(key)
+        if live is None:
+            checks.append((f"{key}: the refused value is not what is running", False,
+                           f"{key} refused at boot and never read back: nothing proves "
+                           "the default replaced it"))
+            continue
+        checks.append((f"{key}: the refused value {stored} is NOT live",
+                       live.strip() != stored.strip(),
+                       f"boot refused {stored} and GET {key} answers {live}: the "
+                       "refusal is decoration, the stale value is in the chain"))
+        if row is None:
+            continue
+        try:
+            lv = float(live)
+        except ValueError:
+            checks.append((f"{key}: the read-back parses as a number", False,
+                           f"GET {key} answered {live!r}"))
+            continue
+        checks.append((f"{key}: the live value sits inside the band the board publishes "
+                       "for it", row[1] <= lv <= row[2],
+                       f"{live} is outside [{row[1]}, {row[2]}]: the value the band "
+                       "rejects is the value in force"))
+        # The sentence promises the registry DEFAULT, and the board publishes that
+        # default on the same schema row: two board answers joined, not a number
+        # copied into the tool.
+        checks.append((f"{key}: the live value is the published default",
+                       abs(lv - row[3]) < 1e-6,
+                       f"boot says the default is used; GET {key} answers {live}, the "
+                       f"schema default is {row[3]}"))
+    # The other direction — the one that passes today: a stored value the band
+    # cannot hold, accepted in silence. Anything live and out of band with no
+    # refusal naming it is that defect.
+    silent = []
+    for key, val in readback.items():
+        row = schema.get(key)
+        if row is None or row[0] == "S":
+            continue
+        try:
+            lv = float(val)
+        except ValueError:
+            continue
+        if not (row[1] <= lv <= row[2]) and not any(m.group("key") == key for m in refs):
+            silent.append(f"{key}={val} outside [{row[1]}, {row[2]}] with no boot refusal")
+    checks.append(("nothing out of band is running that the boot did not refuse",
+                   not silent, "; ".join(silent)))
+    if refs:
+        first = next(l for l in boot_lines if NVS_REFUSAL_RE.match(l.strip()))
+        checks.append((f"NVS holds a value the current band rejects — {first} — run "
+                       "`SET <KEY>` to replace it: the refusal repeats every boot "
+                       "until then", True,
+                       "a bench condition, recorded as a finding, not a firmware fault"))
+    return checks
+
+
+def selftest_nvs_migration():
+    """Lying boots, both directions.
+
+    The honest case is this bench's own boot, captured not typed: VBAT_MIN stored
+    as 10.500 under the old 12 V chemistry, the tightened band rejecting it, the
+    board answering 3.400. The mutations are the two that used to pass green —
+    refuse-and-still-use, and accept-in-silence — plus the sentence losing its
+    tail, which is the half that says what runs instead.
+    """
+    schema = ["K,SP2,F,0.2,4,0,0.21",
+              "K,VBAT_MIN,F,3,4.2,0,3.4",
+              "K,GF_LOW,F,1,3,0,1.3",
+              "K,AP_PASS,S,0,0,0,0"]
+    honest_boot = ["ets Jun  8 2016",
+                   'settings: NVS VBAT_MIN="10.500" refused (out of range) - the '
+                   "registry default for that key is used instead",
+                   "settings: 35 keys from NVS"]
+
+    def g(boot, readback):
+        return grade_nvs_migration(boot, schema, readback)
+
+    def bad(ch):
+        return [c for c in ch if not c[1]]
+
+    checks = [("the honest boot passes clean", not bad(g(honest_boot, {
+        "VBAT_MIN": "3.400", "SP2": "0.210", "GF_LOW": "1.300"})),
+        "; ".join(c[0] for c in bad(g(honest_boot, {
+            "VBAT_MIN": "3.400", "SP2": "0.210", "GF_LOW": "1.300"}))))]
+    muts = [
+        ("refuses the value and STILL runs it", honest_boot,
+         {"VBAT_MIN": "10.500", "SP2": "0.210"}, "is NOT live"),
+        ("refuses it, then runs something that is neither the stored value nor the default",
+         honest_boot, {"VBAT_MIN": "3.900", "SP2": "0.210"}, "is the published default"),
+        ("the refusal loses its tail — the half that says what runs instead",
+         ['settings: NVS VBAT_MIN="10.500" refused (out of range)'],
+         {"VBAT_MIN": "3.400"}, "what is used instead"),
+        ("refuses a key that is not in the published table",
+         ['settings: NVS VBATMINX="10.500" refused (out of range) - the registry '
+          "default for that key is used instead"], {"VBATMINX": "3.400"},
+         "publishes a schema row"),
+        ("the stale value is accepted in silence: no refusal, out-of-band value live",
+         ["settings: 36 keys from NVS"], {"VBAT_MIN": "10.500"},
+         "nothing out of band is running"),
+        ("the refused key is never read back, so 'the default is in force' is unproven",
+         honest_boot, {"SP2": "0.210"}, "is not what is running"),
+    ]
+    for name, boot, read, expect in muts:
+        ch = g(boot, read)
+        checks.append((f"mutation: {name}", any(expect in c[0] for c in bad(ch)),
+                       "; ".join(c[0] for c in bad(ch)) or "nothing failed"))
+    # A clean NVS must invent nothing: no refusal, everything inside its band.
+    clean = g(["settings: 36 keys from NVS"], {"VBAT_MIN": "3.600", "SP2": "0.300"})
+    checks.append(("a board with nothing stale reports nothing", not bad(clean),
+                   "; ".join(c[0] for c in bad(clean))))
+    # A grader that exists and is never called is the failure mode this repo has
+    # been bitten by before (a check hunting an `E,` row its own line filter threw
+    # away). The fixtures prove the grader; this proves the wiring.
+    checks.append(("the live run actually calls this leg",
+                   "grade_nvs_migration(" in inspect.getsource(main),
+                   "grade_nvs_migration is defined and graded by its own selftest, "
+                   "but no acceptance run reaches it"))
+    return checks
+
 def selftest():
     """Proves the surface-log graders can fail.
 
@@ -2139,8 +2462,10 @@ def grade_watch(lines, boot_lines=None, cal_lines=None):
                        "assumed, not measured"))
     else:
         checks.append((f"worst= cycle margin <= {HB_WORST_CYCLE_MS} ms "
-                       f"(worst {worst_cycle}, reboot budget 1500, measured TWDT "
-                       f"expiry {TWDT_MEASURED_SPREAD_MS} ms)",
+                       f"(worst {worst_cycle}, reboot budget "
+                       f"{FIRMWARE_STALL_BUDGET_MS or 'UNREADABLE from defaults.h'} "
+                       f"read from defaults.h, measured TWDT expiry "
+                       f"{TWDT_MEASURED_SPREAD_MS} ms)",
                        worst_cycle <= HB_WORST_CYCLE_MS, "see HB lines"))
     for key, what in (("logskip", "dive-file row"), ("surfskip", "surface record"),
                       ("contskip", "continuity snapshot")):
@@ -3667,6 +3992,8 @@ def main() -> int:
                                   *selftest_dive_file(), *selftest_wifi_legs(),
                                   *selftest_control_margin(),
                                   *selftest_soak_contract(), *selftest_stream(),
+                                  *selftest_stall_budget(),
+                                  *selftest_nvs_migration(),
                                   *selftest()]:
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}" + ("" if ok_ else f": {detail}"))
             fails += 0 if ok_ else 1
@@ -3800,6 +4127,25 @@ def main() -> int:
 
         print("\n--- radio policy: three fields, one state, read twice ---")
         for name, ok_, detail in grade_wifi(proto_pairs, lines):
+            print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
+                  + ("" if ok_ else f": {detail}"))
+            failures += 0 if ok_ else 1
+
+        print("\n--- NVS migration: a refused value must not be the one running ---")
+        # The boot's refusal sentence and the live value are two answers to one
+        # question, taken seconds apart. Pairs, not the raw stream: a bare
+        # `VBAT_MIN=` reply on the stream is indistinguishable from a listing
+        # line, and the whole point is which number is IN the chain.
+        nvs_schema = next((r for c, r in proto_pairs if c == "GET SCHEMA"), [])
+        nvs_read = {}
+        for cmd, replies in proto_pairs:
+            if not cmd.startswith("GET "):
+                continue
+            key = cmd[4:].strip()
+            hit = next((l for l in replies if l.startswith(key + "=")), None)
+            if hit:
+                nvs_read[key] = hit.split("=", 1)[1].strip()
+        for name, ok_, detail in grade_nvs_migration(lines, nvs_schema, nvs_read):
             print(f"  [{'PASS' if ok_ else 'FAIL'}] {name}"
                   + ("" if ok_ else f": {detail}"))
             failures += 0 if ok_ else 1

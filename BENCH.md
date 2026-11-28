@@ -52,7 +52,7 @@ tools/.../python tools/hw_accept.py --expect-web --handset /dev/ttyUSB1 \
                                  # 2026-11-27 (batch E, no --predive: the pack is
                                  # unplugged so its BATTERY step refuses, and no
                                  # --expect-depth: no squeeze operator at the bench)
-tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join graders, no board: 141 cases (re-counted 2026-11-29, batch E: the vrail=/railstate= legs and the soak_logger regex join)
+tools/.../python tools/hw_accept.py --selftest   # the log/depth/depth-source/ruler/value-cap/dive-file/radio/control-margin/soak-join/stall-budget/NVS-migration graders, no board: 161 cases (re-counted 2026-11-28: batch E's `vrail=`/`railstate=` legs and the soak_logger regex join, then the stall-budget join that reads `TASK_STALL_CONTROL_MS` out of `defaults.h` and the NVS refusal-vs-live-value leg)
 tools/.../python tools/web_probe.py --handset /dev/ttyUSB1 --dive-cycle  # 78 checks
 tools/.../python tools/web_probe.py --selftest  # dive-identity + scrub + page graders, no board: 37 cases
 tools/.../python tools/soak_logger.py --selftest  # the soak's HB counting — per-railstate counters and the straddled-reflash behaviour — no port opened, safe beside a live bench: 5 fixtures
@@ -1868,9 +1868,13 @@ now keeps.
 - [ ] I2C: address 0x70 (verify with the boot line, not a datasheet),
       10 kΩ pull-ups, leads twisted, ≤30 cm — same bus-recovery drill as
       the M1 soak (yank SDA/SCL, expect `i2cerr/rec` move, **no reset**).
-- [ ] Cross-check vs BMP085 on the same standpipe: 0.0 / 2.0 / 5.0 m, both
-      readings within 0.3 m; MS5837 hysteresis checked by going up and
-      down through 3 m.
+- [ ] Depth against the standpipe's measured height — not against a second chip:
+      mark 0.0 / 2.0 / 5.0 m on the tube with a tape, and each `T,` depth must sit
+      within 0.3 m of the mark. There is no second depth sensor on this bench to
+      compare with (the one that held this slot was removed on 2026-11-23, never
+      ACKing — PLAN.md), so on this rig the tape IS the reference and a comparison
+      against another sensor is not a leg that can be run. MS5837 hysteresis:
+      go up and back down through 3 m and read both passes.
 - [ ] Firmware still refuses a bad bus: cover the sensor, expect
       `stale`/`SENSOR` alarm, injection stops, valve stays shut.
 
@@ -1906,7 +1910,19 @@ now keeps.
       `vbat=4.92 batlow=1`; after it, `vbat=3.62…3.65 batlow=0 al=0x0000`, with
       the handset readout showing `batt 3.64 V` and no battery marker. The
       refused 10.5 is **not** written back, so that line repeats every boot
-      until a `SET VBAT_MIN` replaces it.
+      until a `SET VBAT_MIN` replaces it. That repetition is now a graded leg and
+      not an observation: the matrix reads the key back (`GET VBAT_MIN`) and joins
+      three answers taken seconds apart — the boot's refusal, the key's band and
+      default from the board's own `GET SCHEMA`, and the live value — so "the
+      registry default is used instead" is compared, not quoted. It reddens if the
+      refused number is the one still running, if something that is neither the
+      stored value nor the published default is running, if the refusal sentence
+      loses the tail that says what runs instead, and — the direction the boot
+      line alone could never show — if an out-of-band value is live with **no**
+      refusal printed at all. Eight host fixtures cover exactly those cases
+      (`hw_accept.py --selftest`), each proven able to fail. The metal half is
+      owed: this leg has never been driven, and it wants the handset bridge back
+      on ttyUSB1.
       **A series pack is not free:** the pack voltage alone cannot see one dead
       cell (6.80 V is 4.00 + 2.80, and a voltage-only gate passes it), so 2S needs
       the midpoint divider to `PIN_VBAT_MID_SENSE` (GPIO36, ADC1, input-only) and
@@ -1969,7 +1985,7 @@ now keeps.
       the implausible sentence (`check the divider at GPIO39`), and a pre-dive run
       taken during a held-down rail should fail the BATTERY step with the console
       saying `coil rail never settled back inside its band`, not `battery` alone.
-      **The chain is sim-witnessed already** (2026-11-29, `test_sim` S8): the rig
+      **The chain is sim-witnessed already** (2026-11-28, `test_sim` S8): the rig
       feeds a scripted rail through the real `sensors/rail.h` at the board's 1 Hz
       sweep, and the three scenarios — dead boost alarming mid-dive while the pack
       stays fine, pre-dive BATTERY refusing and naming the reason, and the

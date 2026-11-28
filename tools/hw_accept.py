@@ -2223,6 +2223,11 @@ def selftest_matrix_window():
              "HIST,2,60,10,25,3,39,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,"
              "19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37"]
     next_answer = "SP2=0.550"
+    # The volunteered line a live bench puts on the wire, copied out of
+    # logs/accept_20261128_185837_handset.log (five identical copies there) rather
+    # than shaped by hand: a fixture `T,` this firmware cannot emit would let the
+    # pattern that steps over it drift with nobody noticing.
+    bench_t = "T,0.20,0.223,0.223,0.223,0.223,0.400,STANDBY,FLAGS0x00,3.64"
     stream = []
 
     def src(lines):
@@ -2243,7 +2248,7 @@ def selftest_matrix_window():
 
     # 1. The fix: all three cells, telemetry stepped over, the next command's
     #    line pushed back and handed on intact.
-    t1 = hist3 + ["T,172,0.00,0.40", next_answer]
+    t1 = hist3 + [bench_t, next_answer]
     ok1, seen1, ok2, seen2 = run(t1, (hist_pat, hist_fam), r"^[A-Z0-9_]+=")
     checks.append(("the histogram answer is taken WHOLE: three cells, not one",
                    sum(1 for l in seen1 if l.startswith("HIST,")) == 3,
@@ -2311,13 +2316,16 @@ def selftest_matrix_window():
     # 7. The live bench never goes silent: `T,` arrives at 2 Hz forever, so a
     #    drain whose only exit is a quiet line never exits. Found on the first
     #    matrix run over the S3 bridge, 2026-11-28: `GET *` was ANSWERED, the
-    #    drain then consumed volunteered telemetry forever, and the matrix sent
-    #    no further command for 38 minutes — bytes flowing, process alive, no
-    #    phase log ever closed. Every fixture above runs out and answers `""`,
-    #    which is exactly the silence a bench does not do; this one keeps
-    #    talking. The flood is finite only so the suite cannot hang: the bound
-    #    under test must stop the drain long before it runs out.
-    flood = ["SP1=0.300", "SP2=0.550"] + ["T,172,0.00,0.40"] * 4000 + [next_answer]
+    #    drain then consumed volunteered telemetry forever, and the repro run sent
+    #    no further command for the 801 s it was allowed to live — bytes flowing,
+    #    process alive, no phase log ever closed
+    #    (`logs/stall_repro_run2_stdout.log`, last console line `[801.32s]`).
+    #    Every fixture above runs out and answers `""`, which is exactly the
+    #    silence a bench does not do; this one keeps talking. The flood line is
+    #    `bench_t` above — the bench's own `T,`, copied from a capture. The flood
+    #    is finite only so the suite cannot hang: the bound under test must stop
+    #    the drain long before it runs out.
+    flood = ["SP1=0.300", "SP2=0.550"] + [bench_t] * 4000 + [next_answer]
     ok1, seen1, ok2, seen2 = run(flood, (r"^[A-Z0-9_]+=", re.compile(r"^[A-Z0-9_]+=")),
                                  r"^[A-Z0-9_]+=")
     over = sum(1 for l in seen1 if UNSOLICITED.match(l))

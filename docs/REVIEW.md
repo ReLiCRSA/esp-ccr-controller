@@ -496,6 +496,15 @@ estimates. The chosen direction was the first option above, mirrored on `vbat`:
 What remains for P9 is metal, and it is written as BENCH.md C3-c legs: fit the divider,
 meter the rail at the coil (standing and under a pulse), measure the 2V025-08 coil's DC
 resistance, and settle whether it opens at ambient differential pressure at all. The
+**not-sensed half of those sentences is now bench-seen** (2026-11-28, on the flashed
+build): the boot prints `rail: coil rail NOT SENSED (VRAIL_SENSE=0, no divider fitted):
+no check here has looked at the 12 V the valve runs on` and every HB line ends
+`vrail=0.00 railstate=3` (`logs/accept_20261128_185837_console.log`,
+`logs/accept_20261128_after_seed_clean_118p_0f.log`). It is worth recording that the same
+check reddened at 18:1x the same day — the board was then running a pre-batch-E image, and
+the field appeared only when HEAD was flashed. That is the usual lesson again: a green or
+red bench check is a statement about the image on the board, not about the source in the
+tree. C3-c's first rail leg is checked off in BENCH.md; the divider legs are not. The
 ±15% band is a documented rating used as a placeholder verdict until that measurement
 replaces it, and `T,`/dive-file publication of the rail stays deferred until the rail is
 metered — publishing an unmetered number is how `vbat` became P1.
@@ -1995,7 +2004,10 @@ which is the global this box was built to remove.
    witnessed by native tests and by two lying captures in `--selftest`, but not yet
    by a dive this board actually injected — unreachable with the pack unplugged.
    Connect the pack and run `tools/pulse_witness.py /dev/ttyUSB1`: exit 0 means the
-   dive file's windows are real on metal.
+   dive file's windows are real on metal. (Both halves of that sentence have moved
+   since: the bridge answers `/dev/ttyACM1` from 2026-11-28, the pack is plugged in,
+   and the witness is now vacuous for the other reason — the pre-dive stops at the
+   SOLENOID step with no pressure source. §1 P5 carries the current wording.)
 2. **m-4's necessity claim.** The fences are one `memw` each on xtensa (measured) and
    invisible on x86 (measured). Nobody has demonstrated a payload/sequence pairing
    that breaks without them; that would need either a weakly-ordered host run or a

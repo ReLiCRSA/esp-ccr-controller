@@ -2004,14 +2004,22 @@ now keeps.
       sentence, which is a different sentence on purpose (the old single printf
       said "cannot be a 1-cell pack" on the clearing edge too). Until that is
       seen, the claim on this path is "host-tested", not "bench-tested".
-- [ ] Rail, first half — **today's truth, no build change**: boot the flashed image
+- [x] Rail, first half — **today's truth, no build change**: boot the flashed image
       and the console must contain `rail: coil rail NOT SENSED (VRAIL_SENSE=0, no
       divider fitted): no check here has looked at the 12 V the valve runs on`, and
       every HB line must end `vrail=0.00 railstate=3`. Those sentences are the point
       of this leg: the gap is now a stated fact on the bench instead of an absence,
       and `tools/hw_accept.py`'s batch-E legs redden a missing `vrail=` or a
       `railstate=3` line that carries a voltage. Graded with the board as-is, this
-      half can be closed without touching the hardware.
+      half can be closed without touching the hardware. **Seen on the bench
+      2026-11-28**, on the flashed `env:esp32` at HEAD: the boot sentence appears
+      verbatim (`logs/accept_20261128_185837_console.log`,
+      `logs/accept_20261128_after_seed_clean_118p_0f.log`) and every HB line of the
+      later run ends `vrail=0.00 railstate=3` (13 lines counted). It had NOT been
+      seen earlier the same day: the 18:1x matrix run reddened
+      `HB reports the coil rail (vrail=)` because the board still held a pre-batch-E
+      image — the field appeared when the current build was flashed for the pulse-base
+      fix. A check about a wire and a check about an image: this one was the image.
 - [ ] Rail, second half — fit and meter the sense path (the metal part of §1 P9).
       Divider 100k/10k from the boost output to GPIO39 (`PIN_VRAIL_SENSE`, ADC1,
       input-only, same ratio as the pack), then the same metering procedure the pack
